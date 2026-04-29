@@ -556,6 +556,10 @@ impl MdkSqliteStorage {
         // Apply all migrations (both OpenMLS tables and MDK tables)
         migrations::run_migrations(&mut connection)?;
 
+        if encryption_config.is_some() {
+            encryption::verify_database_file_encrypted(file_path)?;
+        }
+
         // Ensure secure permissions on the database file and any sidecar files
         Self::apply_secure_permissions(file_path)?;
 
@@ -610,7 +614,7 @@ impl MdkSqliteStorage {
     fn apply_secure_permissions(db_path: &Path) -> Result<(), Error> {
         // Skip special SQLite paths (in-memory databases, etc.)
         let path_str = db_path.to_string_lossy();
-        if path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':') {
+        if path_str.is_empty() || path_str == ":memory:" {
             return Ok(());
         }
 
