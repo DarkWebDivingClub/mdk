@@ -13,6 +13,7 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
+| `src/bin/harness-report.rs` | Tiny report writer CLI. Runs `send-leave/v1` cases with `--seed`, `--cases`, and `--out`, then writes one JSON `ScenarioReport` per generated case. |
 | `vectors/` | External JSON `VectorFixture` files. Each fixture carries both input `scenario` and output `expected_trace`. |
 
 ## Bus model

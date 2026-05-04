@@ -102,6 +102,19 @@ serializable `ScenarioReport` with:
 metadata: family name, generator version, seed, case index, and an optional
 `minimized_case` field for future shrink results.
 
+To run the current generated family and write JSON reports:
+
+```sh
+cargo run -p test-harness --bin harness-report -- \
+  --family send-leave/v1 \
+  --seed 42 \
+  --cases 10 \
+  --out target/harness-reports
+```
+
+Reports are written as one file per case, for example
+`target/harness-reports/send-leave-v1-seed-42-case-0.json`.
+
 ## When to use the harness vs. integration tests
 
 | Question | Where to put the test |

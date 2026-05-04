@@ -64,6 +64,8 @@ Current fixture coverage:
   trace, step log, recovery observations, and invariant failures.
 - `run_generated_case_report` adds generated-family metadata and a future
   `minimized_case` field.
+- `harness-report` writes generated `send-leave/v1` scenario reports as JSON
+  artifacts from seed and case-count CLI arguments.
 - `three-client-message-exchange/v1` is captured as a fixture.
 - `deliberate-fork-recovery/v1` is captured as a fixture and includes
   `ForkRecoveryObservation`.
