@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/traits",
+    "crates/cgka-engine",
+    "crates/storage-memory",
+    "crates/test-harness",
+]
+exclude = ["spike"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# OpenMLS family — tilde-pinned to avoid silent skew (see docs/learnings.md:32)
+openmls = "~0.8.1"
+openmls_basic_credential = "~0.5"
+openmls_rust_crypto = "~0.5"
+openmls_traits = "~0.5"
+tls_codec = "~0.4"
+
+# async
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# utils
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+
+# test
+proptest = "1"
+insta = { version = "1", features = ["json"] }
+test-log = { version = "0.2", features = ["trace"] }
+
+# workspace-internal
+cgka-traits = { path = "crates/traits" }
+cgka-engine = { path = "crates/cgka-engine" }
+storage-memory = { path = "crates/storage-memory" }
+test-harness = { path = "crates/test-harness" }

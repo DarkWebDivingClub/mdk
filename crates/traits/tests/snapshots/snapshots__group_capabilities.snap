@@ -1,0 +1,12 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: caps
+---
+{
+  "proposals": [
+    10
+  ],
+  "extensions": [
+    62187
+  ]
+}

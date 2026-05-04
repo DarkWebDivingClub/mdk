@@ -1,0 +1,25 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::MessageReceived\n{ group_id: gid(), sender: mem_id(), payload: b\"hi\".to_vec(), }"
+---
+{
+  "MessageReceived": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "sender": [
+      97,
+      108,
+      105,
+      99,
+      101
+    ],
+    "payload": [
+      104,
+      105
+    ]
+  }
+}

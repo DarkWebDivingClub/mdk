@@ -1,0 +1,463 @@
+//! Phase 4.3b — invite + MIP-03 SelfRemove (leave) round-trips.
+
+use async_trait::async_trait;
+use cgka_engine::EngineBuilder;
+use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::EngineError;
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::error::PeelerError;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::transport::{
+    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use cgka_traits::types::{MemberId, MessageId};
+use storage_memory::MemoryStorage;
+
+fn pad32(name: &[u8]) -> Vec<u8> {
+    // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
+    // zero-padded to 32 so engine-layer admin tracking works without
+    // breaking ergonomic test names.
+    let mut out = vec![0u8; 32];
+    let n = name.len().min(32);
+    out[..n].copy_from_slice(&name[..n]);
+    out
+}
+
+struct MockPeeler;
+
+fn hash_id(bytes: &[u8]) -> MessageId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+#[async_trait]
+impl TransportPeeler for MockPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::MlsMessage {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        })
+    }
+}
+
+fn selfremove_registry() -> FeatureRegistry {
+    let mut r = FeatureRegistry::new();
+    r.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03",
+        },
+    );
+    r
+}
+
+fn build_client(id: &[u8]) -> impl CgkaEngine {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+// ── Invite ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn invite_adds_third_member_and_advances_epoch() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+
+    // Create a(lice)+b(ob) group.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "test".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    let pending = match &create_result {
+        SendResult::GroupCreated { pending, .. } => *pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome_for_bob = match create_result {
+        SendResult::GroupCreated { mut welcomes, .. } => welcomes.remove(0),
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    // Now alice invites carol.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite_result = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+
+    let (commit, carol_welcome, inv_pending) = match invite_result {
+        SendResult::GroupEvolution {
+            msg,
+            mut welcomes,
+            pending,
+        } => (msg, welcomes.remove(0), pending),
+        _ => panic!("expected GroupEvolution"),
+    };
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+
+    // Alice confirms.
+    alice.confirm_published(inv_pending).await.unwrap();
+
+    // Carol joins.
+    carol.join_welcome(carol_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
+
+    // Bob ingests the commit → epoch advances; MemberAdded fires.
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+
+    let events = bob.drain_events();
+    let has_epoch_change = events.iter().any(|e| {
+        matches!(
+            e,
+            cgka_traits::engine::GroupEvent::EpochChanged {
+                from: cgka_traits::EpochId(1),
+                to: cgka_traits::EpochId(2),
+                ..
+            }
+        )
+    });
+    assert!(
+        has_epoch_change,
+        "bob should see EpochChanged; events: {events:?}"
+    );
+
+    // All three engines converge.
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    assert_eq!(bob.members(&group_id).unwrap().len(), 3);
+    assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn invite_rejects_invitee_missing_required_capability() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut stripped = EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(b"stripped"))
+        .feature_registry(FeatureRegistry::new())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = create {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let stripped_kp = stripped.fresh_key_package().await.unwrap();
+    let err = alice
+        .send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![stripped_kp],
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        EngineError::MissingRequiredCapabilities { .. }
+    ));
+}
+
+// ── Leave (MIP-03 SelfRemove) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn selfremove_full_flow_with_auto_commit() {
+    // MIP-03 end-to-end (post-§149):
+    //   alice creates group with bob + carol, confirms; both join via welcome
+    //   bob (non-admin) sends SelfRemove → Proposal
+    //   alice ingests bob's proposal → auto-commits (lowest-index remaining,
+    //                                                 not the target, alice
+    //                                                 is admin so no §150
+    //                                                 depletion concern)
+    //   alice advances to epoch 2, drain_auto_publish yields the commit
+    //   bob ingests alice's commit → bob's epoch advances, sees himself
+    //                                removed
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mip03".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    // Bob (non-admin) leaves.
+    let proposal = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        _ => unreachable!(),
+    };
+
+    // Alice ingests bob's proposal — alice is the lowest-index non-target
+    // remaining member AND alice is admin, so auto-commit fires.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    let outcome = alice.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+    let alice_events = alice.drain_events();
+    assert!(
+        alice_events.iter().any(|e| matches!(
+            e,
+            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
+                if member == &bob.self_id()
+        )),
+        "alice should emit MemberRemoved for bob; got {alice_events:?}"
+    );
+
+    // Alice's state should now be epoch 2, bob removed.
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+    let alice_members = alice.members(&group_id).unwrap();
+    assert_eq!(
+        alice_members.len(),
+        2,
+        "bob should be removed; got {alice_members:?}"
+    );
+
+    // drain_auto_publish yields the commit alice produced.
+    let auto_msgs = alice.drain_auto_publish();
+    assert_eq!(auto_msgs.len(), 1);
+
+    // Bob ingests alice's commit — bob's epoch advances; he sees himself
+    // removed.
+    let commit = auto_msgs.into_iter().next().unwrap();
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+    let bob_events = bob.drain_events();
+    assert!(
+        bob_events.iter().any(|e| matches!(
+            e,
+            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
+                if member == &bob.self_id()
+        )),
+        "bob should emit MemberRemoved for himself; got {bob_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn leave_produces_selfremove_proposal() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Bob (non-admin) leaves — should produce SendResult::Proposal, NOT
+    // GroupEvolution.
+    let res = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    match &res {
+        SendResult::Proposal { .. } => {} // expected
+        other => panic!("expected Proposal, got {other:?}"),
+    }
+
+    // Alice ingests the proposal — classifies as Processed (OpenMLS buffers
+    // + auto-committer fires).
+    let proposal_msg = match res {
+        SendResult::Proposal { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let outcome = alice.ingest(proposal_msg).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+}
+
+// ── Grep invariant: no non-SelfRemove leave path ────────────────────────────
+
+/// Load-bearing comment: `leave_group_via_self_remove` is the ONLY leave
+/// path the engine exposes. This test is effectively a grep guard — if
+/// anyone adds `mls_group.leave_group(` anywhere in cgka-engine/, CI should
+/// fail. See Task 4.2 in the production refactor plan + spike-findings §2.2.
+#[test]
+fn no_legacy_leave_group_call_in_engine_source() {
+    use std::fs;
+    use std::path::PathBuf;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
+    for entry in walk(&src) {
+        let text = fs::read_to_string(&entry).unwrap();
+        for line in text.lines() {
+            // Allow the comment that explicitly names the legacy call.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains(".leave_group("),
+                "found legacy leave_group() in {entry:?}: {line}"
+            );
+        }
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}

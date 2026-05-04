@@ -1,0 +1,28 @@
+[package]
+name = "cgka-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OpenMLS-backed CGKA engine implementation."
+
+[dependencies]
+cgka-traits.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+tls_codec = { workspace = true, features = ["derive", "std"] }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+storage-memory.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+test-log.workspace = true
+insta.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "storage-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-memory storage backend for the CGKA engine. Suitable for tests and ephemeral scenarios; SQLite backend deferred."
+
+[dependencies]
+cgka-traits.workspace = true
+openmls_memory_storage = "~0.5"
+openmls_traits.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+test-log.workspace = true

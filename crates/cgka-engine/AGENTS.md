@@ -1,0 +1,97 @@
+# AGENTS.md — cgka-engine
+
+Agent-facing map of this crate. Read [`README.md`](README.md) first if you want the human framing.
+
+## Quick orientation
+
+This crate implements `cgka_traits::CgkaEngine` over OpenMLS 0.8.x. The engine is a **thin coordinator** above OpenMLS, not a re-implementation of MLS. The state machine layered on top governs commit sequencing, fork detection/recovery, capability negotiation, and MIP-03 admin policy — everything that OpenMLS does not enforce on its own.
+
+| You want to... | Open... |
+|---|---|
+| Find the public surface | `src/engine.rs` (`Engine<S>`, `EngineBuilder`) — every `CgkaEngine` trait method dispatches from here |
+| Understand the state machine | `src/epoch_manager.rs` + `cgka_traits::engine_state` |
+| Trace an inbound message | `src/message_processor.rs::ingest_inbound` |
+| Trace an outbound intent | `src/message_processor.rs::do_send` (then the matching `do_*` in `group_lifecycle.rs` / `upgrade.rs`) |
+| Add a feature capability | `src/feature_registry.rs` + tests in `tests/capabilities.rs` |
+| Understand fork handling | `src/fork_recovery.rs` + `src/epoch_manager.rs::we_committed_from` + the `WrongEpoch` branch in `message_processor.rs` |
+| Figure out auto-commit policy | `src/auto_committer.rs` |
+| Touch wire-format policy | `src/wire_format.rs` (read the module-level comment first; this is a known revisit point) |
+| Walk the test layout | [`tests/AGENTS.md`](tests/AGENTS.md) |
+
+## Subsystem map (every `src/` module)
+
+Each module has a one-paragraph rustdoc at the top explaining its responsibility and which design-doc section it realises. Read those rustdocs as the source of truth — this table is just an index.
+
+| Module | Owns |
+|---|---|
+| `engine.rs` | `Engine<S>` struct, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` queues |
+| `identity.rs` | local signer + credential bundle |
+| `provider.rs` | ad-hoc `OpenMlsProvider` adapter composed from crypto + storage |
+| `feature_registry.rs` | runtime feature → capability-requirement registry |
+| `capabilities.rs` | translation between `cgka_traits::Capability` and OpenMLS `Capabilities` |
+| `capability_manager.rs` | `feature_status`, `upgradeable_capabilities`, write-through cache population |
+| `key_package.rs` | `fresh_key_package` (no expiry; that's a higher-layer concern) |
+| `group_lifecycle.rs` | `do_create_group`, `do_join_welcome`, `do_send_invite`, `do_send_leave` |
+| `message_processor.rs` | inbound peel → classify → apply; outbound `SendIntent` dispatch; MIP-03 guards |
+| `epoch_manager.rs` | only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind), `committed_from`, fork detection state |
+| `fork_recovery.rs` | deterministic same-epoch commit ordering, pre-commit snapshot metadata, rollback-to-winner recovery |
+| `publish.rs` | `do_confirm_published` (merges staged commit + mirrors Marmot/cache post-merge) and `do_publish_failed` (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here. |
+| `auto_committer.rs` | `LowestIndexAutoCommitter` policy for SelfRemove (pluggable seam) |
+| `upgrade.rs` | `do_upgrade_group_capabilities` — the only GCE-commit construction site today |
+| `group_data.rs` | MIP-01 `marmot_group_data` (`0xF2EE`) extension construction |
+| `group_context_view.rs` | snapshot view of `GroupContext` for trait callers |
+| `wire_format.rs` | `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker |
+
+## Design deviations (read these before changing the contract)
+
+These are the load-bearing departures from the original plan. Each is also documented inline at the deviation site.
+
+1. **Storage aggregate uses accessor composition, not direct supertrait.**
+   `cgka_traits::StorageProvider` exposes `type Mls; fn mls_storage(&self) -> &Self::Mls` instead of being `: openmls_traits::storage::StorageProvider<CURRENT_VERSION>`. Hand-forwarding 50+ OpenMLS trait methods is mechanical churn with zero functional value. Site: `crates/traits/src/storage.rs:120-130`.
+
+2. **`SendResult::GroupCreated { welcomes, pending }` is its own variant.**
+   `GroupEvolution` carries a `msg: TransportMessage` that has no consumer at create-time (every other initial member arrives via welcome with post-commit state). Splitting the variant also eliminates a welcome-before-commit `AlreadyAtEpoch` bounce at creation. Site: `crates/traits/src/engine.rs::SendResult`.
+
+3. **`CreateGroupRequest::initial_admins: Vec<MemberId>`.**
+   Bootstraps multi-admin groups so admins can subsequently self-remove (MIP-03 §149's "not the last admin" constraint). Creator is implicitly an admin; `initial_admins` adds co-admins.
+
+4. **The per-leaf capability cache is load-bearing for correctness, not a pure optimization.**
+   `LeafNode::capabilities()` IS public on OpenMLS (the spike's `pub(crate)` claim was wrong — see `memory/project_openmls_capabilities_access.md`). But `MlsGroup::public_group()` is `pub(crate)`, so there's no public API to walk to a *specific* leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()` for self.
+
+5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.**
+   §149 / §150 admin guards must fire at commit-construction time, which is inside the engine. Transport-y fields (relays, image_*, nostr_group_id) are populated with placeholders that a future transport adapter refines. A future component-based MIP-01 split will retire this monolithic module.
+
+6. **Test identities are 32 bytes via `pad32`.**
+   MIP-01 admin pubkeys MUST be 32-byte x-only secp256k1. The engine strict-fails non-32-byte member identities at admin-set time. Production identities (real Nostr pubkeys) flow through unchanged.
+
+## Open structural items
+
+None in the engine core. Remaining work is around observability and production backends: recovery trace observations for portable vectors, SQLite snapshot retention/pruning, transport adapters, and KeyPackage refresh scheduling. See [`../../plans/2026-04-22-cgka-engine-production-refactor-v1.md`](../../plans/2026-04-22-cgka-engine-production-refactor-v1.md).
+
+### Done — Task 4.2 `update_group_data` (2026-04-25)
+
+`crates/cgka-engine/src/update_group_data.rs` mirrors the `do_upgrade_group_capabilities` shape: stages a GCE commit that overwrites the `marmot_group_data` extension's `name` / `description` fields, defers merge to `do_confirm_published`, rolls back via `do_publish_failed`. Other extension fields (admin set, relays, image_*, disappearing_message_secs, version, nostr_group_id) are preserved verbatim. Admin-set updates and relay updates are deliberately out of scope. Tests: 5 in `tests/update_group_data.rs`.
+
+### Done — Task 4.13 publish-before-apply (2026-04-25)
+
+`do_create_group` / `do_send_invite` / `do_upgrade_group_capabilities` stage their commits and defer merge until `CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` + Marmot re-derive from the still-unmerged group. **Auto-commit** (in `message_processor.rs::ingest_group_message`'s `ProposalMessage` branch) intentionally still merges before publish — see `auto_committer.rs` rustdoc for why. The Marmot record holds *projected post-merge* `members` so `members()` and `feature_status` reflect the user's intent during `PendingPublish`. See `tests/publish_lifecycle.rs` for the contract.
+
+OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>` (`mod.rs:353`), `StagedCommit::export_secret` (`staged_commit.rs:778`, identical signature to `MlsGroup::export_secret`), `MlsGroup::merge_pending_commit` (`processing.rs:307`), `MlsGroup::clear_pending_commit` (`mod.rs:374`).
+
+### Done — ForkRecoveryManager (2026-05-04)
+
+`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is `(TransportMessage::timestamp, MessageId bytes)`. Local and inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing candidate is marked stale. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
+
+## Conventions in this crate
+
+- **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
+- **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for `crates/traits/`, `crates/storage-memory/`.
+- **No `leave_group()` (the legacy MLS path).** Always `leave_group_via_self_remove` per MIP-03. This is grep-banned.
+- **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret — silent companion-crate skew is a real footgun, see `docs/learnings.md:32`.
+- **Wire format is `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`.** This is a deliberate 0.1.0 choice. Before changing it, read the module comment in `src/wire_format.rs` and the three alternative paths it links.
+
+## Memory files agents should consult
+
+- `project_openmls_capabilities_access` — corrects the spike's `pub(crate)` claim.
+- `feedback_openmls_accessor_pattern` — when to prefer accessor composition over hand-forwarding OpenMLS traits.
+- `project_two_layer_addressing` — why `StaleReason::NotForThisClient` is engine-layer identity filtering, not transport-layer defense-in-depth.

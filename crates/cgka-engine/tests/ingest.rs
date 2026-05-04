@@ -1,0 +1,481 @@
+//! Phase 4.3 ingest tests — one per `StaleReason` variant plus
+//! send(AppMessage) + ingest(AppMessage) round-trip.
+
+use async_trait::async_trait;
+use cgka_engine::EngineBuilder;
+use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
+use cgka_traits::error::PeelerError;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::transport::{
+    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use cgka_traits::types::{MemberId, MessageId};
+use storage_memory::MemoryStorage;
+
+fn pad32(name: &[u8]) -> Vec<u8> {
+    // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
+    // zero-padded to 32 so engine-layer admin tracking works without
+    // breaking ergonomic test names.
+    let mut out = vec![0u8; 32];
+    let n = name.len().min(32);
+    out[..n].copy_from_slice(&name[..n]);
+    out
+}
+
+struct MockPeeler;
+
+fn hash_id(bytes: &[u8]) -> MessageId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+#[async_trait]
+impl TransportPeeler for MockPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::MlsMessage {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        })
+    }
+}
+
+fn selfremove_registry() -> FeatureRegistry {
+    let mut r = FeatureRegistry::new();
+    r.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03",
+        },
+    );
+    r
+}
+
+fn build_client(id: &[u8]) -> impl CgkaEngine {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+// ── Every StaleReason reachable ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn ingest_unknown_group_message_returns_unknown_group() {
+    let mut engine = build_client(b"a");
+    let mut group_msg_transport_group_id = vec![0xAA; 32];
+    // With envelope targeting a non-existent group.
+    let msg = TransportMessage {
+        id: MessageId::new(vec![1; 4]),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: std::mem::take(&mut group_msg_transport_group_id),
+        },
+    };
+    let outcome = engine.ingest(msg).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::UnknownGroup
+        }
+    ));
+}
+
+#[tokio::test]
+async fn ingest_welcome_for_another_client_returns_not_for_this_client() {
+    let mut engine = build_client(b"me");
+    let msg = TransportMessage {
+        id: MessageId::new(vec![2; 4]),
+        payload: vec![],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(b"someone-else".to_vec()),
+        },
+    };
+    let outcome = engine.ingest(msg).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::NotForThisClient
+        }
+    ));
+}
+
+#[tokio::test]
+async fn ingest_duplicate_message_id_returns_already_seen() {
+    let mut engine = build_client(b"me");
+    let msg = TransportMessage {
+        id: MessageId::new(vec![3; 4]),
+        payload: vec![],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(b"nope".to_vec()),
+        },
+    };
+    // First ingest classifies Stale{NotForThisClient} but still records the id.
+    engine.ingest(msg.clone()).await.unwrap();
+    let outcome = engine.ingest(msg).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+}
+
+#[tokio::test]
+async fn ingest_own_created_message_returns_own_echo() {
+    // Alice sends an app message, then ingests her own outbound message
+    // (which might be echoed by the transport). The engine should classify
+    // this as OwnEcho via the sent_message_ids set.
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "x".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match &create {
+        SendResult::GroupCreated { pending, .. } => *pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let app_msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"hi".to_vec(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => msg,
+        _ => unreachable!(),
+    };
+
+    // Re-route so the envelope resolves to alice's group.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..app_msg
+    };
+    let outcome = alice.ingest(routed).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::OwnEcho
+        }
+    ));
+    let _ = (bob, create);
+}
+
+#[tokio::test]
+async fn welcome_before_commit_yields_already_at_epoch() {
+    // Post create_group-simplification (we no longer emit a commit for the
+    // initial group, only welcomes — see group_lifecycle.rs), this scenario
+    // plays out on INVITE commits instead: if a new member joins via
+    // welcome at epoch N, and then ingests the invite commit that was for
+    // epoch N-1 → N, MLS rejects WrongEpoch; we classify AlreadyAtEpoch.
+    //
+    // Reproduction:
+    //   alice creates group with bob → bob joins welcome (epoch 1)
+    //   alice invites carol → produces an invite commit (epoch 1→2)
+    //   carol joins via welcome (epoch 2)
+    //   carol ingests the invite commit → her MLS is at epoch 2, commit
+    //   targets epoch 1 → WrongEpoch → AlreadyAtEpoch.
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "x".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (invite_commit, carol_welcome, invite_pending) = match invite {
+        SendResult::GroupEvolution {
+            msg,
+            mut welcomes,
+            pending,
+        } => (msg, welcomes.remove(0), pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(invite_pending).await.unwrap();
+
+    // Carol joins via welcome (epoch 2).
+    carol.join_welcome(carol_welcome).await.unwrap();
+
+    // Carol ingests the invite commit (epoch 1 → 2) — her MLS is already
+    // at epoch 2, so process_message returns WrongEpoch, which we classify
+    // as AlreadyAtEpoch.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..invite_commit
+    };
+    let outcome = carol.ingest(routed).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "got: {outcome:?}"
+    );
+}
+
+// ── Happy path: send+ingest AppMessage ──────────────────────────────────────
+
+#[tokio::test]
+async fn send_app_message_round_trips_to_another_client() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match &result {
+        SendResult::GroupCreated { pending, .. } => *pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let welcome = match result {
+        SendResult::GroupCreated { mut welcomes, .. } => welcomes.remove(0),
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+
+    // Alice sends an app message.
+    let send_res = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"hello bob".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let msg = match send_res {
+        SendResult::ApplicationMessage { msg } => msg,
+        _ => panic!("expected ApplicationMessage"),
+    };
+
+    // Re-route the transport_group_id so bob resolves it.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    let outcome = bob.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+
+    let events = bob.drain_events();
+    let got_it = events.iter().any(|e| {
+        matches!(
+            e,
+            GroupEvent::MessageReceived { sender, payload, .. }
+                if sender == &alice.self_id() && payload == b"hello bob"
+        )
+    });
+    assert!(got_it, "expected MessageReceived; got {events:?}");
+}
+
+#[tokio::test]
+async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    let bob_msg = match bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"arrived while alice was pending".to_vec(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite_pending = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+
+    let outcome = alice.ingest(bob_msg).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "expected buffering while PendingPublish, got {outcome:?}"
+    );
+    assert!(
+        alice
+            .drain_events()
+            .into_iter()
+            .all(|e| !matches!(e, GroupEvent::MessageReceived { .. })),
+        "buffered message must not emit before rollback"
+    );
+
+    alice.publish_failed(invite_pending).await.unwrap();
+    let events = alice.drain_events();
+    let replayed = events.iter().any(
+        |e| matches!(e, GroupEvent::MessageReceived { payload, .. } if payload == b"arrived while alice was pending"),
+    );
+    assert!(
+        replayed,
+        "expected buffered message after rollback; got {events:?}"
+    );
+}

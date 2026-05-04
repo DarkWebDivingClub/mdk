@@ -1,0 +1,273 @@
+//! [`Engine<S>`] — the OpenMLS-backed [`CgkaEngine`] implementation.
+//!
+//! Generic over `S: cgka_traits::StorageProvider`. Holds a `RustCrypto`
+//! instance for the crypto + rand half of OpenMLS's provider surface,
+//! materializing an `EngineOpenMlsProvider` on demand per MLS call.
+//!
+//! This file wires the pieces together. Method bodies for `CgkaEngine`
+//! stub out to `todo!()`-style typed errors until their owning subsystem
+//! lands (Tasks 4.2–4.13).
+
+use crate::feature_registry::FeatureRegistry;
+use crate::identity::Identity;
+use async_trait::async_trait;
+use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
+use cgka_traits::engine::{
+    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+};
+use cgka_traits::engine_state::{PendingStateRef, WelcomeState};
+use cgka_traits::error::EngineError;
+use cgka_traits::group::Member;
+use cgka_traits::group_context::GroupContext;
+use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::StorageProvider;
+use cgka_traits::transport::TransportMessage;
+use cgka_traits::types::MessageId;
+use cgka_traits::types::{EpochId, GroupId, MemberId};
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::types::Ciphersuite;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
+pub const DEFAULT_CIPHERSUITE: Ciphersuite =
+    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+/// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
+pub struct Engine<S: StorageProvider> {
+    pub(crate) storage: S,
+    pub(crate) crypto: RustCrypto,
+    pub(crate) identity: Identity,
+    pub(crate) registry: FeatureRegistry,
+    pub(crate) peeler: Box<dyn TransportPeeler>,
+    pub(crate) ciphersuite: Ciphersuite,
+
+    /// Centralized state-machine ownership (Task 4.4). Every transition,
+    /// pending-ref allocation, and fork-detection bookkeeping flows through
+    /// this struct.
+    pub(crate) epoch_manager: crate::epoch_manager::EpochManager,
+
+    /// Snapshot + ordering metadata for same-epoch competing commits.
+    pub(crate) fork_recovery: crate::fork_recovery::ForkRecoveryManager,
+
+    /// Pending welcomes keyed by origin group id.
+    ///
+    /// Currently unused (welcomes auto-accept via `do_join_welcome`); reserved
+    /// for the user-driven decline UI when that lands.
+    #[allow(dead_code)]
+    pub(crate) welcome_states: HashMap<GroupId, WelcomeState>,
+
+    pub(crate) events_buf: VecDeque<GroupEvent>,
+    pub(crate) auto_publish_buf: VecDeque<TransportMessage>,
+
+    /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
+    pub(crate) seen_message_ids: HashSet<MessageId>,
+
+    /// MessageIds this engine has produced via `send` or `create_group` /
+    /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
+    /// bounces back via ingest before we filter it client-side.
+    pub(crate) sent_message_ids: HashSet<MessageId>,
+}
+
+// ── Builder ─────────────────────────────────────────────────────────────────
+
+/// Construction-time wiring for [`Engine`].
+pub struct EngineBuilder<S: StorageProvider> {
+    storage: S,
+    identity_bytes: Option<Vec<u8>>,
+    registry: FeatureRegistry,
+    peeler: Option<Box<dyn TransportPeeler>>,
+    ciphersuite: Ciphersuite,
+}
+
+impl<S: StorageProvider> EngineBuilder<S> {
+    pub fn new(storage: S) -> Self {
+        Self {
+            storage,
+            identity_bytes: None,
+            registry: FeatureRegistry::new(),
+            peeler: None,
+            ciphersuite: DEFAULT_CIPHERSUITE,
+        }
+    }
+
+    pub fn identity(mut self, bytes: Vec<u8>) -> Self {
+        self.identity_bytes = Some(bytes);
+        self
+    }
+
+    pub fn feature_registry(mut self, registry: FeatureRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn peeler(mut self, peeler: Box<dyn TransportPeeler>) -> Self {
+        self.peeler = Some(peeler);
+        self
+    }
+
+    pub fn ciphersuite(mut self, cs: Ciphersuite) -> Self {
+        self.ciphersuite = cs;
+        self
+    }
+
+    pub fn build(self) -> Result<Engine<S>, EngineError> {
+        let identity_bytes = self
+            .identity_bytes
+            .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;
+        let peeler = self
+            .peeler
+            .ok_or_else(|| EngineError::Other("TransportPeeler is required".into()))?;
+        let identity =
+            Identity::generate(self.ciphersuite, identity_bytes).map_err(EngineError::Other)?;
+
+        Ok(Engine {
+            storage: self.storage,
+            crypto: RustCrypto::default(),
+            identity,
+            registry: self.registry,
+            peeler,
+            ciphersuite: self.ciphersuite,
+            epoch_manager: crate::epoch_manager::EpochManager::new(),
+            fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
+            welcome_states: HashMap::new(),
+            events_buf: VecDeque::new(),
+            auto_publish_buf: VecDeque::new(),
+            seen_message_ids: HashSet::new(),
+            sent_message_ids: HashSet::new(),
+        })
+    }
+}
+
+// ── CgkaEngine impl ─────────────────────────────────────────────────────────
+//
+// Method bodies are stubbed until their owning subsystem lands. The stubs
+// return typed errors so callers never see silent `unimplemented!()`
+// surprises.
+
+#[async_trait]
+impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
+    async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
+        self.do_ingest(msg).await
+    }
+
+    fn drain_events(&mut self) -> Vec<GroupEvent> {
+        self.events_buf.drain(..).collect()
+    }
+
+    fn drain_auto_publish(&mut self) -> Vec<TransportMessage> {
+        self.auto_publish_buf.drain(..).collect()
+    }
+
+    async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
+        self.do_send(intent).await
+    }
+
+    async fn confirm_published(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<GroupEvent, EngineError> {
+        self.do_confirm_published(pending).await
+    }
+
+    async fn publish_failed(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
+        self.do_publish_failed(pending).await
+    }
+
+    async fn create_group(
+        &mut self,
+        req: CreateGroupRequest,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        self.do_create_group(req).await
+    }
+
+    async fn join_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+    ) -> Result<GroupId, EngineError> {
+        self.do_join_welcome(welcome_msg).await
+    }
+
+    fn feature_status(
+        &self,
+        group_id: &GroupId,
+        feature: &Feature,
+    ) -> Result<FeatureStatus, EngineError> {
+        self.do_feature_status(group_id, feature)
+    }
+
+    fn constructable_capabilities(
+        &self,
+        key_packages: &[KeyPackage],
+    ) -> Result<GroupCapabilities, EngineError> {
+        self.do_constructable_capabilities(key_packages)
+    }
+
+    fn upgradeable_capabilities(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<GroupCapabilities, EngineError> {
+        self.do_upgradeable_capabilities(group_id)
+    }
+
+    async fn upgrade_group_capabilities(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendResult, EngineError> {
+        self.do_upgrade_group_capabilities(group_id).await
+    }
+
+    fn group_context(&self, group_id: &GroupId) -> Result<Box<dyn GroupContext + '_>, EngineError> {
+        use crate::provider::EngineOpenMlsProvider;
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        // When the group is in `PendingPublish`, the MLS group is at the
+        // pre-stage epoch but the staged commit carries the projected
+        // future state. Project so callers see the same epoch the rest of
+        // the engine reports via `epoch()` / `EpochState`.
+        let crypto =
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
+        let (epoch, secret) = if let Some(staged) = mls_group.pending_commit() {
+            let s = staged
+                .export_secret(crypto, crate::group_lifecycle::EXPORTER_LABEL, &[], 32)
+                .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
+            (staged.group_context().epoch().as_u64(), s)
+        } else {
+            let s = mls_group
+                .export_secret(crypto, crate::group_lifecycle::EXPORTER_LABEL, &[], 32)
+                .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
+            (mls_group.epoch().as_u64(), s)
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(crate::group_lifecycle::EXPORTER_LABEL.to_string(), secret);
+        Ok(Box::new(crate::group_context_view::GroupContextView::new(
+            EpochId(epoch),
+            map,
+            None,
+        )))
+    }
+
+    fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
+        self.do_members(group_id)
+    }
+
+    fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
+        self.epoch_manager
+            .epoch(group_id)
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+    }
+
+    fn self_id(&self) -> MemberId {
+        self.identity.self_id().clone()
+    }
+
+    async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
+        self.do_fresh_key_package()
+    }
+}

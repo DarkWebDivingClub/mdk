@@ -1,0 +1,22 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackage(vec![0xEF; 4])], }"
+---
+{
+  "Invite": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "key_packages": [
+      [
+        239,
+        239,
+        239,
+        239
+      ]
+    ]
+  }
+}
