@@ -453,19 +453,76 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
 
 #[tokio::test]
 async fn scenario_report_records_trace_log_recoveries_and_failures() {
-    let fixture: VectorFixture =
-        serde_json::from_str(include_str!("../vectors/deliberate-fork-recovery.v1.json"))
-            .expect("fixture JSON parses");
+    // Drives a fork-recovery scenario inline (rather than from a JSON
+    // fixture) because fork-recovery traces are not currently byte-equal
+    // across runs — see the comment in
+    // `canonical_vector_fixtures_match_generated_traces`. The properties
+    // verified here are about the report *machinery*, not specific trace
+    // bytes: step_log length, exactly-one recovery, invariant_failures
+    // empty, JSON serializability.
+    let spec = ScenarioSpec {
+        name: "deliberate-fork-recovery/v1".into(),
+        spec_version: "1".into(),
+        clients: vec![
+            "alice".into(),
+            "bob".into(),
+            "david".into(),
+            "eve".into(),
+        ],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "fork".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::SetPartition {
+                allow: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: vec!["david".into()],
+                pending: "alice-invite".into(),
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "bob".into(),
+                invitees: vec!["eve".into()],
+                pending: "bob-invite".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "alice-invite".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "bob".into(),
+                pending: "bob-invite".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
 
-    let report = run_scenario_report(&fixture.scenario, Some(fixture.expected_trace.clone()))
+    let report = run_scenario_report(&spec, None)
         .await
         .expect("scenario reports");
 
     assert_eq!(report.metadata.scenario_name, "deliberate-fork-recovery/v1");
-    assert_eq!(report.metadata.step_count, fixture.scenario.steps.len());
-    assert_eq!(report.expected_trace, Some(fixture.expected_trace.clone()));
-    assert_eq!(report.observed_trace, Some(fixture.expected_trace));
-    assert_eq!(report.step_log.len(), fixture.scenario.steps.len());
+    assert_eq!(report.metadata.step_count, spec.steps.len());
+    assert_eq!(report.step_log.len(), spec.steps.len());
     assert!(
         report
             .step_log
@@ -473,6 +530,19 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
             .all(|entry| entry.status.is_completed())
     );
     assert_eq!(report.recovery_observations.len(), 1);
+    let recovery = &report.recovery_observations[0];
+    assert_eq!(recovery.source_epoch, 1);
+    assert_eq!(recovery.recovered_epoch, 2);
+    assert_ne!(recovery.winner, recovery.invalidated);
+    assert!(
+        (
+            recovery.winner.source_epoch,
+            recovery.winner.commit_digest.as_str(),
+        ) < (
+            recovery.invalidated.source_epoch,
+            recovery.invalidated.commit_digest.as_str(),
+        )
+    );
     assert!(report.invariant_failures.is_empty());
 
     let json = serde_json::to_value(&report).expect("report serializes");
@@ -720,11 +790,11 @@ async fn deliberate_fork_via_harness() {
     assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
     assert!(
         (
-            recoveries[0].winner.timestamp,
-            recoveries[0].winner.message_id.as_str()
+            recoveries[0].winner.source_epoch,
+            recoveries[0].winner.commit_digest.as_str()
         ) < (
-            recoveries[0].invalidated.timestamp,
-            recoveries[0].invalidated.message_id.as_str()
+            recoveries[0].invalidated.source_epoch,
+            recoveries[0].invalidated.commit_digest.as_str()
         )
     );
     let has_david = alice_members
@@ -739,16 +809,18 @@ async fn deliberate_fork_via_harness() {
 
 #[tokio::test]
 async fn canonical_vector_fixtures_match_generated_traces() {
-    let fixtures = [
-        (
-            "three-client-message-exchange.v1.json",
-            include_str!("../vectors/three-client-message-exchange.v1.json"),
-        ),
-        (
-            "deliberate-fork-recovery.v1.json",
-            include_str!("../vectors/deliberate-fork-recovery.v1.json"),
-        ),
-    ];
+    // Fork-recovery vectors are deliberately absent: under content-derived
+    // ordering (`CommitOrderingKey { source_epoch, commit_digest }`), the
+    // SHA-256 of an OpenMLS commit varies run-to-run because commits include
+    // fresh HPKE path randomness. Both the digest values and the side that
+    // ends up rolling back are non-stable, so byte-equal trace comparison
+    // does not work for fork-recovery scenarios. See
+    // `docs/marmot-architecture/distributed-convergence.md` (Track A) for
+    // the path forward.
+    let fixtures = [(
+        "three-client-message-exchange.v1.json",
+        include_str!("../vectors/three-client-message-exchange.v1.json"),
+    )];
 
     for (fixture_name, contents) in fixtures {
         let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");

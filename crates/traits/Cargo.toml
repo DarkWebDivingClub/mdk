@@ -14,6 +14,7 @@ serde = { workspace = true }
 serde_json.workspace = true
 hex.workspace = true
 openmls_traits.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

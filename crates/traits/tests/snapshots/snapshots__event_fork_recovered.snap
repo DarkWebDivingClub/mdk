@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: EpochId(1), recovered_epoch: EpochId(2),\n    winner: CommitOrderingKey\n    { timestamp: Timestamp(10), message_id: MessageId::new(vec![1]), },\n    invalidated: CommitOrderingKey\n    { timestamp: Timestamp(11), message_id: MessageId::new(vec![2]), },\n}"
+expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: EpochId(1), recovered_epoch: EpochId(2),\n    winner: CommitOrderingKey\n    { source_epoch: EpochId(1), commit_digest: [0xAA; 32], },\n    invalidated: CommitOrderingKey\n    { source_epoch: EpochId(1), commit_digest: [0xBB; 32], },\n}"
 ---
 {
   "ForkRecovered": {
@@ -13,15 +13,77 @@ expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: Ep
     "source_epoch": 1,
     "recovered_epoch": 2,
     "winner": {
-      "timestamp": 10,
-      "message_id": [
-        1
+      "source_epoch": 1,
+      "commit_digest": [
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170
       ]
     },
     "invalidated": {
-      "timestamp": 11,
-      "message_id": [
-        2
+      "source_epoch": 1,
+      "commit_digest": [
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187,
+        187
       ]
     }
   }

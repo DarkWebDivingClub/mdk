@@ -240,12 +240,12 @@ fn snapshot_group_events() {
             source_epoch: EpochId(1),
             recovered_epoch: EpochId(2),
             winner: CommitOrderingKey {
-                timestamp: Timestamp(10),
-                message_id: MessageId::new(vec![1]),
+                source_epoch: EpochId(1),
+                commit_digest: [0xAA; 32],
             },
             invalidated: CommitOrderingKey {
-                timestamp: Timestamp(11),
-                message_id: MessageId::new(vec![2]),
+                source_epoch: EpochId(1),
+                commit_digest: [0xBB; 32],
             },
         }
     );

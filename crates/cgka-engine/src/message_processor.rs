@@ -247,10 +247,15 @@ impl<S: StorageProvider> Engine<S> {
                         && self.epoch_manager.we_committed_from(&group_id, msg_epoch)
                         && current > msg_epoch
                     {
-                        match self.resolve_fork_candidate(&group_id, msg_epoch, msg)? {
+                        match self.resolve_fork_candidate(
+                            &group_id,
+                            msg_epoch,
+                            mls_bytes.as_slice(),
+                        )? {
                             ForkResolution::CandidateWins {
                                 winner,
                                 invalidated,
+                                invalidated_storage_id: _,
                             } => {
                                 pending_recovery = Some((msg_epoch, winner, invalidated));
                                 continue;
@@ -342,7 +347,8 @@ impl<S: StorageProvider> Engine<S> {
                         group_id.clone(),
                         before,
                         after,
-                        msg,
+                        msg.id.clone(),
+                        mls_bytes.as_slice(),
                         recovery_snapshot,
                     );
                     if let Ok(mut g) = self.storage.get_group(&group_id) {
@@ -447,7 +453,7 @@ impl<S: StorageProvider> Engine<S> {
                             .peeler
                             .wrap_group_message(
                                 &EncryptedPayload {
-                                    ciphertext: commit_bytes,
+                                    ciphertext: commit_bytes.clone(),
                                     aad: vec![],
                                 },
                                 &ctx,
@@ -465,7 +471,8 @@ impl<S: StorageProvider> Engine<S> {
                             group_id.clone(),
                             pre_commit_epoch,
                             new_epoch,
-                            &wrapped,
+                            wrapped.id.clone(),
+                            &commit_bytes,
                             recovery_snapshot,
                         );
                         self.auto_publish_buf.push_back(wrapped);
@@ -603,7 +610,7 @@ impl<S: StorageProvider> Engine<S> {
             .peeler
             .wrap_group_message(
                 &EncryptedPayload {
-                    ciphertext: commit_bytes,
+                    ciphertext: commit_bytes.clone(),
                     aad: vec![],
                 },
                 &ctx,
@@ -675,7 +682,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id.clone(),
             prior_epoch,
             new_epoch,
-            &commit_msg,
+            commit_msg.id.clone(),
+            &commit_bytes,
             recovery_snapshot,
         );
 

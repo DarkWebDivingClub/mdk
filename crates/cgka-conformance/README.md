@@ -39,9 +39,28 @@ JSON `VectorFixture` envelope:
 Non-Rust implementations should read the JSON file, run the named scenario
 from `scenario`, serialize their observed trace into the same shape, and
 compare `expected_trace` by value. The trace intentionally avoids OpenMLS
-internals, but it does include `ForkRecoveryObservation` entries so an
-implementation that reaches the same final membership through a different
-recovery path fails the vector.
+internals.
+
+### Fork-recovery vectors are not currently portable
+
+`CommitOrderingKey` is now content-derived (`SHA-256(mls_bytes)` of the
+serialized MLS commit). This makes the engine fully transport-agnostic for
+fork-recovery decisions, but it surfaces a real limitation that the prior
+`(timestamp, message_id)` scheme hid: OpenMLS commits include fresh HPKE path
+randomness, so the same scenario produces *different* commit bytes and thus
+different digests on every run. The lower-digest commit (the fork-recovery
+winner) is effectively a coin flip per run, so neither the digest values nor
+the side that ends up rolling back are stable.
+
+Consequence: the previous `deliberate-fork-recovery/v1` fixture has been
+removed. The engine's deterministic fork-recovery property is still asserted
+in-tree (`tests/canonical_scenarios.rs::deliberate_fork_via_harness`,
+`crates/cgka-engine/tests/fork_detection.rs`) and the report machinery is
+exercised inline (`tests/canonical_scenarios.rs::scenario_report_records_trace_log_recoveries_and_failures`).
+Restoring portable fork-recovery vectors requires either deterministic commit
+production or a trace shape that abstracts over which-side-rolled-back. This
+is tracked in
+[`docs/marmot-architecture/distributed-convergence.md`](../../docs/marmot-architecture/distributed-convergence.md).
 
 `ScenarioSpec` v1 contains ordered client labels and ordered steps. Supported
 steps are:

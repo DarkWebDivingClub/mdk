@@ -44,8 +44,8 @@ pub struct ForkRecoveryObservation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryOrderingKeyObservation {
-    pub timestamp: u64,
-    pub message_id: String,
+    pub source_epoch: u64,
+    pub commit_digest: String,
 }
 
 pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> ClientObservation {
@@ -95,7 +95,7 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
 
 fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
     RecoveryOrderingKeyObservation {
-        timestamp: key.timestamp.0,
-        message_id: hex::encode(key.message_id.as_slice()),
+        source_epoch: key.source_epoch.0,
+        commit_digest: hex::encode(key.commit_digest),
     }
 }

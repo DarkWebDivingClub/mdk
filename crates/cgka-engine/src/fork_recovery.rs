@@ -2,9 +2,18 @@
 //!
 //! The engine snapshots the local group before it applies any commit that
 //! advances epoch `N -> N + 1`. If a second commit later arrives for epoch
-//! `N`, this manager compares transport ordering keys. A better candidate
-//! rolls storage back to the pre-commit snapshot so the caller can process
-//! the candidate against the correct MLS epoch.
+//! `N`, this manager compares content-derived ordering keys
+//! (`SHA-256(mls_bytes)`). A better candidate rolls storage back to the
+//! pre-commit snapshot so the caller can process the candidate against the
+//! correct MLS epoch.
+//!
+//! ## Storage row identity
+//!
+//! Tie-break is content-derived; the storage row identity for marking an
+//! invalidated commit is the transport-layer `MessageId`. The two are kept
+//! separate inside `CommitRecoveryRecord` so the ordering key remains
+//! transport-independent while the engine can still reach back to the
+//! storage record that needs `MessageState::EpochInvalidated`.
 
 use crate::engine::Engine;
 use cgka_traits::engine::CommitOrderingKey;
@@ -12,8 +21,7 @@ use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{EpochId, GroupId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -21,6 +29,9 @@ struct CommitRecoveryRecord {
     group_id: GroupId,
     source_epoch: EpochId,
     ordering_key: CommitOrderingKey,
+    /// Storage-layer identity of the commit. Used to update
+    /// `MessageState::EpochInvalidated` when this commit loses a fork.
+    storage_id: MessageId,
     snapshot_name: String,
 }
 
@@ -29,6 +40,9 @@ pub(crate) enum ForkResolution {
     CandidateWins {
         winner: CommitOrderingKey,
         invalidated: CommitOrderingKey,
+        /// `MessageId` of the now-invalidated incumbent, for the storage
+        /// `update_message_state` call site.
+        invalidated_storage_id: MessageId,
     },
     IncumbentWins,
     MissingSnapshot,
@@ -69,7 +83,8 @@ impl ForkRecoveryManager {
         group_id: GroupId,
         source_epoch: EpochId,
         _result_epoch: EpochId,
-        msg: &TransportMessage,
+        storage_id: MessageId,
+        mls_bytes: &[u8],
         snapshot_name: String,
     ) {
         self.pending.insert(
@@ -77,7 +92,8 @@ impl ForkRecoveryManager {
             CommitRecoveryRecord {
                 group_id,
                 source_epoch,
-                ordering_key: CommitOrderingKey::from_transport_message(msg),
+                ordering_key: CommitOrderingKey::from_commit_bytes(source_epoch, mls_bytes),
+                storage_id,
                 snapshot_name,
             },
         );
@@ -104,14 +120,15 @@ impl ForkRecoveryManager {
         storage: &S,
         group_id: &GroupId,
         source_epoch: EpochId,
-        candidate: &TransportMessage,
+        candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
         let key = (group_id.clone(), source_epoch);
         let Some(incumbent) = self.incumbents.get(&key).cloned() else {
             return Ok(ForkResolution::MissingSnapshot);
         };
 
-        let candidate_key = CommitOrderingKey::from_transport_message(candidate);
+        let candidate_key =
+            CommitOrderingKey::from_commit_bytes(source_epoch, candidate_mls_bytes);
         if candidate_key >= incumbent.ordering_key {
             return Ok(ForkResolution::IncumbentWins);
         }
@@ -126,6 +143,7 @@ impl ForkRecoveryManager {
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
             invalidated: incumbent.ordering_key,
+            invalidated_storage_id: incumbent.storage_id,
         })
     }
 }
@@ -137,7 +155,8 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         source_epoch: EpochId,
         _result_epoch: EpochId,
-        msg: &TransportMessage,
+        storage_id: MessageId,
+        mls_bytes: &[u8],
         snapshot_name: String,
     ) {
         self.fork_recovery.record_pending(
@@ -145,7 +164,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             source_epoch,
             _result_epoch,
-            msg,
+            storage_id,
+            mls_bytes,
             snapshot_name,
         );
     }
@@ -175,13 +195,15 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         source_epoch: EpochId,
         _result_epoch: EpochId,
-        msg: &TransportMessage,
+        storage_id: MessageId,
+        mls_bytes: &[u8],
         snapshot_name: String,
     ) {
         self.fork_recovery.record_applied(CommitRecoveryRecord {
             group_id,
             source_epoch,
-            ordering_key: CommitOrderingKey::from_transport_message(msg),
+            ordering_key: CommitOrderingKey::from_commit_bytes(source_epoch, mls_bytes),
+            storage_id,
             snapshot_name,
         });
     }
@@ -190,17 +212,21 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         source_epoch: EpochId,
-        msg: &TransportMessage,
+        candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
-        let resolution = self
-            .fork_recovery
-            .resolve(&self.storage, group_id, source_epoch, msg)?;
-        if let ForkResolution::CandidateWins { invalidated, .. } = &resolution {
+        let resolution =
+            self.fork_recovery
+                .resolve(&self.storage, group_id, source_epoch, candidate_mls_bytes)?;
+        if let ForkResolution::CandidateWins {
+            invalidated_storage_id,
+            ..
+        } = &resolution
+        {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
             match self
                 .storage
-                .update_message_state(&invalidated.message_id, MessageState::EpochInvalidated)
+                .update_message_state(invalidated_storage_id, MessageState::EpochInvalidated)
             {
                 Ok(()) | Err(StorageError::NotFound) => {}
                 Err(e) => return Err(EngineError::Storage(e)),

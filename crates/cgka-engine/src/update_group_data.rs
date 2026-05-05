@@ -110,7 +110,7 @@ impl<S: StorageProvider> Engine<S> {
             .peeler
             .wrap_group_message(
                 &EncryptedPayload {
-                    ciphertext: commit_bytes,
+                    ciphertext: commit_bytes.clone(),
                     aad: vec![],
                 },
                 &ctx,
@@ -152,7 +152,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id.clone(),
             pre_commit_epoch,
             new_epoch,
-            &wrapped,
+            wrapped.id.clone(),
+            &commit_bytes,
             recovery_snapshot,
         );
 

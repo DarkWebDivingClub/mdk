@@ -24,10 +24,11 @@ use crate::error::EngineError;
 use crate::group::Member;
 use crate::group_context::GroupContext;
 use crate::ingest::IngestOutcome;
-use crate::transport::{Timestamp, TransportMessage};
+use crate::transport::TransportMessage;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 
 // ── Value types on the trait surface ────────────────────────────────────────
@@ -94,29 +95,38 @@ pub enum SendResult {
     },
 }
 
-/// Deterministic transport ordering key used to resolve same-epoch commit
-/// races. Lower keys win: first by transport timestamp, then by message id
-/// bytes as the stable tie-breaker.
+/// Deterministic, content-derived ordering key used to resolve same-epoch
+/// commit races. Two replicas processing the same commit derive the same key
+/// from the same MLS wire bytes, independent of transport metadata. Lower keys
+/// win: first by `source_epoch`, then by `commit_digest` bytes.
+///
+/// `commit_digest` is `SHA-256(mls_bytes)` — the hash of the serialized MLS
+/// message as it appears on the wire. This works for both `PublicMessage` and
+/// `PrivateMessage` framings because we hash the wire form, not the inner
+/// content; no decryption is required to compute it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitOrderingKey {
-    pub timestamp: Timestamp,
-    pub message_id: MessageId,
+    pub source_epoch: EpochId,
+    pub commit_digest: [u8; 32],
 }
 
 impl CommitOrderingKey {
-    pub fn from_transport_message(msg: &TransportMessage) -> Self {
+    /// Build an ordering key from a commit's serialized MLS wire bytes.
+    pub fn from_commit_bytes(source_epoch: EpochId, mls_bytes: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(mls_bytes);
         Self {
-            timestamp: msg.timestamp,
-            message_id: msg.id.clone(),
+            source_epoch,
+            commit_digest: hasher.finalize().into(),
         }
     }
 }
 
 impl Ord for CommitOrderingKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.timestamp
-            .cmp(&other.timestamp)
-            .then_with(|| self.message_id.as_slice().cmp(other.message_id.as_slice()))
+        self.source_epoch
+            .cmp(&other.source_epoch)
+            .then_with(|| self.commit_digest.cmp(&other.commit_digest))
     }
 }
 

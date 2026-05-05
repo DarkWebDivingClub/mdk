@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, SendIntent, SendResult,
+};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -19,7 +21,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -191,69 +193,85 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         bob.confirm_published(*pending).await.unwrap();
     }
 
-    // Alice receives Bob's commit (which targets epoch 1 -> 2). We give it a
-    // smaller outer transport id than Alice's incumbent commit, so Bob's
-    // branch is the deterministic winner under timestamp/id ordering.
-    let mut bob_commit = match bob_invite {
+    // Extract both wrapped commit messages so we can compute their content
+    // digests up front. With content-derived ordering, the winner is fixed by
+    // SHA-256(mls_bytes); we orchestrate the test so the LOSER ingests the
+    // WINNER's commit (the "candidate wins" path that fires fork recovery)
+    // and the WINNER ingests the LOSER's commit (the "incumbent wins" path
+    // that returns Stale).
+    let alice_commit = match alice_invite {
         SendResult::GroupEvolution { msg, .. } => msg,
         _ => unreachable!(),
     };
-    bob_commit.id = MessageId::new(vec![0]);
-    let routed = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..bob_commit
-    };
-    alice.ingest(routed).await.unwrap();
-    let events = alice.drain_events();
-    let (source_epoch, recovered_epoch, winner, invalidated) = events
-        .iter()
-        .find_map(|event| match event {
-            GroupEvent::ForkRecovered {
-                group_id: event_group,
-                source_epoch,
-                recovered_epoch,
-                winner,
-                invalidated,
-            } if event_group == &group_id => {
-                Some((*source_epoch, *recovered_epoch, winner, invalidated))
-            }
-            _ => None,
-        })
-        .expect("alice should emit ForkRecovered after rolling back to Bob's commit");
-    assert_eq!(source_epoch.0, 1);
-    assert_eq!(recovered_epoch.0, 2);
-    assert_eq!(winner.message_id, MessageId::new(vec![0]));
-    assert!(winner < invalidated);
-
-    let alice_members = alice.members(&group_id).unwrap();
-    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
-    assert!(
-        alice_members
-            .iter()
-            .any(|m| m.id == MemberId::new(pad32(b"eve")))
-    );
-    assert!(
-        !alice_members
-            .iter()
-            .any(|m| m.id == MemberId::new(pad32(b"david")))
-    );
-
-    // Bob receives Alice's losing commit. It should be classified as stale,
-    // not force Bob off the already-winning branch.
-    let mut alice_commit = match alice_invite {
+    let bob_commit = match bob_invite {
         SendResult::GroupEvolution { msg, .. } => msg,
         _ => unreachable!(),
     };
-    alice_commit.timestamp = Timestamp(u64::MAX);
-    let routed = TransportMessage {
+    let alice_key = CommitOrderingKey::from_commit_bytes(EpochId(1), &alice_commit.payload);
+    let bob_key = CommitOrderingKey::from_commit_bytes(EpochId(1), &bob_commit.payload);
+    assert_ne!(alice_key, bob_key, "distinct commits must hash distinctly");
+    let bob_wins = bob_key < alice_key;
+
+    let route = |msg: TransportMessage| TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
-        ..alice_commit
+        ..msg
     };
-    let outcome = bob.ingest(routed).await.unwrap();
+
+    // Loser ingests winner's commit → fork recovery rolls them back.
+    let (winning_invitee, losing_invitee) = if bob_wins {
+        alice.ingest(route(bob_commit.clone())).await.unwrap();
+        let events = alice.drain_events();
+        let (source_epoch, recovered_epoch, winner, invalidated) =
+            extract_fork_recovered(&events, &group_id)
+                .expect("alice should emit ForkRecovered after rolling back to Bob's commit");
+        assert_eq!(source_epoch.0, 1);
+        assert_eq!(recovered_epoch.0, 2);
+        assert_eq!(winner, &bob_key);
+        assert_eq!(invalidated, &alice_key);
+        assert!(winner < invalidated);
+        assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+        ("eve", "david")
+    } else {
+        bob.ingest(route(alice_commit.clone())).await.unwrap();
+        let events = bob.drain_events();
+        let (source_epoch, recovered_epoch, winner, invalidated) =
+            extract_fork_recovered(&events, &group_id)
+                .expect("bob should emit ForkRecovered after rolling back to Alice's commit");
+        assert_eq!(source_epoch.0, 1);
+        assert_eq!(recovered_epoch.0, 2);
+        assert_eq!(winner, &alice_key);
+        assert_eq!(invalidated, &bob_key);
+        assert!(winner < invalidated);
+        assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+        ("david", "eve")
+    };
+
+    // Verify the loser's group state now reflects the winner's invitee.
+    let loser_members = if bob_wins {
+        alice.members(&group_id).unwrap()
+    } else {
+        bob.members(&group_id).unwrap()
+    };
+    assert!(
+        loser_members
+            .iter()
+            .any(|m| m.id == MemberId::new(pad32(winning_invitee.as_bytes())))
+    );
+    assert!(
+        !loser_members
+            .iter()
+            .any(|m| m.id == MemberId::new(pad32(losing_invitee.as_bytes())))
+    );
+
+    // Winner ingests loser's commit. Should be classified as stale, not roll
+    // the winner back off their already-winning branch.
+    let outcome = if bob_wins {
+        bob.ingest(route(alice_commit)).await.unwrap()
+    } else {
+        alice.ingest(route(bob_commit)).await.unwrap()
+    };
     use cgka_traits::ingest::{IngestOutcome, StaleReason};
     assert!(matches!(
         outcome,
@@ -261,6 +279,24 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
             reason: StaleReason::AlreadyAtEpoch { .. }
         }
     ));
+}
+
+fn extract_fork_recovered<'a>(
+    events: &'a [GroupEvent],
+    group_id: &cgka_traits::types::GroupId,
+) -> Option<(EpochId, EpochId, &'a CommitOrderingKey, &'a CommitOrderingKey)> {
+    events.iter().find_map(|event| match event {
+        GroupEvent::ForkRecovered {
+            group_id: event_group,
+            source_epoch,
+            recovered_epoch,
+            winner,
+            invalidated,
+        } if event_group == group_id => {
+            Some((*source_epoch, *recovered_epoch, winner, invalidated))
+        }
+        _ => None,
+    })
 }
 
 #[tokio::test]
