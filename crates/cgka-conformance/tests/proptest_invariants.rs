@@ -1,4 +1,4 @@
-//! Phase 6.9 — proptest invariants.
+//! Generated convergence and lifecycle invariants.
 //!
 //! Properties:
 //! - **(a) True same-id replay**: a TransportMessage delivered twice (via
@@ -21,6 +21,7 @@ use cgka_conformance::proptest_support::{
 };
 use cgka_conformance::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::CgkaEngine;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use proptest::prelude::*;

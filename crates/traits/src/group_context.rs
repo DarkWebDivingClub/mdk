@@ -1,10 +1,9 @@
 //! Engine-internal view of a group's live state plus a value-type snapshot
 //! that crosses the peeler boundary.
 //!
-//! Per spike-findings §1.4, `&dyn GroupContext` across `#[async_trait]` hits
-//! `E0195` lifetime issues AND is needlessly dynamic — the peeler only needs
-//! values, not a live callback. Solution: [`GroupContextSnapshot`], a value
-//! type the engine materializes before each peeler call.
+//! Peeler calls use [`GroupContextSnapshot`], a value type the engine
+//! materializes before each wrap or peel operation. This avoids borrowing
+//! live engine state across async trait calls.
 //!
 //! The [`GroupContext`] trait stays as an engine-internal abstraction (so
 //! `CgkaEngine::group_context` can return something richer than a snapshot

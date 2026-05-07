@@ -1,4 +1,4 @@
-//! Phase 4.2 — `SendIntent::UpdateGroupData` round trips.
+//! `SendIntent::UpdateGroupData` round trips.
 //!
 //! Covers:
 //! - Happy path: alice updates name + description; bob ingests + sees the
@@ -10,8 +10,9 @@
 //! - State guard: not allowed during PendingPublish.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
+use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -22,7 +23,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -120,7 +121,7 @@ fn registry() -> FeatureRegistry {
     r
 }
 
-fn build(id: &[u8]) -> impl CgkaEngine {
+fn build(id: &[u8]) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
         .feature_registry(registry())
@@ -129,11 +130,14 @@ fn build(id: &[u8]) -> impl CgkaEngine {
         .unwrap()
 }
 
-async fn create_pair() -> (
-    impl CgkaEngine,
-    impl CgkaEngine,
-    cgka_traits::types::GroupId,
-) {
+fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
+    let result = engine
+        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .expect("buffered commit converges");
+    assert_eq!(result.sync_state, SyncState::Stable);
+}
+
+async fn create_pair() -> (Engine<MemoryStorage>, Engine<MemoryStorage>, GroupId) {
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -193,8 +197,9 @@ async fn update_group_data_renames_group_and_advances_epoch() {
     let outcome = bob.ingest(routed).await.unwrap();
     assert!(matches!(
         outcome,
-        cgka_traits::ingest::IngestOutcome::Processed
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
     ));
+    converge_buffered_commit(&mut bob, &gid);
     assert_eq!(bob.epoch(&gid).unwrap().0, 2);
 }
 

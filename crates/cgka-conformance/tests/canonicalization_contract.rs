@@ -110,6 +110,15 @@ fn commit_edge_with_proposals(
     }
 }
 
+struct ChildCommitEdge<'a> {
+    branch_id: &'a str,
+    parent_branch_id: &'a str,
+    fork_epoch: u64,
+    source_epoch: u64,
+    resulting_epoch: u64,
+    tip_digest: u8,
+}
+
 fn child_commit_edge(
     id: &str,
     branch_id: &str,
@@ -121,37 +130,34 @@ fn child_commit_edge(
 ) -> PeeledMessage {
     child_commit_edge_with_proposals(
         id,
-        branch_id,
-        parent_branch_id,
-        fork_epoch,
-        source_epoch,
-        resulting_epoch,
-        tip_digest,
+        ChildCommitEdge {
+            branch_id,
+            parent_branch_id,
+            fork_epoch,
+            source_epoch,
+            resulting_epoch,
+            tip_digest,
+        },
         &[],
     )
 }
 
 fn child_commit_edge_with_proposals(
     id: &str,
-    branch_id: &str,
-    parent_branch_id: &str,
-    fork_epoch: u64,
-    source_epoch: u64,
-    resulting_epoch: u64,
-    tip_digest: u8,
+    edge: ChildCommitEdge<'_>,
     consumed_proposal_ids: &[&str],
 ) -> PeeledMessage {
     PeeledMessage {
         message_id: id.into(),
         group_id: "group".into(),
         sender: b"alice".to_vec(),
-        source_epoch,
+        source_epoch: edge.source_epoch,
         kind: PeeledMessageKind::Commit {
-            branch_id: branch_id.into(),
-            parent_branch_id: Some(parent_branch_id.into()),
-            fork_epoch,
-            resulting_epoch,
-            tip_digest: digest(tip_digest),
+            branch_id: edge.branch_id.into(),
+            parent_branch_id: Some(edge.parent_branch_id.into()),
+            fork_epoch: edge.fork_epoch,
+            resulting_epoch: edge.resulting_epoch,
+            tip_digest: digest(edge.tip_digest),
             consumed_proposal_ids: consumed_proposal_ids
                 .iter()
                 .map(|proposal_id| (*proposal_id).to_owned())
@@ -320,22 +326,26 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
             proposal("losing-proposal", "losing-parent"),
             child_commit_edge_with_proposals(
                 "live-commit",
-                "live-tip",
-                "live-parent",
-                1,
-                3,
-                4,
-                0x00,
+                ChildCommitEdge {
+                    branch_id: "live-tip",
+                    parent_branch_id: "live-parent",
+                    fork_epoch: 1,
+                    source_epoch: 3,
+                    resulting_epoch: 4,
+                    tip_digest: 0x00,
+                },
                 &["accepted-proposal"],
             ),
             child_commit_edge_with_proposals(
                 "losing-commit",
-                "losing-tip",
-                "losing-parent",
-                1,
-                3,
-                4,
-                0xff,
+                ChildCommitEdge {
+                    branch_id: "losing-tip",
+                    parent_branch_id: "losing-parent",
+                    fork_epoch: 1,
+                    source_epoch: 3,
+                    resulting_epoch: 4,
+                    tip_digest: 0xff,
+                },
                 &["losing-proposal"],
             ),
         ],

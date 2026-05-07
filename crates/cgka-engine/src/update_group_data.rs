@@ -7,10 +7,9 @@
 //! for this intent; admin promotion lives in a follow-on plan and relay
 //! configuration is transport-adapter territory.
 //!
-//! Mirrors `do_upgrade_group_capabilities` in shape: stage GCE commit with
-//! pre-stage exporter wrap, transition to `PendingPublish`, defer merge
-//! until `do_confirm_published`. Rollback via `do_publish_failed` works
-//! identically — `clear_pending_commit` discards the staged GCE.
+//! The send path stages a GCE commit with the pre-stage exporter context,
+//! enters `PendingPublish`, and defers merge until `do_confirm_published`.
+//! Rollback via `do_publish_failed` discards the staged GCE.
 
 use crate::engine::Engine;
 use crate::group_data::{NostrGroupData, read_from_group};
@@ -151,7 +150,6 @@ impl<S: StorageProvider> Engine<S> {
             pending_ref,
             group_id.clone(),
             pre_commit_epoch,
-            new_epoch,
             wrapped.id.clone(),
             &commit_bytes,
             recovery_snapshot,

@@ -1,10 +1,9 @@
 //! Typed outcomes from [`CgkaEngine::ingest`] plus the peeled-message
 //! intermediate form.
 //!
-//! The `IngestOutcome` split (`Processed` / `Stale { reason }`) supersedes
-//! the original `Result<(), EngineError>` shape per spike-findings §1.5 —
-//! see `docs/learnings.md:108-109`. The wiring layer logs `Stale` at debug,
-//! `Err` at warn, and `Processed` silently.
+//! `IngestOutcome` separates applied messages from classifiable stale cases.
+//! Hard errors stay in `EngineError`; stale routing, dedupe, and epoch cases
+//! remain ordinary outcomes.
 
 use crate::transport::TransportMessage;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -25,16 +24,14 @@ pub enum IngestOutcome {
     Stale { reason: StaleReason },
 }
 
-/// Why an inbound message was not processed. Each variant corresponds to a
-/// real case the spike discovered at runtime — see `docs/learnings.md` and
-/// `spike-findings.md` §1.5.
+/// Why an inbound message was not processed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaleReason {
     /// The engine has already seen this `MessageId`. Coordinator dedup.
     AlreadySeen,
     /// The engine is already at or past the message's epoch. Commonly hit
     /// when a commit arrives after a welcome that already advanced the
-    /// recipient (`docs/learnings.md:66-70`).
+    /// recipient.
     AlreadyAtEpoch {
         current: EpochId,
         msg_epoch: EpochId,
@@ -45,8 +42,8 @@ pub enum StaleReason {
     UnknownGroup,
     /// The message is our own commit echoed back by the transport.
     OwnEcho,
-    /// The peeler rejected the message (e.g. stale exporter secret). New
-    /// variant called out in `docs/learnings.md:140`.
+    /// The peeler rejected the message, for example because the exporter
+    /// secret is stale.
     PeelFailed,
 }
 

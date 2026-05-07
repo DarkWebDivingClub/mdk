@@ -1,6 +1,6 @@
 //! MLS wire-format policy for Marmot groups.
 //!
-//! ## ⚠️ REVISIT BEFORE EXTERNAL ROLLOUT
+//! ## Revisit Before External Rollout
 //!
 //! This engine uses `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` (MLS PublicMessage
 //! for both directions) because:
@@ -13,7 +13,7 @@
 //!    kind-445 wraps the PublicMessage in ChaCha20Poly1305 keyed by the
 //!    group's MLS exporter secret, so relays see ciphertext.
 //!
-//! Spike-findings §3.1 enumerates three alternative paths:
+//! Three alternative paths remain available:
 //!
 //! - **A.** Accept pure-plaintext at the MLS layer (current choice).
 //!   Architecturally fine if the outer transport wrap is the trust boundary.
@@ -32,12 +32,11 @@
 use openmls::group::MlsGroupJoinConfig;
 pub use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 
-/// Grep marker — every release checklist item that audits "are we still
+/// Grep marker: every release checklist item that audits "are we still
 /// shipping pure-plaintext MLS?" should find this. Do NOT remove without
-/// also revisiting `docs/marmot-architecture/further-context/spike-findings.md`
-/// §3.1 and `docs/marmot-architecture/further-context/custom_extensions.md`.
+/// also revisiting `docs/marmot-architecture/further-context/custom_extensions.md`.
 pub const WIRE_FORMAT_POLICY_REVIEW_REQUIRED: &str =
-    "PURE_PLAINTEXT — see cgka-engine/src/wire_format.rs";
+    "PURE_PLAINTEXT - see cgka-engine/src/wire_format.rs";
 
 /// Join config preset used by every group. Separate helper so tests can
 /// swap wire-format policies without forking the whole config.

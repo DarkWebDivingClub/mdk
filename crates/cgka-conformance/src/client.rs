@@ -4,8 +4,8 @@
 
 use crate::bus::{ClientId, TransportBus};
 use crate::peeler::MockPeeler;
-use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
@@ -17,7 +17,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId};
 use storage_memory::MemoryStorage;
 
 pub struct HarnessClient {
-    pub engine: Box<dyn CgkaEngine>,
+    pub engine: Engine<MemoryStorage>,
     pub bus_id: ClientId,
     bus: TransportBus,
     storage: MemoryStorage,
@@ -55,7 +55,7 @@ impl ClientBuilder {
             .expect("engine builds");
         let bus_id = bus.attach(MemberId::new(self.identity));
         HarnessClient {
-            engine: Box::new(engine),
+            engine,
             bus_id,
             bus: bus.clone(),
             storage,
@@ -231,10 +231,9 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
-                // Send welcomes BEFORE the commit so new members join via
-                // welcome and only then see the commit (which they'll
-                // classify as AlreadyAtEpoch). Matches the spike's
-                // observed order (`docs/learnings.md:66-70`).
+                // Send welcomes before the commit so new members join via
+                // welcome and only then classify the commit echo as
+                // AlreadyAtEpoch.
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
@@ -274,12 +273,33 @@ impl HarnessClient {
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
         let inbound = self.bus.mailbox(self.bus_id);
         let mut outcomes = Vec::with_capacity(inbound.len());
+        let mut buffered_groups = Vec::new();
         for msg in inbound {
             let result = self.engine.ingest(msg).await;
+            if let Ok(IngestOutcome::Buffered { group_id, .. }) = &result
+                && !buffered_groups.contains(group_id)
+            {
+                buffered_groups.push(group_id.clone());
+            }
             if result.is_ok() {
                 self.capture_engine_events();
             }
             outcomes.push(result);
+        }
+        for group_id in buffered_groups {
+            match self
+                .engine
+                .converge_stored_openmls_messages(&group_id, 1_000_000)
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    outcomes.push(Err(EngineError::Backend(format!(
+                        "converge buffered group: {e}"
+                    ))));
+                    continue;
+                }
+            }
+            self.capture_engine_events();
         }
         // Auto-publish: anything the engine queued in response goes back on
         // the bus.

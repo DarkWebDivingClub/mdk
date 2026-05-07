@@ -1,4 +1,4 @@
-//! Phase 4.13 — publish-before-apply round trips.
+//! Publish-before-apply round trips.
 //!
 //! Covers the four shapes the new `confirm_published` / `publish_failed`
 //! contract introduces:

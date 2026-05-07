@@ -82,7 +82,6 @@ impl ForkRecoveryManager {
         pending: PendingStateRef,
         group_id: GroupId,
         source_epoch: EpochId,
-        _result_epoch: EpochId,
         storage_id: MessageId,
         mls_bytes: &[u8],
         snapshot_name: String,
@@ -127,8 +126,7 @@ impl ForkRecoveryManager {
             return Ok(ForkResolution::MissingSnapshot);
         };
 
-        let candidate_key =
-            CommitOrderingKey::from_commit_bytes(source_epoch, candidate_mls_bytes);
+        let candidate_key = CommitOrderingKey::from_commit_bytes(source_epoch, candidate_mls_bytes);
         if candidate_key >= incumbent.ordering_key {
             return Ok(ForkResolution::IncumbentWins);
         }
@@ -154,7 +152,6 @@ impl<S: StorageProvider> Engine<S> {
         pending: PendingStateRef,
         group_id: GroupId,
         source_epoch: EpochId,
-        _result_epoch: EpochId,
         storage_id: MessageId,
         mls_bytes: &[u8],
         snapshot_name: String,
@@ -163,7 +160,6 @@ impl<S: StorageProvider> Engine<S> {
             pending,
             group_id,
             source_epoch,
-            _result_epoch,
             storage_id,
             mls_bytes,
             snapshot_name,
@@ -194,7 +190,6 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         source_epoch: EpochId,
-        _result_epoch: EpochId,
         storage_id: MessageId,
         mls_bytes: &[u8],
         snapshot_name: String,
@@ -214,9 +209,12 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
-        let resolution =
-            self.fork_recovery
-                .resolve(&self.storage, group_id, source_epoch, candidate_mls_bytes)?;
+        let resolution = self.fork_recovery.resolve(
+            &self.storage,
+            group_id,
+            source_epoch,
+            candidate_mls_bytes,
+        )?;
         if let ForkResolution::CandidateWins {
             invalidated_storage_id,
             ..

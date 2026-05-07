@@ -1,9 +1,8 @@
-//! Phase 4.1 smoke tests.
+//! Engine construction and trait-object scaffold tests.
 //!
-//! Proves: the engine can be built, trait-impl'd, and wrapped in
-//! `Box<dyn CgkaEngine + Send + Sync>` without hitting the spike's E0195
-//! class of lifetime regressions. Real method behaviour is covered in
-//! subsequent phases.
+//! Proves the engine can be built, implements `CgkaEngine`, and can be wrapped
+//! in `Box<dyn CgkaEngine + Send + Sync>` without async-trait lifetime
+//! regressions. Behavior-level coverage lives in the focused integration tests.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -25,11 +24,11 @@ impl TransportPeeler for StubPeeler {
         _msg: &TransportMessage,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("stub".into()))
+        Err(PeelerError::Backend("test peeler".into()))
     }
 
     async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("stub".into()))
+        Err(PeelerError::Backend("test peeler".into()))
     }
 
     async fn wrap_group_message(
@@ -37,7 +36,7 @@ impl TransportPeeler for StubPeeler {
         _payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Backend("stub".into()))
+        Err(PeelerError::Backend("test peeler".into()))
     }
 
     async fn wrap_welcome(
@@ -45,7 +44,7 @@ impl TransportPeeler for StubPeeler {
         _payload: &EncryptedPayload,
         _recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Backend("stub".into()))
+        Err(PeelerError::Backend("test peeler".into()))
     }
 }
 
@@ -60,8 +59,7 @@ fn engine_can_be_built_and_boxed_as_trait_object() {
     // self_id is real from the start.
     assert_eq!(engine.self_id().as_slice(), b"self-identity");
 
-    // Witness: Box<dyn CgkaEngine + Send + Sync>. If async-trait regresses
-    // the spike's E0195 pattern, this line stops compiling.
+    // Witness: this line stops compiling if async-trait lifetimes regress.
     let _boxed: Box<dyn CgkaEngine + Send + Sync> = Box::new(engine);
 }
 
@@ -82,18 +80,18 @@ fn builder_rejects_missing_peeler() {
 }
 
 #[tokio::test]
-async fn stubbed_methods_return_typed_not_panic() {
+async fn empty_engine_methods_return_typed_results() {
     let mut engine = EngineBuilder::new(MemoryStorage::new())
         .identity(b"id".to_vec())
         .peeler(Box::new(StubPeeler))
         .build()
         .unwrap();
 
-    // drain methods return empty (not stubbed) from day one.
+    // Drain methods return empty before any events are emitted.
     assert!(engine.drain_events().is_empty());
     assert!(engine.drain_auto_publish().is_empty());
 
-    // Stubbed methods return typed errors (no panics).
+    // Sending to an unknown group returns a typed error, not a panic.
     let res = engine
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: cgka_traits::GroupId::new(vec![0; 4]),

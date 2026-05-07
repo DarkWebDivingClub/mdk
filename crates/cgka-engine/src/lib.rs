@@ -2,7 +2,11 @@
 //!
 //! OpenMLS-backed implementation of [`cgka_traits::CgkaEngine`].
 //!
-//! The engine is generic over any `S: StorageProvider` — no `dyn` storage.
+//! The engine is generic over any `S: StorageProvider`; storage dispatch is
+//! static. OpenMLS owns MLS validation and key schedule state. Marmot owns the
+//! application-facing state machine, durable message records, convergence
+//! policy, feature negotiation, and transport wrapping boundary.
+//!
 //! The state machine lives above OpenMLS; MLS semantics stay inside OpenMLS
 //! (`docs/marmot-architecture/further-context/cgka-engine-design.md:52`).
 //!
@@ -11,32 +15,26 @@
 //! - [`engine`] — the [`Engine<S>`] struct + its [`EngineBuilder`].
 //! - [`identity`] — local signer + credential bundle.
 //! - [`feature_registry`] — runtime feature registry (replaces static constants).
-//! - [`wire_format`] — `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + grep marker.
-//! - [`provider`] — ad-hoc `OpenMlsProvider` adapter composed from crypto +
-//!   storage.
-//!
-//! Internal subsystems (Phase 4 — see `AGENTS.md` for the responsibility map):
-//!
-//! | Subsystem              | Module                  | Task      | Status   |
-//! | ---                    | ---                     | ---       | ---      |
-//! | `EngineBuilder`        | [`engine`]              | 4.1       | Landed   |
-//! | GroupLifecycle         | [`group_lifecycle`]     | 4.2       | Landed (`update_group_data` stubbed) |
-//! | MessageProcessor       | [`message_processor`]   | 4.3       | Landed   |
-//! | EpochManager           | [`epoch_manager`]       | 4.4 / 4.5 | Landed   |
-//! | ForkRecoveryManager    | [`fork_recovery`]       | 4.5+      | Landed (same-epoch deterministic rollback/replay) |
-//! | CapabilityManager      | [`capability_manager`]  | 4.6 / 4.7 | Landed   |
-//! | KeyPackageManager      | [`key_package`]         | 4.8       | Landed   |
-//! | MIP-03 guards          | [`message_processor`] + [`auto_committer`] | 4.9 | Landed |
-//! | Wire format policy     | [`wire_format`]         | 4.10      | Landed (revisit before external rollout) |
-//! | LowestIndex policy     | [`auto_committer`]      | 4.11      | Landed   |
-//! | `drain_*` queues       | [`engine`]              | 4.12      | Landed   |
-//! | Publish-before-apply   | [`publish`]             | 4.13      | Landed (auto-commit deliberately still merges immediately — see `auto_committer.rs` rustdoc) |
-//! | Group data extension   | [`group_data`]          | MIP-01    | Landed (placeholders for transport-y fields) |
-//! | Capability upgrade     | [`upgrade`]             | 4.6       | Landed   |
+//! - [`wire_format`] - `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` and review marker.
+//! - [`provider`] - `OpenMlsProvider` adapter composed from crypto + storage.
+//! - [`group_lifecycle`] - `create_group`, `join_welcome`, group records.
+//! - [`message_processor`] - inbound `ingest` and outbound `send`.
+//! - [`distributed_convergence`] - stored-message convergence entry points.
+//! - [`canonicalization`] and [`convergence`] - executable policy model.
+//! - [`openmls_projection`] - bytes-first bridge between OpenMLS and the model.
+//! - [`epoch_manager`] - per-group state transitions and pending references.
+//! - [`fork_recovery`] - same-epoch commit rollback/replay support.
+//! - [`publish`] - publish-confirm and publish-failed lifecycle.
+//! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
+//! - [`auto_committer`] - deterministic SelfRemove auto-commit policy.
+//! - [`group_data`] - Marmot group-data extension helpers.
 
 pub mod auto_committer;
+pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+pub mod convergence;
+pub mod distributed_convergence;
 pub mod engine;
 pub mod epoch_manager;
 pub mod feature_registry;
@@ -47,6 +45,7 @@ pub mod group_lifecycle;
 pub mod identity;
 pub mod key_package;
 pub mod message_processor;
+pub mod openmls_projection;
 pub mod provider;
 pub mod publish;
 pub mod update_group_data;

@@ -1,4 +1,4 @@
-//! Publish-confirm + publish-failed paths for `CgkaEngine` (Task 4.13).
+//! Publish-confirm and publish-failed paths for `CgkaEngine`.
 //!
 //! Together with `EpochManager::confirm_publish` / `rollback_publish`,
 //! these implement publish-before-apply: the staged commit only lands on

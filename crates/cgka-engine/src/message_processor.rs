@@ -1,24 +1,24 @@
-//! MessageProcessor — inbound `ingest` pipeline + outbound `send` routing.
+//! Inbound ingest and outbound send routing for [`Engine`](crate::Engine).
 //!
-//! Inbound:  peel → classify by envelope → route to welcome / group-message
-//!           path → produce `IngestOutcome` + emit events
-//! Outbound: classify `SendIntent` → MLS create_message / add / self_remove →
-//!           wrap via peeler → `SendResult`
+//! Inbound messages are peeled, classified, stored, and either applied or
+//! buffered for convergence. Outbound intents are checked against local epoch
+//! state and unresolved convergence inputs before any OpenMLS mutation.
 //!
-//! Per spike-findings §1.5, every "we can't apply this" case returns
-//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`, never
-//! `Err`. The wiring layer logs `Stale` at debug, real errors at warn.
+//! Classifiable stale ingest cases return
+//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`. `Err` is
+//! reserved for storage, peeler, serialization, and OpenMLS failures.
 
 use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
+use crate::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::{CommitOrderingKey, GroupEvent, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{StorageError, StorageProvider};
+use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{MlsGroup, ProcessMessageError};
@@ -26,6 +26,7 @@ use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
     ProcessedMessageContent, Proposal, ProtocolMessage, Sender, ValidationError,
 };
+use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 impl<S: StorageProvider> Engine<S> {
@@ -67,7 +68,9 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
 
-        if !matches!(outcome, IngestOutcome::Buffered { .. }) {
+        if !matches!(outcome, IngestOutcome::Buffered { .. })
+            && self.should_remember_ingested_message(&msg.id)?
+        {
             self.seen_message_ids.insert(msg.id.clone());
         }
         Ok(outcome)
@@ -78,18 +81,11 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         recipient: MemberId,
     ) -> Result<IngestOutcome, EngineError> {
-        // Two-layer addressing. Transport layer filters by endpoint
-        // (e.g. Nostr NIP-44 decryption only succeeds for the intended
-        // pubkey) — in a well-behaved 1:1 pubkey-to-identity deployment,
-        // this engine-layer check would be dead code. It ISN'T dead code
-        // because:
-        //   - the in-memory test harness broadcasts every message to every
-        //     client (Phase 6), so recipient filtering MUST happen here
-        //   - future multi-device (MIP-06) and broadcast transports (FIPS
-        //     mesh) break the 1:1 assumption at the transport layer
-        //   - typed `NotForThisClient` is diagnostically richer than
-        //     `PeelFailed` — routing issue vs. crypto issue at the log site
-        // Do not remove this check under "unreachable in production" logic.
+        // Welcome recipients are checked at the engine layer as well as the
+        // transport layer. Test harnesses broadcast messages to all clients,
+        // and multi-device or broadcast transports may break a one-pubkey-per-
+        // member assumption. `NotForThisClient` also makes routing failures
+        // easier to distinguish from decryption failures.
         if &recipient != self.identity.self_id() {
             self.persist_transport_message(
                 msg,
@@ -191,13 +187,17 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
-            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Created)?;
-
             // Peel.
             let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
             let peeled = match self.peeler.peel_group_message(msg, &ctx).await {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
+                    self.persist_transport_message(
+                        msg,
+                        &group_id,
+                        current_epoch,
+                        MessageState::Failed,
+                    )?;
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
@@ -208,6 +208,12 @@ impl<S: StorageProvider> Engine<S> {
             let mls_bytes = match peeled.content {
                 PeeledContent::MlsMessage { bytes } => bytes,
                 PeeledContent::Welcome { .. } => {
+                    self.persist_transport_message(
+                        msg,
+                        &group_id,
+                        current_epoch,
+                        MessageState::Failed,
+                    )?;
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
@@ -224,6 +230,12 @@ impl<S: StorageProvider> Engine<S> {
                 MlsMessageBodyIn::PrivateMessage(p) => p.into(),
                 MlsMessageBodyIn::PublicMessage(p) => p.into(),
                 _ => {
+                    self.persist_transport_message(
+                        msg,
+                        &group_id,
+                        current_epoch,
+                        MessageState::Failed,
+                    )?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -232,6 +244,39 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
+            if pending_recovery.is_none()
+                && msg_content_type == ContentType::Commit
+                && msg_epoch >= current_epoch
+            {
+                let now_ms = self.convergence_now_ms();
+                self.buffer_openmls_convergence_message(&group_id, msg.clone(), now_ms)
+                    .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+                let result = self
+                    .converge_stored_openmls_messages(&group_id, now_ms)
+                    .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
+                return Ok(convergence_ingest_outcome(
+                    &result,
+                    msg,
+                    group_id,
+                    current_epoch,
+                ));
+            }
+            if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
+                let now_ms = self.convergence_now_ms();
+                self.buffer_openmls_convergence_message(&group_id, msg.clone(), now_ms)
+                    .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+                let result = self
+                    .converge_stored_openmls_messages(&group_id, now_ms)
+                    .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
+                return Ok(convergence_ingest_outcome(
+                    &result,
+                    msg,
+                    group_id,
+                    current_epoch,
+                ));
+            }
+
+            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Created)?;
 
             // Process via MLS.
             let processed = match mls_group.process_message(&provider, proto) {
@@ -322,8 +367,8 @@ impl<S: StorageProvider> Engine<S> {
                                 .map(|bc| MemberId::new(bc.identity().to_vec()))
                         })
                         .collect();
-                    // Task 4.7: extract capabilities from the commit's Add
-                    // proposals before we consume the staged commit.
+                    // Extract capabilities from Add proposals before the
+                    // staged commit is consumed by merge.
                     crate::capability_manager::cache_from_staged_commit(
                         &self.storage,
                         &group_id,
@@ -346,7 +391,6 @@ impl<S: StorageProvider> Engine<S> {
                     self.record_applied_commit_for_recovery(
                         group_id.clone(),
                         before,
-                        after,
                         msg.id.clone(),
                         mls_bytes.as_slice(),
                         recovery_snapshot,
@@ -356,8 +400,8 @@ impl<S: StorageProvider> Engine<S> {
                         g.members = after_members;
                         self.storage.put_group(&g)?;
                     }
-                    // Task 4.7: refresh self-cache since our own leaf may have
-                    // been updated by the commit's path (force_self_update).
+                    // Refresh self-cache since our own leaf may have been
+                    // updated by the commit's path.
                     crate::capability_manager::cache_self_capabilities(
                         &self.storage,
                         &group_id,
@@ -400,11 +444,10 @@ impl<S: StorageProvider> Engine<S> {
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ProposalMessage(queued) => {
-                    // Task 4.11 — ask the auto-committer policy whether we
-                    // should commit this proposal. Currently fires only on
-                    // SelfRemove. OpenMLS does NOT auto-enqueue processed
-                    // proposals — we must explicitly `store_pending_proposal`
-                    // first so `commit_to_pending_proposals` can find it.
+                    // Ask the auto-committer policy whether we should commit
+                    // this proposal. OpenMLS does not auto-enqueue processed
+                    // proposals, so store it before attempting to commit the
+                    // pending proposal queue.
                     let decision = crate::auto_committer::decide(&mls_group, &queued);
                     let auto_removed = match queued.proposal() {
                         Proposal::Remove(r) => member_id_at_leaf(&mls_group, r.removed())
@@ -470,7 +513,6 @@ impl<S: StorageProvider> Engine<S> {
                         self.record_applied_commit_for_recovery(
                             group_id.clone(),
                             pre_commit_epoch,
-                            new_epoch,
                             wrapped.id.clone(),
                             &commit_bytes,
                             recovery_snapshot,
@@ -502,7 +544,6 @@ impl<S: StorageProvider> Engine<S> {
                             });
                         }
                     }
-                    self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
@@ -513,9 +554,16 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Outbound: `SendIntent::AppMessage` only for this iteration. Invite +
-    /// Leave + UpdateGroupData land in subsequent Phase 4 slices.
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
+        let group_id = send_intent_group_id(&intent).clone();
+        if self.should_queue_outbound_intent(&group_id)? {
+            return self.queue_outbound_intent(group_id, intent);
+        }
+
+        self.do_send_ready(intent).await
+    }
+
+    async fn do_send_ready(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         match intent {
             SendIntent::AppMessage { group_id, payload } => {
                 self.do_send_app_message(group_id, payload).await
@@ -534,6 +582,126 @@ impl<S: StorageProvider> Engine<S> {
                     .await
             }
         }
+    }
+
+    pub async fn converge_and_drain_queued_outbound_intents(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        if self.has_unresolved_convergence_inputs(group_id)? {
+            let result = self
+                .converge_stored_openmls_messages(group_id, now_ms)
+                .map_err(|e| EngineError::Backend(format!("converge queued outbound: {e}")))?;
+            if result.sync_state != crate::canonicalization::SyncState::Stable
+                || self.has_unresolved_convergence_inputs(group_id)?
+            {
+                return Ok(Vec::new());
+            }
+        }
+
+        let queued = self.storage.list_queued_outbound_intents(group_id)?;
+        let mut drained = Vec::new();
+        for record in queued {
+            if self.has_unresolved_convergence_inputs(group_id)? {
+                break;
+            }
+            let result = self.do_send_ready(record.intent.clone()).await?;
+            self.storage.delete_queued_outbound_intent(&record.id)?;
+            let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
+            drained.push(result);
+            if pauses_for_pending_publish {
+                break;
+            }
+        }
+        Ok(drained)
+    }
+
+    fn should_queue_outbound_intent(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(false);
+        }
+
+        if !self.has_unresolved_convergence_inputs(group_id)? {
+            return Ok(false);
+        }
+
+        let now_ms = self.convergence_now_ms();
+        let result = self
+            .converge_stored_openmls_messages(group_id, now_ms)
+            .map_err(|e| EngineError::Backend(format!("converge before send: {e}")))?;
+        if result.sync_state != crate::canonicalization::SyncState::Stable {
+            return Ok(true);
+        }
+
+        self.has_unresolved_convergence_inputs(group_id)
+    }
+
+    fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        let anchor = match self.storage.get_group(group_id) {
+            Ok(group) => group
+                .epoch
+                .0
+                .saturating_sub(self.convergence_policy.convergence.max_rewind_commits),
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
+        let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        for record in records {
+            if !matches!(
+                record.state,
+                MessageState::Created | MessageState::Retryable
+            ) {
+                continue;
+            }
+            let Ok(message) = serde_json::from_slice::<TransportMessage>(&record.payload) else {
+                return Ok(true);
+            };
+            let Ok(projection) = project_mls_message(&message.payload) else {
+                return Ok(true);
+            };
+            if matches!(
+                projection.kind,
+                OpenMlsContentKind::Commit
+                    | OpenMlsContentKind::Proposal
+                    | OpenMlsContentKind::Application
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn queue_outbound_intent(
+        &mut self,
+        group_id: GroupId,
+        intent: SendIntent,
+    ) -> Result<SendResult, EngineError> {
+        let created_at_ms = self.convergence_now_ms();
+        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len() as u64;
+        let intent_bytes =
+            serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-queued-outbound-intent/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(self.identity.self_id().as_slice());
+        hasher.update(created_at_ms.to_be_bytes());
+        hasher.update(existing_count.to_be_bytes());
+        hasher.update(&intent_bytes);
+        let intent_id = MessageId::new(hasher.finalize().to_vec());
+        self.storage
+            .put_queued_outbound_intent(&QueuedOutboundIntent {
+                id: intent_id.clone(),
+                group_id: group_id.clone(),
+                intent,
+                created_at_ms,
+            })?;
+        Ok(SendResult::Queued {
+            group_id,
+            intent_id,
+        })
     }
 
     async fn do_send_invite(
@@ -578,8 +746,8 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
-        // Fork-detection bookkeeping (Task 4.5) lives on EpochManager —
-        // record that we're about to commit FROM the current epoch.
+        // Record the pre-commit epoch so a later same-epoch commit can be
+        // compared against this locally produced branch.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let recovery_snapshot =
             self.fork_recovery
@@ -587,9 +755,8 @@ impl<S: StorageProvider> Engine<S> {
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
 
-        // Stage the add-members commit. Under publish-before-apply (Task
-        // 4.13) we do NOT call `merge_pending_commit` here — `mls_group`
-        // stays at the pre-commit epoch with the staged commit attached.
+        // Stage the add-members commit. Publish-before-apply keeps
+        // `mls_group` at the pre-commit epoch with the staged commit attached.
         // Wrap reads exporter from the still-current (pre-stage) epoch,
         // which is the right key for receivers to derive when peeling
         // (they're at the same pre-commit epoch when they decrypt the
@@ -681,7 +848,6 @@ impl<S: StorageProvider> Engine<S> {
             pending_ref,
             group_id.clone(),
             prior_epoch,
-            new_epoch,
             commit_msg.id.clone(),
             &commit_bytes,
             recovery_snapshot,
@@ -695,10 +861,8 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     async fn do_send_leave(&mut self, group_id: GroupId) -> Result<SendResult, EngineError> {
-        // Opinionated default — MIP-03 SelfRemove only. `leave_group()` (the
-        // legacy pre-SelfRemove Remove-self proposal) is deliberately NOT
-        // an option anywhere in this engine. See spike-findings §2.2 and
-        // `docs/learnings.md:115-116`.
+        // MIP-03 SelfRemove only. The legacy Remove-self flow is not exposed
+        // by this engine.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = MlsGroup::load(
@@ -770,7 +934,7 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
-        // Must be Stable to send (buffering of sends lives in Task 4.13).
+        // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
@@ -840,6 +1004,36 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
     }
 }
 
+fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
+    match intent {
+        SendIntent::AppMessage { group_id, .. }
+        | SendIntent::Invite { group_id, .. }
+        | SendIntent::Leave { group_id }
+        | SendIntent::UpdateGroupData { group_id, .. } => group_id,
+    }
+}
+
+fn convergence_ingest_outcome(
+    result: &crate::canonicalization::CanonicalizationResult,
+    msg: &TransportMessage,
+    group_id: GroupId,
+    epoch: EpochId,
+) -> IngestOutcome {
+    let message_id = hex::encode(msg.id.as_slice());
+    let accepted = result
+        .accepted_commits
+        .iter()
+        .chain(&result.accepted_proposals)
+        .chain(&result.accepted_app_messages)
+        .any(|accepted| accepted == &message_id);
+
+    if result.sync_state == crate::canonicalization::SyncState::Stable && accepted {
+        IngestOutcome::Processed
+    } else {
+        IngestOutcome::Buffered { group_id, epoch }
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     fn recorded_message_outcome(
         &mut self,
@@ -866,6 +1060,19 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
         Ok(Some(outcome))
+    }
+
+    fn should_remember_ingested_message(&self, id: &MessageId) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(true),
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
+
+        Ok(!matches!(
+            record.state,
+            MessageState::Created | MessageState::Retryable
+        ))
     }
 
     pub(crate) fn record_sent_message(

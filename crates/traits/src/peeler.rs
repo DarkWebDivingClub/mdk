@@ -1,15 +1,11 @@
-//! The `TransportPeeler` trait — crypto seam between the engine and whatever
-//! transport-specific wrapping lives below it (Nostr gift-wrap + kind-445
-//! exporter-secret ChaCha20, FIPS mesh frames, …).
+//! The `TransportPeeler` trait is the crypto boundary between the engine and
+//! transport-specific wrapping below it.
 //!
-//! Per spike-findings §1.3, welcomes and group messages are **structurally
-//! different operations** (different keys, different addressing) and get
-//! separate methods. Fusing them into one branching `peel`/`wrap` pair made
-//! the spike's implementation harder to test, not easier.
+//! Welcomes and group messages are separate operations: they use different
+//! keys and addressing rules, so they get separate methods.
 //!
 //! The peeler takes a [`GroupContextSnapshot`] (value type) rather than
-//! `&dyn GroupContext` to sidestep the async-trait lifetime issue documented
-//! in `docs/learnings.md:44`.
+//! `&dyn GroupContext` so async peeler calls do not borrow live engine state.
 
 use crate::error::PeelerError;
 use crate::group_context::GroupContextSnapshot;

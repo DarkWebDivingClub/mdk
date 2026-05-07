@@ -6,10 +6,9 @@
 //!
 //! ### Signature note
 //!
-//! `drain_events` + `drain_auto_publish` supersede the design doc's
-//! `events() -> BoxStream<'_, GroupEvent>` per spike-findings §1.7. Drains
-//! are simpler to reason about in a single-threaded coordinator loop and
-//! don't force the engine to hold a broadcast channel.
+//! `drain_events` and `drain_auto_publish` are explicit drains. They are
+//! simple to reason about in a single-threaded coordinator loop and do not
+//! force the engine to hold a broadcast channel.
 //!
 //! ### `#[async_trait]` vs. native AFIT
 //!
@@ -62,17 +61,23 @@ pub enum SendIntent {
 /// The engine's response to [`CgkaEngine::send`].
 ///
 /// `GroupEvolution` carries both the commit and any welcomes produced by
-/// member additions — the spike discovered the original single-`msg` shape
-/// was structurally insufficient (spike-findings §1.2).
+/// member additions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
     /// Pure application message — publish once, no state advance.
     ApplicationMessage { msg: TransportMessage },
+    /// The engine accepted the local intent but did not publish anything
+    /// yet because the group has unresolved convergence input. The intent
+    /// will be regenerated from the canonical state when the group becomes
+    /// stable.
+    Queued {
+        group_id: GroupId,
+        intent_id: MessageId,
+    },
     /// A proposal that does not itself advance the epoch — application
     /// publishes it and moves on. The epoch advance happens later via an
-    /// auto-committer (per MIP-03 SelfRemove) or an explicit
-    /// `SendIntent::Commit*` from some member. No `confirm_published`
-    /// required, no `PendingStateRef` issued.
+    /// auto-committer (per MIP-03 SelfRemove) or another member's commit.
+    /// No `confirm_published` required, no `PendingStateRef` issued.
     Proposal { msg: TransportMessage },
     /// Commit (+ optional welcomes) that EXISTING group members need to
     /// process. Used for invite / remove / update to an existing group.
@@ -196,11 +201,9 @@ pub struct CreateGroupRequest {
 
 // ── The trait ───────────────────────────────────────────────────────────────
 
-/// The entire application-facing contract of the engine.
+/// The application-facing contract of the engine.
 ///
-/// See the module doc for the high-level factoring; every method's
-/// invariants, legal state transitions, and error classes are documented
-/// inline below (Task 3.7 of the production refactor plan).
+/// Method docs describe legal state transitions and error classes.
 #[async_trait]
 pub trait CgkaEngine: Send + Sync {
     // ── Inbound ─────────────────────────────────────────────────────────────
@@ -234,8 +237,10 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Encrypt + prepare an outbound message or group operation.
     ///
-    /// **State.** Valid only when the group is in `Stable`. Returns
-    /// `InvalidTransition` if called during `PendingPublish` / `Merging`.
+    /// **State.** Valid when the group is in `Stable`. If convergence input
+    /// is still unresolved, the engine stores the intent and returns
+    /// [`SendResult::Queued`]. Returns `InvalidTransition` if called during
+    /// `PendingPublish` / `Merging`.
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
 
     /// Confirm that a [`SendResult::GroupEvolution`] (or
@@ -244,8 +249,8 @@ pub trait CgkaEngine: Send + Sync {
     /// updates Marmot bookkeeping + capability cache, and emits
     /// `GroupEvent::EpochChanged` (or `GroupCreated`).
     ///
-    /// **Publish-before-apply contract** (Task 4.13). The engine must NOT
-    /// have applied the commit before this call: if the application calls
+    /// **Publish-before-apply contract.** The engine must NOT have applied
+    /// the commit before this call: if the application calls
     /// `epoch()` between `send` and `confirm_published`, the visible
     /// `EpochState` is `PendingPublish`. Other clients can only observe the
     /// new epoch once `confirm_published` returns, ensuring the engine's
@@ -337,7 +342,6 @@ pub trait CgkaEngine: Send + Sync {
     fn self_id(&self) -> MemberId;
 
     /// Produce a fresh KeyPackage suitable for publishing to a KeyPackage
-    /// directory. Expiry / refresh scheduling is deferred (Task 7 in the
-    /// production refactor plan).
+    /// directory. Expiry and refresh scheduling live above the engine.
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError>;
 }

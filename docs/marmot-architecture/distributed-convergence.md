@@ -179,11 +179,11 @@ for application traffic to overrule any valid branch.
 ## Current Implementation Target
 
 The executable policy model lives in
-[`crates/cgka-conformance/src/convergence.rs`](../../crates/cgka-conformance/src/convergence.rs).
+[`crates/cgka-engine/src/convergence.rs`](../../crates/cgka-engine/src/convergence.rs).
 The model tests live in
 [`crates/cgka-conformance/tests/candidate_state_graph.rs`](../../crates/cgka-conformance/tests/candidate_state_graph.rs).
 The executable canonicalization contract model lives in
-[`crates/cgka-conformance/src/canonicalization.rs`](../../crates/cgka-conformance/src/canonicalization.rs).
+[`crates/cgka-engine/src/canonicalization.rs`](../../crates/cgka-engine/src/canonicalization.rs).
 That model now materializes symbolic commit edges into candidate branches before
 calling the branch selector.
 

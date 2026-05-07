@@ -1,9 +1,8 @@
 //! Executable model for the CGKA canonicalization contract.
 //!
 //! This module stays above OpenMLS. It models the post-peeling contract with
-//! symbolic candidate branches and messages so conformance tests can pin the
-//! state-machine behavior before the engine grows candidate-state
-//! materialization.
+//! symbolic candidate branches and messages, while OpenMLS-specific adapters
+//! materialize the candidate states from stored protocol bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,6 +13,16 @@ pub struct CanonicalizationPolicy {
     pub convergence: ConvergencePolicy,
     pub app_message_past_epoch_limit: u64,
     pub stable_quiescence_ms: u64,
+}
+
+impl Default for CanonicalizationPolicy {
+    fn default() -> Self {
+        Self {
+            convergence: ConvergencePolicy::default(),
+            app_message_past_epoch_limit: 5,
+            stable_quiescence_ms: 1_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -579,15 +588,16 @@ fn handle_commit(
             message,
             DroppedMessageReason::BeyondRollbackHorizon,
         ));
-    } else if selected_commit_ids.contains(&message.message_id) {
-        return;
-    } else if Some(branch_id) == result.selected_branch_id.as_deref() {
-        result.accepted_commits.push(message.message_id.clone());
-    } else if materialized_branch_ids.contains(branch_id) && result.selected_branch_id.is_some() {
-        result.dropped_messages.push(dropped(
-            message,
-            DroppedMessageReason::InvalidAgainstCandidateState,
-        ));
+    } else if !selected_commit_ids.contains(&message.message_id) {
+        if Some(branch_id) == result.selected_branch_id.as_deref() {
+            result.accepted_commits.push(message.message_id.clone());
+        } else if materialized_branch_ids.contains(branch_id) && result.selected_branch_id.is_some()
+        {
+            result.dropped_messages.push(dropped(
+                message,
+                DroppedMessageReason::InvalidAgainstCandidateState,
+            ));
+        }
     }
 }
 

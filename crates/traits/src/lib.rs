@@ -38,8 +38,8 @@ pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState};
 pub use peeler::TransportPeeler;
 pub use storage::{
-    CapabilityStorage, GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -47,11 +47,9 @@ pub use transport::{
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;
 
-// ── Compile-time witness (Task 5.7 started early) ───────────────────────────
+// ── Compile-time witnesses ─────────────────────────────────────────────────
 //
-// If anyone reintroduces a `&dyn GroupContext` across an `.await` on the
-// `CgkaEngine` trait (the spike's E0195 regression — see
-// `docs/learnings.md:44`), this constant will fail to compile because the
-// trait object becomes non-Send.
+// If `CgkaEngine` or `TransportPeeler` stop being object-safe and Send, these
+// witnesses fail at compile time.
 const _: fn(Box<dyn CgkaEngine + Send + Sync>) = |_| {};
 const _: fn(Box<dyn TransportPeeler + Send + Sync>) = |_| {};

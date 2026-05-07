@@ -1,4 +1,4 @@
-//! Phase 4.6 + 4.7 — `feature_status`, cache population, `upgradeable_capabilities`.
+//! Capability negotiation, cache population, and upgrade discovery.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -327,7 +327,7 @@ async fn upgradeable_capabilities_lists_universally_supported() {
     assert!(matches!(status, FeatureStatus::Available));
 }
 
-// ── Phase 5.4: capability matrix coverage ───────────────────────────────────
+// Capability matrix coverage.
 
 #[tokio::test]
 async fn transport_required_when_transport_inactive_behaves_like_optional() {
@@ -369,9 +369,9 @@ async fn transport_required_when_transport_inactive_behaves_like_optional() {
     assert!(matches!(st, FeatureStatus::Upgradeable), "got: {st:?}");
 }
 
-// ── Phase 5.4 — exhaustive capability matrix ────────────────────────────────
+// Exhaustive capability matrix.
 //
-// The plan calls for a 3 × 3 × 4 matrix:
+// Cover a 3 x 3 x 4 matrix:
 //   `RequirementLevel` ∈ {Required, Optional, TransportRequired}
 //   × coverage          ∈ {Universal, Partial, None}
 //   × member count      ∈ {1, 2, 3, 4}

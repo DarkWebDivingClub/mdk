@@ -1,8 +1,8 @@
 //! Canonical scripted scenarios driven through the harness bus.
 //!
-//! Each scenario corresponds to a Phase 6 task in the production refactor
-//! plan. These are the tests the proptest layer (Phase 6.8-6.9) generalizes
-//! into seeded random sequences.
+//! These tests cover named multi-client histories that are too important to
+//! leave only to generated scenarios. The proptest layer generalizes the same
+//! behavior into seeded random send/leave sequences.
 
 use cgka_conformance::{
     ClientBuilder, ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
@@ -39,9 +39,8 @@ fn selfremove_registry() -> FeatureRegistry {
 
 #[tokio::test]
 async fn three_client_happy_path_via_harness() {
-    // Task 6.4 — the canonical smoke test.
-    // Alice creates a group with Bob and Carol. Each sends one app message.
-    // All three converge on epoch 1 and see all three messages.
+    // Alice creates a group with Bob and Carol. Each sends one app message,
+    // then all three converge on epoch 1 and see all three messages.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())
@@ -463,12 +462,7 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
     let spec = ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
         spec_version: "1".into(),
-        clients: vec![
-            "alice".into(),
-            "bob".into(),
-            "david".into(),
-            "eve".into(),
-        ],
+        clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
                 creator: "alice".into(),
@@ -662,8 +656,8 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
 
 #[tokio::test]
 async fn add_then_self_remove_via_harness() {
-    // Task 6.6 echo (post-§149) — alice creates with bob+carol; bob (non-
-    // admin) leaves; alice (admin) auto-commits.
+    // Alice creates with Bob and Carol; Bob, a non-admin, leaves; Alice,
+    // an admin, auto-commits the SelfRemove proposal.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())
@@ -703,11 +697,10 @@ async fn add_then_self_remove_via_harness() {
 
 #[tokio::test]
 async fn deliberate_fork_via_harness() {
-    // Task 6.7 — alice and bob each invite concurrently at the same epoch.
-    // The bus partition keeps each side from seeing the other's commit
-    // until both have committed locally. When the partition lifts and they
-    // ingest each other's commit, fork recovery rolls both clients onto the
-    // same deterministic winner.
+    // Alice and Bob each invite concurrently at the same epoch. The bus
+    // partition keeps each side from seeing the other's commit until both
+    // have committed locally. When the partition lifts, fork recovery rolls
+    // both clients onto the same deterministic winner.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())
@@ -861,9 +854,8 @@ fn assert_vector_fixture_matches(
 
 #[tokio::test]
 async fn welcome_before_commit_via_harness() {
-    // Task 6.5 echo — invite commit arriving at a member who already
-    // joined via welcome at the new epoch must classify as AlreadyAtEpoch,
-    // not error.
+    // An invite commit arriving at a member who already joined via welcome at
+    // the new epoch must classify as AlreadyAtEpoch, not error.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())

@@ -1,4 +1,4 @@
-//! Phase 4.5 — fork detection and recovery.
+//! Fork detection and recovery.
 //!
 //! A concurrent-invite scenario deliberately produces divergent epoch-2
 //! histories. The engine should:
@@ -284,7 +284,12 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
 fn extract_fork_recovered<'a>(
     events: &'a [GroupEvent],
     group_id: &cgka_traits::types::GroupId,
-) -> Option<(EpochId, EpochId, &'a CommitOrderingKey, &'a CommitOrderingKey)> {
+) -> Option<(
+    EpochId,
+    EpochId,
+    &'a CommitOrderingKey,
+    &'a CommitOrderingKey,
+)> {
     events.iter().find_map(|event| match event {
         GroupEvent::ForkRecovered {
             group_id: event_group,

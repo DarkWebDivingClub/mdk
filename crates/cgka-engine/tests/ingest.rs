@@ -1,5 +1,4 @@
-//! Phase 4.3 ingest tests — one per `StaleReason` variant plus
-//! send(AppMessage) + ingest(AppMessage) round-trip.
+//! Ingest tests for stale classifications and application-message round trips.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;

@@ -1,14 +1,10 @@
 //! Group lifecycle — `create_group`, `join_welcome`, etc.
 //!
-//! **Publish-before-apply (Task 4.13, landed).** `do_create_group` stages
-//! its add-members commit but does NOT call `merge_pending_commit`. The
-//! engine wraps welcomes off the still-staged group, transitions to
-//! `PendingPublish`, and returns. The actual MLS merge + Marmot record
-//! update + capability cache happen in `Engine::do_confirm_published`
-//! (in `publish.rs`) once the application reports the welcomes were
-//! published. On `publish_failed`, `MlsGroup::clear_pending_commit`
-//! discards the staged commit and the engine rewinds to `Stable` at the
-//! prior epoch.
+//! `do_create_group` uses publish-before-apply: it stages an add-members
+//! commit, wraps welcomes from the staged group, enters `PendingPublish`,
+//! and returns. `Engine::do_confirm_published` merges the MLS commit and
+//! updates Marmot records after the application reports transport success.
+//! `publish_failed` clears the staged commit and rewinds to `Stable`.
 //!
 //! For SOLO create (no invitees) there is no pending commit — the engine
 //! still issues a `PendingStateRef` so the API shape is uniform, but
@@ -37,8 +33,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 pub(crate) const EXPORTER_LABEL: &str = "marmot/engine/v1";
 
 impl<S: StorageProvider> Engine<S> {
-    /// Real implementation of `CgkaEngine::create_group`. Called by the
-    /// stubbed method in `engine.rs` once this lands.
+    /// Implementation of `CgkaEngine::create_group`.
     pub(crate) async fn do_create_group(
         &mut self,
         req: CreateGroupRequest,
@@ -129,12 +124,11 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
 
-        // 3. Add members → commit + welcome (skipped for solo creation).
-        //    Under publish-before-apply (Task 4.13), the staged commit
-        //    stays attached to `mls_group`; merge happens in
-        //    `do_confirm_published`. The welcome bytes are independently
-        //    serializable from the OpenMLS return value — they don't
-        //    require a merged group.
+        // 3. Add members to produce a staged commit + welcome (skipped for
+        //    solo creation). Publish-before-apply keeps the staged commit
+        //    attached to `mls_group`; merge happens in `do_confirm_published`.
+        //    Welcome bytes are independently serializable from the OpenMLS
+        //    return value; they do not require a merged group.
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
@@ -155,9 +149,8 @@ impl<S: StorageProvider> Engine<S> {
         // only party who'd care about the "commit that creates the group at
         // epoch 1," and once they confirm publish they'll merge it locally.
         // Every other member lands in the group via `welcomes`, which carry
-        // the post-commit state directly. Dropping the commit eliminates the
-        // welcome-before-commit `AlreadyAtEpoch` bounce that the spike
-        // cataloged at `docs/learnings.md:66-70` — no commit, no bounce.
+        // the post-commit state directly. Dropping the commit avoids a
+        // welcome-before-commit `AlreadyAtEpoch` bounce.
         //
         // The context snapshot is built off the still-staged group; for
         // welcomes, only the recipient pubkey matters at wrap time, so the
@@ -331,10 +324,9 @@ impl<S: StorageProvider> Engine<S> {
         mirror_group_data_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;
 
-        // Task 4.7: cache self's capabilities. Other members' capabilities
-        // arrive as we ingest subsequent commits that touched their leaves —
-        // join-via-welcome alone doesn't give us KeyPackage-level access to
-        // other members.
+        // Cache self's capabilities. Other members' capabilities arrive as
+        // we ingest commits that touched their leaves; join-via-welcome
+        // alone does not give us KeyPackage-level access to other members.
         crate::capability_manager::cache_self_capabilities(
             &self.storage,
             &group_id,

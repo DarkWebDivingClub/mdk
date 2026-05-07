@@ -4,9 +4,8 @@
 //!
 //! Mirrors `do_send_invite`'s shape (parse, stage GCE commit, wrap with
 //! pre-stage exporter, transition to `PendingPublish`, return
-//! `GroupEvolution`). Under publish-before-apply (Task 4.13) the merge
-//! defers to `do_confirm_published`; the Marmot record's
-//! `required_capabilities` field updates there too.
+//! `GroupEvolution`). Publish-before-apply defers merge and Marmot record
+//! updates to `do_confirm_published`.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
@@ -162,7 +161,6 @@ impl<S: StorageProvider> Engine<S> {
             pending_ref,
             group_id.clone(),
             pre_commit_epoch,
-            new_epoch,
             wrapped.id.clone(),
             &commit_bytes,
             recovery_snapshot,

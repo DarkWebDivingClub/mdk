@@ -1,13 +1,13 @@
 //! Round-trip, snapshot/rollback, and concurrency tests for `MemoryStorage`.
 //!
-//! These land the substrate for every later test tier — if storage lies,
-//! every engine test downstream is unreliable. Tests are intentionally dense
-//! and type-by-type per the production-refactor plan's Task 2.7.
+//! Storage is the substrate for engine tests, so these cases cover each
+//! storage family directly.
 
 use super::*;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
+use cgka_traits::engine::SendIntent;
 
 fn gid(n: u8) -> GroupId {
     GroupId::new(vec![n; 4])
@@ -47,6 +47,18 @@ fn sample_message(id: MessageId, group_id: GroupId, epoch: u64) -> MessageRecord
     }
 }
 
+fn sample_queued_intent(id: MessageId, group_id: GroupId) -> QueuedOutboundIntent {
+    QueuedOutboundIntent {
+        id,
+        group_id: group_id.clone(),
+        intent: SendIntent::AppMessage {
+            group_id,
+            payload: b"queued".to_vec(),
+        },
+        created_at_ms: 42,
+    }
+}
+
 // ── GroupStorage ────────────────────────────────────────────────────────────
 
 #[test]
@@ -77,8 +89,17 @@ fn group_delete_cascades_messages_and_caps() {
     store
         .save_member_capabilities(&g.id, &g.members[0], GroupCapabilities::default())
         .unwrap();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(2), g.id.clone()))
+        .unwrap();
     store.delete_group(&g.id).unwrap();
     assert!(store.list_messages(&g.id, EpochId(0)).unwrap().is_empty());
+    assert!(
+        store
+            .list_queued_outbound_intents(&g.id)
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         store
             .member_capabilities(&g.id, &g.members[0].id)
@@ -170,6 +191,39 @@ fn list_messages_preserves_insert_order_for_replay() {
     assert_eq!(ids, vec![mid(3), mid(1), mid(2)]);
 }
 
+// ── OutboundIntentStorage ──────────────────────────────────────────────────
+
+#[test]
+fn queued_outbound_intents_are_group_scoped_and_ordered() {
+    let store = MemoryStorage::new();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(3), gid(1)))
+        .unwrap();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(1), gid(1)))
+        .unwrap();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(2), gid(2)))
+        .unwrap();
+
+    let ids: Vec<_> = store
+        .list_queued_outbound_intents(&gid(1))
+        .unwrap()
+        .into_iter()
+        .map(|queued| queued.id)
+        .collect();
+    assert_eq!(ids, vec![mid(3), mid(1)]);
+
+    store.delete_queued_outbound_intent(&mid(3)).unwrap();
+    let ids: Vec<_> = store
+        .list_queued_outbound_intents(&gid(1))
+        .unwrap()
+        .into_iter()
+        .map(|queued| queued.id)
+        .collect();
+    assert_eq!(ids, vec![mid(1)]);
+}
+
 // ── Snapshot / rollback ─────────────────────────────────────────────────────
 
 #[test]
@@ -201,6 +255,30 @@ fn snapshot_rollback_restores_group_and_messages() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].id, mid(1));
     assert_eq!(msgs[0].state, MessageState::Created);
+}
+
+#[test]
+fn snapshot_rollback_restores_queued_outbound_intents() {
+    let store = MemoryStorage::new();
+    let g0 = sample_group(gid(1), 0, 1);
+    store.put_group(&g0).unwrap();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(1), g0.id.clone()))
+        .unwrap();
+    store.create_group_snapshot(&g0.id, "pre-send").unwrap();
+
+    store.delete_queued_outbound_intent(&mid(1)).unwrap();
+    store
+        .put_queued_outbound_intent(&sample_queued_intent(mid(2), g0.id.clone()))
+        .unwrap();
+
+    store
+        .rollback_group_to_snapshot(&g0.id, "pre-send")
+        .unwrap();
+
+    let queued = store.list_queued_outbound_intents(&g0.id).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, mid(1));
 }
 
 #[test]

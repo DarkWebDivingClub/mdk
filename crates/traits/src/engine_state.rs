@@ -1,17 +1,13 @@
 //! Engine-internal state machines modeled as explicit enums.
 //!
-//! Per `docs/marmot-architecture/further-context/cgka-engine-design.md:135-166`
-//! and spike-findings §2.1, the "rustls-style state-machine-as-enum" discipline
-//! makes illegal transitions a compile-time concern rather than a scattered
-//! runtime `if/match`. This module defines the two state machines this
-//! refactor lands:
+//! Explicit enum states keep illegal transitions out of scattered runtime
+//! checks. This module defines two engine state machines:
 //!
 //! - [`EpochState`] — per-group commit lifecycle. The core correctness
 //!   invariant of the engine.
 //! - [`WelcomeState`] — minimal; welcomes auto-accept today.
 //!
-//! `MemberState` is **deliberately omitted** (decision per the production
-//! refactor plan's clarifying round): OpenMLS's own member tracking is
+//! `MemberState` is deliberately omitted. OpenMLS member tracking is
 //! authoritative; a parallel enum would drift.
 //!
 //! ## Opacity discipline
@@ -208,12 +204,9 @@ impl EpochState {
 
     /// `Stable → PendingPublish`. Only legal from `Stable`.
     ///
-    /// `new_epoch` is the epoch the group WILL be at once the commit is
-    /// confirmed. For the 0.1.0 spike-shortcut (merge-before-confirm), this
-    /// equals the MLS group's current epoch post-`merge_pending_commit`.
-    /// Once Task 4.13 lifts into real publish-before-apply, `new_epoch`
-    /// becomes the projected-future epoch and rollback restores the
-    /// caller's prior Stable epoch.
+    /// `new_epoch` is the epoch the group will reach after the staged commit
+    /// is confirmed. Rollback restores the caller-supplied prior Stable
+    /// epoch.
     pub fn begin_pending(
         self,
         new_epoch: EpochId,
@@ -247,11 +240,9 @@ impl EpochState {
         }
     }
 
-    /// `PendingPublish → Stable` at the CALLER-supplied prior epoch. Used
+    /// `PendingPublish → Stable` at the caller-supplied prior epoch. Used
     /// when transport publish fails and the engine must discard the staged
-    /// commit. The caller owns the "what was the previous Stable epoch"
-    /// memory for now — Task 4.13 centralizes this in `EpochManager` with
-    /// real staged-commit state.
+    /// commit. The caller owns the previous Stable epoch memory.
     pub fn rollback_pending(self, prior_epoch: EpochId) -> Result<Self, InvalidTransition> {
         match self {
             EpochState::PendingPublish(_) => Ok(EpochState::Stable { epoch: prior_epoch }),

@@ -1,4 +1,4 @@
-//! Phase 4.2 + 4.8 integration tests.
+//! Group creation and welcome integration tests.
 //!
 //! Uses a pass-through mock peeler that reflects `EncryptedPayload` bytes
 //! into a `TransportMessage` without any crypto. Lets us exercise the engine
@@ -357,7 +357,7 @@ async fn join_welcome_rejects_wrong_recipient() {
 #[tokio::test]
 async fn create_group_buffers_ingest_via_pending_state() {
     // After create_group, alice is in PendingPublish for that group.
-    // can_ingest should be false until confirm_published lands (Phase 4.13).
+    // can_ingest should be false until confirm_published lands.
     let mut alice = build_client(b"a", selfremove_registry());
     let mut bob = build_client(b"b", selfremove_registry());
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -376,7 +376,6 @@ async fn create_group_buffers_ingest_via_pending_state() {
     // epoch() reflects the underlying MLS group (1 after add) — the state
     // machine is PendingPublish but queries still return the current epoch.
     //
-    // We can't directly peek at EpochState from outside the crate; peek via
-    // that fact that ingest is intended to buffer in PendingPublish (when
-    // ingest lands in Phase 4.3, this test will assert the buffering).
+    // We can't directly peek at EpochState from outside the crate; the
+    // observable contract is that ingest buffers while PendingPublish is live.
 }

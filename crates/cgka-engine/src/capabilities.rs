@@ -128,9 +128,8 @@ pub(crate) fn capabilities_of_key_package(kp: &openmls::prelude::KeyPackage) -> 
     capabilities_of_leaf(kp.leaf_node())
 }
 
-/// Read a LeafNode's advertised capabilities. The cache-on-ingest path
-/// (Task 4.7) goes through this — see also the Risk #1 correction in the
-/// production refactor plan.
+/// Read a LeafNode's advertised capabilities for constructability checks and
+/// cache-on-ingest updates.
 pub(crate) fn capabilities_of_leaf(leaf: &openmls::prelude::LeafNode) -> GroupCapabilities {
     let caps = leaf.capabilities();
     let mut out = GroupCapabilities::default();

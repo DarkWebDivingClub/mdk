@@ -1,22 +1,19 @@
 //! EpochManager — single owner of every per-group [`EpochState`] mutation.
 //!
-//! Per Task 4.4 of the production refactor plan: state-machine transitions
-//! were originally scattered across `group_lifecycle.rs`, `message_processor.rs`,
-//! and the trait impl in `engine.rs`. Consolidating here gives one place
-//! that:
+//! This module is the only place that mutates per-group engine epoch state.
+//! It:
 //!
 //! - Owns the `epoch_states` map.
 //! - Issues `PendingStateRef`s and tracks the reverse `pending_ref → group_id`
 //!   index.
-//! - Records pre-commit epochs (Task 4.5 fork-detection bookkeeping).
+//! - Records pre-commit epochs for fork detection.
 //! - Wraps the legal transitions on [`EpochState`] so engine subsystems
 //!   can't construct non-`Stable` variants directly.
 //!
-//! Publish-before-apply (Task 4.13): pending publishes record the
-//! `prior_epoch` so a `rollback_publish` can restore the engine to its
-//! pre-stage `Stable` state. The MLS-side `clear_pending_commit` and the
-//! Marmot/cache rewinds happen on the engine, not in here — this module
-//! tracks the state machine + bookkeeping only.
+//! Pending publishes record `prior_epoch` so `rollback_publish` can restore
+//! the engine to its pre-stage `Stable` state. MLS-side
+//! `clear_pending_commit` and Marmot/cache rewrites happen in the engine;
+//! this module tracks state-machine bookkeeping only.
 
 use cgka_traits::engine_state::{EpochState, PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;

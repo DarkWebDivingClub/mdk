@@ -1,12 +1,12 @@
-//! [`Engine<S>`] — the OpenMLS-backed [`CgkaEngine`] implementation.
+//! [`Engine<S>`] is the OpenMLS-backed [`CgkaEngine`] implementation.
 //!
 //! Generic over `S: cgka_traits::StorageProvider`. Holds a `RustCrypto`
 //! instance for the crypto + rand half of OpenMLS's provider surface,
 //! materializing an `EngineOpenMlsProvider` on demand per MLS call.
 //!
-//! This file wires the pieces together. Method bodies for `CgkaEngine`
-//! stub out to `todo!()`-style typed errors until their owning subsystem
-//! lands (Tasks 4.2–4.13).
+//! This file owns construction, trait dispatch, event drains, and small
+//! read-only helpers. Group creation, ingest/send, publish lifecycle,
+//! convergence, and capability logic live in focused sibling modules.
 
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
@@ -27,7 +27,8 @@ use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::types::Ciphersuite;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -42,9 +43,8 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
 
-    /// Centralized state-machine ownership (Task 4.4). Every transition,
-    /// pending-ref allocation, and fork-detection bookkeeping flows through
-    /// this struct.
+    /// Per-group state-machine owner. Every transition, pending-ref
+    /// allocation, and fork-detection marker flows through this struct.
     pub(crate) epoch_manager: crate::epoch_manager::EpochManager,
 
     /// Snapshot + ordering metadata for same-epoch competing commits.
@@ -60,6 +60,10 @@ pub struct Engine<S: StorageProvider> {
     /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
     /// bounces back via ingest before we filter it client-side.
     pub(crate) sent_message_ids: HashSet<MessageId>,
+
+    pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
+    pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
+    pub(crate) convergence_clock_started_at: Instant,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -127,15 +131,27 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_publish_buf: VecDeque::new(),
             seen_message_ids: HashSet::new(),
             sent_message_ids: HashSet::new(),
+            convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
+            last_convergence_relevant_input_ms: HashMap::new(),
+            convergence_clock_started_at: Instant::now(),
         })
+    }
+}
+
+impl<S: StorageProvider> Engine<S> {
+    pub(crate) fn convergence_now_ms(&self) -> u64 {
+        self.convergence_clock_started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
 // ── CgkaEngine impl ─────────────────────────────────────────────────────────
 //
-// Method bodies are stubbed until their owning subsystem lands. The stubs
-// return typed errors so callers never see silent `unimplemented!()`
-// surprises.
+// Trait methods stay thin: validate the trait boundary, then delegate to
+// the module that owns the behavior.
 
 #[async_trait]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {

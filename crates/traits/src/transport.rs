@@ -1,10 +1,5 @@
-//! Cross-transport value types.
-//!
-//! These cross every seam: engine ↔ peeler ↔ adapter. Per spike-findings §1.1
-//! and §1.2, the original "intentionally minimal" `TransportMessage` shape
-//! was structurally insufficient — it carried no envelope discriminator and
-//! `SendResult::GroupEvolution` had no place for welcomes. Both corrections
-//! are landed below.
+//! Cross-transport value types shared by the engine, peeler, and transport
+//! adapters.
 
 use crate::types::{MemberId, MessageId};
 use serde::{Deserialize, Serialize};
@@ -26,8 +21,7 @@ pub struct TransportSource(pub String);
 /// still transport-wrapped; the peeler produces the decrypted
 /// [`crate::ingest::PeeledMessage`].
 ///
-/// The `envelope` field is the routing discriminator added per
-/// spike-findings §1.1.
+/// The `envelope` field is the routing discriminator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportMessage {
     pub id: MessageId,

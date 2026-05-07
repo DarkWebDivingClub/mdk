@@ -1,9 +1,8 @@
 //! Storage traits and the `StorageProvider` aggregate.
 //!
-//! Four Marmot-level traits compose with `openmls_traits::storage::StorageProvider`
-//! (at `CURRENT_VERSION`) to form a single type parameter `S: StorageProvider`
-//! carried by the engine. No `dyn` storage dispatch; all impls are reached
-//! via generics so the compiler can inline + prove consistency.
+//! Marmot-level traits compose with `openmls_traits::storage::StorageProvider`
+//! (at `CURRENT_VERSION`) to form the single `S: StorageProvider` type
+//! carried by the engine. The engine uses static storage dispatch.
 //!
 //! **Invariant:** storage trait methods are **sync**. OpenMLS's storage
 //! surface is sync; async concerns live above storage (on the engine). If a
@@ -11,11 +10,13 @@
 //! methods in `tokio::task::spawn_blocking`.
 
 use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
+use crate::engine::SendIntent;
 use crate::group::{Group, Member};
 use crate::message::{MessageRecord, MessageState};
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
+use serde::{Deserialize, Serialize};
 
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
@@ -72,6 +73,27 @@ pub trait MessageStorage {
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
 }
 
+// ── OutboundIntentStorage ──────────────────────────────────────────────────
+
+/// Durable queue for local outbound work that cannot be safely published
+/// until convergence reaches `Stable`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedOutboundIntent {
+    pub id: MessageId,
+    pub group_id: GroupId,
+    pub intent: SendIntent,
+    pub created_at_ms: u64,
+}
+
+pub trait OutboundIntentStorage {
+    fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()>;
+    fn list_queued_outbound_intents(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<QueuedOutboundIntent>>;
+    fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()>;
+}
+
 // ── WelcomeStorage ──────────────────────────────────────────────────────────
 
 pub trait WelcomeStorage {
@@ -84,11 +106,9 @@ pub trait WelcomeStorage {
 
 /// Feature registry + per-member capability cache.
 ///
-/// Per-member capabilities could be read live from OpenMLS via
-/// `group.public_group().leaf(idx)?.capabilities()` (see Risk #1 correction
-/// in the production refactor plan). This cache is an optimization: avoids
-/// tree walks, retains capabilities for members who later leave, and keeps
-/// `feature_status` a cheap local lookup.
+/// Per-member capabilities can be read live from OpenMLS, but the cache avoids
+/// repeated tree walks, retains capabilities for members who later leave, and
+/// keeps `feature_status` a cheap local lookup.
 pub trait CapabilityStorage {
     fn register_feature(
         &self,
@@ -117,20 +137,19 @@ pub trait CapabilityStorage {
 
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
-/// The single type parameter carried by the engine. Composes every Marmot
-/// storage concern plus an **accessor** to the OpenMLS storage side.
+/// The single storage type parameter carried by the engine.
 ///
-/// **Design note vs. `plans/2026-04-22-cgka-engine-production-refactor-v1.md`
-/// Task 2.5.** The plan originally described this as a direct-supertrait
-/// composition with `openmls_traits::storage::StorageProvider<CURRENT_VERSION>`.
-/// In practice that would force the Marmot storage struct to hand-forward all
-/// 50+ OpenMLS trait methods — purely mechanical, zero value. An accessor
-/// (`mls_storage()`) gives the engine exactly the same capability: it can
-/// construct an `OpenMlsProvider` bundle (crypto + rand + this storage) when
-/// invoking MLS operations, and can treat the Marmot traits as a separate
-/// set. The functional contract is unchanged.
+/// Marmot storage concerns live on this trait. OpenMLS storage is exposed
+/// through `mls_storage()` so the engine can build an `OpenMlsProvider`
+/// bundle without hand-forwarding every OpenMLS storage method.
 pub trait StorageProvider:
-    GroupStorage + MessageStorage + WelcomeStorage + CapabilityStorage + Send + Sync
+    GroupStorage
+    + MessageStorage
+    + OutboundIntentStorage
+    + WelcomeStorage
+    + CapabilityStorage
+    + Send
+    + Sync
 {
     /// Concrete OpenMLS storage type this provider owns.
     type Mls: OpenMlsStorageProvider<CURRENT_VERSION> + Send + Sync;

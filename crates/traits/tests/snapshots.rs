@@ -1,4 +1,4 @@
-//! Phase 5.8 — Snapshot tests for the cross-boundary value-type surface.
+//! Snapshot tests for the cross-boundary value-type surface.
 //!
 //! Locks in the JSON shape of every type that crosses a seam (transport,
 //! peeler, engine API). Wire-level and log-level shape changes break these

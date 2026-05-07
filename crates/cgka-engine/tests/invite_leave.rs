@@ -1,8 +1,9 @@
-//! Phase 4.3b — invite + MIP-03 SelfRemove (leave) round-trips.
+//! Invite and MIP-03 SelfRemove round trips.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
+use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -13,7 +14,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -114,13 +115,20 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8]) -> impl CgkaEngine {
+fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap()
+}
+
+fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
+    let result = engine
+        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .expect("buffered commit converges");
+    assert_eq!(result.sync_state, SyncState::Stable);
 }
 
 // ── Invite ──────────────────────────────────────────────────────────────────
@@ -190,7 +198,8 @@ async fn invite_adds_third_member_and_advances_epoch() {
         ..commit
     };
     let outcome = bob.ingest(routed_commit).await.unwrap();
-    assert!(matches!(outcome, IngestOutcome::Processed));
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
     assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
 
     let events = bob.drain_events();
@@ -354,7 +363,8 @@ async fn selfremove_full_flow_with_auto_commit() {
         ..commit
     };
     let outcome = bob.ingest(routed).await.unwrap();
-    assert!(matches!(outcome, IngestOutcome::Processed));
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
     assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
     let bob_events = bob.drain_events();
     assert!(
@@ -427,7 +437,8 @@ async fn leave_produces_selfremove_proposal() {
 /// Load-bearing comment: `leave_group_via_self_remove` is the ONLY leave
 /// path the engine exposes. This test is effectively a grep guard — if
 /// anyone adds `mls_group.leave_group(` anywhere in cgka-engine/, CI should
-/// fail. See Task 4.2 in the production refactor plan + spike-findings §2.2.
+/// fail. Marmot leave is represented as a SelfRemove proposal, never through
+/// OpenMLS's legacy direct leave path.
 #[test]
 fn no_legacy_leave_group_call_in_engine_source() {
     use std::fs;

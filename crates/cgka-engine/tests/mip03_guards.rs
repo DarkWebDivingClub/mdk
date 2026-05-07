@@ -1,11 +1,10 @@
-//! Phase 4.9 — MIP-03 policy guards.
+//! MIP-03 policy guards.
 //!
-//! Engine-layer guards we CAN implement without an admin model:
+//! Engine-layer guards the engine can enforce directly:
 //! - Committer-MUST-NOT-be-leaver (RFC 9420 §12.2)
 //!
-//! Admin-related guards (§149/§150) require an admin-tracking concept the
-//! engine layer doesn't have; flagged as deferred in
-//! `auto_committer.rs:decide`.
+//! Admin-related guards are enforced through Marmot group data and capability
+//! tracking rather than by OpenMLS alone.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -199,12 +198,12 @@ async fn committer_must_not_be_leaver_holds_for_self_proposal() {
     let _ = carol;
 }
 
-// ── Phase 4.9 §149 admin-cannot-self-remove ─────────────────────────────────
+// Admin cannot self-remove when they are the only admin.
 
 #[tokio::test]
 async fn admin_cannot_self_remove_when_only_admin() {
-    // Alice creates a group with bob. Alice is sole admin (creator
-    // policy). Alice tries to leave → §149 fires.
+    // Alice creates a group with Bob. Alice is sole admin by creator policy,
+    // so her attempt to leave is rejected.
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();

@@ -1,22 +1,28 @@
 use std::collections::BTreeSet;
 
 use cgka_conformance::canonicalization::{
-    CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState, DroppedMessageReason,
+    CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
+    DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
     MessageKind, SyncState, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance::convergence::ConvergencePolicy;
 use cgka_conformance::openmls_projection::{
     OpenMlsCandidatePath, OpenMlsCanonicalizationBatch, OpenMlsContentKind,
-    OpenMlsReplayObservation, canonicalize_openmls_batch, canonicalize_stored_openmls_messages,
-    materialize_openmls_candidate_paths, project_mls_message, replay_openmls_messages,
+    OpenMlsReplayObservation, apply_openmls_canonicalization_result, canonicalize_openmls_batch,
+    canonicalize_stored_openmls_messages, materialize_openmls_candidate_paths,
+    persist_openmls_canonicalization_dispositions, project_mls_message, replay_openmls_messages,
 };
 use cgka_conformance::{ClientBuilder, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{EpochId, GroupId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
+use openmls::group::MlsGroup;
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::OpenMlsProvider;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -556,10 +562,443 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
     );
 }
 
+#[tokio::test]
+async fn stored_openmls_canonicalization_persists_message_dispositions() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group(
+            "stored-openmls-dispositions",
+            vec![bob_kp, carol_kp],
+            vec![],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let alice_pending = alice.invite(vec![david_kp]).await;
+    let bob_pending = bob.invite(vec![eve_kp]).await;
+
+    let commit_messages: Vec<_> = bus
+        .queued_messages()
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(commit_messages.len(), 2);
+
+    let first_digest = project_mls_message(&commit_messages[0].payload)
+        .expect("first commit projects")
+        .message_digest;
+    let second_digest = project_mls_message(&commit_messages[1].payload)
+        .expect("second commit projects")
+        .message_digest;
+    let app_branch_index = if first_digest > second_digest { 0 } else { 1 };
+    let quiet_branch_index = 1 - app_branch_index;
+
+    let app_msg = if app_branch_index == 0 {
+        alice.confirm(alice_pending).await;
+        alice
+            .send_app_capture(b"persisted witness from higher digest branch".to_vec())
+            .await
+    } else {
+        bob.confirm(bob_pending).await;
+        bob.send_app_capture(b"persisted witness from higher digest branch".to_vec())
+            .await
+    };
+
+    store_created_message(carol.storage(), &group_id, &commit_messages[0]);
+    store_created_message(carol.storage(), &group_id, &commit_messages[1]);
+    store_created_message(carol.storage(), &group_id, &app_msg);
+
+    let result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 5,
+                witness_quorum_senders_per_epoch: 2,
+                witness_quorum_epochs: 1,
+                max_witness_override_depth: 1,
+            },
+            app_message_past_epoch_limit: 5,
+            stable_quiescence_ms: 1_000,
+        },
+        2_000,
+    )
+    .expect("stored OpenMLS canonicalization succeeds");
+
+    persist_openmls_canonicalization_dispositions(carol.storage(), &result)
+        .expect("canonicalization dispositions persist");
+
+    assert_message_state(
+        carol.storage(),
+        &commit_messages[app_branch_index],
+        MessageState::Processed,
+    );
+    assert_message_state(
+        carol.storage(),
+        &commit_messages[quiet_branch_index],
+        MessageState::EpochInvalidated,
+    );
+    assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_group() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group("stored-openmls-apply", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let alice_pending = alice.invite(vec![david_kp]).await;
+    let bob_pending = bob.invite(vec![eve_kp]).await;
+
+    let commit_messages: Vec<_> = bus
+        .queued_messages()
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(commit_messages.len(), 2);
+
+    let first_digest = project_mls_message(&commit_messages[0].payload)
+        .expect("first commit projects")
+        .message_digest;
+    let second_digest = project_mls_message(&commit_messages[1].payload)
+        .expect("second commit projects")
+        .message_digest;
+    let app_branch_index = if first_digest > second_digest { 0 } else { 1 };
+    let quiet_branch_index = 1 - app_branch_index;
+
+    let app_msg = if app_branch_index == 0 {
+        alice.confirm(alice_pending).await;
+        alice
+            .send_app_capture(b"applied witness from higher digest branch".to_vec())
+            .await
+    } else {
+        bob.confirm(bob_pending).await;
+        bob.send_app_capture(b"applied witness from higher digest branch".to_vec())
+            .await
+    };
+
+    store_created_message(carol.storage(), &group_id, &commit_messages[0]);
+    store_created_message(carol.storage(), &group_id, &commit_messages[1]);
+    store_created_message(carol.storage(), &group_id, &app_msg);
+
+    let result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 5,
+                witness_quorum_senders_per_epoch: 2,
+                witness_quorum_epochs: 1,
+                max_witness_override_depth: 1,
+            },
+            app_message_past_epoch_limit: 5,
+            stable_quiescence_ms: 1_000,
+        },
+        2_000,
+    )
+    .expect("stored OpenMLS canonicalization succeeds");
+
+    let observations = apply_openmls_canonicalization_result(carol.storage(), &group_id, &result)
+        .expect("selected OpenMLS branch applies");
+
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
+    assert_eq!(
+        carol
+            .storage()
+            .get_group(&group_id)
+            .expect("group stored")
+            .epoch,
+        EpochId(2)
+    );
+    assert!(observations.iter().any(|observation| {
+        matches!(
+            observation,
+            OpenMlsReplayObservation::CommitStaged { message_id, .. }
+                if *message_id == hex::encode(commit_messages[app_branch_index].id.as_slice())
+        )
+    }));
+    assert!(observations.iter().any(|observation| {
+        matches!(
+            observation,
+            OpenMlsReplayObservation::ApplicationProcessed { message_id, .. }
+                if *message_id == hex::encode(app_msg.id.as_slice())
+        )
+    }));
+    assert_message_state(
+        carol.storage(),
+        &commit_messages[app_branch_index],
+        MessageState::Processed,
+    );
+    assert_message_state(
+        carol.storage(),
+        &commit_messages[quiet_branch_index],
+        MessageState::EpochInvalidated,
+    );
+    assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group(
+            "stored-openmls-apply-rollback",
+            vec![bob_kp, carol_kp],
+            vec![],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let _alice_pending = alice.invite(vec![david_kp]).await;
+    let _bob_pending = bob.invite(vec![eve_kp]).await;
+
+    let commit_messages: Vec<_> = bus
+        .queued_messages()
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(commit_messages.len(), 2);
+
+    store_created_message(carol.storage(), &group_id, &commit_messages[0]);
+    store_created_message(carol.storage(), &group_id, &commit_messages[1]);
+
+    let bad_result = CanonicalizationResult {
+        previous_tip: 1,
+        selected_tip: Some(3),
+        selected_branch_id: Some("bad-selected-path".into()),
+        sync_state: SyncState::Stable,
+        accepted_commits: commit_messages
+            .iter()
+            .map(|message| hex::encode(message.id.as_slice()))
+            .collect(),
+        accepted_proposals: vec![],
+        accepted_app_messages: vec![],
+        invalidated_app_messages: vec![],
+        dropped_messages: vec![],
+        already_seen: vec![],
+        queued_outbound_intents: vec![],
+        publishable_outbound_messages: vec![],
+        errors: vec![],
+    };
+
+    let err = apply_openmls_canonicalization_result(carol.storage(), &group_id, &bad_result)
+        .expect_err("conflicting same-epoch commits cannot both apply");
+
+    assert!(
+        err.to_string().contains("process_message"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 1);
+    assert_message_state(carol.storage(), &commit_messages[0], MessageState::Created);
+    assert_message_state(carol.storage(), &commit_messages[1], MessageState::Created);
+}
+
+#[test]
+fn openmls_disposition_persistence_maps_all_canonicalization_states() {
+    let storage = storage_memory::MemoryStorage::new();
+    let group_id = GroupId::new(b"disposition-group".to_vec());
+    let accepted_commit_id = MessageId::new(vec![1]);
+    let accepted_app_id = MessageId::new(vec![2]);
+    let losing_commit_id = MessageId::new(vec![3]);
+    let losing_app_id = MessageId::new(vec![4]);
+    let malformed_proposal_id = MessageId::new(vec![5]);
+
+    for id in [
+        &accepted_commit_id,
+        &accepted_app_id,
+        &losing_commit_id,
+        &losing_app_id,
+        &malformed_proposal_id,
+    ] {
+        store_dummy_created_message(&storage, &group_id, id);
+    }
+
+    let result = CanonicalizationResult {
+        previous_tip: 1,
+        selected_tip: Some(2),
+        selected_branch_id: Some("accepted-branch".into()),
+        sync_state: SyncState::Stable,
+        accepted_commits: vec![hex::encode(accepted_commit_id.as_slice())],
+        accepted_proposals: vec![],
+        accepted_app_messages: vec![hex::encode(accepted_app_id.as_slice())],
+        invalidated_app_messages: vec![InvalidatedAppMessage {
+            message_id: hex::encode(losing_app_id.as_slice()),
+            epoch: 2,
+            reason: InvalidatedAppMessageReason::LosingBranch,
+            decrypted_payload_ref: Some("stored-payload".into()),
+        }],
+        dropped_messages: vec![
+            DroppedMessage {
+                message_id: hex::encode(losing_commit_id.as_slice()),
+                kind: MessageKind::Commit,
+                reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            },
+            DroppedMessage {
+                message_id: hex::encode(malformed_proposal_id.as_slice()),
+                kind: MessageKind::Proposal,
+                reason: DroppedMessageReason::Malformed,
+            },
+        ],
+        already_seen: vec![],
+        queued_outbound_intents: vec![],
+        publishable_outbound_messages: vec![],
+        errors: vec![],
+    };
+
+    persist_openmls_canonicalization_dispositions(&storage, &result)
+        .expect("canonicalization dispositions persist");
+
+    assert_message_id_state(&storage, &accepted_commit_id, MessageState::Processed);
+    assert_message_id_state(&storage, &accepted_app_id, MessageState::Processed);
+    assert_message_id_state(&storage, &losing_commit_id, MessageState::EpochInvalidated);
+    assert_message_id_state(&storage, &losing_app_id, MessageState::EpochInvalidated);
+    assert_message_id_state(&storage, &malformed_proposal_id, MessageState::Failed);
+}
+
 fn assert_projected_kind(msg: &TransportMessage, expected_kind: OpenMlsContentKind, source: u64) {
     let projection = project_mls_message(&msg.payload).expect("MLS message projects");
     assert_eq!(projection.kind, expected_kind);
     assert_eq!(projection.source_epoch, Some(source));
+}
+
+fn assert_message_state(
+    storage: &storage_memory::MemoryStorage,
+    msg: &TransportMessage,
+    expected: MessageState,
+) {
+    assert_message_id_state(storage, &msg.id, expected);
+}
+
+fn assert_message_id_state(
+    storage: &storage_memory::MemoryStorage,
+    id: &MessageId,
+    expected: MessageState,
+) {
+    let record = storage.get_message(id).expect("message remains stored");
+    assert_eq!(record.state, expected);
+}
+
+fn stored_openmls_epoch(storage: &storage_memory::MemoryStorage, group_id: &GroupId) -> u64 {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<storage_memory::MemoryStorage>::new(&crypto, storage.mls_storage());
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let group = MlsGroup::load(provider.storage(), &mls_group_id)
+        .expect("MLS group loads")
+        .expect("MLS group exists");
+    group.epoch().as_u64()
+}
+
+fn store_dummy_created_message(
+    storage: &storage_memory::MemoryStorage,
+    group_id: &GroupId,
+    id: &MessageId,
+) {
+    storage
+        .put_message(&MessageRecord {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Created,
+            payload: Vec::new(),
+        })
+        .expect("message stored");
 }
 
 fn store_created_message(

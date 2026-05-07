@@ -334,6 +334,19 @@ Rules:
 The engine MUST NOT publish a commit or app message from an MLS state that was
 created before the latest successful canonicalization pass.
 
+On the application-facing engine API, a queued local send is reported as:
+
+```text
+SendResult::Queued {
+  group_id,
+  intent_id,
+}
+```
+
+`intent_id` identifies the durable queued intent. When the group reaches
+`Stable`, the engine regenerates publishable messages from the selected
+canonical state and removes the queued intent after regeneration succeeds.
+
 ## Result
 
 `CanonicalizationResult` reports the complete disposition of work handled in the
@@ -461,8 +474,8 @@ selection model. This contract defines how the CGKA engine packages that model
 as a state-machine operation with inputs, outputs, lifecycle, and storage.
 
 The current executable policy model lives in
-[`crates/cgka-conformance/src/convergence.rs`](../../crates/cgka-conformance/src/convergence.rs).
+[`crates/cgka-engine/src/convergence.rs`](../../crates/cgka-engine/src/convergence.rs).
 The executable canonicalization contract model lives in
-[`crates/cgka-conformance/src/canonicalization.rs`](../../crates/cgka-conformance/src/canonicalization.rs).
+[`crates/cgka-engine/src/canonicalization.rs`](../../crates/cgka-engine/src/canonicalization.rs).
 The contract scenario tests live in
 [`crates/cgka-conformance/tests/canonicalization_contract.rs`](../../crates/cgka-conformance/tests/canonicalization_contract.rs).

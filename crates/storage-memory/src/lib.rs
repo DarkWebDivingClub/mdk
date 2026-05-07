@@ -18,8 +18,8 @@ use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilitie
 use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{
-    CapabilityStorage, GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
@@ -33,6 +33,9 @@ struct Inner {
     messages: HashMap<MessageId, MessageRecord>,
     message_order: HashMap<MessageId, u64>,
     next_message_order: u64,
+    queued_outbound_intents: HashMap<MessageId, QueuedOutboundIntent>,
+    queued_outbound_order: HashMap<MessageId, u64>,
+    next_queued_outbound_order: u64,
     welcomes: HashMap<MessageId, PendingWelcome>,
     features: HashMap<Feature, CapabilityRequirement>,
     member_caps: HashMap<(GroupId, MemberId), GroupCapabilities>,
@@ -46,6 +49,8 @@ struct GroupSnapshot {
     group: Group,
     messages: HashMap<MessageId, MessageRecord>,
     message_order: HashMap<MessageId, u64>,
+    queued_outbound_intents: HashMap<MessageId, QueuedOutboundIntent>,
+    queued_outbound_order: HashMap<MessageId, u64>,
     member_caps: HashMap<MemberId, GroupCapabilities>,
     mls_values: HashMap<Vec<u8>, Vec<u8>>,
 }
@@ -106,6 +111,18 @@ impl GroupStorage for MemoryStorage {
         inner.messages.retain(|_, m| m.group_id != *id);
         for msg_id in removed_ids {
             inner.message_order.remove(&msg_id);
+        }
+        let removed_queued_ids: Vec<MessageId> = inner
+            .queued_outbound_intents
+            .iter()
+            .filter(|(_, queued)| queued.group_id == *id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        inner
+            .queued_outbound_intents
+            .retain(|_, queued| queued.group_id != *id);
+        for queued_id in removed_queued_ids {
+            inner.queued_outbound_order.remove(&queued_id);
         }
         inner.member_caps.retain(|(g, _), _| g != id);
         inner.snapshots.retain(|(g, _), _| g != id);
@@ -186,6 +203,23 @@ impl MessageStorage for MemoryStorage {
             })
             .map(|(id, order)| (id.clone(), *order))
             .collect();
+        let queued_outbound_intents = inner
+            .queued_outbound_intents
+            .iter()
+            .filter(|(_, queued)| queued.group_id == *group_id)
+            .map(|(id, queued)| (id.clone(), queued.clone()))
+            .collect();
+        let queued_outbound_order = inner
+            .queued_outbound_order
+            .iter()
+            .filter(|(id, _)| {
+                inner
+                    .queued_outbound_intents
+                    .get(id)
+                    .is_some_and(|queued| queued.group_id == *group_id)
+            })
+            .map(|(id, order)| (id.clone(), *order))
+            .collect();
         let member_caps = inner
             .member_caps
             .iter()
@@ -204,6 +238,8 @@ impl MessageStorage for MemoryStorage {
                 group,
                 messages,
                 message_order,
+                queued_outbound_intents,
+                queued_outbound_order,
                 member_caps,
                 mls_values,
             },
@@ -225,6 +261,16 @@ impl MessageStorage for MemoryStorage {
             .collect();
         let message_order: Vec<(MessageId, u64)> = snap
             .message_order
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let queued_outbound_intents: Vec<(MessageId, QueuedOutboundIntent)> = snap
+            .queued_outbound_intents
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let queued_outbound_order: Vec<(MessageId, u64)> = snap
+            .queued_outbound_order
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
@@ -251,6 +297,24 @@ impl MessageStorage for MemoryStorage {
         for (id, order) in message_order {
             inner.message_order.insert(id, order);
         }
+        let removed_queued_ids: Vec<MessageId> = inner
+            .queued_outbound_intents
+            .iter()
+            .filter(|(_, queued)| queued.group_id == *group_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        inner
+            .queued_outbound_intents
+            .retain(|_, queued| queued.group_id != *group_id);
+        for id in removed_queued_ids {
+            inner.queued_outbound_order.remove(&id);
+        }
+        for (id, queued) in queued_outbound_intents {
+            inner.queued_outbound_intents.insert(id, queued);
+        }
+        for (id, order) in queued_outbound_order {
+            inner.queued_outbound_order.insert(id, order);
+        }
         inner.member_caps.retain(|(g, _), _| g != group_id);
         for (key, caps) in member_caps {
             inner.member_caps.insert(key, caps);
@@ -270,6 +334,54 @@ impl MessageStorage for MemoryStorage {
             .snapshots
             .remove(&(group_id.clone(), name.to_string()))
             .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?;
+        Ok(())
+    }
+}
+
+// ── OutboundIntentStorage ──────────────────────────────────────────────────
+
+impl OutboundIntentStorage for MemoryStorage {
+    fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        let mut inner = write(&self.inner)?;
+        if !inner.queued_outbound_order.contains_key(&record.id) {
+            let order = inner.next_queued_outbound_order;
+            inner.next_queued_outbound_order += 1;
+            inner.queued_outbound_order.insert(record.id.clone(), order);
+        }
+        inner
+            .queued_outbound_intents
+            .insert(record.id.clone(), record.clone());
+        Ok(())
+    }
+
+    fn list_queued_outbound_intents(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        let inner = read(&self.inner)?;
+        let mut out: Vec<_> = inner
+            .queued_outbound_intents
+            .values()
+            .filter(|queued| &queued.group_id == group_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|queued| {
+            inner
+                .queued_outbound_order
+                .get(&queued.id)
+                .copied()
+                .unwrap_or(u64::MAX)
+        });
+        Ok(out)
+    }
+
+    fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
+        let mut inner = write(&self.inner)?;
+        inner
+            .queued_outbound_intents
+            .remove(id)
+            .ok_or(StorageError::NotFound)?;
+        inner.queued_outbound_order.remove(id);
         Ok(())
     }
 }

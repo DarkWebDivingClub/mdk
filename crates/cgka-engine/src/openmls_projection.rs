@@ -1,17 +1,19 @@
-//! Bytes-first OpenMLS probes for the conformance harness.
+//! Bytes-first OpenMLS projection and canonicalization helpers.
 //!
 //! OpenMLS protocol objects are intentionally consumed by processing APIs.
 //! The canonicalization contract should therefore retain bytes and derived
-//! observations, not long-lived OpenMLS values. This module probes actual
-//! OpenMLS behavior from MLS bytes and rolls storage back after replay.
+//! observations, not long-lived OpenMLS values. This module can either
+//! snapshot-and-replay messages for candidate materialization or apply a
+//! selected canonical branch to retained storage.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_engine::provider::EngineOpenMlsProvider;
+use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::group::Member;
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{EpochId, GroupId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent,
@@ -24,7 +26,7 @@ use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
 
 use crate::canonicalization::{
     CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
-    MaterializedCandidate, OutboundIntent, PeeledMessage, PeeledMessageKind,
+    DroppedMessageReason, MaterializedCandidate, OutboundIntent, PeeledMessage, PeeledMessageKind,
     canonicalize_with_materialized_candidates,
 };
 use crate::convergence::BranchCandidate;
@@ -133,6 +135,13 @@ pub enum OpenMlsReplayObservation {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenMlsReplayOutput {
+    observations: Vec<OpenMlsReplayObservation>,
+    final_epoch: u64,
+    final_members: Vec<Member>,
+}
+
 #[derive(Debug)]
 pub enum OpenMlsProjectionError {
     Decode(String),
@@ -201,7 +210,8 @@ pub fn replay_openmls_messages<S: StorageProvider>(
         .create_group_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let result = replay_openmls_messages_inner(storage, group_id, messages);
+    let result =
+        process_openmls_messages_inner(storage, group_id, messages).map(|out| out.observations);
     let rollback_result = storage
         .rollback_group_to_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
@@ -362,14 +372,152 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     )
 }
 
+pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    result: &CanonicalizationResult,
+) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    let replay_messages = replay_messages_for_canonicalization_result(storage, result)?;
+    let snapshot = apply_snapshot_name(group_id, result);
+    storage
+        .create_group_snapshot(group_id, &snapshot)
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+
+    let apply_result =
+        apply_openmls_canonicalization_result_inner(storage, group_id, result, &replay_messages);
+
+    match apply_result {
+        Ok(observations) => {
+            storage
+                .release_group_snapshot(group_id, &snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            Ok(observations)
+        }
+        Err(err) => {
+            storage
+                .rollback_group_to_snapshot(group_id, &snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            storage
+                .release_group_snapshot(group_id, &snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            Err(err)
+        }
+    }
+}
+
+pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
+    storage: &S,
+    result: &CanonicalizationResult,
+) -> Result<(), OpenMlsProjectionError> {
+    let mut state_by_message_id = BTreeMap::new();
+
+    for dropped in &result.dropped_messages {
+        state_by_message_id.insert(
+            dropped.message_id.clone(),
+            message_state_for_dropped_reason(dropped.reason),
+        );
+    }
+    for invalidated in &result.invalidated_app_messages {
+        state_by_message_id.insert(
+            invalidated.message_id.clone(),
+            MessageState::EpochInvalidated,
+        );
+    }
+    for accepted in result
+        .accepted_commits
+        .iter()
+        .chain(&result.accepted_proposals)
+        .chain(&result.accepted_app_messages)
+    {
+        state_by_message_id.insert(accepted.clone(), MessageState::Processed);
+    }
+
+    for (hex_message_id, state) in state_by_message_id {
+        let message_id = message_id_from_hex(&hex_message_id)?;
+        storage
+            .update_message_state(&message_id, state)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    }
+
+    Ok(())
+}
+
+fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    result: &CanonicalizationResult,
+    replay_messages: &[TransportMessage],
+) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    let output = process_openmls_messages_inner(storage, group_id, replay_messages)?;
+    update_group_record_from_replay(storage, group_id, &output)?;
+    persist_openmls_canonicalization_dispositions(storage, result)?;
+    Ok(output.observations)
+}
+
+fn replay_messages_for_canonicalization_result<S: StorageProvider>(
+    storage: &S,
+    result: &CanonicalizationResult,
+) -> Result<Vec<TransportMessage>, OpenMlsProjectionError> {
+    let mut replay_messages = Vec::new();
+    let mut seen = BTreeSet::new();
+    for hex_message_id in result
+        .accepted_proposals
+        .iter()
+        .chain(&result.accepted_commits)
+        .chain(&result.accepted_app_messages)
+    {
+        if !seen.insert(hex_message_id.clone()) {
+            continue;
+        }
+        let message_id = message_id_from_hex(hex_message_id)?;
+        let record = storage
+            .get_message(&message_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        replay_messages.push(transport_message_from_record(&record)?);
+    }
+    Ok(replay_messages)
+}
+
+fn update_group_record_from_replay<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    output: &OpenMlsReplayOutput,
+) -> Result<(), OpenMlsProjectionError> {
+    let mut group = match storage.get_group(group_id) {
+        Ok(group) => group,
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
+    };
+    group.epoch = EpochId(output.final_epoch);
+    group.members = output.final_members.clone();
+    storage
+        .put_group(&group)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))
+}
+
 fn record_state_is_canonicalization_input(state: MessageState) -> bool {
     matches!(
         state,
-        MessageState::Sent
-            | MessageState::Created
-            | MessageState::Processed
-            | MessageState::Retryable
+        MessageState::Sent | MessageState::Created | MessageState::Retryable
     )
+}
+
+fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageState {
+    match reason {
+        DroppedMessageReason::Malformed | DroppedMessageReason::UnsupportedPolicy => {
+            MessageState::Failed
+        }
+        DroppedMessageReason::BeyondRollbackHorizon
+        | DroppedMessageReason::BeyondAnchor
+        | DroppedMessageReason::BeyondAppRetention
+        | DroppedMessageReason::InvalidAgainstCandidateState => MessageState::EpochInvalidated,
+    }
+}
+
+fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
+    hex::decode(encoded)
+        .map(MessageId::new)
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
 }
 
 fn transport_message_from_record(
@@ -537,11 +685,11 @@ fn project_pending_canonicalization_messages(
     Ok(pending)
 }
 
-fn replay_openmls_messages_inner<S: StorageProvider>(
+fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     messages: &[TransportMessage],
-) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -632,7 +780,24 @@ fn replay_openmls_messages_inner<S: StorageProvider>(
             }
         }
     }
-    Ok(observations)
+    Ok(OpenMlsReplayOutput {
+        observations,
+        final_epoch: mls_group.epoch().as_u64(),
+        final_members: marmot_members(&mls_group),
+    })
+}
+
+fn marmot_members(group: &MlsGroup) -> Vec<Member> {
+    group
+        .members()
+        .filter_map(|member| {
+            let basic = BasicCredential::try_from(member.credential).ok()?;
+            Some(Member {
+                id: MemberId::new(basic.identity().to_vec()),
+                credential: member.signature_key.to_vec(),
+            })
+        })
+        .collect()
 }
 
 fn protocol_message_from_bytes(
@@ -693,6 +858,24 @@ fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> St
     }
     let digest = hasher.finalize();
     format!("openmls-probe-{}", hex::encode(&digest[..8]))
+}
+
+fn apply_snapshot_name(group_id: &GroupId, result: &CanonicalizationResult) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(group_id.as_slice());
+    if let Some(branch_id) = &result.selected_branch_id {
+        hasher.update(branch_id.as_bytes());
+    }
+    for message_id in result
+        .accepted_proposals
+        .iter()
+        .chain(&result.accepted_commits)
+        .chain(&result.accepted_app_messages)
+    {
+        hasher.update(message_id.as_bytes());
+    }
+    let digest = hasher.finalize();
+    format!("openmls-apply-{}", hex::encode(&digest[..8]))
 }
 
 fn tls_hex<T: TlsSerialize>(value: &T) -> Result<String, OpenMlsProjectionError> {

@@ -1,8 +1,8 @@
-//! Model-level candidate-state graph rules for distributed convergence.
+//! Candidate-state graph rules for distributed convergence.
 //!
 //! This module does not drive OpenMLS. It captures the deterministic branch
-//! selection policy that the engine canonicalizer is expected to implement
-//! once it can materialize competing MLS states.
+//! selection policy that the engine canonicalizer uses after materializing
+//! competing MLS states.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +13,17 @@ pub struct ConvergencePolicy {
     pub witness_quorum_senders_per_epoch: usize,
     pub witness_quorum_epochs: usize,
     pub max_witness_override_depth: u64,
+}
+
+impl Default for ConvergencePolicy {
+    fn default() -> Self {
+        Self {
+            max_rewind_commits: 5,
+            witness_quorum_senders_per_epoch: 2,
+            witness_quorum_epochs: 1,
+            max_witness_override_depth: 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

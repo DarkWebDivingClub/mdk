@@ -1,9 +1,7 @@
 //! Typed errors returned by the engine and the peeler.
 //!
-//! Every variant corresponds to a real case the spike hit. Stringly-typed
-//! errors (`EngineError::Backend(String)`) are the fallback of last resort
-//! and deliberately the widest variant — everything we can classify should
-//! get its own variant first.
+//! Typed variants cover cases the engine can classify. `Backend(String)` is
+//! the fallback for backend failures that do not yet have a narrower variant.
 
 use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId};
@@ -29,16 +27,13 @@ pub enum EngineError {
     AdminCannotSelfRemove { group_id: GroupId },
 
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
-    /// before construction. Currently fires from the auto-committer when an
-    /// inbound SelfRemove from the only admin would deplete admins on
-    /// commit.
+    /// before construction. Used when an inbound SelfRemove from the only
+    /// admin would deplete admins on commit.
     #[error("commit would deplete admins on group {group_id}")]
     AdminDepletion { group_id: GroupId },
 
-    /// Structured replacement for the spike's stringly-typed
-    /// "invitee KeyPackage missing required capabilities" error (see
-    /// `docs/learnings.md:127-129`). `required` and `had` are populated so
-    /// the UI can render the diff directly.
+    /// Invitee KeyPackage is missing a capability required by the group.
+    /// `required` and `had` are populated so callers can render the diff.
     #[error("missing required capabilities: required={required:?} had={had:?}")]
     MissingRequiredCapabilities {
         required: GroupCapabilities,
