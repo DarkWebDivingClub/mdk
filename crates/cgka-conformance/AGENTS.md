@@ -7,8 +7,11 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | Module | Role |
 |---|---|
 | `src/bus.rs` | `TransportBus` — in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId → ClientId` (for welcome routing). |
+| `src/canonicalization.rs` | Executable model of the CGKA canonicalization contract. Uses symbolic peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce deterministic message dispositions. |
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
+| `src/convergence.rs` | Model-level candidate-state graph scoring rules for the distributed convergence design. These tests do not drive OpenMLS yet; they pin policy before the engine canonicalizer lands. |
 | `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` records family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
+| `src/openmls_projection.rs` | Bytes-first OpenMLS projection and candidate materialization helpers. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
 | `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, recoveries, and invariant failures. |
@@ -51,6 +54,26 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
 4. Make recovery behavior observable through `ForkRecoveryObservation`, not just final membership.
 5. Run `cargo test -p cgka-conformance canonical_vector_fixtures_match_generated_traces`.
+
+## OpenMLS replay probes
+
+`openmls_projection` is intentionally bytes-first. Probe tests should capture
+`TransportMessage` values from the harness, replay their MLS payload bytes
+against a `MemoryStorage` group snapshot, collect observations such as
+`ProposalRef`s from `StagedCommit::queued_proposals()`, then rely on the helper
+to roll storage back. Candidate materialization should turn those replay
+observations into `MaterializedCandidate` values, then call
+`canonicalize_with_materialized_candidates` so commit ids, consumed proposal
+ids, and losing-branch dispositions are handled by the canonicalizer. Do not
+store OpenMLS protocol objects in conformance fixtures; they are consumed by
+OpenMLS APIs. For a full replay-to-canonicalization pass, use
+`canonicalize_openmls_batch`: it maps OpenMLS `ProposalRef`s back to canonical
+message ids and turns successful application-message replays into branch
+witnesses plus stored payload refs. Candidate paths should carry commits; the
+batch's `pending_messages` supplies proposals and app messages for replay
+probing. Use `canonicalize_stored_openmls_messages` when the test should prove
+that durable `MessageRecord` rows can reconstruct the same batch after restart
+or relay sync.
 
 ## How to run generated reports
 

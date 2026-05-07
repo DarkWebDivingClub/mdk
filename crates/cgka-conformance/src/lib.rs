@@ -10,13 +10,21 @@
 //! - [`client`] — [`client::HarnessClient`] wrapping `Engine<MemoryStorage>`
 //!   plus a [`peeler::MockPeeler`] (skips actual crypto — tests assert on
 //!   inner payloads directly).
+//! - [`canonicalization`] — executable model of the CGKA canonicalization
+//!   contract above the branch selector.
+//! - [`convergence`] — model-level candidate-state graph scoring rules.
+//! - [`openmls_projection`] — bytes-first OpenMLS projection and snapshot
+//!   replay probes used to keep the symbolic contract honest.
 //! - [`peeler`] — pass-through [`peeler::MockPeeler`].
 //!
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
 pub mod bus;
+pub mod canonicalization;
 pub mod client;
+pub mod convergence;
 pub mod family;
+pub mod openmls_projection;
 pub mod peeler;
 pub mod proptest_support;
 pub mod report;

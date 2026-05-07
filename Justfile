@@ -24,6 +24,14 @@ conformance:
 conformance-slow:
     cargo test -p cgka-conformance --features conformance-slow
 
+tamarin:
+    @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
+    @make -C formal/tamarin prove
+
+tamarin-interactive:
+    @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
+    @make -C formal/tamarin interactive
+
 coverage:
     just coverage-traits
     just coverage-storage

@@ -43,6 +43,8 @@ These are longer working documents. Go here when you need depth, not orientation
 
 | Doc | What it covers |
 |---|---|
+| [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md) | Draft CGKA engine canonicalization contract: post-peeling inputs, candidate-state graph, sync state, outputs, storage, conformance scenarios. |
+| [`distributed-convergence.md`](./distributed-convergence.md) | Draft convergence model for selecting one MLS branch from unordered multi-relay input. |
 | [`further-context/target-architecture.md`](./further-context/target-architecture.md) | The full target architecture with Rust trait sketches, data flow diagrams, migration path. |
 | [`further-context/cgka-engine-design.md`](./further-context/cgka-engine-design.md) | Detailed `CgkaEngine` trait design, internal subsystems, state machine enums, storage trait design, feature registry. |
 | [`further-context/capability-negotiation.md`](./further-context/capability-negotiation.md) | Full capability negotiation design. The three queries, group creation, upgrade, admin action, MIP checklist. |

@@ -20,6 +20,7 @@ pub struct HarnessClient {
     pub engine: Box<dyn CgkaEngine>,
     pub bus_id: ClientId,
     bus: TransportBus,
+    storage: MemoryStorage,
     pending_events: Vec<GroupEvent>,
     /// Default group_id used to set transport_group_id on outbound + inbound
     /// envelopes. Set automatically after the first create/join.
@@ -45,7 +46,8 @@ impl ClientBuilder {
     }
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
-        let engine = EngineBuilder::new(MemoryStorage::new())
+        let storage = MemoryStorage::new();
+        let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
             .feature_registry(self.registry)
             .peeler(Box::new(MockPeeler::new(self.identity.clone())))
@@ -56,6 +58,7 @@ impl ClientBuilder {
             engine: Box::new(engine),
             bus_id,
             bus: bus.clone(),
+            storage,
             pending_events: Vec::new(),
             default_group: None,
         }
@@ -63,6 +66,10 @@ impl ClientBuilder {
 }
 
 impl HarnessClient {
+    pub fn storage(&self) -> &MemoryStorage {
+        &self.storage
+    }
+
     pub fn member_id(&self) -> MemberId {
         self.engine.self_id()
     }
@@ -240,6 +247,11 @@ impl HarnessClient {
 
     /// Send a SelfRemove proposal (Leave intent).
     pub async fn leave(&mut self) {
+        self.leave_capture().await;
+    }
+
+    /// Send a SelfRemove proposal and return the wrapped transport message.
+    pub async fn leave_capture(&mut self) -> TransportMessage {
         let gid = self.default_group.clone().expect("group");
         let res = self
             .engine
@@ -249,7 +261,9 @@ impl HarnessClient {
             .await
             .expect("send leave");
         if let SendResult::Proposal { msg } = res {
-            self.bus.send(self.bus_id, route(msg, &gid));
+            let routed = route(msg, &gid);
+            self.bus.send(self.bus_id, routed.clone());
+            routed
         } else {
             panic!("expected Proposal");
         }

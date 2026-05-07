@@ -189,6 +189,17 @@ impl TransportBus {
         self.inner.lock().unwrap().queue.len()
     }
 
+    /// Snapshot queued messages without altering delivery order.
+    pub fn queued_messages(&self) -> Vec<TransportMessage> {
+        self.inner
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .map(|in_flight| in_flight.msg.clone())
+            .collect()
+    }
+
     /// Drop one queued message by its current queue index.
     pub fn drop_queued(&self, index: usize) -> bool {
         let mut inner = self.inner.lock().unwrap();
