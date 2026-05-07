@@ -6,6 +6,8 @@ if ! command -v ruby >/dev/null 2>&1; then
   exit 1
 fi
 
+bash scripts/check-github-actions-pinned.sh
+
 ruby <<'RUBY'
 require "yaml"
 

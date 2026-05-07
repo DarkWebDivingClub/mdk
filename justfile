@@ -61,6 +61,10 @@ fmt:
 docs:
     @bash scripts/check-docs.sh
 
+# Check that GitHub Actions references are SHA-pinned
+actions-pinned:
+    @bash scripts/check-github-actions-pinned.sh
+
 # Check GitHub workflow policy
 workflow-policy:
     @bash scripts/check-workflow-policy.sh
