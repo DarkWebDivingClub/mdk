@@ -353,6 +353,61 @@ rule Init_Withheld_Published_After_Anchor:
   generate from the Rust policy model. Each case names the expected winner and
   reason.
 */
+rule Init_Generated_Family_QuorumOverride:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_quorum_override'),
+    GeneratedBoundedCase(~run, 'quorum_override'),
+    GeneratedExpectedSelection(~run, 'online', 'quorum_tie'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'online'),
+    Eligible(~run, 'withheld'),
+    QuorumMet(~run, 'online'),
+    BoostAllowed(~run, 'online'),
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
+    Score(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00'),
+    QuorumTieCase(~run, 'online', 'withheld')
+  ]->
+  [
+    Compare(~run, 'online', 'withheld'),
+    Compare(~run, 'withheld', 'online'),
+    View(~run, 'alice', 'online', 'withheld'),
+    View(~run, 'bob', 'withheld', 'online'),
+    !EligibleState(~run, 'online'),
+    !EligibleState(~run, 'withheld'),
+    !BoostAllowedState(~run, 'online'),
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
+    !ScoreState(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00'),
+    !QuorumTieCaseState(~run, 'online', 'withheld')
+  ]
+
+rule Init_Generated_Family_QuorumCappedByDepth:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_quorum_capped_by_depth'),
+    GeneratedBoundedCase(~run, 'quorum_capped_by_depth'),
+    GeneratedExpectedSelection(~run, 'withheld', 'effective_depth'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'online'),
+    Eligible(~run, 'withheld'),
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
+    Score(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    ScoreGreater(~run, 'd6', 'd5')
+  ]->
+  [
+    Compare(~run, 'withheld', 'online'),
+    Compare(~run, 'online', 'withheld'),
+    View(~run, 'alice', 'withheld', 'online'),
+    View(~run, 'bob', 'online', 'withheld'),
+    !EligibleState(~run, 'online'),
+    !EligibleState(~run, 'withheld'),
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
+    !ScoreState(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    !GtState(~run, 'd6', 'd5')
+  ]
+
 rule Init_Generated_Family_DepthPriority:
   [ Fr(~run) ]
 --[
@@ -874,6 +929,18 @@ lemma withheld_published_after_anchor_executable:
       Scenario(run, 'withheld_published_after_anchor') @ #i
     & LateWithheldRejected(run, 'late', 'e5') @ #j
     & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #k"
+
+lemma generated_quorum_override_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'quorum_override') @ #i
+    & Selected(run, 'alice', 'online', 'quorum_tie') @ #j"
+
+lemma generated_quorum_capped_by_depth_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'quorum_capped_by_depth') @ #i
+    & Selected(run, 'alice', 'withheld', 'effective_depth') @ #j"
 
 lemma generated_depth_priority_executable:
   exists-trace

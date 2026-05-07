@@ -80,6 +80,10 @@ fn print_tamarin(cases: &[PolicyCase]) {
         for candidate in &candidates {
             println!("    Eligible(~run, '{}'),", candidate.id);
         }
+        if reason == "quorum_tie" {
+            println!("    QuorumMet(~run, '{}'),", winner.id);
+            println!("    BoostAllowed(~run, '{}'),", winner.id);
+        }
         for candidate in &candidates {
             let score = candidate.score(&policy);
             println!(
@@ -98,6 +102,7 @@ fn print_tamarin(cases: &[PolicyCase]) {
                 digest_rank(&winner_score.tip_digest),
                 digest_rank(&loser_score.tip_digest)
             ),
+            "quorum_tie" => println!("    QuorumTieCase(~run, '{}', '{}')", winner.id, loser.id),
             "witness_score_tie" => println!(
                 "    ScoreGreater(~run, '{}', '{}')",
                 witness(winner_score.app_witness_score),
@@ -118,6 +123,9 @@ fn print_tamarin(cases: &[PolicyCase]) {
         for candidate in &candidates {
             println!("    !EligibleState(~run, '{}'),", candidate.id);
         }
+        if reason == "quorum_tie" {
+            println!("    !BoostAllowedState(~run, '{}'),", winner.id);
+        }
         for candidate in &candidates {
             let score = candidate.score(&policy);
             println!(
@@ -135,6 +143,10 @@ fn print_tamarin(cases: &[PolicyCase]) {
                 "    !DigestLtState(~run, '{}', '{}')",
                 digest_rank(&winner_score.tip_digest),
                 digest_rank(&loser_score.tip_digest)
+            ),
+            "quorum_tie" => println!(
+                "    !QuorumTieCaseState(~run, '{}', '{}')",
+                winner.id, loser.id
             ),
             "witness_score_tie" => println!(
                 "    !GtState(~run, '{}', '{}')",
