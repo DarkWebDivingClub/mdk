@@ -413,6 +413,23 @@ fn materialized_candidates_drive_commit_and_proposal_dispositions() {
 }
 
 #[test]
+fn materialized_candidate_preserves_commit_application_order() {
+    let result = canonicalize_with_materialized_candidates(
+        input(vec![], vec![]),
+        vec![MaterializedCandidate {
+            branch: branch("live", 1, 4, 0x00),
+            commit_message_ids: vec!["z-first-commit".into(), "a-second-commit".into()],
+            consumed_proposal_ids: vec![],
+        }],
+    );
+
+    assert_eq!(
+        result.accepted_commits,
+        vec!["z-first-commit".to_string(), "a-second-commit".to_string()]
+    );
+}
+
+#[test]
 fn app_message_beyond_mls_past_epoch_limit_is_invalidated() {
     let mut input = input(
         vec![app_message("expired-app", "alice", 2, &["live"], None)],

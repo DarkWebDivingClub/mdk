@@ -241,6 +241,7 @@ fn canonicalize_internal(
         .and_then(|branch_id| materialized_graph.commit_path_by_branch.get(branch_id))
         .cloned()
         .unwrap_or_default();
+    let selected_commit_id_set: BTreeSet<String> = selected_commit_ids.iter().cloned().collect();
     let selected_branch_path = selected_branch_id
         .as_deref()
         .and_then(|branch_id| materialized_graph.branch_path_by_branch.get(branch_id))
@@ -255,7 +256,7 @@ fn canonicalize_internal(
         })
         .cloned()
         .unwrap_or_default();
-    result.accepted_commits = selected_commit_ids.iter().cloned().collect();
+    result.accepted_commits = selected_commit_ids;
 
     for message in unique_messages {
         match &message.kind {
@@ -272,7 +273,7 @@ fn canonicalize_internal(
                 message,
                 branch_id,
                 *fork_epoch,
-                &selected_commit_ids,
+                &selected_commit_id_set,
                 &materialized_graph.branch_ids,
             ),
             PeeledMessageKind::Proposal { branch_id } => handle_proposal(
@@ -316,7 +317,7 @@ fn canonicalize_internal(
 #[derive(Clone, Debug)]
 struct MaterializedGraph {
     candidates: Vec<BranchCandidate>,
-    commit_path_by_branch: BTreeMap<String, BTreeSet<String>>,
+    commit_path_by_branch: BTreeMap<String, Vec<String>>,
     branch_path_by_branch: BTreeMap<String, BTreeSet<String>>,
     consumed_proposal_ids_by_branch: BTreeMap<String, BTreeSet<String>>,
     materialized_commit_ids_by_branch: BTreeMap<String, BTreeSet<String>>,
@@ -326,7 +327,7 @@ struct MaterializedGraph {
 #[derive(Clone, Debug)]
 struct ResolvedParent {
     fork_epoch: u64,
-    commit_path: BTreeSet<String>,
+    commit_path: Vec<String>,
     branch_path: BTreeSet<String>,
     consumed_proposal_ids: BTreeSet<String>,
 }
@@ -342,10 +343,10 @@ fn materialize_candidate_graph(
         .cloned()
         .map(|candidate| (candidate.id.clone(), candidate))
         .collect();
-    let mut commit_path_by_branch: BTreeMap<String, BTreeSet<String>> = input
+    let mut commit_path_by_branch: BTreeMap<String, Vec<String>> = input
         .candidate_branches
         .iter()
-        .map(|candidate| (candidate.id.clone(), BTreeSet::new()))
+        .map(|candidate| (candidate.id.clone(), Vec::new()))
         .collect();
     let mut branch_path_by_branch: BTreeMap<String, BTreeSet<String>> = input
         .candidate_branches
@@ -362,10 +363,7 @@ fn materialize_candidate_graph(
     for materialized in materialized_candidates {
         let branch_id = materialized.branch.id.clone();
         candidates.insert(branch_id.clone(), materialized.branch.clone());
-        commit_path_by_branch.insert(
-            branch_id.clone(),
-            materialized.commit_message_ids.iter().cloned().collect(),
-        );
+        commit_path_by_branch.insert(branch_id.clone(), materialized.commit_message_ids.clone());
         branch_path_by_branch.insert(branch_id.clone(), BTreeSet::from([branch_id.clone()]));
         consumed_proposal_ids_by_branch.insert(
             branch_id.clone(),
@@ -436,9 +434,7 @@ fn materialize_candidate_graph(
                 continue;
             }
 
-            resolved_parent
-                .commit_path
-                .insert(message.message_id.clone());
+            resolved_parent.commit_path.push(message.message_id.clone());
             resolved_parent.branch_path.insert(branch_id.clone());
             resolved_parent
                 .consumed_proposal_ids
@@ -481,7 +477,7 @@ fn resolve_parent(
     parent_branch_id: Option<&str>,
     fork_epoch: u64,
     candidates: &BTreeMap<String, BranchCandidate>,
-    commit_path_by_branch: &BTreeMap<String, BTreeSet<String>>,
+    commit_path_by_branch: &BTreeMap<String, Vec<String>>,
     branch_path_by_branch: &BTreeMap<String, BTreeSet<String>>,
     consumed_proposal_ids_by_branch: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<ResolvedParent> {
@@ -508,7 +504,7 @@ fn resolve_parent(
     } else {
         Some(ResolvedParent {
             fork_epoch,
-            commit_path: BTreeSet::new(),
+            commit_path: Vec::new(),
             branch_path: BTreeSet::new(),
             consumed_proposal_ids: BTreeSet::new(),
         })
@@ -739,7 +735,6 @@ fn invalidated_app(
 
 impl CanonicalizationResult {
     fn sort(&mut self) {
-        self.accepted_commits.sort();
         self.accepted_proposals.sort();
         self.accepted_app_messages.sort();
         self.invalidated_app_messages.sort();
