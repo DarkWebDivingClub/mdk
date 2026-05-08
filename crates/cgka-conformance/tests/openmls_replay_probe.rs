@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use cgka_conformance::canonicalization::{
-    CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
-    DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
-    MessageKind, SyncState, canonicalize_with_materialized_candidates,
+    CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
+    CanonicalizationState, DroppedMessage, DroppedMessageReason, InvalidatedAppMessage,
+    InvalidatedAppMessageReason, MessageKind, SyncState, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance::convergence::ConvergencePolicy;
 use cgka_conformance::openmls_projection::{
@@ -42,6 +42,19 @@ fn selfremove_registry() -> FeatureRegistry {
         },
     );
     r
+}
+
+fn one_rewind_policy() -> CanonicalizationPolicy {
+    CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            witness_quorum_senders_per_epoch: 2,
+            witness_quorum_epochs: 1,
+            max_witness_override_depth: 1,
+        },
+        app_message_past_epoch_limit: 5,
+        stable_quiescence_ms: 1_000,
+    }
 }
 
 #[tokio::test]
@@ -812,6 +825,367 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
         MessageState::EpochInvalidated,
     );
     assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn retained_anchor_late_commit_within_horizon_is_resolved() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group(
+            "retained-anchor-late-within",
+            vec![bob_kp, carol_kp],
+            vec![],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let _alice_pending = alice.invite(vec![david_kp]).await;
+    let _bob_pending = bob.invite(vec![eve_kp]).await;
+    let commit_messages: Vec<_> = bus
+        .queued_messages()
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(commit_messages.len(), 2);
+    let online_commit = commit_messages[0].clone();
+    let late_commit = commit_messages[1].clone();
+    let policy = one_rewind_policy();
+
+    store_created_message(carol.storage(), &group_id, &online_commit);
+    let first_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy.clone(),
+        2_000,
+    )
+    .expect("online branch canonicalizes");
+    apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &first_result,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("online branch applies and retains epoch 1");
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
+
+    store_created_message(carol.storage(), &group_id, &late_commit);
+    let late_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 2,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy.clone(),
+        3_000,
+    )
+    .expect("late branch canonicalizes from retained anchor");
+
+    assert!(late_result.errors.is_empty());
+    assert_ne!(
+        late_result.selected_branch_id, None,
+        "late same-epoch input should produce a selectable branch"
+    );
+    apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &late_result,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("selected retained-anchor branch applies");
+
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
+    assert_ne!(
+        carol.storage().get_message(&late_commit.id).unwrap().state,
+        MessageState::Created,
+        "late commit should be resolved within the retained horizon"
+    );
+}
+
+#[tokio::test]
+async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group("retained-anchor-missing", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let _alice_pending = alice.invite(vec![david_kp]).await;
+    let _bob_pending = bob.invite(vec![eve_kp]).await;
+    let commit_messages: Vec<_> = bus
+        .queued_messages()
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(commit_messages.len(), 2);
+    let online_commit = commit_messages[0].clone();
+    let late_commit = commit_messages[1].clone();
+    let policy = one_rewind_policy();
+
+    store_created_message(carol.storage(), &group_id, &online_commit);
+    let first_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy.clone(),
+        2_000,
+    )
+    .expect("online branch canonicalizes");
+    apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &first_result,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("online branch applies and retains epoch 1");
+    carol
+        .storage()
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-1")
+        .expect("test removes retained anchor");
+
+    store_created_message(carol.storage(), &group_id, &late_commit);
+    let late_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 2,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy,
+        3_000,
+    )
+    .expect("missing retained anchor is reported in result");
+
+    assert_eq!(
+        late_result.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
+    assert_message_state(carol.storage(), &late_commit, MessageState::Created);
+}
+
+#[tokio::test]
+async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut frank = ClientBuilder::new(pad32(b"frank"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group("retained-anchor-beyond", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+    let policy = one_rewind_policy();
+
+    let frank_kp = frank.fresh_key_package().await;
+    let _bob_pending = bob.invite(vec![frank_kp]).await;
+    let stale_commit = bus
+        .queued_messages()
+        .into_iter()
+        .find(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .expect("bob emitted stale commit");
+
+    let david_kp = david.fresh_key_package().await;
+    let alice_pending = alice.invite(vec![david_kp]).await;
+    let commit_david = bus
+        .queued_messages()
+        .into_iter()
+        .find(|msg| {
+            msg.id != stale_commit.id
+                && project_mls_message(&msg.payload)
+                    .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .expect("alice emitted david commit");
+    store_created_message(carol.storage(), &group_id, &commit_david);
+    let david_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy.clone(),
+        2_000,
+    )
+    .expect("david branch canonicalizes");
+    apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &david_result,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("david branch applies");
+    alice.confirm(alice_pending).await;
+
+    let eve_kp = eve.fresh_key_package().await;
+    let _eve_pending = alice.invite(vec![eve_kp]).await;
+    let commit_eve = bus
+        .queued_messages()
+        .into_iter()
+        .find(|msg| {
+            msg.id != stale_commit.id
+                && msg.id != commit_david.id
+                && project_mls_message(&msg.payload)
+                    .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .expect("alice emitted eve commit");
+    store_created_message(carol.storage(), &group_id, &commit_eve);
+    let eve_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 2,
+            retained_anchor_epoch: 1,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy.clone(),
+        3_000,
+    )
+    .expect("eve branch canonicalizes");
+    apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &eve_result,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("eve branch applies and prunes epoch 1");
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 3);
+
+    store_created_message(carol.storage(), &group_id, &stale_commit);
+    let stale_result = canonicalize_stored_openmls_messages(
+        carol.storage(),
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 3,
+            retained_anchor_epoch: 2,
+            sync_state: SyncState::Stable,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        policy,
+        4_000,
+    )
+    .expect("stale branch canonicalizes as a disposition-only drop");
+
+    assert!(stale_result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == hex::encode(stale_commit.id.as_slice())
+            && dropped.kind == MessageKind::Commit
+            && dropped.reason == DroppedMessageReason::BeyondAnchor
+    }));
+    persist_openmls_canonicalization_dispositions(carol.storage(), &stale_result)
+        .expect("stale disposition persists");
+    assert_message_state(
+        carol.storage(),
+        &stale_commit,
+        MessageState::EpochInvalidated,
+    );
+    assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 3);
 }
 
 #[tokio::test]

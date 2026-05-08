@@ -46,7 +46,8 @@ flowchart LR
 Graph terms:
 
 - **Finalized anchor:** oldest retained group state usable as a rollback
-  parent.
+  parent. The engine stores this as an epoch snapshot of both Marmot metadata
+  and OpenMLS group state.
 - **Candidate state:** materialized MLS state at an epoch, derived by applying
   valid commits from the anchor.
 - **Edge:** commit that validates against exactly one parent candidate state.
@@ -55,6 +56,27 @@ Graph terms:
 
 Edges are discovered by replay. A v0.1 commit does not need an explicit parent
 pointer.
+
+## Retained Anchors
+
+The retained anchor is the oldest epoch from which the engine may rebuild a
+candidate branch. Implementations MUST retain epoch snapshots for the current
+tip and every epoch inside `max_rewind_commits`. They MUST prune older retained
+anchors once the current tip advances past the rewind window.
+
+Late commits are handled by their source epoch:
+
+- If the commit source epoch is at or after the retained anchor, the engine may
+  roll back to that retained snapshot, replay candidate paths, and select the
+  canonical branch.
+- If the required retained snapshot is missing, canonicalization returns
+  `MissingRetainedAnchor` and leaves group state and message state unchanged.
+- If the commit source epoch is older than the retained anchor, the commit is
+  dropped with `BeyondAnchor` and persisted as invalidated.
+
+This rule is the local storage boundary for the forward-secrecy tradeoff. A
+client cannot be forced to replay commits older than the group policy says it
+will retain.
 
 ## Sync Lifecycle
 
@@ -182,7 +204,7 @@ winner:    competing branch
 The quorum boost protects against short private branch dumps. It is not a way
 for application traffic to overrule any valid branch.
 
-## Current Implementation Target
+## Current Implementation
 
 The executable policy model lives in
 [`crates/cgka-engine/src/convergence.rs`](../../crates/cgka-engine/src/convergence.rs).
@@ -190,8 +212,10 @@ The model tests live in
 [`crates/cgka-conformance/tests/candidate_state_graph.rs`](../../crates/cgka-conformance/tests/candidate_state_graph.rs).
 The executable canonicalization contract model lives in
 [`crates/cgka-engine/src/canonicalization.rs`](../../crates/cgka-engine/src/canonicalization.rs).
-That model now materializes symbolic commit edges into candidate branches before
-calling the branch selector.
+That model materializes symbolic commit edges into candidate branches before
+calling the branch selector. The OpenMLS projection layer builds production
+candidate paths from stored commit bytes, probes them from retained snapshots,
+applies the selected path, and persists message dispositions.
 
 Those tests cover:
 
@@ -202,8 +226,15 @@ Those tests cover:
 - stale branch rejected by rewind horizon,
 - digest as final tie-break.
 
-The current engine still has single-rollback fork recovery. The next engine
-step is to replace that path with candidate-state graph materialization.
+Engine integration and OpenMLS conformance tests also cover:
+
+- multi-commit path reconstruction from stored commits,
+- child commit pending until its parent arrives,
+- late same-epoch commits replayed from a retained anchor,
+- missing retained anchor reported without mutation,
+- retained anchor pruning by `max_rewind_commits`,
+- stale commits older than the retained anchor invalidated,
+- retained-anchor replay and stale invalidation after engine rebuild.
 
 ## Formal Verification
 

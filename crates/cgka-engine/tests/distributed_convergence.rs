@@ -122,13 +122,17 @@ fn selfremove_registry() -> FeatureRegistry {
 
 fn build_client(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
     let storage = MemoryStorage::new();
-    let engine = EngineBuilder::new(storage.clone())
+    let engine = build_client_with_storage(id, storage.clone());
+    (engine, storage)
+}
+
+fn build_client_with_storage(id: &[u8], storage: MemoryStorage) -> Engine<MemoryStorage> {
+    EngineBuilder::new(storage)
         .identity(pad32(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
-        .unwrap();
-    (engine, storage)
+        .unwrap()
 }
 
 #[tokio::test]
@@ -639,6 +643,118 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
 }
 
 #[tokio::test]
+async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+    let policy = CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    };
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-retained-anchor-restart".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(policy.clone());
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .expect("alice commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("alice branch applies and retains epoch 1 anchor");
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().epoch,
+        EpochId(2)
+    );
+    drop(carol);
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+    let alice_digest = project_mls_message(&alice_commit.payload)
+        .expect("alice commit projects")
+        .message_digest;
+    let bob_digest = project_mls_message(&bob_commit.payload)
+        .expect("bob commit projects")
+        .message_digest;
+    let bob_wins = bob_digest < alice_digest;
+
+    let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
+    carol.set_convergence_policy(policy);
+    carol
+        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .expect("late bob commit buffered after restart");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("rebuilt engine replays late same-epoch commit from retained anchor");
+
+    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_ne!(
+        carol_storage.get_message(&bob_commit.id).unwrap().state,
+        MessageState::Created,
+        "late commit should be resolved after engine rebuild"
+    );
+    if bob_wins {
+        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+    } else {
+        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
+    }
+    let members = carol.members(&group_id).unwrap();
+    assert_eq!(
+        members.iter().any(|member| member.id == eve.self_id()),
+        bob_wins
+    );
+    assert_eq!(
+        members.iter().any(|member| member.id == david.self_id()),
+        !bob_wins
+    );
+}
+
+#[tokio::test]
 async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
@@ -920,6 +1036,131 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
         MessageState::EpochInvalidated,
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert!(
+        !carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == frank.self_id())
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+    let (mut frank, _frank_storage) = build_client(b"frank");
+    let policy = CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    };
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-old-commit-invalidated-restart".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(policy.clone());
+
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap();
+    let (stale_bob_commit, _bob_pending) = evolution(bob_invite);
+    let stale_bob_commit = route(stale_bob_commit, &group_id);
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_david, pending_david) = evolution(invite_david);
+    alice.confirm_published(pending_david).await.unwrap();
+    let commit_david = route(commit_david, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_david, 1_000)
+        .expect("david commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("david branch applies");
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_eve, _pending_eve) = evolution(invite_eve);
+    let commit_eve = route(commit_eve, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_eve, 2_000)
+        .expect("eve commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("eve branch applies");
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().epoch,
+        EpochId(3)
+    );
+    drop(carol);
+
+    let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
+    carol.set_convergence_policy(policy);
+    carol
+        .buffer_openmls_convergence_message(&group_id, stale_bob_commit.clone(), 4_000)
+        .expect("stale bob commit buffered after restart");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 5_000_000)
+        .expect("rebuilt engine resolves stale commit without historical replay");
+
+    assert!(result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == hex::encode(stale_bob_commit.id.as_slice())
+            && dropped.kind == MessageKind::Commit
+            && dropped.reason == DroppedMessageReason::BeyondAnchor
+    }));
+    assert_message_state(
+        &carol_storage,
+        &stale_bob_commit,
+        MessageState::EpochInvalidated,
+    );
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().epoch,
+        EpochId(3)
+    );
     assert!(
         !carol
             .members(&group_id)

@@ -196,6 +196,17 @@ ConvergencePolicy {
 `max_rewind_commits` defaults to 5 and is normative for v0 groups unless the
 group negotiates another value.
 
+The same value bounds retained anchor snapshots. At current tip `T`, the
+oldest retained anchor is:
+
+```text
+oldest_retained_anchor = T - max_rewind_commits
+```
+
+Engines MUST retain snapshots for the current tip and every epoch at or after
+that anchor. Engines MUST prune older retained anchors after a successful
+canonicalization pass advances the current tip.
+
 `app_message_past_epoch_limit` MUST follow the MLS configuration used by the
 engine for decrypting past-epoch application messages. App messages outside
 that limit are discarded or reported as expired. The engine MUST NOT invent a
@@ -245,8 +256,15 @@ Rules:
   candidate state.
 - A child commit whose parent candidate is unavailable remains pending until
   that parent appears or the commit expires.
+- A commit at or after the retained anchor MAY be replayed from the retained
+  snapshot for its source epoch.
 - A commit that forks before the retained anchor or beyond
   `max_rewind_commits` MUST be discarded.
+- A commit whose source epoch is older than the retained anchor MUST be dropped
+  with `BeyondAnchor` and persisted as invalidated.
+- If a commit needs a retained snapshot that is no longer present, the engine
+  MUST return `MissingRetainedAnchor` and MUST NOT mutate group state or the
+  commit's message state.
 - A commit that validates against no candidate state remains pending until it
   expires or a parent state appears.
 - A commit that validates against more than one candidate state is a protocol
@@ -415,7 +433,8 @@ Required storage:
 
 - negotiated convergence policy and engine version,
 - finalized anchor and anchor epoch,
-- retained candidate states up to `max_rewind_commits`,
+- retained Marmot and OpenMLS epoch snapshots from the current tip back through
+  `max_rewind_commits`,
 - canonical commit sequence from the anchor to the selected tip,
 - pending commits that may still become valid,
 - pending proposals not yet consumed or expired,
@@ -433,6 +452,11 @@ Required storage:
 Storage MAY discard candidate states, pending messages, and app payloads outside
 their negotiated retention horizons. Once discarded, those artifacts cannot
 cause rollback or app-message acceptance.
+
+When storage discards a retained anchor, later commits that require that anchor
+fall into one of two outcomes: `MissingRetainedAnchor` if the commit is still
+inside the configured rewind window but the snapshot is absent, or `BeyondAnchor`
+if the commit is older than the retained anchor.
 
 ## Error Handling
 
@@ -471,6 +495,12 @@ The conformance suite should cover:
 - app message on losing branch invalidated with payload reference when known,
 - app message beyond MLS past-epoch retention expired,
 - commit beyond `max_rewind_commits` discarded,
+- late same-epoch commit inside the retained anchor window replayed from the
+  retained snapshot,
+- late same-epoch commit with a missing retained snapshot reported as
+  `MissingRetainedAnchor` without mutation,
+- commit older than the retained anchor dropped as `BeyondAnchor` and persisted
+  as invalidated,
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app-message intent queued during `Syncing`,
 - outbound commit intent regenerated after `Stable`,
