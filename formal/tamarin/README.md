@@ -107,11 +107,12 @@ The current app-output proof slice is:
 
 ```text
 applied canonical branch + app decrypt evidence => application-visible output;
-losing-branch app invalidation => no normal application-visible output
+losing-branch app invalidation => public invalidation disposition;
+invalidated apps => no normal application-visible output
 ```
 
-That maps to `GroupEvent::MessageReceived` emission in the engine integration
-tests.
+That maps to `GroupEvent::MessageReceived` and
+`GroupEvent::AppMessageInvalidated` emission in the engine integration tests.
 
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:

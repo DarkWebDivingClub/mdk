@@ -974,6 +974,17 @@ rule Invalidate_Losing_Branch_App:
     InvalidatedApp(run, app, losing, 'losing_branch'),
     NotApplicationVisible(run, app, 'losing_branch')
   ]->
+  [
+    !InvalidatedAppState(run, app, losing, 'losing_branch')
+  ]
+
+rule Emit_Invalidated_App_Disposition:
+  [
+    !InvalidatedAppState(run, app, branch, reason)
+  ]
+--[
+    AppInvalidationDisposition(run, app, branch, reason)
+  ]->
   []
 
 lemma same_input_set_converges:
@@ -1037,6 +1048,21 @@ lemma losing_app_invalidation_requires_applied_different_branch:
 lemma invalidated_apps_are_never_application_visible:
   "All run client app branch reason #i #j.
       InvalidatedApp(run, app, branch, reason) @ #i
+    & ApplicationVisible(run, client, app) @ #j
+    ==> F"
+
+lemma app_invalidation_disposition_requires_invalidation:
+  "All run app branch reason #i.
+      AppInvalidationDisposition(run, app, branch, reason) @ #i
+    ==> (
+      Ex #j.
+          InvalidatedApp(run, app, branch, reason) @ #j
+        & #j < #i
+    )"
+
+lemma invalidated_dispositions_are_never_application_visible:
+  "All run client app branch reason #i #j.
+      AppInvalidationDisposition(run, app, branch, reason) @ #i
     & ApplicationVisible(run, client, app) @ #j
     ==> F"
 
@@ -1327,12 +1353,13 @@ lemma beyond_anchor_invalidated_executable:
 
 lemma commit_application_app_output_executable:
   exists-trace
-  "Ex run #i #j #k #l #m.
+  "Ex run #i #j #k #l #m #n.
       Scenario(run, 'commit_application_app_output') @ #i
     & AppliedCanonicalBranch(run, 'alice', 'selected') @ #j
     & AcceptedAppOutput(run, 'alice', 'app_selected', 'selected') @ #k
     & ApplicationVisible(run, 'alice', 'app_selected') @ #l
-    & InvalidatedApp(run, 'app_losing', 'losing', 'losing_branch') @ #m"
+    & InvalidatedApp(run, 'app_losing', 'losing', 'losing_branch') @ #m
+    & AppInvalidationDisposition(run, 'app_losing', 'losing', 'losing_branch') @ #n"
 
 lemma generated_quorum_override_executable:
   exists-trace
