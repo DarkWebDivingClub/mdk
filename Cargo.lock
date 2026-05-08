@@ -2090,6 +2090,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "transport-nostr-peeler"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cgka-traits",
+ "chacha20poly1305",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

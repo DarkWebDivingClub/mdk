@@ -1,6 +1,7 @@
 ---
 title: "Nostr's Role in Marmot — Three Layers"
 created: 2026-04-19
+updated: 2026-05-08
 tags: [marmot, overview, nostr, identity, transport]
 status: overview
 ---
@@ -40,6 +41,11 @@ The inner event structure is **tied to Nostr identity** (the `pubkey` field is t
 But transport is explicitly pluggable. A different transport (FIPS mesh, direct P2P, BLE, etc.) would have its own wrapping. The outer envelope is purely a transport concern; the inner application message stays Nostr-structured regardless.
 
 The `TransportPeeler` trait is the explicit seam where this pluggability happens (see [`target-architecture.md`](./target-architecture.md)).
+
+In this workspace, `crates/transport-nostr-peeler` is the first concrete Nostr
+peeler layer. It maps kind `445` / `1059` event shapes into engine transport
+messages and peels kind `445` group envelopes. Relay networking, event signing,
+and full NIP-59 welcome unwrapping remain adapter work above that crate.
 
 ---
 

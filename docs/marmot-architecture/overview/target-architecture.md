@@ -100,12 +100,14 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/storage-memory` provides in-memory storage and rollback snapshots.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
   metadata and group-scoped OpenMLS state.
+- `crates/transport-nostr-peeler` maps Nostr kind `445` / `1059` events into
+  engine transport messages and peels Nostr/MLS group envelopes.
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
   delivery variants, and property tests over the engine.
 
 The production perimeter is still partly outside this workspace: real transport
-adapters, account key-management integration, persistence operations policy,
-and packaging.
+adapters, NIP-59 welcome gift-wrap signer/decrypter integration, account
+key-management integration, persistence operations policy, and packaging.
 
 ---
 

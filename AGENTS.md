@@ -11,6 +11,7 @@ This repo owns the candidate CGKA engine workspace:
 - OpenMLS-backed engine implementation,
 - production-shaped account-device session wrapper,
 - in-memory and SQLCipher-backed storage backends,
+- Nostr transport peeler,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
 - architecture and spec drafts.
@@ -25,6 +26,7 @@ This repo owns the candidate CGKA engine workspace:
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | In-memory storage | `crates/storage-memory/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
+| Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |

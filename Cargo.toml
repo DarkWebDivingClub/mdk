@@ -7,6 +7,7 @@ members = [
     "crates/storage-memory",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
+    "crates/transport-nostr-peeler",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tempfile = "3"
 
@@ -52,3 +54,4 @@ cgka-session = { path = "crates/cgka-session" }
 storage-memory = { path = "crates/storage-memory" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
+transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }

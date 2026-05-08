@@ -14,6 +14,8 @@ Marmot protocol work.
   runs.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
   metadata and group-scoped OpenMLS state.
+- `crates/transport-nostr-peeler` maps Nostr kind `445` / `1059` events into
+  engine transport messages and peels Nostr/MLS group envelopes.
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
   delivery variants, vector fixtures, and property tests.
 - `formal/tamarin` contains the abstract convergence model and proof harness.
@@ -27,7 +29,8 @@ Marmot protocol work.
 3. `crates/cgka-engine/README.md`
 4. `crates/cgka-session/README.md`
 5. `crates/storage-sqlite/README.md`
-6. `formal/tamarin/README.md`
+6. `crates/transport-nostr-peeler/README.md`
+7. `formal/tamarin/README.md`
 
 ## Common commands
 
