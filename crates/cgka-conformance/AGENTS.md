@@ -14,8 +14,8 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/openmls_projection.rs` | Bytes-first OpenMLS projection and candidate materialization helpers. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
 | `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
-| `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, recoveries, and invariant failures. |
-| `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
+| `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, flattened epoch changes, app invalidations, recoveries, and invariant failures. |
+| `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus member additions/removals, epoch changes, app invalidations, and `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
 | `src/bin/cgka-conformance-report.rs` | Tiny report writer CLI. Runs `send-leave/v1` cases with `--seed`, `--cases`, and `--out`, then writes one JSON `ScenarioReport` per generated case. |
 | `vectors/` | External JSON `VectorFixture` files. Each fixture carries both input `scenario` and output `expected_trace`. |
 
@@ -36,6 +36,11 @@ The bus knows about welcomes vs. group messages so welcomes can be routed to a s
 before delivery by zero-based queue index: `drop_queued`, `duplicate_queued`,
 `delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
 `clear_partition` remain the partition/heal operations.
+
+Use `clear_events` after setup when a scenario wants the final trace to describe
+only the behavior under test. The convergence E2E vector does this after the
+initial welcome joins so its trace contains only canonical branch application,
+app invalidation, epoch change, and member addition events.
 
 ## How to add a new scripted scenario
 

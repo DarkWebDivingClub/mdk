@@ -59,6 +59,9 @@ pub enum ScenarioStep {
     Observe {
         clients: Vec<String>,
     },
+    ClearEvents {
+        clients: Vec<String>,
+    },
     DropQueued {
         index: usize,
     },
@@ -93,6 +96,7 @@ impl ScenarioStep {
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
             ScenarioStep::Observe { .. } => "observe",
+            ScenarioStep::ClearEvents { .. } => "clear_events",
             ScenarioStep::DropQueued { .. } => "drop_queued",
             ScenarioStep::DuplicateQueued { .. } => "duplicate_queued",
             ScenarioStep::DelayQueued { .. } => "delay_queued",
@@ -111,7 +115,24 @@ pub struct ScenarioReport {
     pub observed_trace: Option<ScenarioTrace>,
     pub step_log: Vec<ScenarioStepLogEntry>,
     pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
+    pub epoch_change_observations: Vec<EpochChangeReportObservation>,
+    pub app_invalidation_observations: Vec<AppInvalidationReportObservation>,
     pub invariant_failures: Vec<InvariantFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochChangeReportObservation {
+    pub client: String,
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppInvalidationReportObservation {
+    pub client: String,
+    pub epoch: u64,
+    pub reason: String,
+    pub payload_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +291,12 @@ pub async fn run_scenario_report(
                     observations.push(observe_client(label.clone(), client));
                 }
             }
+            ScenarioStep::ClearEvents { clients: labels } => {
+                for label in labels {
+                    let client = client_mut(&mut clients, label, step_index)?;
+                    client.drain_events();
+                }
+            }
             ScenarioStep::DropQueued { index } => {
                 if !bus.drop_queued(*index) {
                     return Err(err(
@@ -335,6 +362,34 @@ pub async fn run_scenario_report(
         .iter()
         .flat_map(|observation| observation.recoveries.clone())
         .collect();
+    let epoch_change_observations = observed_trace
+        .observations
+        .iter()
+        .flat_map(|observation| {
+            observation
+                .epoch_changes
+                .iter()
+                .map(|epoch_change| EpochChangeReportObservation {
+                    client: observation.client.clone(),
+                    from: epoch_change.from,
+                    to: epoch_change.to,
+                })
+        })
+        .collect();
+    let app_invalidation_observations = observed_trace
+        .observations
+        .iter()
+        .flat_map(|observation| {
+            observation.app_invalidations.iter().map(|invalidation| {
+                AppInvalidationReportObservation {
+                    client: observation.client.clone(),
+                    epoch: invalidation.epoch,
+                    reason: invalidation.reason.clone(),
+                    payload_ref: invalidation.payload_ref.clone(),
+                }
+            })
+        })
+        .collect();
     let invariant_failures = invariant_failures(expected_trace.as_ref(), &observed_trace);
 
     Ok(ScenarioReport {
@@ -348,6 +403,8 @@ pub async fn run_scenario_report(
         observed_trace: Some(observed_trace),
         step_log,
         recovery_observations,
+        epoch_change_observations,
+        app_invalidation_observations,
         invariant_failures,
     })
 }

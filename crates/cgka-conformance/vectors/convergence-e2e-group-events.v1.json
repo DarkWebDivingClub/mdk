@@ -1,0 +1,183 @@
+{
+  "scenario_name": "convergence-e2e-group-events/v1",
+  "vector_version": "1",
+  "conformance_version": "0.1.0",
+  "seed": null,
+  "scenario": {
+    "name": "convergence-e2e-group-events/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "carol",
+      "frank",
+      "david",
+      "eve",
+      "grace"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "convergence-e2e",
+        "invitees": [
+          "bob",
+          "carol",
+          "frank"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol",
+          "frank"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "frank"
+        ]
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "david"
+        ],
+        "pending": "alice-invite-david"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-invite-david"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "grace"
+        ],
+        "pending": "alice-invite-grace"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-invite-grace"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "bob",
+        "invitees": [
+          "eve"
+        ],
+        "pending": "bob-invite-eve"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-invite-eve"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "alice",
+        "payload": "alice canonical payload"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "bob losing payload"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol",
+          "frank"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "carol",
+          "frank"
+        ]
+      }
+    ]
+  },
+  "expected_trace": {
+    "name": "convergence-e2e-group-events/v1",
+    "observations": [
+      {
+        "client": "carol",
+        "epoch": 3,
+        "member_count": 6,
+        "received_payloads": [
+          "alice canonical payload"
+        ],
+        "added_members": [
+          "david",
+          "grace"
+        ],
+        "removed_members": [],
+        "epoch_changes": [
+          {
+            "from": 1,
+            "to": 3
+          }
+        ],
+        "app_invalidations": [
+          {
+            "epoch": 2,
+            "reason": "losing_branch",
+            "payload_ref": "sha256:332eb919fa451d7fdde9cc5f837219d64519382256f54027f41258d58c82ead7"
+          }
+        ],
+        "recoveries": []
+      },
+      {
+        "client": "frank",
+        "epoch": 3,
+        "member_count": 6,
+        "received_payloads": [
+          "alice canonical payload"
+        ],
+        "added_members": [
+          "david",
+          "grace"
+        ],
+        "removed_members": [],
+        "epoch_changes": [
+          {
+            "from": 1,
+            "to": 3
+          }
+        ],
+        "app_invalidations": [
+          {
+            "epoch": 2,
+            "reason": "losing_branch",
+            "payload_ref": "sha256:332eb919fa451d7fdde9cc5f837219d64519382256f54027f41258d58c82ead7"
+          }
+        ],
+        "recoveries": []
+      }
+    ]
+  }
+}

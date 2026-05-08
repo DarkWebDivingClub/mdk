@@ -5,7 +5,7 @@
 //! should produce after running the same scripted scenario.
 
 use crate::{HarnessClient, ScenarioSpec};
-use cgka_traits::engine::{CommitOrderingKey, GroupEvent};
+use cgka_traits::engine::{AppMessageInvalidationReason, CommitOrderingKey, GroupEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +30,27 @@ pub struct ClientObservation {
     pub epoch: u64,
     pub member_count: usize,
     pub received_payloads: Vec<String>,
+    #[serde(default)]
+    pub added_members: Vec<String>,
     pub removed_members: Vec<String>,
+    #[serde(default)]
+    pub epoch_changes: Vec<EpochChangeObservation>,
+    #[serde(default)]
+    pub app_invalidations: Vec<AppInvalidationObservation>,
     pub recoveries: Vec<ForkRecoveryObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochChangeObservation {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppInvalidationObservation {
+    pub epoch: u64,
+    pub reason: String,
+    pub payload_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,8 +86,43 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             .iter()
             .filter_map(|e| match e {
                 GroupEvent::MemberRemoved { member, .. } => {
-                    Some(String::from_utf8_lossy(member.as_slice()).into_owned())
+                    Some(observe_member_id(member.as_slice()))
                 }
+                _ => None,
+            })
+            .collect(),
+        added_members: events
+            .iter()
+            .filter_map(|e| match e {
+                GroupEvent::MemberAdded { member, .. } => {
+                    Some(observe_member_id(member.id.as_slice()))
+                }
+                _ => None,
+            })
+            .collect(),
+        epoch_changes: events
+            .iter()
+            .filter_map(|e| match e {
+                GroupEvent::EpochChanged { from, to, .. } => Some(EpochChangeObservation {
+                    from: from.0,
+                    to: to.0,
+                }),
+                _ => None,
+            })
+            .collect(),
+        app_invalidations: events
+            .iter()
+            .filter_map(|e| match e {
+                GroupEvent::AppMessageInvalidated {
+                    epoch,
+                    reason,
+                    decrypted_payload_ref,
+                    ..
+                } => Some(AppInvalidationObservation {
+                    epoch: epoch.0,
+                    reason: observe_app_invalidation_reason(*reason),
+                    payload_ref: decrypted_payload_ref.clone(),
+                }),
                 _ => None,
             })
             .collect(),
@@ -91,6 +145,26 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             })
             .collect(),
     }
+}
+
+fn observe_member_id(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn observe_app_invalidation_reason(reason: AppMessageInvalidationReason) -> String {
+    match reason {
+        AppMessageInvalidationReason::LosingBranch => "losing_branch",
+        AppMessageInvalidationReason::BeyondAnchor => "beyond_anchor",
+        AppMessageInvalidationReason::BeyondAppRetention => "beyond_app_retention",
+        AppMessageInvalidationReason::UndecryptableInCanonicalState => {
+            "undecryptable_in_canonical_state"
+        }
+    }
+    .into()
 }
 
 fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {

@@ -41,6 +41,12 @@ from `scenario`, serialize their observed trace into the same shape, and
 compare `expected_trace` by value. The trace intentionally avoids OpenMLS
 internals.
 
+`convergence-e2e-group-events/v1` is the full bridge fixture: raw harness
+messages enter through the mock peeler and `ingest`, the convergence engine
+selects a longer canonical branch, and the observed trace records the canonical
+application payload, losing-branch app invalidation, epoch transition, and
+member additions.
+
 ### Fork-recovery vectors are not currently portable
 
 `CommitOrderingKey` is now content-derived (`SHA-256(mls_bytes)` of the
@@ -74,6 +80,7 @@ steps are:
 - `deliver_all`
 - `tick`
 - `observe`
+- `clear_events`
 - `drop_queued`
 - `duplicate_queued`
 - `delay_queued`
@@ -118,6 +125,10 @@ serializable `ScenarioReport` with:
 - `step_log` — one entry per completed scenario step.
 - `recovery_observations` — flattened fork-recovery events from all client
   observations.
+- `epoch_change_observations` — flattened `EpochChanged` events from all
+  client observations.
+- `app_invalidation_observations` — flattened app invalidation dispositions
+  from all client observations.
 - `invariant_failures` — currently records `trace_mismatch` when expected and
   observed traces differ.
 

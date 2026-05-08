@@ -5,15 +5,16 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance::{
-    ClientBuilder, ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
-    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
-    run_scenario_spec,
+    AppInvalidationObservation, ClientBuilder, EpochChangeObservation, ScenarioSpec, ScenarioStep,
+    ScenarioTrace, TransportBus, VectorFixture, generate_send_leave_family, observe_client,
+    run_generated_case_report, run_scenario_report, run_scenario_spec,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
+use sha2::{Digest, Sha256};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
@@ -150,7 +151,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     received_payloads: vec!["bob:hello".into(), "carol:hello".into()],
+                    added_members: vec![],
                     removed_members: vec![],
+                    epoch_changes: vec![],
+                    app_invalidations: vec![],
                     recoveries: vec![],
                 },
                 cgka_conformance::ClientObservation {
@@ -158,7 +162,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     received_payloads: vec!["alice:hello".into(), "carol:hello".into()],
+                    added_members: vec![],
                     removed_members: vec![],
+                    epoch_changes: vec![],
+                    app_invalidations: vec![],
                     recoveries: vec![],
                 },
                 cgka_conformance::ClientObservation {
@@ -166,7 +173,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     received_payloads: vec!["alice:hello".into(), "bob:hello".into()],
+                    added_members: vec![],
                     removed_members: vec![],
+                    epoch_changes: vec![],
+                    app_invalidations: vec![],
                     recoveries: vec![],
                 },
             ],
@@ -934,6 +944,34 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
 }
 
 #[tokio::test]
+async fn scenario_report_records_convergence_e2e_group_events() {
+    let spec = convergence_e2e_group_events_spec();
+    let expected = convergence_e2e_group_events_trace();
+
+    let report = run_scenario_report(&spec, Some(expected.clone()))
+        .await
+        .expect("scenario reports");
+
+    assert_eq!(report.observed_trace, Some(expected));
+    assert!(report.invariant_failures.is_empty());
+    assert_eq!(report.epoch_change_observations.len(), 2);
+    assert_eq!(report.app_invalidation_observations.len(), 2);
+    assert!(
+        report
+            .step_log
+            .iter()
+            .any(|entry| entry.step_type == "clear_events")
+    );
+    assert!(
+        report
+            .app_invalidation_observations
+            .iter()
+            .all(|observation| observation.reason == "losing_branch"
+                && observation.payload_ref == Some(payload_ref("bob losing payload")))
+    );
+}
+
+#[tokio::test]
 async fn canonical_vector_fixtures_match_generated_traces() {
     // Fork-recovery vectors are deliberately absent: under content-derived
     // ordering (`CommitOrderingKey { source_epoch, commit_digest }`), the
@@ -943,10 +981,16 @@ async fn canonical_vector_fixtures_match_generated_traces() {
     // does not work for fork-recovery scenarios. See
     // `docs/marmot-architecture/distributed-convergence.md` (Track A) for
     // the path forward.
-    let fixtures = [(
-        "three-client-message-exchange.v1.json",
-        include_str!("../vectors/three-client-message-exchange.v1.json"),
-    )];
+    let fixtures = [
+        (
+            "three-client-message-exchange.v1.json",
+            include_str!("../vectors/three-client-message-exchange.v1.json"),
+        ),
+        (
+            "convergence-e2e-group-events.v1.json",
+            include_str!("../vectors/convergence-e2e-group-events.v1.json"),
+        ),
+    ];
 
     for (fixture_name, contents) in fixtures {
         let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");
@@ -955,6 +999,110 @@ async fn canonical_vector_fixtures_match_generated_traces() {
             .expect("fixture scenario runs");
         assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);
     }
+}
+
+fn convergence_e2e_group_events_spec() -> ScenarioSpec {
+    ScenarioSpec {
+        name: "convergence-e2e-group-events/v1".into(),
+        spec_version: "1".into(),
+        clients: vec![
+            "alice".into(),
+            "bob".into(),
+            "carol".into(),
+            "frank".into(),
+            "david".into(),
+            "eve".into(),
+            "grace".into(),
+        ],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "convergence-e2e".into(),
+                invitees: vec!["bob".into(), "carol".into(), "frank".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into(), "frank".into()],
+            },
+            ScenarioStep::ClearEvents {
+                clients: vec!["alice".into(), "bob".into(), "carol".into(), "frank".into()],
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: vec!["david".into()],
+                pending: "alice-invite-david".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "alice-invite-david".into(),
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: vec!["grace".into()],
+                pending: "alice-invite-grace".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "alice-invite-grace".into(),
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "bob".into(),
+                invitees: vec!["eve".into()],
+                pending: "bob-invite-eve".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "bob".into(),
+                pending: "bob-invite-eve".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "alice canonical payload".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob losing payload".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["carol".into(), "frank".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["carol".into(), "frank".into()],
+            },
+        ],
+    }
+}
+
+fn convergence_e2e_group_events_trace() -> ScenarioTrace {
+    let observation = |client: &str| cgka_conformance::ClientObservation {
+        client: client.into(),
+        epoch: 3,
+        member_count: 6,
+        received_payloads: vec!["alice canonical payload".into()],
+        added_members: vec!["david".into(), "grace".into()],
+        removed_members: vec![],
+        epoch_changes: vec![EpochChangeObservation { from: 1, to: 3 }],
+        app_invalidations: vec![AppInvalidationObservation {
+            epoch: 2,
+            reason: "losing_branch".into(),
+            payload_ref: Some(payload_ref("bob losing payload")),
+        }],
+        recoveries: vec![],
+    };
+    ScenarioTrace {
+        name: "convergence-e2e-group-events/v1".into(),
+        observations: vec![observation("carol"), observation("frank")],
+    }
+}
+
+fn payload_ref(payload: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(payload.as_bytes())))
 }
 
 fn assert_tick_reached_convergence(

@@ -37,11 +37,11 @@ pub use family::{GeneratedScenarioCase, generate_send_leave_family, run_generate
 pub use peeler::MockPeeler;
 pub use report::{ReportArgs, ReportCommand, parse_report_command, report_usage, run_report};
 pub use scenario::{
-    GeneratedScenarioMetadata, InvariantFailure, ScenarioReport, ScenarioReportMetadata,
-    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus,
-    run_scenario_report, run_scenario_spec,
+    AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
+    InvariantFailure, ScenarioReport, ScenarioReportMetadata, ScenarioRunError, ScenarioSpec,
+    ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, run_scenario_report, run_scenario_spec,
 };
 pub use vector::{
-    ClientObservation, ForkRecoveryObservation, RecoveryOrderingKeyObservation, ScenarioTrace,
-    VectorFixture, observe_client,
+    AppInvalidationObservation, ClientObservation, EpochChangeObservation, ForkRecoveryObservation,
+    RecoveryOrderingKeyObservation, ScenarioTrace, VectorFixture, observe_client,
 };

@@ -249,7 +249,9 @@ Engine integration and OpenMLS conformance tests also cover:
 - stale commits older than the retained anchor invalidated,
 - retained-anchor replay and stale invalidation after engine rebuild,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients,
-  including canonical app delivery and losing-branch app invalidation.
+  including canonical app delivery and losing-branch app invalidation. The
+  portable fixture is
+  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json).
 
 ## Formal Verification
 
