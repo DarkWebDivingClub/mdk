@@ -315,6 +315,10 @@ Initial lemmas:
 14. **Proposal disposition:** a proposal is accepted only when a canonical
     branch consumes it; proposals that belong only to losing branches are
     dropped and cannot also become accepted.
+15. **Delivery-order robustness:** reordered, duplicate, and delayed peeled
+    delivery yields the same canonical branch, creates only one pending input
+    per logical message, emits selected-branch app output once per client, and
+    emits losing-branch invalidation dispositions once.
 
 The v0 model currently verifies deterministic selection, eligible-only
 selection, score-order justifications, stale-rewind rejection derived from
@@ -322,7 +326,8 @@ anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
 three-branch permutations, late withheld publication after anchor, loaded-policy
 requirements, retained-anchor replay, missing-anchor no-mutation, `BeyondAnchor`
 invalidation, canonical app output, losing-branch app invalidation disposition,
-welcome/commit handoff, proposal disposition, generated bounded seed cases, and
+one-shot app output/disposition emission, welcome/commit handoff, proposal
+disposition, delivery-order robustness, generated bounded seed cases, and
 executable traces for each modeled scenario.
 The bounded seed source is
 [`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);

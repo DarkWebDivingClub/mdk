@@ -547,5 +547,9 @@ The current executable policy model lives in
 [`crates/cgka-engine/src/convergence.rs`](../../crates/cgka-engine/src/convergence.rs).
 The executable canonicalization contract model lives in
 [`crates/cgka-engine/src/canonicalization.rs`](../../crates/cgka-engine/src/canonicalization.rs).
+The current Tamarin model lives in
+[`formal/tamarin/distributed_convergence_v0.spthy`](../../formal/tamarin/distributed_convergence_v0.spthy)
+and includes the delivery-order robustness contract for the generated
+`convergence-e2e-delivery/v1` variants.
 The contract scenario tests live in
 [`crates/cgka-conformance/tests/canonicalization_contract.rs`](../../crates/cgka-conformance/tests/canonicalization_contract.rs).

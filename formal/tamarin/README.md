@@ -36,6 +36,9 @@ It models only the convergence boundary:
   the stability gate opens.
 - three-branch candidate sets converge even when clients enumerate branches in
   different orders.
+- reordered, duplicated, and delayed delivery after peeling does not change
+  canonical selection, duplicate the logical pending input, or duplicate app
+  output/disposition emission.
 - late withheld commits published after the retained anchor are rejected when
   their rewind distance exceeds policy.
 - bounded generator seed cases preserve the expected selection reason.
@@ -113,6 +116,21 @@ invalidated apps => no normal application-visible output
 
 That maps to `GroupEvent::MessageReceived` and
 `GroupEvent::AppMessageInvalidated` emission in the engine integration tests.
+The model now makes these emissions one-shot: the same client/app pair cannot
+produce duplicate accepted app output, and the same invalidated app cannot
+produce duplicate invalidation dispositions.
+
+The current delivery-order proof slice is:
+
+```text
+same logical peeled inputs + reordered delivery + delayed release + duplicate
+delivery => same canonical branch; one pending input per logical message; one
+visible or invalidated output disposition
+```
+
+That maps to the generated `convergence-e2e-delivery/v1` variants. Tamarin
+proves the abstract delivery contract; the Rust variants check that queued
+delivery permutations preserve the real end-to-end group events.
 
 The current welcome/commit handoff proof slice is:
 
@@ -175,6 +193,7 @@ until the model includes it.
 | all-traces lemma | An invariant that must hold in every modeled trace. | Property tests, invariant assertions, or both. |
 | `*_requires_*` lemma | A selected outcome must have matching evidence. | Debug assertions or tests that inspect selection reasons and evidence. |
 | lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, `BeyondAnchor`, or app output, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs`, OpenMLS replay tests in `crates/cgka-conformance/tests/openmls_replay_probe.rs`, and harness E2E coverage in `crates/cgka-conformance/tests/canonical_scenarios.rs` / `crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json`. |
+| delivery-order lemma | Reordered, delayed, and duplicate delivery after peeling is normalized before canonical output. | `generate_convergence_e2e_delivery_family` in `crates/cgka-conformance/src/family.rs` and `convergence_e2e_delivery_family_runs_generated_variants`. |
 | model assumption | A fact the model accepts as already validated. | Tests or review at the layer that owns the assumption. |
 
 Keep names aligned across the proof and tests. If the Tamarin scenario is

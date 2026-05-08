@@ -663,7 +663,9 @@ rule Init_Commit_Application_App_Output:
     !GtState(~run, 'd2', 'd1'),
     !AppDecryptsOnBranchState(~run, 'app_selected', 'selected'),
     !AppDecryptsOnBranchState(~run, 'app_losing', 'losing'),
-    !BranchDifferentState(~run, 'losing', 'selected')
+    !BranchDifferentState(~run, 'losing', 'selected'),
+    AppOutputReady(~run, 'alice', 'app_selected', 'selected'),
+    AppInvalidationReady(~run, 'app_losing', 'losing', 'selected')
   ]
 
 /*
@@ -759,6 +761,68 @@ rule Init_Proposal_Canonical_Consumption:
     !ProposalMessageState(~run, 'losing_remove', 'losing'),
     !CommitConsumesProposalState(~run, 'selected', 'remove_bob'),
     !BranchDifferentState(~run, 'losing', 'selected')
+  ]
+
+/*
+  Scenario 19:
+
+  Delivery-order robustness starts after peeling. Two clients receive the same
+  logical inputs in different orders; one selected-branch app input is delivered
+  twice, and the losing-branch inputs are delayed before release. The canonical
+  selector still converges, duplicate delivery creates only one pending input,
+  the selected app becomes visible once per client, and the losing app produces
+  one invalidation disposition.
+*/
+rule Init_Delivery_Order_Robustness:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'delivery_order_robustness'),
+    SameInputSet(~run, 'carol'),
+    SameInputSet(~run, 'frank'),
+    DeliverySchedule(~run, 'carol', 'selected_first'),
+    DeliverySchedule(~run, 'frank', 'losing_first'),
+    DeliveryOrder(~run, 'carol', 'selected_commit', 'rank1'),
+    DeliveryOrder(~run, 'carol', 'selected_app', 'rank2'),
+    DeliveryOrder(~run, 'carol', 'losing_commit', 'rank3'),
+    DeliveryOrder(~run, 'carol', 'losing_app', 'rank4'),
+    DeliveryOrder(~run, 'frank', 'losing_commit', 'rank1'),
+    DeliveryOrder(~run, 'frank', 'losing_app', 'rank2'),
+    DeliveryOrder(~run, 'frank', 'selected_commit', 'rank3'),
+    DeliveryOrder(~run, 'frank', 'selected_app', 'rank4'),
+    DelayedInput(~run, 'losing_commit'),
+    DelayedInput(~run, 'losing_app'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
+    Eligible(~run, 'selected'),
+    Eligible(~run, 'losing'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    ScoreGreater(~run, 'd2', 'd1'),
+    AppDecryptsOnBranch(~run, 'app_selected', 'selected'),
+    AppDecryptsOnBranch(~run, 'app_losing', 'losing'),
+    BranchDifferent(~run, 'losing', 'selected')
+  ]->
+  [
+    DirectDeliveryInputToken(~run, 'selected_commit'),
+    DirectDeliveryInputToken(~run, 'selected_app'),
+    DelayedDeliveryInputToken(~run, 'losing_commit'),
+    DelayedDeliveryInputToken(~run, 'losing_app'),
+    DuplicateDeliveryInputToken(~run, 'selected_app'),
+    Compare(~run, 'selected', 'losing'),
+    Compare(~run, 'losing', 'selected'),
+    View(~run, 'carol', 'selected', 'losing'),
+    View(~run, 'frank', 'losing', 'selected'),
+    !PolicyLoadedState(~run),
+    !EligibleState(~run, 'selected'),
+    !EligibleState(~run, 'losing'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !GtState(~run, 'd2', 'd1'),
+    !AppDecryptsOnBranchState(~run, 'app_selected', 'selected'),
+    !AppDecryptsOnBranchState(~run, 'app_losing', 'losing'),
+    !BranchDifferentState(~run, 'losing', 'selected'),
+    AppOutputReady(~run, 'carol', 'app_selected', 'selected'),
+    AppOutputReady(~run, 'frank', 'app_selected', 'selected'),
+    AppInvalidationReady(~run, 'app_losing', 'losing', 'selected')
   ]
 
 rule Derive_Stale_Beyond_Rewind:
@@ -889,6 +953,50 @@ rule Publish_Outbound_When_Stable:
   ]
 --[
     PublishedOutbound(run, client, intent)
+  ]->
+  []
+
+rule Observe_Delivered_Input:
+  [
+    DirectDeliveryInputToken(run, input)
+  ]
+--[
+    DeliveredInput(run, input)
+  ]->
+  [
+    PendingDeliveryInputToken(run, input)
+  ]
+
+rule Release_Delayed_Input:
+  [
+    DelayedDeliveryInputToken(run, input)
+  ]
+--[
+    ReleasedDelayedInput(run, input)
+  ]->
+  [
+    PendingDeliveryInputToken(run, input)
+  ]
+
+rule Accept_Pending_Delivery_Input:
+  [
+    PendingDeliveryInputToken(run, input)
+  ]
+--[
+    DeliveryPendingInput(run, input)
+  ]->
+  [
+    !DeliveryPendingInputState(run, input)
+  ]
+
+rule Ignore_Duplicate_Delivery:
+  [
+    DuplicateDeliveryInputToken(run, input),
+    !DeliveryPendingInputState(run, input)
+  ]
+--[
+    DuplicateDeliveredInput(run, input),
+    DuplicateDeliveryIgnored(run, input)
   ]->
   []
 
@@ -1087,6 +1195,7 @@ rule Apply_Selected_Canonical_Branch:
 
 rule Emit_Accepted_App_Output:
   [
+    AppOutputReady(run, client, app, branch),
     !AppliedCanonicalBranchState(run, client, branch),
     !AppDecryptsOnBranchState(run, app, branch)
   ]
@@ -1120,6 +1229,7 @@ rule Drop_Losing_Branch_Proposal:
 
 rule Invalidate_Losing_Branch_App:
   [
+    AppInvalidationReady(run, app, losing, selected),
     !AppliedCanonicalBranchState(run, client, selected),
     !AppDecryptsOnBranchState(run, app, losing),
     !BranchDifferentState(run, losing, selected)
@@ -1129,11 +1239,13 @@ rule Invalidate_Losing_Branch_App:
     NotApplicationVisible(run, app, 'losing_branch')
   ]->
   [
-    !InvalidatedAppState(run, app, losing, 'losing_branch')
+    !InvalidatedAppState(run, app, losing, 'losing_branch'),
+    AppInvalidationDispositionReady(run, app, losing, 'losing_branch')
   ]
 
 rule Emit_Invalidated_App_Disposition:
   [
+    AppInvalidationDispositionReady(run, app, branch, reason),
     !InvalidatedAppState(run, app, branch, reason)
   ]
 --[
@@ -1218,6 +1330,68 @@ lemma invalidated_dispositions_are_never_application_visible:
   "All run client app branch reason #i #j.
       AppInvalidationDisposition(run, app, branch, reason) @ #i
     & ApplicationVisible(run, client, app) @ #j
+    ==> F"
+
+lemma accepted_app_output_once_per_client_app:
+  "All run client app branch_a branch_b #i #j.
+      AcceptedAppOutput(run, client, app, branch_a) @ #i
+    & AcceptedAppOutput(run, client, app, branch_b) @ #j
+    ==> #i = #j"
+
+lemma app_invalidation_disposition_once_per_app:
+  "All run app branch_a reason_a branch_b reason_b #i #j.
+      AppInvalidationDisposition(run, app, branch_a, reason_a) @ #i
+    & AppInvalidationDisposition(run, app, branch_b, reason_b) @ #j
+    ==> #i = #j"
+
+lemma released_delayed_input_requires_prior_delay:
+  "All run input #i.
+      ReleasedDelayedInput(run, input) @ #i
+    ==> (
+      Ex #j.
+          DelayedInput(run, input) @ #j
+        & #j < #i
+    )"
+
+lemma delivery_pending_input_requires_delivery_observation:
+  "All run input #i.
+      DeliveryPendingInput(run, input) @ #i
+    ==> (
+      (Ex #j.
+          DeliveredInput(run, input) @ #j
+        & #j < #i)
+      |
+      (Ex #k.
+          ReleasedDelayedInput(run, input) @ #k
+        & #k < #i)
+    )"
+
+lemma delivery_pending_input_is_deduplicated:
+  "All run input #i #j.
+      DeliveryPendingInput(run, input) @ #i
+    & DeliveryPendingInput(run, input) @ #j
+    ==> #i = #j"
+
+lemma duplicate_delivery_requires_prior_pending_input:
+  "All run input #i.
+      DuplicateDeliveryIgnored(run, input) @ #i
+    ==> (
+      Ex #j.
+          DeliveryPendingInput(run, input) @ #j
+        & #j < #i
+    )"
+
+lemma delivery_reordered_clients_select_same_branch:
+  "All run branch_a branch_b reason_a reason_b #s #i #j.
+      Scenario(run, 'delivery_order_robustness') @ #s
+    & Selected(run, 'carol', branch_a, reason_a) @ #i
+    & Selected(run, 'frank', branch_b, reason_b) @ #j
+    ==> branch_a = branch_b"
+
+lemma delivery_losing_app_never_application_visible:
+  "All run client #s #i.
+      Scenario(run, 'delivery_order_robustness') @ #s
+    & ApplicationVisible(run, client, 'app_losing') @ #i
     ==> F"
 
 lemma welcome_acceptance_requires_matching_commit_context:
@@ -1601,6 +1775,21 @@ lemma proposal_canonical_consumption_executable:
       Scenario(run, 'proposal_canonical_consumption') @ #i
     & AcceptedProposal(run, 'alice', 'remove_bob', 'selected') @ #j
     & DroppedProposal(run, 'losing_remove', 'losing', 'losing_branch') @ #k"
+
+lemma delivery_order_robustness_executable:
+  exists-trace
+  "Ex run #i #j #k #l #m #n #o #p #q #r #s.
+      Scenario(run, 'delivery_order_robustness') @ #i
+    & DeliveredInput(run, 'selected_app') @ #j
+    & DeliveryPendingInput(run, 'selected_app') @ #k
+    & DuplicateDeliveryIgnored(run, 'selected_app') @ #l
+    & ReleasedDelayedInput(run, 'losing_app') @ #m
+    & Selected(run, 'carol', 'selected', 'effective_depth') @ #n
+    & Selected(run, 'frank', 'selected', 'effective_depth') @ #o
+    & AppliedCanonicalBranch(run, 'carol', 'selected') @ #p
+    & AppliedCanonicalBranch(run, 'frank', 'selected') @ #q
+    & AcceptedAppOutput(run, 'carol', 'app_selected', 'selected') @ #r
+    & AppInvalidationDisposition(run, 'app_losing', 'losing', 'losing_branch') @ #s"
 
 lemma generated_quorum_override_executable:
   exists-trace
