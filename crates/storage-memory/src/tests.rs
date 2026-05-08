@@ -320,6 +320,24 @@ fn rollback_of_missing_snapshot_errors_typed() {
 }
 
 #[test]
+fn list_group_snapshots_is_group_scoped_and_sorted() {
+    let store = MemoryStorage::new();
+    let g1 = sample_group(gid(1), 0, 0);
+    let g2 = sample_group(gid(2), 0, 0);
+    store.put_group(&g1).unwrap();
+    store.put_group(&g2).unwrap();
+
+    store.create_group_snapshot(&g1.id, "z-after").unwrap();
+    store.create_group_snapshot(&g2.id, "other-group").unwrap();
+    store.create_group_snapshot(&g1.id, "a-before").unwrap();
+
+    assert_eq!(
+        store.list_group_snapshots(&g1.id).unwrap(),
+        vec!["a-before".to_string(), "z-after".to_string()]
+    );
+}
+
+#[test]
 fn release_drops_the_snapshot_only() {
     let store = MemoryStorage::new();
     let g = sample_group(gid(1), 0, 0);

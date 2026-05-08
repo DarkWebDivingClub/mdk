@@ -768,8 +768,15 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
     )
     .expect("stored OpenMLS canonicalization succeeds");
 
-    let observations = apply_openmls_canonicalization_result(carol.storage(), &group_id, &result)
-        .expect("selected OpenMLS branch applies");
+    let observations = apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &result,
+        CanonicalizationPolicy::default()
+            .convergence
+            .max_rewind_commits,
+    )
+    .expect("selected OpenMLS branch applies");
 
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
     assert_eq!(
@@ -877,8 +884,15 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         errors: vec![],
     };
 
-    let err = apply_openmls_canonicalization_result(carol.storage(), &group_id, &bad_result)
-        .expect_err("conflicting same-epoch commits cannot both apply");
+    let err = apply_openmls_canonicalization_result(
+        carol.storage(),
+        &group_id,
+        &bad_result,
+        CanonicalizationPolicy::default()
+            .convergence
+            .max_rewind_commits,
+    )
+    .expect_err("conflicting same-epoch commits cannot both apply");
 
     assert!(
         err.to_string().contains("process_message"),

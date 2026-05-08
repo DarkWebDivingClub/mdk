@@ -69,6 +69,7 @@ pub trait MessageStorage {
     ) -> StorageResult<Vec<MessageRecord>>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
+    fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
 }

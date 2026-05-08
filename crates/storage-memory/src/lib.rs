@@ -247,6 +247,18 @@ impl MessageStorage for MemoryStorage {
         Ok(())
     }
 
+    fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
+        let inner = read(&self.inner)?;
+        let mut snapshots: Vec<_> = inner
+            .snapshots
+            .keys()
+            .filter(|(snapshot_group_id, _)| snapshot_group_id == group_id)
+            .map(|(_, name)| name.clone())
+            .collect();
+        snapshots.sort();
+        Ok(snapshots)
+    }
+
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         let mut inner = write(&self.inner)?;
         let snap = inner

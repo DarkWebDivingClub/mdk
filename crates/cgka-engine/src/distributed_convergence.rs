@@ -77,6 +77,7 @@ impl<S: StorageProvider> Engine<S> {
             .epoch(group_id)
             .unwrap_or(previous_group.epoch);
         let policy = self.convergence_policy.clone();
+        let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0
             .saturating_sub(policy.convergence.max_rewind_commits);
@@ -109,7 +110,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(result);
         }
 
-        apply_openmls_canonicalization_result(&self.storage, group_id, &result)?;
+        apply_openmls_canonicalization_result(
+            &self.storage,
+            group_id,
+            &result,
+            max_retained_anchor_rewind,
+        )?;
 
         if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
