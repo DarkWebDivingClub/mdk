@@ -206,7 +206,33 @@ Lower ordering keys win. Transport metadata MUST NOT affect this recovery rule.
 
 ## Branch Selection
 
-Only branches inside `max_rewind_commits` are eligible.
+Only branches inside `max_rewind_commits` are eligible:
+
+```text
+eligible =
+  current_tip_epoch - branch.fork_epoch <= max_rewind_commits
+```
+
+Ineligible branches MUST NOT be selected.
+
+Branch selection uses these values:
+
+- `fork_epoch`: the epoch where this branch diverged from the retained
+  canonical state.
+- `tip_epoch`: the epoch reached by replaying the branch's valid commits.
+- `raw_commit_depth`: the number of valid commits from `fork_epoch` to
+  `tip_epoch`.
+- `app_witness`: an application message that decrypts against a candidate
+  branch state.
+- `app_witness_score`: the sum of distinct app-message senders counted per
+  branch epoch, capped by that epoch's sender quorum.
+- `witness_quorum_met`: true when the branch has enough distinct app-message
+  senders in enough branch epochs under the group policy.
+- `effective_commit_depth`: `raw_commit_depth` plus the bounded witness boost
+  when `witness_quorum_met` is true.
+
+Witnesses are evidence that group members used a branch after it was created.
+They do not create epochs, apply commits, or replace MLS validation.
 
 Branches are compared in this order:
 
@@ -220,8 +246,78 @@ Application witnesses are valid application messages that decrypt against a
 candidate state. Witness score counts distinct senders per epoch. One sender
 cannot increase score by sending many messages in the same epoch.
 
-The witness quorum MAY add a bounded depth boost. It MUST NOT override more
-than `max_witness_override_depth` commits.
+The group policy defines the quorum. A typical policy uses:
+
+```text
+witness_quorum_senders_per_epoch
+witness_quorum_epochs
+max_witness_override_depth
+```
+
+For each branch epoch, the engine counts distinct senders with valid app
+messages on that branch:
+
+```text
+epoch_witness_score =
+  min(distinct_valid_app_senders_at_epoch,
+      witness_quorum_senders_per_epoch)
+```
+
+A branch meets witness quorum when at least
+`witness_quorum_senders_per_epoch` distinct senders witnessed at least
+`witness_quorum_epochs` branch epochs.
+
+When a branch meets witness quorum, the selector MAY add a bounded boost:
+
+```text
+effective_commit_depth =
+  raw_commit_depth
+  + (witness_quorum_met ? max_witness_override_depth : 0)
+```
+
+This boost is capped. If `max_witness_override_depth = 2`, witness quorum can
+make a branch compare as up to two commits deeper. It cannot compare as three
+or more commits deeper, no matter how many app messages exist.
+
+Example with `max_witness_override_depth = 2`:
+
+```text
+live branch:
+  raw_commit_depth = 3
+  witness_quorum_met = true
+  effective_commit_depth = 5
+
+private branch:
+  raw_commit_depth = 5
+  witness_quorum_met = false
+  effective_commit_depth = 5
+
+winner: live branch, because effective depth ties and witness quorum beats no quorum
+```
+
+The witnessed branch wins because the group had broad app-message evidence on
+that branch, and the competing branch is only two commits deeper.
+
+Another example with the same policy:
+
+```text
+live branch:
+  raw_commit_depth = 3
+  witness_quorum_met = true
+  effective_commit_depth = 5
+
+private branch:
+  raw_commit_depth = 6
+  witness_quorum_met = false
+  effective_commit_depth = 6
+
+winner: private branch, because it is more than two valid commits deeper
+```
+
+The cap keeps app-message evidence secondary to the commit log. Witness quorum
+can protect the branch most members were using from a small late private branch
+dump. It MUST NOT let application traffic overrule an arbitrarily longer valid
+commit branch.
 
 ## Proposals
 
