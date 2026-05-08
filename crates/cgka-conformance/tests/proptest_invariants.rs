@@ -14,8 +14,23 @@
 //! - **(d) Event conservation**: canonical scripted scenarios assert exact
 //!   app-message delivery counts; the generated properties below focus on
 //!   convergence across larger send/leave schedules.
+//! - **(e) Candidate graph determinism**: a generated valid candidate set
+//!   selects the same canonical branch under multiple enumeration orders.
+//! - **(f) Canonicalization dispositions**: generated proposal/app batches
+//!   preserve accepted, invalidated, dropped, and already-seen dispositions
+//!   under reordered duplicate delivery.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance::bus::DeliveryPolicy;
+use cgka_conformance::canonicalization::{
+    AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
+    DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate, MessageKind,
+    PeeledMessage, PeeledMessageKind, SyncState, canonicalize_with_materialized_candidates,
+};
+use cgka_conformance::convergence::{
+    AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
+};
 use cgka_conformance::proptest_support::{
     ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
 };
@@ -27,6 +42,12 @@ use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use proptest::prelude::*;
 
 const REACTIONS_PROPOSAL: u16 = 0xF210;
+
+fn digest_from_u64(value: u64) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest[24..].copy_from_slice(&value.to_be_bytes());
+    digest
+}
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -93,6 +114,511 @@ async fn setup_group(n: usize, bus: &TransportBus) -> Vec<HarnessClient> {
 fn prop_assert<T: PartialEq + std::fmt::Debug>(actual: T, expected: T, msg: &str) {
     if actual != expected {
         panic!("invariant violated: {msg} (actual={actual:?} expected={expected:?})");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelectorCandidateShape {
+    fork_back: u64,
+    tip_delta: u64,
+    digest_rank: u64,
+    witnesses: Vec<(u64, u8)>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectorCase {
+    current_tip_epoch: u64,
+    policy: ConvergencePolicy,
+    candidates: Vec<BranchCandidate>,
+}
+
+fn selector_candidate_shape() -> impl Strategy<Value = SelectorCandidateShape> {
+    (
+        0u64..=10,
+        0u64..=6,
+        any::<u16>(),
+        prop::collection::vec((0u64..=6, 0u8..=5), 0..=8),
+    )
+        .prop_map(
+            |(fork_back, tip_delta, digest_seed, witnesses)| SelectorCandidateShape {
+                fork_back,
+                tip_delta,
+                digest_rank: digest_seed as u64,
+                witnesses,
+            },
+        )
+}
+
+fn convergence_policy_strategy() -> impl Strategy<Value = ConvergencePolicy> {
+    (0u64..=10, 1usize..=4, 1usize..=3, 0u64..=3).prop_map(
+        |(
+            max_rewind_commits,
+            witness_quorum_senders_per_epoch,
+            witness_quorum_epochs,
+            max_witness_override_depth,
+        )| ConvergencePolicy {
+            max_rewind_commits,
+            witness_quorum_senders_per_epoch,
+            witness_quorum_epochs,
+            max_witness_override_depth,
+        },
+    )
+}
+
+fn selector_case() -> impl Strategy<Value = SelectorCase> {
+    (
+        1u64..=20,
+        convergence_policy_strategy(),
+        prop::collection::vec(selector_candidate_shape(), 1..=6),
+    )
+        .prop_map(|(current_tip_epoch, policy, shapes)| {
+            let candidates = shapes
+                .into_iter()
+                .enumerate()
+                .map(|(index, shape)| {
+                    let fork_epoch = current_tip_epoch.saturating_sub(shape.fork_back);
+                    let witnesses = shape
+                        .witnesses
+                        .into_iter()
+                        .map(|(epoch_delta, sender)| AppWitness {
+                            epoch: fork_epoch.saturating_add(epoch_delta),
+                            sender: vec![sender],
+                        })
+                        .collect();
+                    BranchCandidate {
+                        id: format!("branch-{index}"),
+                        fork_epoch,
+                        tip_epoch: fork_epoch.saturating_add(shape.tip_delta),
+                        // The selector's final modeled tie-breaker is the
+                        // branch digest; keep generated digests unique so the
+                        // property targets candidate ordering, not hash
+                        // collision behavior.
+                        tip_digest: digest_from_u64((shape.digest_rank << 16) | index as u64),
+                        app_witnesses: witnesses,
+                    }
+                })
+                .collect();
+            SelectorCase {
+                current_tip_epoch,
+                policy,
+                candidates,
+            }
+        })
+}
+
+fn selected_branch_id(case: &SelectorCase, candidates: &[BranchCandidate]) -> Option<String> {
+    select_canonical_branch(case.current_tip_epoch, candidates, &case.policy)
+        .map(|branch| branch.id.clone())
+}
+
+fn candidate_orders(candidates: &[BranchCandidate]) -> Vec<Vec<BranchCandidate>> {
+    let mut orders = vec![candidates.to_vec()];
+
+    let mut reversed = candidates.to_vec();
+    reversed.reverse();
+    if !orders.contains(&reversed) {
+        orders.push(reversed);
+    }
+
+    if candidates.len() > 1 {
+        let mut rotated = candidates.to_vec();
+        rotated.rotate_left(1);
+        if !orders.contains(&rotated) {
+            orders.push(rotated);
+        }
+    }
+
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    if !orders.contains(&sorted) {
+        orders.push(sorted);
+    }
+
+    orders
+}
+
+fn selector_is_order_invariant(case: SelectorCase) {
+    let expected = selected_branch_id(&case, &case.candidates);
+
+    for ordered_candidates in candidate_orders(&case.candidates) {
+        let observed = selected_branch_id(&case, &ordered_candidates);
+        prop_assert(
+            observed,
+            expected.clone(),
+            "candidate order must not change selected branch",
+        );
+    }
+
+    if let Some(selected) = expected {
+        let selected_branch = case
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == selected)
+            .expect("selected branch should be in original candidate set");
+        assert!(
+            is_branch_eligible(case.current_tip_epoch, selected_branch, &case.policy),
+            "selected branch must be eligible"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 1000 } else { 128 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (e) — a generated candidate graph selects the same winner
+    /// regardless of candidate enumeration order.
+    #[test]
+    fn prop_candidate_graph_selection_is_order_invariant(case in selector_case()) {
+        selector_is_order_invariant(case);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalDispositionCase {
+    selected_apps: usize,
+    losing_apps: usize,
+    accepted_proposals: usize,
+    pending_proposals: usize,
+    losing_proposals: usize,
+    duplicate_selected_app: bool,
+    duplicate_losing_app: bool,
+    duplicate_accepted_proposal: bool,
+    order_variant: u8,
+}
+
+fn canonical_disposition_case() -> impl Strategy<Value = CanonicalDispositionCase> {
+    (
+        0usize..=4,
+        0usize..=4,
+        0usize..=3,
+        0usize..=3,
+        0usize..=3,
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        0u8..=3,
+    )
+        .prop_map(
+            |(
+                selected_apps,
+                losing_apps,
+                accepted_proposals,
+                pending_proposals,
+                losing_proposals,
+                duplicate_selected_app,
+                duplicate_losing_app,
+                duplicate_accepted_proposal,
+                order_variant,
+            )| CanonicalDispositionCase {
+                selected_apps,
+                losing_apps,
+                accepted_proposals,
+                pending_proposals,
+                losing_proposals,
+                duplicate_selected_app,
+                duplicate_losing_app,
+                duplicate_accepted_proposal,
+                order_variant,
+            },
+        )
+}
+
+fn canonical_branch(
+    id: &str,
+    fork_epoch: u64,
+    tip_epoch: u64,
+    digest_rank: u64,
+) -> BranchCandidate {
+    BranchCandidate {
+        id: id.into(),
+        fork_epoch,
+        tip_epoch,
+        tip_digest: digest_from_u64(digest_rank),
+        app_witnesses: vec![],
+    }
+}
+
+fn canonical_state() -> CanonicalizationState {
+    CanonicalizationState {
+        current_tip_epoch: 4,
+        retained_anchor_epoch: 1,
+        sync_state: SyncState::Stable,
+        last_convergence_relevant_input_ms: 0,
+        seen_message_ids: BTreeSet::new(),
+    }
+}
+
+fn canonical_policy() -> CanonicalizationPolicy {
+    CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 5,
+            // This disposition property fixes the selected branch by commit
+            // depth. Witness override behavior is covered by selector tests.
+            witness_quorum_senders_per_epoch: 10,
+            witness_quorum_epochs: 2,
+            max_witness_override_depth: 0,
+        },
+        app_message_past_epoch_limit: 5,
+        stable_quiescence_ms: 1_000,
+    }
+}
+
+fn proposal_message(id: &str, branch_id: &str) -> PeeledMessage {
+    PeeledMessage {
+        message_id: id.into(),
+        group_id: "group".into(),
+        sender: b"alice".to_vec(),
+        source_epoch: 2,
+        kind: PeeledMessageKind::Proposal {
+            branch_id: branch_id.into(),
+        },
+    }
+}
+
+fn app_message(id: &str, sender: u8, decrypts_on_branch: &str) -> PeeledMessage {
+    PeeledMessage {
+        message_id: id.into(),
+        group_id: "group".into(),
+        sender: vec![sender],
+        source_epoch: 3,
+        kind: PeeledMessageKind::AppMessage {
+            epoch: 3,
+            decrypts_on_branches: vec![decrypts_on_branch.into()],
+            decrypted_payload_ref: Some(format!("payload-{id}")),
+        },
+    }
+}
+
+fn reorder_messages(mut messages: Vec<PeeledMessage>, variant: u8) -> Vec<PeeledMessage> {
+    match variant % 4 {
+        0 => messages,
+        1 => {
+            messages.reverse();
+            messages
+        }
+        2 => {
+            if !messages.is_empty() {
+                let shift = (messages.len() / 2).max(1);
+                messages.rotate_left(shift);
+            }
+            messages
+        }
+        _ => {
+            messages.sort_by(|a, b| b.message_id.cmp(&a.message_id));
+            messages
+        }
+    }
+}
+
+fn message_id_counts(messages: &[PeeledMessage]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for message in messages {
+        *counts.entry(message.message_id.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn message_ids_with_duplicates(messages: &[PeeledMessage]) -> BTreeSet<String> {
+    message_id_counts(messages)
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id))
+        .collect()
+}
+
+fn canonicalize_disposition_case(
+    case: &CanonicalDispositionCase,
+    messages: Vec<PeeledMessage>,
+) -> cgka_conformance::canonicalization::CanonicalizationResult {
+    let accepted_proposal_ids: Vec<String> = (0..case.accepted_proposals)
+        .map(|i| format!("accepted-proposal-{i}"))
+        .collect();
+    canonicalize_with_materialized_candidates(
+        CanonicalizationInput {
+            state: canonical_state(),
+            pending_messages: messages,
+            outbound_intents: vec![],
+            candidate_branches: vec![],
+            policy: canonical_policy(),
+            now_ms: 2_000,
+        },
+        vec![
+            MaterializedCandidate {
+                branch: canonical_branch("selected", 1, 4, 0),
+                commit_message_ids: vec!["selected-commit".into()],
+                consumed_proposal_ids: accepted_proposal_ids,
+            },
+            MaterializedCandidate {
+                branch: canonical_branch("losing", 1, 3, 255),
+                commit_message_ids: vec!["losing-commit".into()],
+                consumed_proposal_ids: (0..case.losing_proposals)
+                    .map(|i| format!("losing-proposal-{i}"))
+                    .collect(),
+            },
+        ],
+    )
+}
+
+fn build_canonical_messages(case: &CanonicalDispositionCase) -> Vec<PeeledMessage> {
+    let mut messages = Vec::new();
+
+    for i in 0..case.accepted_proposals {
+        messages.push(proposal_message(
+            &format!("accepted-proposal-{i}"),
+            "selected",
+        ));
+    }
+    for i in 0..case.pending_proposals {
+        messages.push(proposal_message(
+            &format!("pending-proposal-{i}"),
+            "selected",
+        ));
+    }
+    for i in 0..case.losing_proposals {
+        messages.push(proposal_message(&format!("losing-proposal-{i}"), "losing"));
+    }
+    for i in 0..case.selected_apps {
+        messages.push(app_message(
+            &format!("selected-app-{i}"),
+            i as u8,
+            "selected",
+        ));
+    }
+    for i in 0..case.losing_apps {
+        messages.push(app_message(&format!("losing-app-{i}"), i as u8, "losing"));
+    }
+
+    if case.duplicate_selected_app && case.selected_apps > 0 {
+        messages.push(app_message("selected-app-0", 0, "selected"));
+    }
+    if case.duplicate_losing_app && case.losing_apps > 0 {
+        messages.push(app_message("losing-app-0", 0, "losing"));
+    }
+    if case.duplicate_accepted_proposal && case.accepted_proposals > 0 {
+        messages.push(proposal_message("accepted-proposal-0", "selected"));
+    }
+
+    messages
+}
+
+fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
+    let base_messages = build_canonical_messages(&case);
+    let reordered_messages = reorder_messages(base_messages.clone(), case.order_variant);
+    let baseline = canonicalize_disposition_case(&case, base_messages.clone());
+    let observed = canonicalize_disposition_case(&case, reordered_messages);
+
+    prop_assert(
+        observed.clone(),
+        baseline.clone(),
+        "canonicalization dispositions must not depend on peeled delivery order",
+    );
+    prop_assert(
+        observed.selected_branch_id.as_deref(),
+        Some("selected"),
+        "selected materialized branch should win",
+    );
+
+    let accepted_apps: BTreeSet<String> = observed.accepted_app_messages.iter().cloned().collect();
+    let expected_selected_apps: BTreeSet<String> = (0..case.selected_apps)
+        .map(|i| format!("selected-app-{i}"))
+        .collect();
+    prop_assert(
+        accepted_apps,
+        expected_selected_apps,
+        "only selected-branch app messages are accepted",
+    );
+
+    let invalidated_losing_apps: BTreeSet<String> = observed
+        .invalidated_app_messages
+        .iter()
+        .filter(|message| message.reason == InvalidatedAppMessageReason::LosingBranch)
+        .map(|message| message.message_id.clone())
+        .collect();
+    let expected_losing_apps: BTreeSet<String> = (0..case.losing_apps)
+        .map(|i| format!("losing-app-{i}"))
+        .collect();
+    prop_assert(
+        invalidated_losing_apps,
+        expected_losing_apps,
+        "losing-branch app messages are invalidated",
+    );
+
+    let accepted_proposals: BTreeSet<String> =
+        observed.accepted_proposals.iter().cloned().collect();
+    let expected_accepted_proposals: BTreeSet<String> = (0..case.accepted_proposals)
+        .map(|i| format!("accepted-proposal-{i}"))
+        .collect();
+    prop_assert(
+        accepted_proposals,
+        expected_accepted_proposals,
+        "only consumed selected-branch proposals are accepted",
+    );
+
+    let dropped_losing_proposals: BTreeSet<String> = observed
+        .dropped_messages
+        .iter()
+        .filter(|message| {
+            message.kind == MessageKind::Proposal
+                && message.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        })
+        .map(|message| message.message_id.clone())
+        .collect();
+    let expected_losing_proposals: BTreeSet<String> = (0..case.losing_proposals)
+        .map(|i| format!("losing-proposal-{i}"))
+        .collect();
+    prop_assert(
+        dropped_losing_proposals,
+        expected_losing_proposals,
+        "losing-branch proposals are dropped",
+    );
+
+    let already_seen_ids: BTreeSet<String> = observed
+        .already_seen
+        .iter()
+        .map(|AlreadySeen { message_id, .. }| message_id.clone())
+        .collect();
+    prop_assert(
+        already_seen_ids,
+        message_ids_with_duplicates(&base_messages),
+        "duplicate peeled messages are reported as AlreadySeen",
+    );
+
+    prop_assert(
+        observed.accepted_app_messages.len(),
+        observed
+            .accepted_app_messages
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        "accepted app output is one-shot per message id",
+    );
+    prop_assert(
+        observed.invalidated_app_messages.len(),
+        observed
+            .invalidated_app_messages
+            .iter()
+            .map(|message| &message.message_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        "invalidated app dispositions are one-shot per message id",
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 1000 } else { 128 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (f) — generated canonicalization batches preserve app and
+    /// proposal dispositions under reordered duplicate delivery.
+    #[test]
+    fn prop_canonicalization_dispositions_are_order_invariant(
+        case in canonical_disposition_case()
+    ) {
+        canonical_dispositions_are_order_invariant(case);
     }
 }
 
