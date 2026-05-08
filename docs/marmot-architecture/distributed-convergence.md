@@ -297,14 +297,17 @@ Initial lemmas:
     `MissingRetainedAnchor` without applying, while commits older than the
     retained anchor are invalidated with `BeyondAnchor` and are never selected
     or applied.
+12. **Canonical app output:** accepted app messages become application-visible
+    only after their canonical branch is applied; losing-branch app messages
+    are invalidated and never delivered as normal output.
 
 The v0 model currently verifies deterministic selection, eligible-only
 selection, score-order justifications, stale-rewind rejection derived from
 anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
 three-branch permutations, late withheld publication after anchor, loaded-policy
 requirements, retained-anchor replay, missing-anchor no-mutation, `BeyondAnchor`
-invalidation, generated bounded seed cases, and executable traces for each
-modeled scenario.
+invalidation, canonical app output, losing-branch app non-delivery, generated
+bounded seed cases, and executable traces for each modeled scenario.
 The bounded seed source is
 [`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);
 `cgka-policy-casegen` emits matching Tamarin seed rules from the same file that

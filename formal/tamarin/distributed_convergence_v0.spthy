@@ -627,6 +627,45 @@ rule Init_Beyond_Anchor_Invalidation:
     !SourceEpochBeforeAnchorState(~run, 'stale', 'e1', 'e2')
   ]
 
+/*
+  Scenario 15:
+
+  After the selected canonical branch is applied, application messages that
+  decrypt on that branch become application-visible output. Application
+  messages that only decrypt on a losing branch are invalidated instead.
+*/
+rule Init_Commit_Application_App_Output:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'commit_application_app_output'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
+    Eligible(~run, 'selected'),
+    Eligible(~run, 'losing'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    ScoreGreater(~run, 'd2', 'd1'),
+    AppDecryptsOnBranch(~run, 'app_selected', 'selected'),
+    AppDecryptsOnBranch(~run, 'app_losing', 'losing'),
+    BranchDifferent(~run, 'losing', 'selected')
+  ]->
+  [
+    Compare(~run, 'selected', 'losing'),
+    Compare(~run, 'losing', 'selected'),
+    View(~run, 'alice', 'selected', 'losing'),
+    View(~run, 'bob', 'losing', 'selected'),
+    !PolicyLoadedState(~run),
+    !EligibleState(~run, 'selected'),
+    !EligibleState(~run, 'losing'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !GtState(~run, 'd2', 'd1'),
+    !AppDecryptsOnBranchState(~run, 'app_selected', 'selected'),
+    !AppDecryptsOnBranchState(~run, 'app_losing', 'losing'),
+    !BranchDifferentState(~run, 'losing', 'selected')
+  ]
+
 rule Derive_Stale_Beyond_Rewind:
   [
     !RetainedAnchorState(run, anchor),
@@ -909,6 +948,31 @@ rule Apply_Selected_Canonical_Branch:
   ]
 --[
     AppliedCanonicalBranch(run, client, branch)
+]->
+  [
+    !AppliedCanonicalBranchState(run, client, branch)
+  ]
+
+rule Emit_Accepted_App_Output:
+  [
+    !AppliedCanonicalBranchState(run, client, branch),
+    !AppDecryptsOnBranchState(run, app, branch)
+  ]
+--[
+    AcceptedAppOutput(run, client, app, branch),
+    ApplicationVisible(run, client, app)
+  ]->
+  []
+
+rule Invalidate_Losing_Branch_App:
+  [
+    !AppliedCanonicalBranchState(run, client, selected),
+    !AppDecryptsOnBranchState(run, app, losing),
+    !BranchDifferentState(run, losing, selected)
+  ]
+--[
+    InvalidatedApp(run, app, losing, 'losing_branch'),
+    NotApplicationVisible(run, app, 'losing_branch')
   ]->
   []
 
@@ -939,6 +1003,42 @@ lemma applied_branch_requires_prior_selection:
           Selected(run, client, branch, reason) @ #j
         & #j < #i
     )"
+
+lemma accepted_app_output_requires_applied_branch:
+  "All run client app branch #i.
+      AcceptedAppOutput(run, client, app, branch) @ #i
+    ==> (
+      Ex #j #k.
+          AppliedCanonicalBranch(run, client, branch) @ #j
+        & AppDecryptsOnBranch(run, app, branch) @ #k
+        & #j < #i
+    )"
+
+lemma application_visible_requires_accepted_app_output:
+  "All run client app #i.
+      ApplicationVisible(run, client, app) @ #i
+    ==> (
+      Ex branch #j.
+          AcceptedAppOutput(run, client, app, branch) @ #j
+        & #j = #i
+    )"
+
+lemma losing_app_invalidation_requires_applied_different_branch:
+  "All run app losing #i.
+      InvalidatedApp(run, app, losing, 'losing_branch') @ #i
+    ==> (
+      Ex client selected #j #k #m.
+          AppliedCanonicalBranch(run, client, selected) @ #j
+        & AppDecryptsOnBranch(run, app, losing) @ #k
+        & BranchDifferent(run, losing, selected) @ #m
+        & #j < #i
+    )"
+
+lemma invalidated_apps_are_never_application_visible:
+  "All run client app branch reason #i #j.
+      InvalidatedApp(run, app, branch, reason) @ #i
+    & ApplicationVisible(run, client, app) @ #j
+    ==> F"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -1224,6 +1324,15 @@ lemma beyond_anchor_invalidated_executable:
       Scenario(run, 'beyond_anchor_invalidated') @ #i
     & InvalidatedBeyondAnchor(run, 'group', 'stale', 'e2') @ #j
     & NotApplied(run, 'group', 'stale', 'beyond_anchor') @ #k"
+
+lemma commit_application_app_output_executable:
+  exists-trace
+  "Ex run #i #j #k #l #m.
+      Scenario(run, 'commit_application_app_output') @ #i
+    & AppliedCanonicalBranch(run, 'alice', 'selected') @ #j
+    & AcceptedAppOutput(run, 'alice', 'app_selected', 'selected') @ #k
+    & ApplicationVisible(run, 'alice', 'app_selected') @ #l
+    & InvalidatedApp(run, 'app_losing', 'losing', 'losing_branch') @ #m"
 
 lemma generated_quorum_override_executable:
   exists-trace

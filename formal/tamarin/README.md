@@ -24,6 +24,10 @@ It models only the convergence boundary:
   any canonical branch.
 - a commit older than the retained anchor is invalidated with `BeyondAnchor`
   and is never selected or applied.
+- accepted app messages become application-visible only after their canonical
+  branch is applied.
+- app messages tied only to a losing branch are invalidated and never delivered
+  as normal application output.
 - duplicate app witnesses from the same sender in the same epoch do not inflate
   witness score.
 - stale rewind status is derived from retained anchor, branch fork epoch,
@@ -99,6 +103,16 @@ That keeps the lifecycle part aligned with
 `crates/cgka-engine/src/distributed_convergence.rs` and
 `crates/cgka-engine/src/openmls_projection.rs`.
 
+The current app-output proof slice is:
+
+```text
+applied canonical branch + app decrypt evidence => application-visible output;
+losing-branch app invalidation => no normal application-visible output
+```
+
+That maps to `GroupEvent::MessageReceived` emission in the engine integration
+tests.
+
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:
 
@@ -135,7 +149,7 @@ until the model includes it.
 | `Derive_*` rule | One policy step, such as score comparison or stale derivation. | Unit tests for the selector/comparator and its selected reason. |
 | all-traces lemma | An invariant that must hold in every modeled trace. | Property tests, invariant assertions, or both. |
 | `*_requires_*` lemma | A selected outcome must have matching evidence. | Debug assertions or tests that inspect selection reasons and evidence. |
-| lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, or `BeyondAnchor`, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs` and OpenMLS replay tests in `crates/cgka-conformance/tests/openmls_replay_probe.rs`. |
+| lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, `BeyondAnchor`, or app output, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs` and OpenMLS replay tests in `crates/cgka-conformance/tests/openmls_replay_probe.rs`. |
 | model assumption | A fact the model accepts as already validated. | Tests or review at the layer that owns the assumption. |
 
 Keep names aligned across the proof and tests. If the Tamarin scenario is
