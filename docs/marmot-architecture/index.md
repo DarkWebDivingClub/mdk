@@ -87,7 +87,7 @@ These are longer working documents. Go here when you need depth, not orientation
 | FFI bridge | flutter_rust_bridge | **whitenoise-ffi** — transport-agnostic, Dart + Swift |
 | Application | whitenoise-rs singleton | **whitenoise-core** — thin facade, per-account sessions |
 | Transport | Nostr relay control planes, embedded | `TransportAdapter` trait, `NostrAdapter` as first impl |
-| CGKA Engine | `crates/cgka-engine` implements the current OpenMLS-backed engine candidate | Spec-level `CgkaEngine` contract with production persistence and packaging |
+| CGKA Engine | `crates/cgka-engine` implements the current OpenMLS-backed engine candidate; `crates/cgka-session` wraps it in an encrypted account-device lifecycle | Spec-level `CgkaEngine` contract with production persistence and packaging |
 | Crypto | OpenMLS behind `CgkaEngine` | OpenMLS first, with the trait boundary preserving future CGKA swap room |
 | Storage | `storage-memory` for tests/simulator work; `storage-sqlite` for SQLCipher-backed persistence | MLS app-component policy negotiation, app key-management integration, packaging |
 

@@ -244,6 +244,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgka-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cgka-engine",
+ "cgka-traits",
+ "storage-sqlite",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "cgka-traits"
 version = "0.1.0"
 dependencies = [

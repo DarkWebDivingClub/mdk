@@ -1,0 +1,17 @@
+[package]
+name = "cgka-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cgka-engine.workspace = true
+cgka-traits.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

@@ -139,6 +139,22 @@ impl<S: StorageProvider> EngineBuilder<S> {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Restore stable epoch state for groups already present in storage.
+    ///
+    /// This is used by production session startup after opening durable
+    /// storage. Pending publish state is deliberately not reconstructed here:
+    /// v1 sessions require the application to resolve publish success/failure
+    /// before shutdown, and future resumable-pending support should persist a
+    /// dedicated pending-publish record instead of inferring one from group
+    /// rows.
+    pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
+        for group_id in self.storage.list_groups()? {
+            let group = self.storage.get_group(&group_id)?;
+            self.epoch_manager.set_stable(group_id, group.epoch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn convergence_now_ms(&self) -> u64 {
         self.convergence_clock_started_at
             .elapsed()

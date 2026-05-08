@@ -8,6 +8,8 @@ Marmot protocol work.
 - `crates/traits` defines the cross-boundary engine, peeler, storage, and value
   types.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
+- `crates/cgka-session` wires `Engine<SqliteStorage>` into a
+  production-shaped account-device lifecycle.
 - `crates/storage-memory` provides an in-memory backend for tests and simulator
   runs.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
@@ -23,8 +25,9 @@ Marmot protocol work.
 1. `docs/marmot-architecture/index.md`
 2. `docs/marmot-architecture/overview/current-state.md`
 3. `crates/cgka-engine/README.md`
-4. `crates/storage-sqlite/README.md`
-5. `formal/tamarin/README.md`
+4. `crates/cgka-session/README.md`
+5. `crates/storage-sqlite/README.md`
+6. `formal/tamarin/README.md`
 
 ## Common commands
 

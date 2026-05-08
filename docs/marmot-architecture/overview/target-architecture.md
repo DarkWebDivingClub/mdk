@@ -96,6 +96,7 @@ The active workspace proves the shape without the old prototype tree:
 
 - `crates/traits` defines the cross-boundary types.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
+- `crates/cgka-session` wires the engine to encrypted account-device storage.
 - `crates/storage-memory` provides in-memory storage and rollback snapshots.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
   metadata and group-scoped OpenMLS state.
@@ -103,7 +104,8 @@ The active workspace proves the shape without the old prototype tree:
   delivery variants, and property tests over the engine.
 
 The production perimeter is still partly outside this workspace: real transport
-adapters, persistence policy hardening, packaging, and app integration.
+adapters, account key-management integration, persistence operations policy,
+and packaging.
 
 ---
 

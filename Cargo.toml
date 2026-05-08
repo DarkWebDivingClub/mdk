@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/traits",
     "crates/cgka-engine",
+    "crates/cgka-session",
     "crates/storage-memory",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
@@ -47,6 +48,7 @@ test-log = { version = "0.2", features = ["trace"] }
 # workspace-internal
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
+cgka-session = { path = "crates/cgka-session" }
 storage-memory = { path = "crates/storage-memory" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
