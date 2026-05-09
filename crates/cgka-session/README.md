@@ -54,7 +54,7 @@ against the same stack. It writes reproducibility reports to
 `target/session-stack-chaos/` and currently keeps generated same-epoch
 app-message reordering inside a shallow delivery window. It also includes an
 invite lifecycle chaos path for wrong-route drops, welcome replay, shared commit
-fanout, and welcome-before-commit delivery to a new member.
+fanout, welcome-before-commit delivery, and commit-before-welcome delivery.
 
 Run:
 

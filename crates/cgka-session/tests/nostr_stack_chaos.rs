@@ -138,37 +138,12 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_eq!(commit_deliveries.len(), 2);
 
     let bob_commit = take_effect_for(&mut commit_deliveries, &bob_account_id);
-    assert_eq!(bob_commit.outcome, IngestOutcome::Processed);
-    assert!(bob_commit.effects.events.iter().any(|event| matches!(
-        event,
-        GroupEvent::EpochChanged {
-            group_id: changed_group,
-            from: EpochId(1),
-            to: EpochId(2),
-        } if changed_group == &group_id
-    )));
-    assert!(bob_commit.effects.events.iter().any(|event| matches!(
-        event,
-        GroupEvent::MemberAdded {
-            group_id: changed_group,
-            member,
-        } if changed_group == &group_id && member.id == carol_account_id
-    )));
+    assert_invite_commit_processed(&bob_commit, &group_id, &carol_account_id);
     assert_eq!(bob.session.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(bob.session.members(&group_id).unwrap().len(), 3);
 
     let carol_late_commit = take_effect_for(&mut commit_deliveries, &carol_account_id);
-    assert!(
-        matches!(
-            carol_late_commit.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
-            }
-        ),
-        "unexpected Carol late commit outcome: {:?}",
-        carol_late_commit.outcome
-    );
-    assert!(carol_late_commit.effects.events.is_empty());
+    assert_peel_failed(&carol_late_commit);
 
     let mut replay_deliveries = stack
         .deliver_event_to_sessions(
@@ -181,22 +156,108 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_eq!(replay_deliveries.len(), 2);
 
     let bob_commit_replay = take_effect_for(&mut replay_deliveries, &bob_account_id);
-    assert!(matches!(
-        bob_commit_replay.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
-        }
-    ));
-    assert!(bob_commit_replay.effects.events.is_empty());
+    assert_already_seen(&bob_commit_replay);
 
     let carol_commit_replay = take_effect_for(&mut replay_deliveries, &carol_account_id);
-    assert!(matches!(
-        carol_commit_replay.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
-    ));
-    assert!(carol_commit_replay.effects.events.is_empty());
+    assert_peel_failed(&carol_commit_replay);
+}
+
+#[tokio::test]
+async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay() {
+    let seed = 0xC01117_u64;
+    let stack = NostrStackHarness::new();
+    let mut alice = stack.client("alice").await;
+    let mut bob = stack.client("bob").await;
+    let mut carol = stack.client("carol").await;
+    let created = create_group_for_bob(&mut alice, &mut bob, seed).await;
+    let group_id = created.group_id.clone();
+    publish_confirm_and_deliver_welcome(&stack, &mut alice, &mut bob, created).await;
+    stack.sync_group(&bob, &group_id).await;
+    bob.session.set_convergence_policy(CanonicalizationPolicy {
+        stable_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+
+    let invite = invite_carol(&mut alice, &mut carol, &group_id).await;
+    let commit_report = stack
+        .publish_group(&alice, &group_id, invite.commit.clone(), 1)
+        .await
+        .unwrap();
+    let welcome_report = stack
+        .publish_welcome(&alice, &carol, invite.welcome.clone(), 1)
+        .await
+        .unwrap();
+    assert!(commit_report.met_required_acks());
+    assert!(welcome_report.met_required_acks());
+    alice
+        .session
+        .confirm_published(invite.pending)
+        .await
+        .unwrap();
+
+    let commit_event = stack.take_next_published();
+    let welcome_event = stack.take_next_published();
+    let bob_commit = stack
+        .deliver_event_to_session(
+            &mut bob,
+            stack.group_endpoint(),
+            "bob-commit-before-welcome",
+            commit_event.event.clone(),
+        )
+        .await
+        .expect("valid commit should route to Bob");
+    assert_invite_commit_processed(&bob_commit, &group_id, &carol.account_id);
+    assert_eq!(bob.session.epoch(&group_id).unwrap(), EpochId(2));
+
+    let bob_replay = stack
+        .deliver_event_to_session(
+            &mut bob,
+            stack.group_endpoint(),
+            "bob-commit-before-welcome-replay",
+            commit_event.event.clone(),
+        )
+        .await
+        .expect("commit replay should route to Bob");
+    assert_already_seen(&bob_replay);
+
+    let carol_endpoint = carol.inbox_endpoint.clone();
+    let carol_joined = stack
+        .deliver_event_to_session(
+            &mut carol,
+            carol_endpoint,
+            "carol-welcome-after-bob-commit",
+            welcome_event.event,
+        )
+        .await
+        .expect("valid welcome should route to Carol");
+    assert_eq!(carol_joined.outcome, IngestOutcome::Processed);
+    assert_eq!(
+        carol_joined.effects.events,
+        vec![GroupEvent::GroupJoined {
+            group_id: group_id.clone(),
+            via_welcome: welcome_report.message_id,
+        }]
+    );
+    assert_eq!(carol.session.epoch(&group_id).unwrap(), EpochId(2));
+
+    stack.sync_group(&carol, &group_id).await;
+    let bob_account_id = bob.account_id.clone();
+    let carol_account_id = carol.account_id.clone();
+    let mut shared_replay = stack
+        .deliver_event_to_sessions(
+            &mut [&mut bob, &mut carol],
+            stack.group_endpoint(),
+            "shared-commit-after-welcome",
+            commit_event.event,
+        )
+        .await;
+    assert_eq!(shared_replay.len(), 2);
+
+    let bob_shared_replay = take_effect_for(&mut shared_replay, &bob_account_id);
+    assert_already_seen(&bob_shared_replay);
+
+    let carol_late_commit = take_effect_for(&mut shared_replay, &carol_account_id);
+    assert_peel_failed(&carol_late_commit);
 }
 
 #[derive(Clone, Debug)]
@@ -747,6 +808,53 @@ fn take_effect_for(
         .position(|(delivered, _)| delivered == account_id)
         .expect("expected delivery for account");
     deliveries.remove(position).1
+}
+
+fn assert_invite_commit_processed(
+    effects: &IngestEffects,
+    group_id: &GroupId,
+    added_member: &MemberId,
+) {
+    assert_eq!(effects.outcome, IngestOutcome::Processed);
+    assert!(effects.effects.events.iter().any(|event| matches!(
+        event,
+        GroupEvent::EpochChanged {
+            group_id: changed_group,
+            from: EpochId(1),
+            to: EpochId(2),
+        } if changed_group == group_id
+    )));
+    assert!(effects.effects.events.iter().any(|event| matches!(
+        event,
+        GroupEvent::MemberAdded {
+            group_id: changed_group,
+            member,
+        } if changed_group == group_id && &member.id == added_member
+    )));
+}
+
+fn assert_already_seen(effects: &IngestEffects) {
+    assert!(matches!(
+        effects.outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+    assert!(effects.effects.events.is_empty());
+}
+
+fn assert_peel_failed(effects: &IngestEffects) {
+    assert!(
+        matches!(
+            effects.outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ),
+        "unexpected peel failure outcome: {:?}",
+        effects.outcome
+    );
+    assert!(effects.effects.events.is_empty());
 }
 
 fn payload_label(seed: u64, message_index: usize) -> String {
