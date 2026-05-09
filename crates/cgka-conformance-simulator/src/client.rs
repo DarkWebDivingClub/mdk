@@ -356,7 +356,8 @@ impl HarnessClient {
         for group_id in buffered_groups {
             match self
                 .engine
-                .converge_stored_openmls_messages(&group_id, 1_000_000)
+                .advance_convergence_inputs_until_stable(&group_id, 1_000_000)
+                .await
             {
                 Ok(_) => {}
                 Err(e) => {

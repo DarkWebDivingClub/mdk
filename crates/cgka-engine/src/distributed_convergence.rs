@@ -70,6 +70,7 @@ impl<S: StorageProvider> Engine<S> {
         now_ms: u64,
     ) -> Result<(), OpenMlsProjectionError> {
         match self.storage.get_message(&message.id) {
+            Ok(record) if record.state == MessageState::PeelDeferred => {}
             Ok(_) => return Ok(()),
             Err(StorageError::NotFound) => {}
             Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),

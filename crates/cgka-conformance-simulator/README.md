@@ -47,12 +47,15 @@ internals.
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr
 peeler and `ingest`, the convergence engine selects one same-epoch branch, and
-the observed trace records the epoch transition plus selected member addition.
+the observed trace records the selected epoch/member additions plus the
+canonical branch application payload.
 Delayed past-epoch application messages are also covered: the receiver advances,
 then peels the late transport message from a retained epoch context and emits
 the payload once.
-Future-epoch branch app messages are currently fail-closed at the outer peeler
-until branch-aware outer-message retry is implemented.
+Future-epoch branch messages are stored as raw transport bytes when the outer
+peeler cannot unwrap them yet. After canonical branch selection advances the
+MLS context, the engine retries those raw records and emits only the payloads
+that decrypt on the selected branch.
 
 ### Fork-recovery vectors are not currently portable
 
@@ -125,9 +128,10 @@ separate execution path.
 variants of `convergence-e2e-group-events/v1`. Each variant keeps the logical
 branch race stable but mutates queued delivery with duplicate, delay/release,
 and reorder steps before observer clients tick. Under the real Nostr peeler the
-stable expectation is that observers converge to epoch 2 and one selected
-invitee; future-epoch branch app payload retry is intentionally left out of the
-portable assertion surface for now.
+stable expectation is that observers agree on one canonical branch, which may
+be Bob's single-commit branch at epoch 2 or Alice's deeper branch at epoch 3
+depending on which messages are available before the stability gate. In both
+cases the trace includes exactly the selected branch application payload.
 
 ## Report artifacts
 

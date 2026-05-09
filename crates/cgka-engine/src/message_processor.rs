@@ -31,6 +31,8 @@ use openmls::prelude::{
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
 
+const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
+
 impl<S: StorageProvider> Engine<S> {
     /// Inbound pipeline. Never panics; every classifiable stale case returns
     /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
@@ -584,6 +586,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
+        self.retry_deferred_peels(&group_id).await?;
         if self.should_queue_outbound_intent(&group_id)? {
             return self.queue_outbound_intent(group_id, intent);
         }
@@ -623,21 +626,20 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
-        if self.has_unresolved_convergence_inputs(group_id)? {
-            let result = self
-                .converge_stored_openmls_messages(group_id, now_ms)
-                .map_err(|e| EngineError::Backend(format!("converge queued outbound: {e}")))?;
-            if result.sync_state != crate::canonicalization::SyncState::Stable
-                || self.has_unresolved_convergence_inputs(group_id)?
-            {
-                return Ok(Vec::new());
-            }
+        if !self
+            .advance_convergence_inputs_until_stable(group_id, now_ms)
+            .await?
+        {
+            return Ok(Vec::new());
         }
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
         for record in queued {
-            if self.has_unresolved_convergence_inputs(group_id)? {
+            if !self
+                .advance_convergence_inputs_until_stable(group_id, now_ms)
+                .await?
+            {
                 break;
             }
             let result = self.do_send_ready(record.intent.clone()).await?;
@@ -673,6 +675,38 @@ impl<S: StorageProvider> Engine<S> {
         self.has_unresolved_convergence_inputs(group_id)
     }
 
+    /// Drive stored OpenMLS inputs to stability, retrying raw transport
+    /// records after each stable branch selection. This is the branch-aware
+    /// path for future-epoch application messages and deeper branch commits:
+    /// opaque transport bytes do not participate in canonicalization until a
+    /// selected branch gives the peeler the epoch context needed to unwrap
+    /// them.
+    pub async fn advance_convergence_inputs_until_stable(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> Result<bool, EngineError> {
+        for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
+            if self.has_unresolved_convergence_inputs(group_id)? {
+                let result = self
+                    .converge_stored_openmls_messages(group_id, now_ms)
+                    .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
+                if result.sync_state != crate::canonicalization::SyncState::Stable {
+                    return Ok(false);
+                }
+                if self.has_unresolved_convergence_inputs(group_id)? {
+                    return Ok(false);
+                }
+            }
+
+            if self.retry_deferred_peels(group_id).await? == 0 {
+                return Ok(!self.has_unresolved_convergence_inputs(group_id)?);
+            }
+        }
+
+        Ok(false)
+    }
+
     fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         let anchor = match self.storage.get_group(group_id) {
             Ok(group) => {
@@ -691,7 +725,7 @@ impl<S: StorageProvider> Engine<S> {
         for record in records {
             if !matches!(
                 record.state,
-                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
+                MessageState::Created | MessageState::Retryable
             ) {
                 continue;
             }
@@ -714,6 +748,58 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(false)
+    }
+
+    pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(0);
+        }
+
+        let records = self.storage.list_messages(group_id, EpochId(0))?;
+        let mut progressed = 0;
+        for record in records {
+            if record.state != MessageState::PeelDeferred {
+                continue;
+            }
+            let stored_payload = StoredMessagePayload::decode(&record.payload)
+                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+            let Some(msg) = stored_payload.as_raw_transport().cloned() else {
+                continue;
+            };
+            match self
+                .ingest_group_message(&msg, group_id.as_slice().to_vec())
+                .await
+            {
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                }) => {}
+                Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
+                    progressed += 1;
+                }
+                Ok(IngestOutcome::Stale { .. }) => {
+                    progressed += 1;
+                }
+                Err(EngineError::ForkedEpoch {
+                    group_id,
+                    last_stable,
+                    conflicting_epoch,
+                }) => {
+                    self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
+                    return Err(EngineError::ForkedEpoch {
+                        group_id,
+                        last_stable,
+                        conflicting_epoch,
+                    });
+                }
+                Err(e) => {
+                    self.update_stored_message_state(&record.id, MessageState::Retryable)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(progressed)
     }
 
     fn queue_outbound_intent(

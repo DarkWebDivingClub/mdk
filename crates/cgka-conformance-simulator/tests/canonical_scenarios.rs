@@ -588,7 +588,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .expect("generated convergence variant reports");
         assert!(report.invariant_failures.is_empty());
         assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
-        assert_eq!(report.epoch_change_observations.len(), 2);
+        assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
         assert!(report.app_invalidation_observations.is_empty());
     }
 }
@@ -1028,6 +1028,17 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     } else {
         david.member_id()
     };
+    let (expected_payload, losing_payload) = if selected_index == 0 {
+        (
+            b"alice branch payload".to_vec(),
+            b"bob branch payload".to_vec(),
+        )
+    } else {
+        (
+            b"bob branch payload".to_vec(),
+            b"alice branch payload".to_vec(),
+        )
+    };
     let _ = (alice_app, bob_app);
 
     bus.deliver_all();
@@ -1036,8 +1047,18 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     assert_tick_reached_convergence("carol", &carol_outcomes);
     assert_tick_reached_convergence("frank", &frank_outcomes);
 
-    assert_no_application_events("carol", carol.drain_events());
-    assert_no_application_events("frank", frank.drain_events());
+    assert_canonical_application_event(
+        "carol",
+        carol.drain_events(),
+        &expected_payload,
+        &losing_payload,
+    );
+    assert_canonical_application_event(
+        "frank",
+        frank.drain_events(),
+        &expected_payload,
+        &losing_payload,
+    );
     assert_eq!(carol.epoch(), EpochId(2));
     assert_eq!(frank.epoch(), EpochId(2));
     for (name, members) in [("carol", carol.members()), ("frank", frank.members())] {
@@ -1062,7 +1083,7 @@ async fn scenario_report_records_convergence_e2e_group_events() {
 
     assert!(report.invariant_failures.is_empty());
     assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
-    assert_eq!(report.epoch_change_observations.len(), 2);
+    assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
     assert!(report.app_invalidation_observations.is_empty());
     assert!(
         report
@@ -1193,7 +1214,12 @@ fn assert_tick_reached_convergence(
     );
 }
 
-fn assert_no_application_events(client: &str, events: Vec<GroupEvent>) {
+fn assert_canonical_application_event(
+    client: &str,
+    events: Vec<GroupEvent>,
+    expected_payload: &[u8],
+    losing_payload: &[u8],
+) {
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {
@@ -1201,9 +1227,16 @@ fn assert_no_application_events(client: &str, events: Vec<GroupEvent>) {
             _ => None,
         })
         .collect();
+    assert_eq!(
+        received_payloads,
+        vec![expected_payload.to_vec()],
+        "{client} should receive exactly the selected branch payload: {events:?}"
+    );
     assert!(
-        received_payloads.is_empty(),
-        "{client} app messages: {events:?}"
+        !received_payloads
+            .iter()
+            .any(|payload| payload == losing_payload),
+        "{client} should not receive losing branch payload: {events:?}"
     );
     assert!(
         !events
@@ -1228,19 +1261,31 @@ fn assert_no_application_events(client: &str, events: Vec<GroupEvent>) {
 
 fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
     for observation in &trace.observations {
-        assert_eq!(observation.epoch, 2);
-        assert_eq!(observation.member_count, 5);
-        assert!(observation.received_payloads.is_empty());
-        assert_eq!(observation.added_members.len(), 1);
-        assert!(matches!(
-            observation.added_members[0].as_str(),
-            "david" | "eve"
-        ));
+        match observation.received_payloads.as_slice() {
+            [payload] if payload == "alice canonical payload" => {
+                assert_eq!(observation.epoch, 3);
+                assert_eq!(observation.member_count, 6);
+                assert_eq!(observation.added_members, vec!["david", "grace"]);
+                assert_eq!(
+                    observation.epoch_changes,
+                    vec![
+                        EpochChangeObservation { from: 1, to: 2 },
+                        EpochChangeObservation { from: 2, to: 3 },
+                    ]
+                );
+            }
+            [payload] if payload == "bob losing payload" => {
+                assert_eq!(observation.epoch, 2);
+                assert_eq!(observation.member_count, 5);
+                assert_eq!(observation.added_members, vec!["eve"]);
+                assert_eq!(
+                    observation.epoch_changes,
+                    vec![EpochChangeObservation { from: 1, to: 2 }]
+                );
+            }
+            _ => panic!("unexpected convergence trace observation: {observation:?}"),
+        }
         assert!(observation.removed_members.is_empty());
-        assert_eq!(
-            observation.epoch_changes,
-            vec![EpochChangeObservation { from: 1, to: 2 }]
-        );
         assert!(observation.app_invalidations.is_empty());
         assert!(observation.recoveries.is_empty());
     }

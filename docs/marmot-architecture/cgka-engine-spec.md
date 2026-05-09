@@ -134,6 +134,15 @@ context. If that fails and retained epoch snapshots are available, it SHOULD
 try those retained contexts newest-to-oldest within the retention window before
 classifying the message as `PeelDeferred`.
 
+When convergence reaches a stable selected branch, the engine MUST retry
+`PeelDeferred` raw group messages for that group. A retry that peels into
+OpenMLS wire bytes promotes the stored payload from `RawTransport` to
+`OpenMlsWire`; it is then either processed immediately if it belongs to the
+current selected epoch or buffered as convergence input if it targets a later
+candidate epoch. Raw `PeelDeferred` messages MUST NOT by themselves block
+outbound work; only peeled OpenMLS commit, proposal, or application messages
+are unresolved convergence inputs.
+
 ## Welcomes
 
 A welcome join lands the recipient at the post-commit epoch carried by the
@@ -357,6 +366,10 @@ Application-message rules:
   past-epoch decryption limit MUST be emitted as `GroupEvent::MessageReceived`.
 - A transport-wrapped application message for a past epoch SHOULD be retried
   against retained epoch contexts before it is left in `PeelDeferred`.
+- A transport-wrapped application message for a future candidate epoch SHOULD
+  stay in `PeelDeferred` until branch selection advances the local MLS context;
+  then it MUST be retried and emitted only if it decrypts on the selected
+  branch.
 - A message that decrypts only on a losing branch MUST be reported as
   `GroupEvent::AppMessageInvalidated`.
 - A message older than the MLS past-epoch decryption limit MUST expire.

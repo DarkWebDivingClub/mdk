@@ -39,9 +39,10 @@ before delivery by zero-based queue index: `drop_queued`, `duplicate_queued`,
 Use `clear_events` after setup when a scenario wants the final trace to describe
 only the behavior under test. The convergence E2E scenario does this after the
 initial welcome joins so its trace focuses on the peeler-ingest epoch change
-and selected member addition. Delayed past-epoch app messages are covered via
-retained epoch contexts. Future-epoch branch app messages currently fail closed
-at the real outer peeler until branch-aware retry exists.
+and selected branch outputs. Delayed past-epoch app messages are covered via
+retained epoch contexts. Future-epoch branch messages are stored as raw
+transport bytes, retried after canonical branch selection advances the MLS
+context, and only emitted if they decrypt on the selected branch.
 
 The `convergence-e2e-delivery/v1` generated family reuses that E2E shape and
 varies queue delivery with duplicate, delay/release, and reorder steps before

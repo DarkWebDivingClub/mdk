@@ -251,10 +251,11 @@ Engine integration and OpenMLS conformance tests also cover:
 - retained-anchor replay and stale invalidation after engine rebuild,
 - delayed past-epoch application messages peeled from retained epoch contexts,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients using
-  the real Nostr peeler over an in-memory bus. This currently proves selected
-  branch epoch/member events; future-epoch branch app payload retry remains an
-  implementation gap because those outer messages cannot be decrypted until a
-  candidate branch has been applied.
+  the real Nostr peeler over an in-memory bus. This proves selected branch
+  epoch/member events plus branch-aware retry for future-epoch raw transport
+  messages: once canonical selection applies a branch, observers retry deferred
+  outer messages and emit only the payload that decrypts on the selected
+  branch.
 
 ## Formal Verification
 
