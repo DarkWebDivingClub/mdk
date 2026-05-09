@@ -44,6 +44,10 @@ Those live above this crate.
   publish reports over an in-memory relay client;
 - NIP-59 welcome publication/delivery into `GroupJoined`;
 - kind `445` group message publication/delivery into `MessageReceived`.
+- publish lifecycle resolution for successful acks, insufficient acks, and
+  relay publish errors;
+- group subscription gating, duplicate relay delivery, out-of-order delivery,
+  and invite group evolution with both commit and welcome outputs.
 
 Run:
 

@@ -88,9 +88,10 @@ This repository now has the main engine candidate:
 The current workspace can exercise the peeler-ingest boundary through
 in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,
 drive a real `AccountDeviceSession` + `NostrTransportAdapter` +
-`NostrMlsPeeler` stack over an in-memory relay client, converge stored OpenMLS
-messages, emit application-visible group events, model losing-branch
-invalidations, and test generated delivery variants.
+`NostrMlsPeeler` stack over an in-memory relay client, cover publish ack/fail
+resolution and basic delivery-chaos cases at that stack boundary, converge
+stored OpenMLS messages, emit application-visible group events, model
+losing-branch invalidations, and test generated delivery variants.
 
 ## Known gaps
 
@@ -106,10 +107,12 @@ invalidations, and test generated delivery variants.
   adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health
   summaries. The SDK owns reconnect/backoff, retry interval adjustment, jitter,
   and relay status mechanics. The session crate now has an in-memory relay
-  integration test that drives NIP-59 welcomes and kind `445` group messages
-  through the real session, adapter, and peeler stack. Production relay auth,
-  app-level relay policy, richer telemetry export, and account key-management
-  wiring still need integration.
+  integration harness that drives NIP-59 welcomes, kind `445` group messages,
+  invite group evolution, insufficient acks, publish errors, subscription
+  gating, duplicate delivery, and reordered delivery through the real session,
+  adapter, and peeler stack. Production relay auth, app-level relay policy,
+  richer telemetry export, and account key-management wiring still need
+  integration.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library
