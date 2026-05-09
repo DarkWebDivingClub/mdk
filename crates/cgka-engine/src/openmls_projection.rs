@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::group::Member;
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::prelude::{
@@ -379,7 +379,12 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
         if !record_state_can_contribute_to_openmls_graph(record.state) {
             continue;
         }
-        let message = transport_message_from_record(&record)?;
+        let Some(message) = openmls_wire_message_from_record(&record)? else {
+            continue;
+        };
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            continue;
+        }
         let projection = project_mls_message(&message.payload)?;
         let source_epoch = projection.source_epoch;
         match projection.kind {
@@ -840,7 +845,7 @@ fn restore_live_message_and_queue_records<S: StorageProvider>(
     Ok(())
 }
 
-fn retain_current_group_epoch_snapshot<S: StorageProvider>(
+pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     max_retained_anchor_rewind: u64,
@@ -914,7 +919,13 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         let record = storage
             .get_message(&message_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        replay_messages.push(transport_message_from_record(&record)?);
+        let Some(message) = openmls_wire_message_from_record(&record)? else {
+            return Err(OpenMlsProjectionError::Decode(format!(
+                "accepted message {} is not a stored OpenMLS wire payload",
+                hex_message_id
+            )));
+        };
+        replay_messages.push(message);
     }
     Ok(replay_messages)
 }
@@ -972,11 +983,12 @@ fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionErro
         .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
 }
 
-fn transport_message_from_record(
+fn openmls_wire_message_from_record(
     record: &MessageRecord,
-) -> Result<TransportMessage, OpenMlsProjectionError> {
-    serde_json::from_slice(&record.payload)
-        .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))
+) -> Result<Option<TransportMessage>, OpenMlsProjectionError> {
+    let payload = StoredMessagePayload::decode(&record.payload)
+        .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+    Ok(payload.as_openmls_wire().cloned())
 }
 
 fn candidate_paths_with_pending_replay_messages(
@@ -1317,7 +1329,7 @@ fn retained_anchor_snapshot_name(epoch: u64) -> String {
     format!("openmls-retained-anchor-{epoch}")
 }
 
-fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64> {
+pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64> {
     name.strip_prefix("openmls-retained-anchor-")?.parse().ok()
 }
 

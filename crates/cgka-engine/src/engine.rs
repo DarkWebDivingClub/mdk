@@ -42,6 +42,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) registry: FeatureRegistry,
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
+    pub(crate) max_past_epochs: usize,
 
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
@@ -75,6 +76,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     registry: FeatureRegistry,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
+    max_past_epochs: usize,
 }
 
 impl<S: StorageProvider> EngineBuilder<S> {
@@ -85,6 +87,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             registry: FeatureRegistry::new(),
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
+            max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
         }
     }
 
@@ -108,6 +111,11 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    pub fn max_past_epochs(mut self, max_past_epochs: usize) -> Self {
+        self.max_past_epochs = max_past_epochs;
+        self
+    }
+
     pub fn build(self) -> Result<Engine<S>, EngineError> {
         let identity_bytes = self
             .identity_bytes
@@ -125,6 +133,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             registry: self.registry,
             peeler,
             ciphersuite: self.ciphersuite,
+            max_past_epochs: self.max_past_epochs,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
@@ -282,7 +291,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
             map,
-            None,
+            Some(group_id.as_slice().to_vec()),
         )))
     }
 

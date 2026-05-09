@@ -32,6 +32,11 @@
 use openmls::group::MlsGroupJoinConfig;
 pub use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 
+/// Default number of past MLS epochs retained for delayed application
+/// messages. This is intentionally small because it trades away some forward
+/// secrecy for delivery robustness.
+pub const DEFAULT_MAX_PAST_EPOCHS: usize = 5;
+
 /// Grep marker: every release checklist item that audits "are we still
 /// shipping pure-plaintext MLS?" should find this. Do NOT remove without
 /// also revisiting `docs/marmot-architecture/further-context/custom_extensions.md`.
@@ -41,7 +46,12 @@ pub const WIRE_FORMAT_POLICY_REVIEW_REQUIRED: &str =
 /// Join config preset used by every group. Separate helper so tests can
 /// swap wire-format policies without forking the whole config.
 pub fn default_join_config() -> MlsGroupJoinConfig {
+    join_config(DEFAULT_MAX_PAST_EPOCHS)
+}
+
+pub fn join_config(max_past_epochs: usize) -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .max_past_epochs(max_past_epochs)
         .build()
 }

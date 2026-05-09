@@ -16,7 +16,7 @@ use crate::capabilities::{
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
-use crate::wire_format::default_join_config;
+use crate::wire_format::join_config;
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::EngineError;
@@ -111,6 +111,7 @@ impl<S: StorageProvider> Engine<S> {
             .ciphersuite(self.ciphersuite)
             .capabilities(leaf_caps)
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .max_past_epochs(self.max_past_epochs)
             .with_group_context_extensions(gc_exts)
             .use_ratchet_tree_extension(true)
             .build();
@@ -301,7 +302,7 @@ impl<S: StorageProvider> Engine<S> {
 
         // 4. Stage + land.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let join_config = default_join_config();
+        let join_config = join_config(self.max_past_epochs);
         let staged = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
             .map_err(|e| EngineError::Backend(format!("stage welcome: {e:?}")))?;
         let mls_group = staged
@@ -468,7 +469,7 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
     Ok(cgka_traits::group_context::GroupContextSnapshot::new(
         EpochId(mls_group.epoch().as_u64()),
         map,
-        None,
+        Some(mls_group.group_id().as_slice().to_vec()),
     ))
 }
 

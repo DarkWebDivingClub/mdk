@@ -2,18 +2,19 @@
 
 In-process multi-client simulator for the CGKA engine. Lets us replay scripted
 scenarios and run property-based invariants against `Engine<MemoryStorage>`
-without a network or transport encryption.
+without real relays. Transport wrapping still goes through the Nostr peeler, so
+group messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift
+wraps over the in-memory bus.
 
 ## What this crate gives you
 
 - `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed delivery (for welcomes), and replay hooks.
-- `HarnessClient` — wraps `Engine<MemoryStorage>` + a `MockPeeler` (skips encryption so tests can assert on inner payloads directly).
+- `HarnessClient` — wraps `Engine<MemoryStorage>` + the real Nostr transport peeler while keeping delivery in memory.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with expected `ScenarioTrace` output.
 - `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families and writes JSON reports.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
-- `MockPeeler` — a deliberately trivial `TransportPeeler` impl. Distinguishes the group-message vs welcome paths but performs no encryption.
 
 ## Run the tests
 
@@ -43,11 +44,15 @@ from `scenario`, serialize their observed trace into the same shape, and
 compare `expected_trace` by value. The trace intentionally avoids OpenMLS
 internals.
 
-`convergence-e2e-group-events/v1` is the full bridge fixture: raw harness
-messages enter through the mock peeler and `ingest`, the convergence engine
-selects a longer canonical branch, and the observed trace records the canonical
-application payload, losing-branch app invalidation, epoch transition, and
-member additions.
+`convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
+than a portable JSON fixture. Raw harness messages enter through the Nostr
+peeler and `ingest`, the convergence engine selects one same-epoch branch, and
+the observed trace records the epoch transition plus selected member addition.
+Delayed past-epoch application messages are also covered: the receiver advances,
+then peels the late transport message from a retained epoch context and emits
+the payload once.
+Future-epoch branch app messages are currently fail-closed at the outer peeler
+until branch-aware outer-message retry is implemented.
 
 ### Fork-recovery vectors are not currently portable
 
@@ -92,8 +97,9 @@ steps are:
 - `clear_partition`
 
 Pending operations are referenced by string labels chosen inside the scenario.
-Client labels are stable logical names; the Rust harness maps them to padded
-32-byte test identities. Queue fault steps select messages by the current
+Client labels are stable logical names; the Rust harness maps them to
+deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the
+same identity shape as production. Queue fault steps select messages by the current
 zero-based queue index at that step. `reorder_queued.order` is a full
 permutation of current queue indices; each entry names which old queue slot
 moves into the next position. `delay_queued` stores selected messages under a
@@ -118,9 +124,10 @@ separate execution path.
 `generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic
 variants of `convergence-e2e-group-events/v1`. Each variant keeps the logical
 branch race stable but mutates queued delivery with duplicate, delay/release,
-and reorder steps before observer clients tick. The expected application
-behavior remains the same: canonical app payload delivered once, losing-branch
-app invalidated, epoch advanced, and selected members added.
+and reorder steps before observer clients tick. Under the real Nostr peeler the
+stable expectation is that observers converge to epoch 2 and one selected
+invitee; future-epoch branch app payload retry is intentionally left out of the
+portable assertion surface for now.
 
 ## Report artifacts
 

@@ -112,6 +112,8 @@ impl<S: StorageProvider> Engine<S> {
                 .create_snapshot(&self.storage, group_id, pre_commit_epoch)?;
         self.epoch_manager
             .record_committed_from(group_id, pre_commit_epoch);
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
         // Produce + stage the GCE commit. Under publish-before-apply we
         // do NOT call `merge_pending_commit` here — the merge + Marmot
@@ -125,7 +127,6 @@ impl<S: StorageProvider> Engine<S> {
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
 
-        let ctx = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let wrapped = self
             .peeler
             .wrap_group_message(
@@ -133,7 +134,7 @@ impl<S: StorageProvider> Engine<S> {
                     ciphertext: commit_bytes.clone(),
                     aad: vec![],
                 },
-                &ctx,
+                &pre_commit_ctx,
             )
             .await
             .map_err(EngineError::Peeler)?;
@@ -143,7 +144,12 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..wrapped
         };
-        self.record_sent_message(&wrapped, group_id, pre_commit_epoch)?;
+        self.record_sent_openmls_message(
+            &wrapped,
+            commit_bytes.as_slice(),
+            group_id,
+            pre_commit_epoch,
+        )?;
 
         // State: PendingPublish at the projected post-merge epoch (+1).
         let new_epoch = EpochId(pre_commit_epoch.0 + 1);

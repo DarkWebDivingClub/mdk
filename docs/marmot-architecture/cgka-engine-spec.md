@@ -122,6 +122,18 @@ MUST NOT require string parsing by the caller.
 During `PendingPublish` or `Merging`, inbound group messages MAY be buffered.
 The engine MUST replay buffered messages when the group returns to `Stable`.
 
+Stored message payloads are typed:
+
+- `RawTransport`: the original transport-wrapped message, kept for retry when
+  peeling is not yet possible.
+- `OpenMlsWire`: the same transport metadata with `payload` replaced by peeled
+  MLS wire bytes, used by canonicalization and OpenMLS replay.
+
+For group messages, the engine MUST first peel with the current MLS exporter
+context. If that fails and retained epoch snapshots are available, it SHOULD
+try those retained contexts newest-to-oldest within the retention window before
+classifying the message as `PeelDeferred`.
+
 ## Welcomes
 
 A welcome join lands the recipient at the post-commit epoch carried by the
@@ -343,6 +355,8 @@ Application-message rules:
 
 - A message that decrypts on the selected branch and is within the MLS
   past-epoch decryption limit MUST be emitted as `GroupEvent::MessageReceived`.
+- A transport-wrapped application message for a past epoch SHOULD be retried
+  against retained epoch contexts before it is left in `PeelDeferred`.
 - A message that decrypts only on a losing branch MUST be reported as
   `GroupEvent::AppMessageInvalidated`.
 - A message older than the MLS past-epoch decryption limit MUST expire.
@@ -384,7 +398,8 @@ Required storage:
 - retained Marmot and OpenMLS snapshots from current tip back through
   `max_rewind_commits`,
 - durable message records for retained commits, proposals, app messages, and
-  welcomes,
+  welcomes, with typed stored payloads distinguishing raw transport bytes from
+  peeled OpenMLS wire bytes,
 - message states and dispositions,
 - pending commits, proposals, and application messages still inside retention,
 - decrypted payload references retained by application policy,

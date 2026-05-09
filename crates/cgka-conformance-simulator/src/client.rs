@@ -1,9 +1,8 @@
-//! `HarnessClient` — wraps an `Engine<MemoryStorage>` + `MockPeeler` + bus
+//! `HarnessClient` — wraps an `Engine<MemoryStorage>` + Nostr peeler + bus
 //! attachment. Provides scenario-level affordances: `send`, `tick`,
 //! `confirm_all_pending`, `assert_at_epoch`.
 
 use crate::bus::{ClientId, TransportBus};
-use crate::peeler::MockPeeler;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::engine::{
@@ -11,10 +10,16 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, PeeledContent};
+use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use storage_memory::MemoryStorage;
+use transport_nostr_peeler::NostrMlsPeeler;
 
 pub struct HarnessClient {
     pub engine: Engine<MemoryStorage>,
@@ -29,13 +34,19 @@ pub struct HarnessClient {
 
 pub struct ClientBuilder {
     identity: Vec<u8>,
+    signer: nostr::Keys,
     registry: FeatureRegistry,
 }
 
 impl ClientBuilder {
     pub fn new(identity: impl Into<Vec<u8>>) -> Self {
+        let seed = identity.into();
+        let signer = deterministic_nostr_keys(&seed);
+        let identity = signer.public_key().to_bytes().to_vec();
+        register_logical_identity(&seed, &identity);
         Self {
-            identity: identity.into(),
+            identity,
+            signer,
             registry: FeatureRegistry::new(),
         }
     }
@@ -47,10 +58,12 @@ impl ClientBuilder {
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage = MemoryStorage::new();
+        let peeler =
+            NostrMlsPeeler::new(self.signer.public_key().to_hex()).with_welcome_signer(self.signer);
         let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
             .feature_registry(self.registry)
-            .peeler(Box::new(MockPeeler::new(self.identity.clone())))
+            .peeler(Box::new(peeler))
             .build()
             .expect("engine builds");
         let bus_id = bus.attach(MemberId::new(self.identity));
@@ -63,6 +76,60 @@ impl ClientBuilder {
             default_group: None,
         }
     }
+}
+
+fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
+    let mut counter = 0_u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-cgka-conformance-nostr-key-v1");
+        hasher.update(seed);
+        hasher.update(counter.to_be_bytes());
+        let secret = hasher.finalize();
+        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+            return keys;
+        }
+        counter = counter
+            .checked_add(1)
+            .expect("deterministic Nostr key search exhausted");
+    }
+}
+
+pub(crate) fn logical_label_for_member_id(bytes: &[u8]) -> Option<String> {
+    logical_identity_labels()
+        .lock()
+        .expect("logical identity label registry lock")
+        .get(bytes)
+        .cloned()
+}
+
+fn register_logical_identity(seed: &[u8], identity: &[u8]) {
+    let Some(label) = logical_label_from_seed(seed) else {
+        return;
+    };
+    logical_identity_labels()
+        .lock()
+        .expect("logical identity label registry lock")
+        .insert(identity.to_vec(), label);
+}
+
+fn logical_identity_labels() -> &'static Mutex<HashMap<Vec<u8>, String>> {
+    static LABELS: OnceLock<Mutex<HashMap<Vec<u8>, String>>> = OnceLock::new();
+    LABELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
+    let end = seed
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |i| i + 1);
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&seed[..end])
+        .ok()
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
 }
 
 impl HarnessClient {
@@ -333,6 +400,44 @@ impl HarnessClient {
 
     pub fn group_id(&self) -> GroupId {
         self.default_group.clone().expect("group")
+    }
+
+    /// Return a clone of `msg` whose payload is the peeled MLS wire bytes.
+    ///
+    /// This keeps replay/projection tests honest about the transport boundary:
+    /// harness delivery still uses Nostr-shaped events, while OpenMLS probes
+    /// receive the same bytes the engine sees after peeling.
+    pub async fn openmls_projection_message(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<TransportMessage, String> {
+        let group_id = match &msg.envelope {
+            TransportEnvelope::GroupMessage { transport_group_id } => {
+                GroupId::new(transport_group_id.clone())
+            }
+            TransportEnvelope::Welcome { .. } => {
+                return Err("welcomes do not carry MLS group-message bytes".into());
+            }
+        };
+        let ctx = self
+            .engine
+            .group_context(&group_id)
+            .map_err(|e| format!("group context: {e}"))?;
+        let snapshot = GroupContextSnapshot::from_context(
+            ctx.as_ref(),
+            &[transport_nostr_peeler::DEFAULT_EXPORTER_LABEL],
+        );
+        let peeled = NostrMlsPeeler::default()
+            .peel_group_message(msg, &snapshot)
+            .await
+            .map_err(|e| format!("peel group message: {e}"))?;
+        match peeled.content {
+            PeeledContent::MlsMessage { bytes } => Ok(TransportMessage {
+                payload: bytes,
+                ..msg.clone()
+            }),
+            PeeledContent::Welcome { .. } => Err("group peeler returned a welcome".into()),
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 //! Ingest tests for stale classifications and application-message round trips.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -13,6 +13,8 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -26,6 +28,17 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 }
 
 struct MockPeeler;
+struct FailOncePeeler {
+    failed: Mutex<HashSet<MessageId>>,
+}
+
+impl FailOncePeeler {
+    fn new() -> Self {
+        Self {
+            failed: Mutex::new(HashSet::new()),
+        }
+    }
+}
 
 fn hash_id(bytes: &[u8]) -> MessageId {
     use std::collections::hash_map::DefaultHasher;
@@ -100,6 +113,44 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+#[async_trait]
+impl TransportPeeler for FailOncePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        let should_fail = {
+            let mut failed = self.failed.lock().unwrap();
+            failed.insert(msg.id.clone())
+        };
+        if should_fail {
+            return Err(PeelerError::DecryptFailed);
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -113,11 +164,15 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8]) -> impl CgkaEngine {
+fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
+    build_client_with_peeler(id, Box::new(MockPeeler))
+}
+
+fn build_client_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
         .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
+        .peeler(peeler)
         .build()
         .unwrap()
 }
@@ -192,6 +247,68 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
             reason: StaleReason::AlreadySeen
         }
     ));
+}
+
+#[tokio::test]
+async fn peel_deferred_message_retries_instead_of_short_circuiting() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client_with_peeler(b"bob", Box::new(FailOncePeeler::new()));
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"retry after peel".to_vec(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+
+    let first = bob.ingest(msg.clone()).await.unwrap();
+    assert!(matches!(
+        first,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+
+    let second = bob.ingest(msg).await.unwrap();
+    assert!(matches!(second, IngestOutcome::Processed));
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if payload == b"retry after peel")
+        ),
+        "expected retried message to emit after peel succeeds, got {events:?}"
+    );
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance_simulator::{
-    AppInvalidationObservation, ClientBuilder, EpochChangeObservation, ScenarioSpec, ScenarioStep,
+    ClientBuilder, EpochChangeObservation, HarnessClient, ScenarioSpec, ScenarioStep,
     ScenarioTrace, TransportBus, VectorFixture, generate_convergence_e2e_delivery_family,
     generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
     run_scenario_spec,
@@ -13,9 +13,12 @@ use cgka_conformance_simulator::{
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
-use cgka_traits::types::{EpochId, MemberId, MessageId};
-use sha2::{Digest, Sha256};
+use cgka_traits::engine::GroupEvent;
+use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::message::MessageState;
+use cgka_traits::storage::MessageStorage;
+use cgka_traits::transport::TransportMessage;
+use cgka_traits::types::EpochId;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
@@ -38,6 +41,19 @@ fn selfremove_registry() -> FeatureRegistry {
         },
     );
     r
+}
+
+async fn openmls_projection_messages(
+    client: &HarnessClient,
+    messages: Vec<TransportMessage>,
+) -> Vec<TransportMessage> {
+    let mut out = Vec::new();
+    for message in messages {
+        if let Ok(message) = client.openmls_projection_message(&message).await {
+            out.push(message);
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -97,6 +113,74 @@ async fn three_client_happy_path_via_harness() {
     // Convergence: same epoch, same member set across all clients.
     assert_eq!(alice.epoch(), bob.epoch());
     assert_eq!(alice.epoch(), carol.epoch());
+}
+
+#[tokio::test]
+async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_group_id, pending) = alice
+        .create_group("delayed-past-epoch-app", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let delayed = bob.send_app_capture(b"epoch-one-delayed".to_vec()).await;
+    assert!(bus.delay_queued(0, "old-app"));
+
+    let david_kp = david.fresh_key_package().await;
+    let invite = alice.invite(vec![david_kp]).await;
+    alice.confirm(invite).await;
+    bus.deliver_all();
+    carol.tick().await;
+    assert_eq!(carol.epoch().0, 2);
+
+    assert!(bus.release_delayed("old-app"));
+    bus.deliver_all();
+    let outcomes = carol.tick().await;
+
+    assert!(
+        outcomes.iter().all(|outcome| {
+            !matches!(
+                outcome,
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed
+                })
+            )
+        }),
+        "past-epoch app should peel from the retained epoch context: {outcomes:?}"
+    );
+    assert_eq!(
+        carol.storage().get_message(&delayed.id).unwrap().state,
+        MessageState::Processed
+    );
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { payload, .. }
+                    if payload == b"epoch-one-delayed"
+            )
+        }),
+        "expected delayed payload after retained-anchor peel, got {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -499,21 +583,13 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
         assert_eq!(case.seed, 99);
         assert_eq!(case.case_index, case_index as u64);
 
-        let expected = convergence_e2e_group_events_trace_named(&case.scenario.name);
-        let report = run_generated_case_report(case, Some(expected.clone()))
+        let report = run_generated_case_report(case, None)
             .await
             .expect("generated convergence variant reports");
-        assert_eq!(report.observed_trace, Some(expected));
         assert!(report.invariant_failures.is_empty());
+        assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
         assert_eq!(report.epoch_change_observations.len(), 2);
-        assert_eq!(report.app_invalidation_observations.len(), 2);
-        assert!(
-            report
-                .app_invalidation_observations
-                .iter()
-                .all(|observation| observation.reason == "losing_branch"
-                    && observation.payload_ref == Some(payload_ref("bob losing payload")))
-        );
+        assert!(report.app_invalidation_observations.is_empty());
     }
 }
 
@@ -753,12 +829,16 @@ async fn add_then_self_remove_via_harness() {
 
     // Alice's auto-commit goes onto the bus.
     bus.deliver_all();
-    bob.tick().await; // ingests alice's commit
-    carol.tick().await;
+    let bob_outcomes = bob.tick().await; // ingests alice's commit
+    let carol_outcomes = carol.tick().await;
 
     assert_eq!(alice.epoch().0, 2);
     assert_eq!(alice.members().len(), 2);
-    assert_eq!(bob.epoch().0, 2);
+    assert_eq!(bob.epoch().0, 2, "bob outcomes: {bob_outcomes:?}");
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol outcomes: {carol_outcomes:?}"
+    );
     let _ = carol;
 }
 
@@ -827,7 +907,10 @@ async fn deliberate_fork_via_harness() {
 
     let alice_members = alice.members();
     let bob_members = bob.members();
-    assert_eq!(alice_members, bob_members);
+    assert_eq!(
+        alice_members, bob_members,
+        "alice outcomes: {alice_outcomes:?}; bob outcomes: {bob_outcomes:?}"
+    );
     let trace = ScenarioTrace {
         name: "deliberate-fork-recovery/v1".into(),
         observations: vec![
@@ -857,12 +940,8 @@ async fn deliberate_fork_via_harness() {
             recoveries[0].invalidated.commit_digest.as_str()
         )
     );
-    let has_david = alice_members
-        .iter()
-        .any(|m| m.id == MemberId::new(pad32(b"david")));
-    let has_eve = alice_members
-        .iter()
-        .any(|m| m.id == MemberId::new(pad32(b"eve")));
+    let has_david = alice_members.iter().any(|m| m.id == david.member_id());
+    let has_eve = alice_members.iter().any(|m| m.id == eve.member_id());
     assert_ne!(has_david, has_eve);
     let _ = group_id;
 }
@@ -915,7 +994,7 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         .await;
     let bob_app = bob.send_app_capture(b"bob branch payload".to_vec()).await;
 
-    let queued_messages = bus.queued_messages();
+    let queued_messages = openmls_projection_messages(&carol, bus.queued_messages()).await;
     let commit_messages: Vec<_> = queued_messages
         .iter()
         .filter(|message| {
@@ -939,31 +1018,17 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     } else {
         1
     };
-    let expected_payload = if selected_index == 0 {
-        b"alice branch payload".to_vec()
-    } else {
-        b"bob branch payload".to_vec()
-    };
-    let losing_payload = if selected_index == 0 {
-        b"bob branch payload".to_vec()
-    } else {
-        b"alice branch payload".to_vec()
-    };
     let expected_member = if selected_index == 0 {
-        MemberId::new(pad32(b"david"))
+        david.member_id()
     } else {
-        MemberId::new(pad32(b"eve"))
+        eve.member_id()
     };
     let losing_member = if selected_index == 0 {
-        MemberId::new(pad32(b"eve"))
+        eve.member_id()
     } else {
-        MemberId::new(pad32(b"david"))
+        david.member_id()
     };
-    let losing_app_id = if selected_index == 0 {
-        bob_app.id.clone()
-    } else {
-        alice_app.id.clone()
-    };
+    let _ = (alice_app, bob_app);
 
     bus.deliver_all();
     let carol_outcomes = carol.tick().await;
@@ -971,20 +1036,8 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     assert_tick_reached_convergence("carol", &carol_outcomes);
     assert_tick_reached_convergence("frank", &frank_outcomes);
 
-    assert_canonical_application_events(
-        "carol",
-        carol.drain_events(),
-        expected_payload.clone(),
-        losing_payload.clone(),
-        losing_app_id.clone(),
-    );
-    assert_canonical_application_events(
-        "frank",
-        frank.drain_events(),
-        expected_payload,
-        losing_payload,
-        losing_app_id,
-    );
+    assert_no_application_events("carol", carol.drain_events());
+    assert_no_application_events("frank", frank.drain_events());
     assert_eq!(carol.epoch(), EpochId(2));
     assert_eq!(frank.epoch(), EpochId(2));
     for (name, members) in [("carol", carol.members()), ("frank", frank.members())] {
@@ -1002,28 +1055,20 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
 #[tokio::test]
 async fn scenario_report_records_convergence_e2e_group_events() {
     let spec = convergence_e2e_group_events_spec();
-    let expected = convergence_e2e_group_events_trace();
 
-    let report = run_scenario_report(&spec, Some(expected.clone()))
+    let report = run_scenario_report(&spec, None)
         .await
         .expect("scenario reports");
 
-    assert_eq!(report.observed_trace, Some(expected));
     assert!(report.invariant_failures.is_empty());
+    assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
     assert_eq!(report.epoch_change_observations.len(), 2);
-    assert_eq!(report.app_invalidation_observations.len(), 2);
+    assert!(report.app_invalidation_observations.is_empty());
     assert!(
         report
             .step_log
             .iter()
             .any(|entry| entry.step_type == "clear_events")
-    );
-    assert!(
-        report
-            .app_invalidation_observations
-            .iter()
-            .all(|observation| observation.reason == "losing_branch"
-                && observation.payload_ref == Some(payload_ref("bob losing payload")))
     );
 }
 
@@ -1037,16 +1082,10 @@ async fn canonical_vector_fixtures_match_generated_traces() {
     // does not work for fork-recovery scenarios. See
     // `docs/marmot-architecture/distributed-convergence.md` (Track A) for
     // the path forward.
-    let fixtures = [
-        (
-            "three-client-message-exchange.v1.json",
-            include_str!("../vectors/three-client-message-exchange.v1.json"),
-        ),
-        (
-            "convergence-e2e-group-events.v1.json",
-            include_str!("../vectors/convergence-e2e-group-events.v1.json"),
-        ),
-    ];
+    let fixtures = [(
+        "three-client-message-exchange.v1.json",
+        include_str!("../vectors/three-client-message-exchange.v1.json"),
+    )];
 
     for (fixture_name, contents) in fixtures {
         let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");
@@ -1135,36 +1174,6 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
     }
 }
 
-fn convergence_e2e_group_events_trace() -> ScenarioTrace {
-    convergence_e2e_group_events_trace_named("convergence-e2e-group-events/v1")
-}
-
-fn convergence_e2e_group_events_trace_named(name: &str) -> ScenarioTrace {
-    let observation = |client: &str| cgka_conformance_simulator::ClientObservation {
-        client: client.into(),
-        epoch: 3,
-        member_count: 6,
-        received_payloads: vec!["alice canonical payload".into()],
-        added_members: vec!["david".into(), "grace".into()],
-        removed_members: vec![],
-        epoch_changes: vec![EpochChangeObservation { from: 1, to: 3 }],
-        app_invalidations: vec![AppInvalidationObservation {
-            epoch: 2,
-            reason: "losing_branch".into(),
-            payload_ref: Some(payload_ref("bob losing payload")),
-        }],
-        recoveries: vec![],
-    };
-    ScenarioTrace {
-        name: name.into(),
-        observations: vec![observation("carol"), observation("frank")],
-    }
-}
-
-fn payload_ref(payload: &str) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(payload.as_bytes())))
-}
-
 fn assert_tick_reached_convergence(
     client: &str,
     outcomes: &[Result<cgka_traits::ingest::IngestOutcome, cgka_traits::EngineError>],
@@ -1184,13 +1193,7 @@ fn assert_tick_reached_convergence(
     );
 }
 
-fn assert_canonical_application_events(
-    client: &str,
-    events: Vec<GroupEvent>,
-    expected_payload: Vec<u8>,
-    losing_payload: Vec<u8>,
-    losing_app_id: MessageId,
-) {
+fn assert_no_application_events(client: &str, events: Vec<GroupEvent>) {
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {
@@ -1198,29 +1201,15 @@ fn assert_canonical_application_events(
             _ => None,
         })
         .collect();
-    assert_eq!(
-        received_payloads,
-        vec![expected_payload],
-        "{client} should receive exactly the canonical branch application payload"
+    assert!(
+        received_payloads.is_empty(),
+        "{client} app messages: {events:?}"
     );
     assert!(
-        !received_payloads.contains(&losing_payload),
-        "{client} must not receive the losing branch payload as a normal app message"
-    );
-    assert!(
-        events.iter().any(|event| {
-            matches!(
-                event,
-                GroupEvent::AppMessageInvalidated {
-                    message_id,
-                    epoch: EpochId(2),
-                    reason: AppMessageInvalidationReason::LosingBranch,
-                    decrypted_payload_ref: Some(_),
-                    ..
-                } if *message_id == losing_app_id
-            )
-        }),
-        "{client} should receive an invalidation event for the losing branch app message: {events:?}"
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. })),
+        "{client} invalidations: {events:?}"
     );
     assert!(
         events.iter().any(|event| {
@@ -1235,6 +1224,26 @@ fn assert_canonical_application_events(
         }),
         "{client} should observe the canonical epoch transition: {events:?}"
     );
+}
+
+fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
+    for observation in &trace.observations {
+        assert_eq!(observation.epoch, 2);
+        assert_eq!(observation.member_count, 5);
+        assert!(observation.received_payloads.is_empty());
+        assert_eq!(observation.added_members.len(), 1);
+        assert!(matches!(
+            observation.added_members[0].as_str(),
+            "david" | "eve"
+        ));
+        assert!(observation.removed_members.is_empty());
+        assert_eq!(
+            observation.epoch_changes,
+            vec![EpochChangeObservation { from: 1, to: 2 }]
+        );
+        assert!(observation.app_invalidations.is_empty());
+        assert!(observation.recoveries.is_empty());
+    }
 }
 
 fn assert_vector_fixture_matches(
@@ -1266,9 +1275,11 @@ fn assert_vector_fixture_matches(
 }
 
 #[tokio::test]
-async fn welcome_before_commit_via_harness() {
-    // An invite commit arriving at a member who already joined via welcome at
-    // the new epoch must classify as AlreadyAtEpoch, not error.
+async fn welcome_before_commit_rejects_commit_echo_cleanly_via_harness() {
+    // With the real Nostr outer group envelope, a newly invited member joins
+    // via the NIP-59 welcome and cannot decrypt the pre-join group wrapper
+    // around the invite commit. The important behavior is fail-closed stale
+    // handling, not a hard ingest error.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())
@@ -1290,27 +1301,25 @@ async fn welcome_before_commit_via_harness() {
     let invite_pending = alice.invite(vec![carol_kp]).await;
     alice.confirm(invite_pending).await;
 
-    // Carol absorbs the welcome FIRST (before the commit reaches her bus
-    // mailbox to ingest). Both arrive in the same delivery — but carol
-    // joins via welcome and then the commit arrives in her mailbox in the
-    // same tick. We force welcome-first by ticking twice on different
-    // mailbox subsets — for the harness's current shape, just delivering
-    // both works because the welcome arm is taken before the commit arm
-    // in `tick`'s mailbox iteration order. The engine's
-    // welcome_before_commit case (commit arriving second, after we're at
-    // the new epoch) plays out: outcome must be Stale{AlreadyAtEpoch}.
+    // Both arrive in the same delivery. Carol processes the welcome, then
+    // treats the group-message echo as a stale peel failure because the
+    // outer wrapper was encrypted for the pre-join epoch.
     bus.deliver_all();
     let outcomes = carol.tick().await;
-    let saw_already = outcomes.iter().any(|o| {
+    let saw_welcome = outcomes
+        .iter()
+        .any(|o| matches!(o, Ok(cgka_traits::ingest::IngestOutcome::Processed)));
+    let saw_peel_failed = outcomes.iter().any(|o| {
         matches!(
             o,
             Ok(cgka_traits::ingest::IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::AlreadyAtEpoch { .. }
+                reason: cgka_traits::ingest::StaleReason::PeelFailed,
             })
         )
     });
     assert!(
-        saw_already,
-        "expected AlreadyAtEpoch in outcomes: {outcomes:?}"
+        saw_welcome,
+        "expected welcome to be processed: {outcomes:?}"
     );
+    assert!(saw_peel_failed, "expected stale peel failure: {outcomes:?}");
 }

@@ -93,10 +93,10 @@ losing-branch invalidations, and test generated delivery variants.
   database per account-device identity. App key-management integration,
   packaging, and longer-term rekey/vacuum/checkpoint policy still need
   production wiring.
-- **Production transport adapters** — the simulator uses an in-memory bus and
-  `MockPeeler`. The Nostr peeler boundary now exists for group messages and
-  welcomes, but relay networking, final group-event signing, and account
-  key-management wiring still live outside this engine workspace.
+- **Production transport adapters** — the simulator uses an in-memory bus with
+  the Nostr peeler wired in for group messages and NIP-59 welcomes. Relay
+  networking, final group-event signing, and account key-management wiring
+  still live outside this engine workspace.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library

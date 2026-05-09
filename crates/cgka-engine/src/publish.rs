@@ -61,6 +61,7 @@ impl<S: StorageProvider> Engine<S> {
         // staged_commit.add_proposals() exposes each new member's KeyPackage
         // leaf node. After merge the staged commit is consumed.
         if let Some(staged) = mls_group.pending_commit() {
+            self.retain_current_epoch_snapshot_for_group(&group_id)?;
             crate::capability_manager::cache_from_staged_commit(&self.storage, &group_id, staged)?;
             mls_group
                 .merge_pending_commit(&provider)

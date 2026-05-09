@@ -95,6 +95,8 @@ impl<S: StorageProvider> Engine<S> {
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
         // Stage the GCE commit. Don't merge — confirm path does that.
         let (commit_out, _welcome_opt, _gi) = mls_group
@@ -104,7 +106,6 @@ impl<S: StorageProvider> Engine<S> {
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
 
-        let ctx = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let wrapped = self
             .peeler
             .wrap_group_message(
@@ -112,7 +113,7 @@ impl<S: StorageProvider> Engine<S> {
                     ciphertext: commit_bytes.clone(),
                     aad: vec![],
                 },
-                &ctx,
+                &pre_commit_ctx,
             )
             .await
             .map_err(EngineError::Peeler)?;
@@ -122,7 +123,12 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..wrapped
         };
-        self.record_sent_message(&wrapped, &group_id, pre_commit_epoch)?;
+        self.record_sent_openmls_message(
+            &wrapped,
+            commit_bytes.as_slice(),
+            &group_id,
+            pre_commit_epoch,
+        )?;
 
         // Mirror the projected name/description in the Marmot record at
         // send time (rolled back on publish_failed via the stored data

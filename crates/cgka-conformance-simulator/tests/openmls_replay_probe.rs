@@ -12,7 +12,7 @@ use cgka_conformance_simulator::openmls_projection::{
     canonicalize_stored_openmls_messages, materialize_openmls_candidate_paths,
     persist_openmls_canonicalization_dispositions, project_mls_message, replay_openmls_messages,
 };
-use cgka_conformance_simulator::{ClientBuilder, TransportBus};
+use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -57,6 +57,43 @@ fn one_rewind_policy() -> CanonicalizationPolicy {
     }
 }
 
+async fn openmls_projection_message(
+    client: &HarnessClient,
+    msg: &TransportMessage,
+) -> TransportMessage {
+    client
+        .openmls_projection_message(msg)
+        .await
+        .expect("transport message peels to MLS projection bytes")
+}
+
+async fn openmls_projection_messages(
+    client: &HarnessClient,
+    messages: Vec<TransportMessage>,
+) -> Vec<TransportMessage> {
+    let mut out = Vec::new();
+    for message in messages {
+        if let Ok(message) = client.openmls_projection_message(&message).await {
+            out.push(message);
+        }
+    }
+    out
+}
+
+async fn queued_commit_messages(
+    client: &HarnessClient,
+    bus: &TransportBus,
+) -> Vec<TransportMessage> {
+    openmls_projection_messages(client, bus.queued_messages())
+        .await
+        .into_iter()
+        .filter(|msg| {
+            project_mls_message(&msg.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     let bus = TransportBus::ordered();
@@ -81,6 +118,7 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     carol.tick().await;
 
     let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     assert_projected_kind(&proposal_msg, OpenMlsContentKind::Proposal, 1);
 
     bus.deliver_all();
@@ -90,13 +128,10 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
         "alice should process bob's proposal and auto-commit: {alice_outcomes:?}"
     );
 
-    let commit_msg = bus
-        .queued_messages()
+    let commit_msg = queued_commit_messages(&carol, &bus)
+        .await
         .into_iter()
-        .find(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
+        .next()
         .expect("alice auto-published a commit");
     assert_projected_kind(&commit_msg, OpenMlsContentKind::Commit, 1);
 
@@ -171,14 +206,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
     let _alice_pending = alice.invite(vec![david_kp]).await;
     let _bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(
         commit_messages.len(),
         2,
@@ -291,19 +319,17 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
     carol.tick().await;
 
     let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     bus.deliver_all();
     let alice_outcomes = alice.tick().await;
     assert!(
         alice_outcomes.iter().all(Result::is_ok),
         "alice should process bob's proposal and auto-commit: {alice_outcomes:?}"
     );
-    let commit_msg = bus
-        .queued_messages()
+    let commit_msg = queued_commit_messages(&carol, &bus)
+        .await
         .into_iter()
-        .find(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
+        .next()
         .expect("alice auto-published a commit");
 
     let result = canonicalize_openmls_batch(
@@ -384,14 +410,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
     let alice_pending = alice.invite(vec![david_kp]).await;
     let bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
 
     let first_digest = project_mls_message(&commit_messages[0].payload)
@@ -405,13 +424,16 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
 
     let app_msg = if app_branch_index == 0 {
         alice.confirm(alice_pending).await;
-        alice
+        let msg = alice
             .send_app_capture(b"witness from higher digest branch".to_vec())
-            .await
+            .await;
+        openmls_projection_message(&alice, &msg).await
     } else {
         bob.confirm(bob_pending).await;
-        bob.send_app_capture(b"witness from higher digest branch".to_vec())
-            .await
+        let msg = bob
+            .send_app_capture(b"witness from higher digest branch".to_vec())
+            .await;
+        openmls_projection_message(&bob, &msg).await
     };
 
     let result = canonicalize_openmls_batch(
@@ -501,14 +523,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
     let alice_pending = alice.invite(vec![david_kp]).await;
     let bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
 
     let first_digest = project_mls_message(&commit_messages[0].payload)
@@ -521,13 +536,16 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
 
     let app_msg = if app_branch_index == 0 {
         alice.confirm(alice_pending).await;
-        alice
+        let msg = alice
             .send_app_capture(b"stored witness from higher digest branch".to_vec())
-            .await
+            .await;
+        openmls_projection_message(&alice, &msg).await
     } else {
         bob.confirm(bob_pending).await;
-        bob.send_app_capture(b"stored witness from higher digest branch".to_vec())
-            .await
+        let msg = bob
+            .send_app_capture(b"stored witness from higher digest branch".to_vec())
+            .await;
+        openmls_projection_message(&bob, &msg).await
     };
 
     store_created_message(carol.storage(), &group_id, &commit_messages[0]);
@@ -609,14 +627,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
     let alice_pending = alice.invite(vec![david_kp]).await;
     let bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
 
     let first_digest = project_mls_message(&commit_messages[0].payload)
@@ -630,13 +641,16 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
 
     let app_msg = if app_branch_index == 0 {
         alice.confirm(alice_pending).await;
-        alice
+        let msg = alice
             .send_app_capture(b"persisted witness from higher digest branch".to_vec())
-            .await
+            .await;
+        openmls_projection_message(&alice, &msg).await
     } else {
         bob.confirm(bob_pending).await;
-        bob.send_app_capture(b"persisted witness from higher digest branch".to_vec())
-            .await
+        let msg = bob
+            .send_app_capture(b"persisted witness from higher digest branch".to_vec())
+            .await;
+        openmls_projection_message(&bob, &msg).await
     };
 
     store_created_message(carol.storage(), &group_id, &commit_messages[0]);
@@ -717,14 +731,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
     let alice_pending = alice.invite(vec![david_kp]).await;
     let bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
 
     let first_digest = project_mls_message(&commit_messages[0].payload)
@@ -738,13 +745,16 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
 
     let app_msg = if app_branch_index == 0 {
         alice.confirm(alice_pending).await;
-        alice
+        let msg = alice
             .send_app_capture(b"applied witness from higher digest branch".to_vec())
-            .await
+            .await;
+        openmls_projection_message(&alice, &msg).await
     } else {
         bob.confirm(bob_pending).await;
-        bob.send_app_capture(b"applied witness from higher digest branch".to_vec())
-            .await
+        let msg = bob
+            .send_app_capture(b"applied witness from higher digest branch".to_vec())
+            .await;
+        openmls_projection_message(&bob, &msg).await
     };
 
     store_created_message(carol.storage(), &group_id, &commit_messages[0]);
@@ -858,14 +868,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
     let eve_kp = eve.fresh_key_package().await;
     let _alice_pending = alice.invite(vec![david_kp]).await;
     let _bob_pending = bob.invite(vec![eve_kp]).await;
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
     let online_commit = commit_messages[0].clone();
     let late_commit = commit_messages[1].clone();
@@ -965,14 +968,7 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
     let eve_kp = eve.fresh_key_package().await;
     let _alice_pending = alice.invite(vec![david_kp]).await;
     let _bob_pending = bob.invite(vec![eve_kp]).await;
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
     let online_commit = commit_messages[0].clone();
     let late_commit = commit_messages[1].clone();
@@ -1064,25 +1060,18 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
 
     let frank_kp = frank.fresh_key_package().await;
     let _bob_pending = bob.invite(vec![frank_kp]).await;
-    let stale_commit = bus
-        .queued_messages()
+    let stale_commit = queued_commit_messages(&carol, &bus)
+        .await
         .into_iter()
-        .find(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
+        .next()
         .expect("bob emitted stale commit");
 
     let david_kp = david.fresh_key_package().await;
     let alice_pending = alice.invite(vec![david_kp]).await;
-    let commit_david = bus
-        .queued_messages()
+    let commit_david = queued_commit_messages(&carol, &bus)
+        .await
         .into_iter()
-        .find(|msg| {
-            msg.id != stale_commit.id
-                && project_mls_message(&msg.payload)
-                    .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
+        .find(|msg| msg.id != stale_commit.id)
         .expect("alice emitted david commit");
     store_created_message(carol.storage(), &group_id, &commit_david);
     let david_result = canonicalize_stored_openmls_messages(
@@ -1110,15 +1099,10 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
 
     let eve_kp = eve.fresh_key_package().await;
     let _eve_pending = alice.invite(vec![eve_kp]).await;
-    let commit_eve = bus
-        .queued_messages()
+    let commit_eve = queued_commit_messages(&carol, &bus)
+        .await
         .into_iter()
-        .find(|msg| {
-            msg.id != stale_commit.id
-                && msg.id != commit_david.id
-                && project_mls_message(&msg.payload)
-                    .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
+        .find(|msg| msg.id != stale_commit.id && msg.id != commit_david.id)
         .expect("alice emitted eve commit");
     store_created_message(carol.storage(), &group_id, &commit_eve);
     let eve_result = canonicalize_stored_openmls_messages(
@@ -1213,14 +1197,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
     let _alice_pending = alice.invite(vec![david_kp]).await;
     let _bob_pending = bob.invite(vec![eve_kp]).await;
 
-    let commit_messages: Vec<_> = bus
-        .queued_messages()
-        .into_iter()
-        .filter(|msg| {
-            project_mls_message(&msg.payload)
-                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
-        })
-        .collect();
+    let commit_messages = queued_commit_messages(&carol, &bus).await;
     assert_eq!(commit_messages.len(), 2);
 
     store_created_message(carol.storage(), &group_id, &commit_messages[0]);

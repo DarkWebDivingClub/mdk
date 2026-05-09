@@ -249,12 +249,12 @@ Engine integration and OpenMLS conformance tests also cover:
 - retained anchor pruning by `max_rewind_commits`,
 - stale commits older than the retained anchor invalidated,
 - retained-anchor replay and stale invalidation after engine rebuild,
-- peeler-ingest to `GroupEvent` output across multiple in-memory clients,
-  including canonical app delivery and losing-branch app invalidation. The
-  portable fixture is
-  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance-simulator/vectors/convergence-e2e-group-events.v1.json),
-  and the generated `convergence-e2e-delivery/v1` family exercises the same
-  contract under duplicated, delayed, and reordered queued delivery.
+- delayed past-epoch application messages peeled from retained epoch contexts,
+- peeler-ingest to `GroupEvent` output across multiple in-memory clients using
+  the real Nostr peeler over an in-memory bus. This currently proves selected
+  branch epoch/member events; future-epoch branch app payload retry remains an
+  implementation gap because those outer messages cannot be decrypted until a
+  candidate branch has been applied.
 
 ## Formal Verification
 

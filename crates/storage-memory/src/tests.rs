@@ -139,6 +139,14 @@ fn message_state_transitions() {
     );
 
     store
+        .update_message_state(&m.id, MessageState::PeelDeferred)
+        .unwrap();
+    assert_eq!(
+        store.get_message(&m.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    store
         .update_message_state(&m.id, MessageState::Processed)
         .unwrap();
     assert_eq!(

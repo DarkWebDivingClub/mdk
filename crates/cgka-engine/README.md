@@ -8,6 +8,10 @@ This crate is the core of the system: it owns the per-group state machine that s
 
 - Wraps `MlsGroup` for each joined group and manages its `EpochState` lifecycle (`Stable → PendingPublish → Merging → Stable`, plus deterministic rollback/replay for recoverable forks).
 - Translates `SendIntent`s (create, invite, leave, app-message, capability upgrade) into MLS commits; translates inbound `TransportEnvelope`s into typed `IngestOutcome`s + `GroupEvent`s.
+- Stores inbound payloads as typed raw-transport or peeled-OpenMLS records so
+  peel-deferred messages can be retried without polluting convergence replay.
+- Retains a small, configurable OpenMLS past-epoch window for delayed
+  application messages.
 - Maintains a per-leaf capability cache so `feature_status` lookups don't walk the ratchet tree.
 - Picks a deterministic auto-committer for MIP-03 SelfRemove proposals.
 

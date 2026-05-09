@@ -144,6 +144,14 @@ impl ForkRecoveryManager {
             invalidated_storage_id: incumbent.storage_id,
         })
     }
+
+    fn retained_snapshots(&self, group_id: &GroupId) -> Vec<(EpochId, String)> {
+        self.incumbents
+            .values()
+            .filter(|record| &record.group_id == group_id)
+            .map(|record| (record.source_epoch, record.snapshot_name.clone()))
+            .collect()
+    }
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -231,5 +239,9 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(resolution)
+    }
+
+    pub(crate) fn retained_fork_snapshots(&self, group_id: &GroupId) -> Vec<(EpochId, String)> {
+        self.fork_recovery.retained_snapshots(group_id)
     }
 }

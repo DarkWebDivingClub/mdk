@@ -8,11 +8,10 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 |---|---|
 | `src/bus.rs` | `TransportBus`, the in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId` to `ClientId` for welcome routing. |
 | `cgka_engine::canonicalization` | Executable model of the CGKA canonicalization contract, re-exported by this crate for tests. Uses symbolic peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce deterministic message dispositions. |
-| `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
+| `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>`, a real `NostrMlsPeeler`, and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
 | `cgka_engine::convergence` | Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for tests. These tests pin selector policy independently from OpenMLS replay. |
 | `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` and `generate_convergence_e2e_delivery_family` record family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
 | `cgka_engine::openmls_projection` | Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
-| `src/peeler.rs` | `MockPeeler`, a pass-through peeler. Group messages and welcomes go through distinct methods, matching the production `TransportPeeler` four-method shape, but the body is just length-prefixed framing with no transport encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, flattened epoch changes, app invalidations, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus member additions/removals, epoch changes, app invalidations, and `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
@@ -38,9 +37,11 @@ before delivery by zero-based queue index: `drop_queued`, `duplicate_queued`,
 `clear_partition` remain the partition/heal operations.
 
 Use `clear_events` after setup when a scenario wants the final trace to describe
-only the behavior under test. The convergence E2E vector does this after the
-initial welcome joins so its trace contains only canonical branch application,
-app invalidation, epoch change, and member addition events.
+only the behavior under test. The convergence E2E scenario does this after the
+initial welcome joins so its trace focuses on the peeler-ingest epoch change
+and selected member addition. Delayed past-epoch app messages are covered via
+retained epoch contexts. Future-epoch branch app messages currently fail closed
+at the real outer peeler until branch-aware retry exists.
 
 The `convergence-e2e-delivery/v1` generated family reuses that E2E shape and
 varies queue delivery with duplicate, delay/release, and reorder steps before
@@ -51,7 +52,7 @@ under transport schedule noise.
 
 1. Prefer a `ScenarioSpec` when the case should become portable or reportable.
 2. For narrow engine-harness behavior, add a test fn in `tests/canonical_scenarios.rs`.
-3. Build N clients with `ClientBuilder::new(pad32(b"alice")).registry(registry()).attach(&bus)` only when the test needs lower-level harness control.
+3. Build N clients with `ClientBuilder::new(pad32(b"alice")).registry(registry()).attach(&bus)` only when the test needs lower-level harness control. The label bytes seed deterministic Nostr keys; use `client.member_id()` when a scenario needs the actual engine member id.
 4. Drive manual scenarios with `client.send_*` / `bus.deliver_all()` / `client.tick().await`.
 5. Assert on `client.epoch()`, `client.members()`, `observe_client(...)`, or `run_scenario_report(...)` depending on the test surface.
 
@@ -115,6 +116,6 @@ These are tracked in [`../../plans/2026-05-04-cgka-conformance-simulator-vectors
 
 ## Conventions
 
-- **Identities are `pad32(b"name")`.** MIP-01 requires 32-byte x-only pubkeys; the engine strict-fails on non-32-byte. Don't shortcut.
-- **`MockPeeler` does not panic on garbage.** It returns a structured `PeelerError`. Tests can assert on `StaleReason::PeelFailed` if needed.
+- **Client labels seed deterministic Nostr keys.** The ergonomic `pad32(b"name")` helper remains fine for stable test labels, but the engine identity attached to the bus is the derived public key. Use `HarnessClient::member_id()` for admin lists or other policy inputs.
+- **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and welcomes go through `transport-nostr-peeler`.
 - **`HarnessClient` exposes only what tests need.** If you need the inner `Engine<S>`, that's a smell — extend the harness API instead and keep tests at one abstraction level.

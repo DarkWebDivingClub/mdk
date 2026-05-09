@@ -35,7 +35,7 @@ pub use error::{EngineError, PeelerError};
 pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot};
 pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
-pub use message::{MessageRecord, MessageState};
+pub use message::{MessageRecord, MessageState, StoredMessagePayload};
 pub use peeler::TransportPeeler;
 pub use storage::{
     CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,

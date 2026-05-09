@@ -11,5 +11,5 @@ vector workflow.
   `ScenarioStep` variants before using it in vectors.
 - Keep generated families versioned. A generator behavior change should bump
   the family generator version.
-- Use `MockPeeler` only as a pass-through boundary witness. Do not add real
-  encryption here.
+- Keep real relay/network behavior out of this crate. The harness uses the
+  production-shaped Nostr peeler over the in-memory `TransportBus`.

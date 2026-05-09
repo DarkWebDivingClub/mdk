@@ -11,13 +11,15 @@
 use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
-use crate::openmls_projection::{OpenMlsContentKind, project_mls_message};
+use crate::openmls_projection::{
+    OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
+};
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::{CommitOrderingKey, GroupEvent, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -192,16 +194,26 @@ impl<S: StorageProvider> Engine<S> {
             let peeled = match self.peeler.peel_group_message(msg, &ctx).await {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
-                    self.persist_transport_message(
-                        msg,
-                        &group_id,
-                        current_epoch,
-                        MessageState::Failed,
-                    )?;
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
-                    });
+                    if let Some(peeled) = self
+                        .try_peel_group_message_from_available_snapshots(
+                            msg,
+                            &group_id,
+                            current_epoch,
+                        )
+                        .await?
+                    {
+                        peeled
+                    } else {
+                        self.persist_transport_message(
+                            msg,
+                            &group_id,
+                            current_epoch,
+                            MessageState::PeelDeferred,
+                        )?;
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::PeelFailed,
+                        });
+                    }
                 }
                 Err(e) => return Err(EngineError::Peeler(e)),
             };
@@ -220,6 +232,10 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
             };
+            let openmls_msg = TransportMessage {
+                payload: mls_bytes.clone(),
+                ..msg.clone()
+            };
 
             // Parse into ProtocolMessage. Grab its epoch before process_message
             // consumes it — we need it for the fork-detection branch below.
@@ -231,7 +247,7 @@ impl<S: StorageProvider> Engine<S> {
                 MlsMessageBodyIn::PublicMessage(p) => p.into(),
                 _ => {
                     self.persist_transport_message(
-                        msg,
+                        &openmls_msg,
                         &group_id,
                         current_epoch,
                         MessageState::Failed,
@@ -249,7 +265,7 @@ impl<S: StorageProvider> Engine<S> {
                 && msg_epoch >= current_epoch
             {
                 let now_ms = self.convergence_now_ms();
-                self.buffer_openmls_convergence_message(&group_id, msg.clone(), now_ms)
+                self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
                     .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
                     .converge_stored_openmls_messages(&group_id, now_ms)
@@ -263,7 +279,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
                 let now_ms = self.convergence_now_ms();
-                self.buffer_openmls_convergence_message(&group_id, msg.clone(), now_ms)
+                self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
                     .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
                     .converge_stored_openmls_messages(&group_id, now_ms)
@@ -276,7 +292,12 @@ impl<S: StorageProvider> Engine<S> {
                 ));
             }
 
-            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Created)?;
+            self.persist_openmls_wire_message(
+                &openmls_msg,
+                &group_id,
+                current_epoch,
+                MessageState::Created,
+            )?;
 
             // Process via MLS.
             let processed = match mls_group.process_message(&provider, proto) {
@@ -367,6 +388,7 @@ impl<S: StorageProvider> Engine<S> {
                                 .map(|bc| MemberId::new(bc.identity().to_vec()))
                         })
                         .collect();
+                    self.retain_current_epoch_snapshot_for_group(&group_id)?;
                     // Extract capabilities from Add proposals before the
                     // staged commit is consumed by merge.
                     crate::capability_manager::cache_from_staged_commit(
@@ -477,21 +499,14 @@ impl<S: StorageProvider> Engine<S> {
                         )?;
                         self.epoch_manager
                             .record_committed_from(&group_id, pre_commit_epoch);
+                        let pre_commit_ctx =
+                            group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
                         let (commit_out, _welcome_opt, _gi) = mls_group
                             .commit_to_pending_proposals(&provider, &self.identity.signer)
                             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
                         let commit_bytes = commit_out
                             .tls_serialize_detached()
                             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-                        mls_group
-                            .merge_pending_commit(&provider)
-                            .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
-
-                        let new_epoch = EpochId(mls_group.epoch().as_u64());
-                        let prior = EpochId(new_epoch.0.saturating_sub(1));
-
-                        let ctx =
-                            group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
                         let wrapped = self
                             .peeler
                             .wrap_group_message(
@@ -499,7 +514,7 @@ impl<S: StorageProvider> Engine<S> {
                                     ciphertext: commit_bytes.clone(),
                                     aad: vec![],
                                 },
-                                &ctx,
+                                &pre_commit_ctx,
                             )
                             .await
                             .map_err(EngineError::Peeler)?;
@@ -509,7 +524,20 @@ impl<S: StorageProvider> Engine<S> {
                             },
                             ..wrapped
                         };
-                        self.record_sent_message(&wrapped, &group_id, new_epoch)?;
+                        self.retain_current_epoch_snapshot_for_group(&group_id)?;
+                        mls_group
+                            .merge_pending_commit(&provider)
+                            .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+
+                        let new_epoch = EpochId(mls_group.epoch().as_u64());
+                        let prior = EpochId(new_epoch.0.saturating_sub(1));
+
+                        self.record_sent_openmls_message(
+                            &wrapped,
+                            commit_bytes.as_slice(),
+                            &group_id,
+                            pre_commit_epoch,
+                        )?;
                         self.record_applied_commit_for_recovery(
                             group_id.clone(),
                             pre_commit_epoch,
@@ -663,11 +691,14 @@ impl<S: StorageProvider> Engine<S> {
         for record in records {
             if !matches!(
                 record.state,
-                MessageState::Created | MessageState::Retryable
+                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
             ) {
                 continue;
             }
-            let Ok(message) = serde_json::from_slice::<TransportMessage>(&record.payload) else {
+            let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
+                return Ok(true);
+            };
+            let Some(message) = stored_payload.as_openmls_wire() else {
                 return Ok(true);
             };
             let Ok(projection) = project_mls_message(&message.payload) else {
@@ -765,6 +796,8 @@ impl<S: StorageProvider> Engine<S> {
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
         // Stage the add-members commit. Publish-before-apply keeps
         // `mls_group` at the pre-commit epoch with the staged commit attached.
@@ -783,7 +816,6 @@ impl<S: StorageProvider> Engine<S> {
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
 
-        let ctx = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit_msg = self
             .peeler
             .wrap_group_message(
@@ -791,7 +823,7 @@ impl<S: StorageProvider> Engine<S> {
                     ciphertext: commit_bytes.clone(),
                     aad: vec![],
                 },
-                &ctx,
+                &pre_commit_ctx,
             )
             .await
             .map_err(EngineError::Peeler)?;
@@ -801,7 +833,12 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..commit_msg
         };
-        self.record_sent_message(&commit_msg, &group_id, pre_commit_epoch)?;
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_id,
+            pre_commit_epoch,
+        )?;
 
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         for kp in &parsed_kps {
@@ -909,7 +946,7 @@ impl<S: StorageProvider> Engine<S> {
             .peeler
             .wrap_group_message(
                 &EncryptedPayload {
-                    ciphertext: bytes,
+                    ciphertext: bytes.clone(),
                     aad: vec![],
                 },
                 &ctx,
@@ -922,7 +959,12 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..wrapped
         };
-        self.record_sent_message(&wrapped, &group_id, EpochId(mls_group.epoch().as_u64()))?;
+        self.record_sent_openmls_message(
+            &wrapped,
+            bytes.as_slice(),
+            &group_id,
+            EpochId(mls_group.epoch().as_u64()),
+        )?;
 
         // SelfRemove is a proposal — the leaver's epoch doesn't advance
         // until some other member (per MIP-03 §144, the lowest-index
@@ -970,7 +1012,7 @@ impl<S: StorageProvider> Engine<S> {
             .peeler
             .wrap_group_message(
                 &EncryptedPayload {
-                    ciphertext: out_bytes,
+                    ciphertext: out_bytes.clone(),
                     aad: vec![],
                 },
                 &ctx,
@@ -984,7 +1026,12 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..wrapped
         };
-        self.record_sent_message(&wrapped, &group_id, EpochId(mls_group.epoch().as_u64()))?;
+        self.record_sent_openmls_message(
+            &wrapped,
+            out_bytes.as_slice(),
+            &group_id,
+            EpochId(mls_group.epoch().as_u64()),
+        )?;
 
         Ok(SendResult::ApplicationMessage { msg: wrapped })
     }
@@ -1064,6 +1111,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: record.group_id,
                 epoch: record.epoch,
             },
+            MessageState::PeelDeferred => return Ok(None),
             MessageState::Processed | MessageState::Failed | MessageState::EpochInvalidated => {
                 IngestOutcome::Stale {
                     reason: StaleReason::AlreadySeen,
@@ -1082,7 +1130,7 @@ impl<S: StorageProvider> Engine<S> {
 
         Ok(!matches!(
             record.state,
-            MessageState::Created | MessageState::Retryable
+            MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
         ))
     }
 
@@ -1096,6 +1144,111 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_transport_message(msg, group_id, epoch, MessageState::Sent)
     }
 
+    async fn try_peel_group_message_from_available_snapshots(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        current_epoch: EpochId,
+    ) -> Result<Option<cgka_traits::ingest::PeeledMessage>, EngineError> {
+        let snapshots = self.available_past_peel_snapshots(group_id)?;
+        for (source_epoch, snapshot_name) in snapshots {
+            if source_epoch >= current_epoch {
+                continue;
+            }
+            let restore_snapshot = format!(
+                "peel-restore-{}-{}-{}",
+                hex::encode(group_id.as_slice()),
+                current_epoch.0,
+                hex::encode(msg.id.as_slice())
+            );
+            self.storage
+                .create_group_snapshot(group_id, &restore_snapshot)?;
+            let ctx = match self.context_from_group_snapshot(group_id, &snapshot_name) {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    self.restore_after_snapshot_peel(group_id, &restore_snapshot)?;
+                    return Err(err);
+                }
+            };
+            let peeled = self.peeler.peel_group_message(msg, &ctx).await;
+            self.restore_after_snapshot_peel(group_id, &restore_snapshot)?;
+            match peeled {
+                Ok(peeled) => return Ok(Some(peeled)),
+                Err(PeelerError::DecryptFailed) => continue,
+                Err(err) => return Err(EngineError::Peeler(err)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn available_past_peel_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(EpochId, String)>, EngineError> {
+        let mut snapshots = self.retained_fork_snapshots(group_id);
+        for snapshot_name in self.storage.list_group_snapshots(group_id)? {
+            if let Some(epoch) = retained_anchor_epoch_from_snapshot_name(&snapshot_name) {
+                snapshots.push((EpochId(epoch), snapshot_name));
+            }
+        }
+        snapshots.sort_by(|(a_epoch, a_name), (b_epoch, b_name)| {
+            b_epoch.cmp(a_epoch).then_with(|| a_name.cmp(b_name))
+        });
+        snapshots.dedup_by(|(a_epoch, a_name), (b_epoch, b_name)| {
+            a_epoch == b_epoch && a_name == b_name
+        });
+        Ok(snapshots)
+    }
+
+    fn context_from_group_snapshot(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+    ) -> Result<cgka_traits::group_context::GroupContextSnapshot, EngineError> {
+        self.storage
+            .rollback_group_to_snapshot(group_id, snapshot_name)?;
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
+    }
+
+    fn restore_after_snapshot_peel(
+        &self,
+        group_id: &GroupId,
+        restore_snapshot: &str,
+    ) -> Result<(), EngineError> {
+        self.storage
+            .rollback_group_to_snapshot(group_id, restore_snapshot)?;
+        match self
+            .storage
+            .release_group_snapshot(group_id, restore_snapshot)
+        {
+            Ok(()) | Err(StorageError::SnapshotMissing(_)) => Ok(()),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
+
+    pub(crate) fn record_sent_openmls_message(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.sent_message_ids.insert(msg.id.clone());
+        let openmls_msg = TransportMessage {
+            payload: mls_bytes.to_vec(),
+            ..msg.clone()
+        };
+        self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)
+    }
+
     fn persist_transport_message(
         &self,
         msg: &TransportMessage,
@@ -1103,10 +1256,44 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         state: MessageState,
     ) -> Result<(), EngineError> {
-        let payload =
-            serde_json::to_vec(msg).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        self.persist_stored_message_payload(
+            msg.id.clone(),
+            group_id,
+            epoch,
+            state,
+            StoredMessagePayload::raw_transport(msg.clone()),
+        )
+    }
+
+    fn persist_openmls_wire_message(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+    ) -> Result<(), EngineError> {
+        self.persist_stored_message_payload(
+            msg.id.clone(),
+            group_id,
+            epoch,
+            state,
+            StoredMessagePayload::openmls_wire(msg.clone()),
+        )
+    }
+
+    fn persist_stored_message_payload(
+        &self,
+        id: MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+        payload: StoredMessagePayload,
+    ) -> Result<(), EngineError> {
+        let payload = payload
+            .encode()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         self.storage.put_message(&MessageRecord {
-            id: msg.id.clone(),
+            id,
             group_id: group_id.clone(),
             epoch,
             state,
@@ -1132,12 +1319,15 @@ impl<S: StorageProvider> Engine<S> {
         for record in records {
             if !matches!(
                 record.state,
-                MessageState::Created | MessageState::Retryable
+                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
             ) {
                 continue;
             }
-            let msg: TransportMessage = serde_json::from_slice(&record.payload)
+            let stored_payload = StoredMessagePayload::decode(&record.payload)
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+            let Some(msg) = stored_payload.as_raw_transport().cloned() else {
+                continue;
+            };
             match self
                 .ingest_group_message(&msg, group_id.as_slice().to_vec())
                 .await

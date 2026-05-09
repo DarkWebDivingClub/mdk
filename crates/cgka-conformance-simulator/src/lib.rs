@@ -8,22 +8,19 @@
 //! - [`bus`] - in-memory [`bus::TransportBus`] with seeded scheduler,
 //!   partition support, broadcast / addressed delivery for welcomes.
 //! - [`client`] - [`client::HarnessClient`] wrapping `Engine<MemoryStorage>`
-//!   plus a [`peeler::MockPeeler`] (skips actual crypto - tests assert on
-//!   inner payloads directly).
+//!   plus the real Nostr transport peeler over the in-memory bus.
 //! - [`canonicalization`] - executable model of the CGKA canonicalization
 //!   contract above the branch selector, re-exported from `cgka-engine`.
 //! - [`convergence`] - candidate-state graph scoring rules, re-exported
 //!   from `cgka-engine`.
 //! - [`openmls_projection`] - bytes-first OpenMLS projection and snapshot
 //!   replay probes, re-exported from `cgka-engine`.
-//! - [`peeler`] - pass-through [`peeler::MockPeeler`].
 //!
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
 pub mod bus;
 pub mod client;
 pub mod family;
-pub mod peeler;
 pub mod policy_cases;
 pub mod proptest_support;
 pub mod report;
@@ -37,7 +34,6 @@ pub use family::{
     GeneratedScenarioCase, generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report,
 };
-pub use peeler::MockPeeler;
 pub use report::{ReportArgs, ReportCommand, parse_report_command, report_usage, run_report};
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,

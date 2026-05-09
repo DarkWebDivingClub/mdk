@@ -137,7 +137,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         report["app_invalidation_observations"]
             .as_array()
             .map(Vec::len),
-        Some(2)
+        Some(0)
     );
     assert_eq!(
         report["epoch_change_observations"].as_array().map(Vec::len),

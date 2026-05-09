@@ -148,11 +148,20 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
 }
 
 fn observe_member_id(bytes: &[u8]) -> String {
+    if let Some(label) = crate::client::logical_label_for_member_id(bytes) {
+        return label;
+    }
     let end = bytes
         .iter()
         .rposition(|byte| *byte != 0)
         .map_or(0, |i| i + 1);
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    if end > 0
+        && let Ok(label) = std::str::from_utf8(&bytes[..end])
+        && !label.is_empty()
+    {
+        return label.into();
+    }
+    hex::encode(bytes)
 }
 
 fn observe_app_invalidation_reason(reason: AppMessageInvalidationReason) -> String {

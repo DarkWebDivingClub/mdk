@@ -15,6 +15,7 @@ conformance-slow = []
 cgka-traits.workspace = true
 cgka-engine.workspace = true
 storage-memory.workspace = true
+transport-nostr-peeler.workspace = true
 openmls.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
@@ -25,6 +26,7 @@ async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing.workspace = true
 rand.workspace = true
+nostr.workspace = true
 proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true

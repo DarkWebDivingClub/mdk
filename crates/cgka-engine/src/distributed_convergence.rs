@@ -10,10 +10,10 @@ use crate::engine::Engine;
 use crate::openmls_projection::{
     OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation,
     apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
-    project_mls_message,
+    project_mls_message, retain_current_group_epoch_snapshot,
 };
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -48,6 +48,21 @@ impl<S: StorageProvider> Engine<S> {
         decode_convergence_policy(&policy_bytes)
     }
 
+    pub(crate) fn retain_current_epoch_snapshot_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), cgka_traits::error::EngineError> {
+        let policy = self.convergence_policy_for_group(group_id).map_err(|e| {
+            cgka_traits::error::EngineError::Backend(format!("load convergence policy: {e}"))
+        })?;
+        retain_current_group_epoch_snapshot(
+            &self.storage,
+            group_id,
+            policy.convergence.max_rewind_commits,
+        )
+        .map_err(|e| cgka_traits::error::EngineError::Backend(format!("retain anchor: {e}")))
+    }
+
     pub fn buffer_openmls_convergence_message(
         &mut self,
         group_id: &GroupId,
@@ -79,7 +94,8 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
                 epoch: EpochId(source_epoch),
                 state: MessageState::Created,
-                payload: serde_json::to_vec(&message)
+                payload: StoredMessagePayload::openmls_wire(message)
+                    .encode()
                     .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?,
             })
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;

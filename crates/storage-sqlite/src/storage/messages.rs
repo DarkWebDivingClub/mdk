@@ -130,6 +130,14 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::Retryable
         );
+
+        store
+            .update_message_state(&message.id, MessageState::PeelDeferred)
+            .unwrap();
+        assert_eq!(
+            store.get_message(&message.id).unwrap().state,
+            MessageState::PeelDeferred
+        );
     }
 
     #[test]

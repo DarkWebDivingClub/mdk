@@ -19,6 +19,7 @@ use cgka_traits::engine::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -62,6 +63,74 @@ fn snapshot_transport_message_welcome() {
         },
     };
     insta::assert_json_snapshot!(msg);
+}
+
+#[test]
+fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
+    let raw = TransportMessage {
+        id: mid(),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(1717171717),
+        causal_deps: vec![],
+        source: TransportSource("nostr".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xCC; 4],
+        },
+    };
+    let openmls = TransportMessage {
+        payload: vec![0xAB, 0xCD],
+        ..raw.clone()
+    };
+
+    let raw_payload = StoredMessagePayload::raw_transport(raw.clone());
+    let openmls_payload = StoredMessagePayload::openmls_wire(openmls.clone());
+
+    insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
+    insta::assert_json_snapshot!("stored_payload_openmls_wire", openmls_payload);
+
+    assert_eq!(
+        StoredMessagePayload::decode(&StoredMessagePayload::raw_transport(raw).encode().unwrap())
+            .unwrap()
+            .as_raw_transport()
+            .unwrap()
+            .payload,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        StoredMessagePayload::decode(
+            &StoredMessagePayload::openmls_wire(openmls)
+                .encode()
+                .unwrap()
+        )
+        .unwrap()
+        .as_openmls_wire()
+        .unwrap()
+        .payload,
+        vec![0xAB, 0xCD]
+    );
+}
+
+#[test]
+fn stored_message_payload_decodes_legacy_transport_message_as_openmls_wire() {
+    let legacy = TransportMessage {
+        id: mid(),
+        payload: vec![0xAA, 0xBB],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("legacy".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xCC; 4],
+        },
+    };
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+
+    assert_eq!(
+        StoredMessagePayload::decode(&legacy_bytes)
+            .unwrap()
+            .as_openmls_wire()
+            .unwrap(),
+        &legacy
+    );
 }
 
 #[test]

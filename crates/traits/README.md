@@ -13,6 +13,9 @@ caller imports from here.
   `WelcomeStorage`, `CapabilityStorage`, `ConvergencePolicyStorage`) — plus an
   accessor for the underlying OpenMLS `StorageProvider`.
 - `EpochState`, `WelcomeState`, `IngestOutcome`, `StaleReason`, `EngineError` — the typed state-machine + error vocabulary.
+- `MessageRecord`, `MessageState`, `StoredMessagePayload` — durable message
+  state plus the typed envelope that distinguishes raw transport bytes from
+  peeled OpenMLS wire bytes.
 - All cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
 
 ## Run the tests

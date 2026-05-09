@@ -267,6 +267,7 @@ dependencies = [
  "cgka-engine",
  "cgka-traits",
  "hex",
+ "nostr",
  "openmls",
  "openmls_rust_crypto",
  "openmls_traits",
@@ -279,6 +280,7 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "transport-nostr-peeler",
 ]
 
 [[package]]

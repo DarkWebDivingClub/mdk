@@ -115,6 +115,11 @@ PeeledMessage {
 }
 ```
 
+Durable storage distinguishes raw transport bytes from peeled protocol bytes.
+Only `OpenMlsWire` stored payloads enter this contract. `RawTransport` payloads
+remain engine-ingest inputs and are retried through the peeler when more epoch
+contexts are available.
+
 `message_id` is a transport-independent dedupe key. It MAY be a digest of the
 peeled protocol bytes. It MUST NOT be a Nostr event id.
 
@@ -470,7 +475,9 @@ Required storage:
 - app messages within the MLS past-epoch decryption limit,
 - durable transport message records for retained commit, proposal, and
   application-message inputs, including enough bytes to reconstruct the same
-  OpenMLS replay batch after restart,
+  OpenMLS replay batch after restart. Each stored payload MUST say whether it
+  is raw transport bytes waiting for peel retry or peeled OpenMLS wire bytes
+  ready for replay,
 - decrypted app payloads retained by application policy,
 - invalidation records for messages already surfaced to the application,
 - dedupe index for commits, proposals, and app messages,
@@ -525,11 +532,10 @@ The conformance suite should cover:
 - proposal not consumed by a canonical commit left pending,
 - proposal on losing branch dropped,
 - app message on losing branch invalidated with payload reference when known,
-- end-to-end peeler ingest emits only canonical application `GroupEvent`
-  output and losing-branch invalidation events across multiple clients
-  (`convergence-e2e-group-events/v1`),
-- generated `convergence-e2e-delivery/v1` variants preserve that output under
-  duplicated, delayed, and reordered queued delivery,
+- end-to-end peeler ingest emits selected branch epoch/member `GroupEvent`
+  output across multiple clients (`convergence-e2e-group-events/v1`),
+- generated `convergence-e2e-delivery/v1` variants preserve that epoch/member
+  output under duplicated, delayed, and reordered queued delivery,
 - app message beyond MLS past-epoch retention expired,
 - commit beyond `max_rewind_commits` discarded,
 - late same-epoch commit inside the retained anchor window replayed from the
