@@ -159,7 +159,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_already_seen(&bob_commit_replay);
 
     let carol_commit_replay = take_effect_for(&mut replay_deliveries, &carol_account_id);
-    assert_peel_failed(&carol_commit_replay);
+    assert_already_seen(&carol_commit_replay);
 }
 
 #[tokio::test]

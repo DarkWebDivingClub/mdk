@@ -217,6 +217,28 @@ impl<S: StorageProvider> Engine<S> {
                         });
                     }
                 }
+                Err(PeelerError::StaleEpoch { .. }) => {
+                    if let Some(peeled) = self
+                        .try_peel_group_message_from_available_snapshots(
+                            msg,
+                            &group_id,
+                            current_epoch,
+                        )
+                        .await?
+                    {
+                        peeled
+                    } else {
+                        self.persist_transport_message(
+                            msg,
+                            &group_id,
+                            current_epoch,
+                            MessageState::Failed,
+                        )?;
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::PeelFailed,
+                        });
+                    }
+                }
                 Err(e) => return Err(EngineError::Peeler(e)),
             };
             let mls_bytes = match peeled.content {
@@ -1260,7 +1282,7 @@ impl<S: StorageProvider> Engine<S> {
             self.restore_after_snapshot_peel(group_id, &restore_snapshot)?;
             match peeled {
                 Ok(peeled) => return Ok(Some(peeled)),
-                Err(PeelerError::DecryptFailed) => continue,
+                Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
                 Err(err) => return Err(EngineError::Peeler(err)),
             }
         }

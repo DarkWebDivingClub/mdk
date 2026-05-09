@@ -13,6 +13,8 @@ peels Marmot group MLS bytes for Nostr kind `445`.
 - Preserves causal `e` tags as `TransportMessage::causal_deps`.
 - Encrypts and decrypts kind `445` group envelopes with
   ChaCha20Poly1305 using the engine exporter snapshot.
+- Includes the group source epoch in kind `445` envelope metadata so the engine
+  can classify pre-join stale messages as terminal instead of retryable.
 - Wraps and peels MLS Welcome bytes as NIP-59 gift wraps when a local Nostr
   signer/decrypter is injected.
 

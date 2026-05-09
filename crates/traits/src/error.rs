@@ -85,6 +85,12 @@ pub enum PeelerError {
     #[error("decrypt failed (likely stale or wrong-epoch exporter secret)")]
     DecryptFailed,
 
+    #[error("message epoch {message_epoch} is older than available context epoch {context_epoch}")]
+    StaleEpoch {
+        message_epoch: EpochId,
+        context_epoch: EpochId,
+    },
+
     #[error("required context secret missing: {label}")]
     MissingContext { label: String },
 

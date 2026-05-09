@@ -118,6 +118,16 @@ impl TransportPeeler for NostrMlsPeeler {
                 content.version
             )));
         }
+        if let Some(source_epoch) = content.source_epoch {
+            let message_epoch = cgka_traits::types::EpochId(source_epoch);
+            let context_epoch = ctx.epoch();
+            if message_epoch < context_epoch {
+                return Err(PeelerError::StaleEpoch {
+                    message_epoch,
+                    context_epoch,
+                });
+            }
+        }
 
         let key = self.group_key(ctx)?;
         let nonce =
@@ -215,6 +225,7 @@ impl TransportPeeler for NostrMlsPeeler {
             .map_err(|_| PeelerError::WrapFailed("group encryption failed".into()))?;
         let content = GroupEnvelopeContent {
             version: GROUP_CONTENT_VERSION,
+            source_epoch: Some(ctx.epoch().0),
             nonce: hex::encode(nonce),
             ciphertext: hex::encode(ciphertext),
             aad: hex::encode(&payload.aad),
@@ -265,6 +276,8 @@ impl TransportPeeler for NostrMlsPeeler {
 #[derive(Serialize, Deserialize)]
 struct GroupEnvelopeContent {
     version: u8,
+    #[serde(default)]
+    source_epoch: Option<u64>,
     nonce: String,
     ciphertext: String,
     aad: String,
@@ -421,6 +434,46 @@ mod tests {
             .expect_err("wrong secret should not decrypt");
 
         assert!(matches!(err, PeelerError::DecryptFailed));
+    }
+
+    #[tokio::test]
+    async fn group_peel_reports_stale_source_epoch_before_decrypting() {
+        let group_id = vec![0x99; 32];
+        let secret = vec![0x7a; 32];
+        let wrap_ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), secret.clone())]),
+            Some(group_id),
+        );
+        let stale_peel_ctx = GroupContextSnapshot::new(
+            EpochId(10),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), secret)]),
+            None,
+        );
+        let peeler = NostrMlsPeeler::default();
+        let wrapped = peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &wrap_ctx,
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let err = peeler
+            .peel_group_message(&wrapped, &stale_peel_ctx)
+            .await
+            .expect_err("stale source epoch should not decrypt");
+
+        assert!(matches!(
+            err,
+            PeelerError::StaleEpoch {
+                message_epoch: EpochId(9),
+                context_epoch: EpochId(10)
+            }
+        ));
     }
 
     #[tokio::test]
