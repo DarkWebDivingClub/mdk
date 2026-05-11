@@ -1561,6 +1561,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
+name = "marmot-account"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cgka-engine",
+ "cgka-session",
+ "cgka-traits",
+ "storage-sqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

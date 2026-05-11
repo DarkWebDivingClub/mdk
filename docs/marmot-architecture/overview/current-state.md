@@ -89,6 +89,11 @@ This repository now has the main engine candidate:
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
 - `crates/cgka-session` — production-shaped account-device session wrapper
   over `Engine<SqliteStorage>`.
+- `crates/marmot-account` — thin future app-core shell over a session and
+  transport adapter. It activates the transport account, uses static transport
+  routing for early harnesses, publishes fresh KeyPackages through an injected
+  boundary, and confirms or rolls back pending session work from adapter
+  publish reports.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and
   custom OpenMLS state, with Rust migrations for schema/data evolution.
@@ -111,8 +116,10 @@ in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,
 drive a real `AccountDeviceSession` + `NostrTransportAdapter` +
 `NostrMlsPeeler` stack over an in-memory relay client, cover publish ack/fail
 resolution and delivery/invite-lifecycle chaos cases at that stack boundary,
-converge stored OpenMLS messages, emit application-visible group events, model
-losing-branch invalidations, and test generated delivery variants.
+exercise a transport-generic account runtime for activation, KeyPackage
+publication, and publish confirmation/rollback, converge stored OpenMLS
+messages, emit application-visible group events, model losing-branch
+invalidations, and test generated delivery variants.
 
 ## Known gaps
 
@@ -132,9 +139,9 @@ losing-branch invalidations, and test generated delivery variants.
   invite group evolution, insufficient acks, publish errors, subscription
   gating, duplicate delivery, reordered delivery, invite commit/welcome order
   variants, and terminal stale-epoch invite commits through the real session,
-  adapter, and peeler stack. Production relay auth, app-level relay policy,
-  richer telemetry export, and account key-management wiring still need
-  integration.
+  adapter, and peeler stack. Production relay auth, Nostr-backed transport
+  routing policy, KeyPackage publication through the transport layer, richer
+  telemetry export, and account key-management wiring still need integration.
 - **Deep same-epoch app-message reordering** — the seeded stack-chaos runner
   keeps generated app-message reordering shallow. A deeper generated reversal
   exposed OpenMLS `TooDistantInThePast` behavior in the message generation

@@ -81,8 +81,9 @@ The core technical challenge: **MLS requires total linear ordering of group-stat
 - 🚧 Production app integration remains outside the current engine simulator;
   the Nostr adapter core, optional SDK client, stale subscription cleanup, and
   adapter diagnostics exist. The adapter relies on `nostr-sdk` for
-  reconnect/backoff and relay status mechanics, but relay auth, app-level relay
-  policy, telemetry export, and account key-management integration still need
+  reconnect/backoff and relay status mechanics, but relay auth, Nostr-backed
+  transport routing policy, KeyPackage publication through the transport
+  layer, telemetry export, and account key-management integration still need
   production work.
 
 ---

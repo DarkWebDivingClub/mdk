@@ -54,8 +54,8 @@ jitter, and relay status mechanics remain owned by `nostr-sdk`.
 `445` / `1059` event shapes into engine transport messages, peels kind `445`
 group envelopes, and handles NIP-59 welcome gift-wraps when the account-device
 layer supplies the local signer/decrypter. Production relay auth, app-level
-relay policy, telemetry export, and account key-management integration still
-sit above those crates.
+transport routing policy, telemetry export, and account key-management
+integration still sit above those crates.
 
 ---
 

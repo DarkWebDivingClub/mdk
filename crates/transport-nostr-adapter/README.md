@@ -33,9 +33,9 @@ The default core stays relay-client agnostic; the optional `sdk` feature adds a
 - No duplicate reconnect/backoff loop. The optional `nostr-sdk` client relies
   on SDK `RelayOptions` for reconnect, retry interval adjustment, jitter,
   relay sleep/ban/terminate behavior, and connection stats.
-- No full production relay-plane orchestration yet. Relay auth, app-level relay
-  policy, richer telemetry export, and per-platform lifecycle wiring still need
-  hardening.
+- No full production relay-plane orchestration yet. Relay auth, Nostr-backed
+  transport routing policy, KeyPackage publication, richer telemetry export,
+  and per-platform lifecycle wiring still need hardening.
 
 ## Privacy-safe diagnostics
 
@@ -64,6 +64,12 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 
 `NostrRelayClient` is intentionally small so tests can use an in-memory client
 and production can use `NostrSdkRelayClient` behind the `sdk` feature.
+
+The likely next expansion is to keep Nostr-specific routing here: derive group
+subscriptions and group-message publish targets from
+`marmot.transport.nostr.routing.v1`, derive KeyPackage publish targets from the
+user's kind `10051` KeyPackage relay list, and publish KeyPackages as Nostr
+kind `30443` events through the same relay-client boundary.
 
 ## Run tests
 

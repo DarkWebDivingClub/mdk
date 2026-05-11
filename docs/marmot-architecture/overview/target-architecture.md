@@ -115,6 +115,9 @@ The active workspace proves the shape without the old prototype tree:
   requests/reports, and delivery metadata.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
 - `crates/cgka-session` wires the engine to encrypted account-device storage.
+- `crates/marmot-account` starts the future app-core shell: it combines an
+  account-device session, a transport adapter, transport routing policy,
+  KeyPackage publication, and pending publish confirmation.
 - `crates/storage-memory` provides in-memory storage and rollback snapshots.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
   metadata and group-scoped OpenMLS state.
@@ -129,9 +132,16 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
   delivery variants, and property tests over the engine.
 
-The production perimeter is still partly outside this workspace: app-level relay
-policy, relay auth, account key-management integration, persistence operations
-policy, and packaging.
+The production perimeter is still partly outside this workspace:
+Nostr-backed transport routing policy, relay auth, account key-management
+integration, persistence operations policy, and packaging.
+
+The expected Nostr routing source of truth is the signed
+`marmot.transport.nostr.routing.v1` app component for group routes and the
+user's kind `10051` KeyPackage relay list for KeyPackage publication. The
+generic account runtime should remain transport-agnostic; Nostr-specific
+routing and KeyPackage event publication likely belong in the Nostr transport
+adapter family.
 
 ---
 
