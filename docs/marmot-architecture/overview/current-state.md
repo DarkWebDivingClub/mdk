@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-10
+updated: 2026-05-11
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -142,6 +142,17 @@ invalidations, and test generated delivery variants.
   adapter, and peeler stack. Production relay auth, Nostr-backed transport
   routing policy, KeyPackage publication through the transport layer, richer
   telemetry export, and account key-management wiring still need integration.
+- **Nostr account transport shape** — the likely production shape includes a
+  Nostr user directory, account bootstrap for relay-list events, a shared
+  multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing,
+  and explicit relay URL safety policy. This is captured as a working note in
+  [`nostr-account-transport.md`](./nostr-account-transport.md), but it should
+  not pull focus away from the engine work.
+- **Byte-level and scenario vector maturity** — the simulator has portable
+  scenario fixtures and generated chaos families, but the byte-level vector
+  plan is still thin. We need a manifest that names which cases are portable,
+  Rust-only, generated, or byte-level, plus a fixture schema for exact
+  component and wire-format bytes.
 - **Deep same-epoch app-message reordering** — the seeded stack-chaos runner
   keeps generated app-message reordering shallow. A deeper generated reversal
   exposed OpenMLS `TooDistantInThePast` behavior in the message generation
@@ -161,5 +172,7 @@ invalidations, and test generated delivery variants.
 
 - Target architecture: [`target-architecture.md`](./target-architecture.md)
 - Direction: [`direction.md`](./direction.md)
+- Engine quality and vectors: [`cgka-engine-quality-and-vectors.md`](./cgka-engine-quality-and-vectors.md)
+- Nostr account transport notes: [`nostr-account-transport.md`](./nostr-account-transport.md)
 - Canonicalization contract: [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - Distributed convergence: [`../distributed-convergence.md`](../distributed-convergence.md)

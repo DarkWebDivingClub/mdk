@@ -3,7 +3,7 @@ title: "Direction — Where We're Going"
 created: 2026-04-19
 tags: [marmot, overview, direction, conclusions]
 status: overview
-updated: 2026-05-09
+updated: 2026-05-11
 ---
 
 # Direction — Where We're Going
@@ -82,10 +82,16 @@ proposal.
 
 Each small enough to actually do, each produces an artifact that makes bigger decisions cheaper:
 
-1. **Draft a spec-structure reorganization proposal.** Walk one existing feature (MIP-03 SelfRemove or MIP-06 multi-device) through a component-based structure. Decide whether to pilot.
-2. **Investigate OpenMLS + Marmot-TS Safe framework support.** Gate for §1.4 above.
-3. **Sketch `IdentityRemove` as a full MIP-sized design.** First concrete data point for how any new spec structure handles a new custom proposal.
-4. **Start an MDK/whitenoise-rs decomposition exploration.** Use the current
+1. **Build the CGKA engine vector plan.** Write a vector manifest, define the
+   byte-level fixture schema, and promote the best chaos cases into portable
+   scenario vectors where the OpenMLS randomness model allows it.
+2. **Map the whitenoise-rs integration boundary.** Decide whether the first
+   path is a direct interface change or a shim, and list the exact methods the
+   app core needs from `cgka-session` / `marmot-account`.
+3. **Draft a spec-structure reorganization proposal.** Walk one existing feature (MIP-03 SelfRemove or MIP-06 multi-device) through a component-based structure. Decide whether to pilot.
+4. **Investigate OpenMLS + Marmot-TS Safe framework support.** Gate for §1.4 above.
+5. **Sketch `IdentityRemove` as a full MIP-sized design.** First concrete data point for how any new spec structure handles a new custom proposal.
+6. **Start an MDK/whitenoise-rs decomposition exploration.** Use the current
    target architecture and engine contract as the baseline for deciding what is
    evolution-compatible, refactor-required, or rebuild-only.
 

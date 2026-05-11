@@ -1,7 +1,7 @@
 ---
 title: "Nostr's Role in Marmot — Three Layers"
 created: 2026-04-19
-updated: 2026-05-09
+updated: 2026-05-11
 tags: [marmot, overview, nostr, identity, transport]
 status: overview
 ---
@@ -97,4 +97,5 @@ Sort of, but imprecisely. **Inside** MLS encryption, application messages have N
 
 ## See also
 
+- Account transport working note: [`nostr-account-transport.md`](./nostr-account-transport.md)
 - Deep reference: [`../further-context/nostr-role-in-marmot.md`](../further-context/nostr-role-in-marmot.md)

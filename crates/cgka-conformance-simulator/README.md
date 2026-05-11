@@ -44,6 +44,12 @@ from `scenario`, serialize their observed trace into the same shape, and
 compare `expected_trace` by value. The trace intentionally avoids OpenMLS
 internals.
 
+The next vector pass is tracked in
+[`docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`](../../docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md).
+That pass should add a vector manifest and a byte-level fixture schema for
+component and wire-format bytes. This crate currently has scenario fixtures,
+not a full byte-level vector suite.
+
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr
 peeler and `ingest`, the convergence engine selects one same-epoch branch, and
