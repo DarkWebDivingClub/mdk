@@ -419,7 +419,9 @@ impl<T: PartialEq> PushUnique<T> for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NostrKeyPackagePublication;
     use cgka_traits::Timestamp;
+    use cgka_traits::engine::KeyPackage;
     use nostr_sdk::prelude::Keys;
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
@@ -553,6 +555,32 @@ mod tests {
         event.verify().expect("signed event verifies");
         assert_eq!(event.pubkey, keys.public_key());
         assert_eq!(event.kind, Kind::MlsGroupMessage);
+        assert_eq!(event.content, dto.content);
+    }
+
+    #[tokio::test]
+    async fn unsigned_marmot_key_package_event_is_signed_as_kind_30443() {
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys.clone()).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = NostrKeyPackagePublication {
+            account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+            key_package: KeyPackage(vec![1, 2, 3, 4]),
+            key_package_id: "kp-ref-1".into(),
+            mls_ciphersuite: "0x0001".into(),
+            mls_extensions: vec!["0xf2ee".into()],
+            mls_proposals: vec!["0x000a".into()],
+            advertised_relays: vec![TransportEndpoint("wss://kp.example".into())],
+            publish_endpoints: vec![TransportEndpoint("wss://kp.example".into())],
+        }
+        .to_event()
+        .expect("key package event");
+
+        let event = sdk.event_for_publish(&dto).await.expect("event");
+
+        event.verify().expect("signed event verifies");
+        assert_eq!(event.pubkey, keys.public_key());
+        assert_eq!(event.kind.as_u16(), 30_443);
         assert_eq!(event.content, dto.content);
     }
 

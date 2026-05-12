@@ -46,14 +46,15 @@ The current `KeyPackagePublisher` trait is a temporary boundary for the first
 account-runtime slice. The likely production shape is for KeyPackage
 publication to move into the transport adapter family, so the account runtime
 can ask the active transport to publish a KeyPackage without knowing whether
-that means Nostr kind `30443`, another relay-plane format, or a future
+that means Marmot Nostr kind `30443`, another relay-plane format, or a future
 non-Nostr transport.
 
 ## What it does not do
 
 - No UI projection or message database.
 - No account key derivation or recovery.
-- No concrete Nostr KeyPackage event format yet.
+- No derivation of full MIP-00 KeyPackage metadata from fresh engine
+  KeyPackage bytes yet.
 - No relay auth, Nostr routing-component reader, or relay-list discovery yet.
 
 ## Run tests

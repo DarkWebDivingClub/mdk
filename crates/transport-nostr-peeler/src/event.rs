@@ -111,7 +111,9 @@ impl NostrTransportEvent {
             .map(String::as_str)
     }
 
-    pub(crate) fn new_local(
+    /// Build an unsigned local Nostr DTO and precompute the event id for the
+    /// supplied unsigned event core.
+    pub fn new_unsigned(
         pubkey: String,
         kind: u64,
         tags: Vec<Vec<String>>,
@@ -128,6 +130,15 @@ impl NostrTransportEvent {
             content,
             sig: None,
         }
+    }
+
+    pub(crate) fn new_local(
+        pubkey: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Self {
+        Self::new_unsigned(pubkey, kind, tags, content)
     }
 }
 

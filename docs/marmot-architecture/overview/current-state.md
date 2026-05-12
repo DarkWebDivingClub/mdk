@@ -99,8 +99,10 @@ This repository now has the main engine candidate:
   custom OpenMLS state, with Rust migrations for schema/data evolution.
 - `crates/transport-nostr-adapter` — Nostr transport adapter core for account
   activation, group subscription sync, relay-event routing, and endpoint-level
-  publish reports behind an injectable relay-client boundary. Its optional
-  `sdk` feature provides the first `nostr-sdk` backed relay client.
+  publish reports behind an injectable relay-client boundary. It also has the
+  first Marmot kind `30443` KeyPackage event builder/publisher boundary, with
+  MIP-00 metadata supplied explicitly. Its optional `sdk` feature provides the
+  first `nostr-sdk` backed relay client.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` /
   `1059` events, kind `445` group envelope peeling, and NIP-59 welcome
   wrap/peel with injected local signer/decrypter.
@@ -141,8 +143,9 @@ invalidations, and test generated delivery variants.
   gating, duplicate delivery, reordered delivery, invite commit/welcome order
   variants, and terminal stale-epoch invite commits through the real session,
   adapter, and peeler stack. Production relay auth, Nostr-backed transport
-  routing policy, KeyPackage publication through the transport layer, richer
-  telemetry export, and account key-management wiring still need integration.
+  routing policy, full KeyPackage metadata derivation through the transport
+  layer, richer telemetry export, and account key-management wiring still need
+  integration.
 - **Nostr account transport shape** — the likely production shape includes a
   Nostr user directory, account bootstrap for relay-list events, a shared
   multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing,
@@ -172,7 +175,9 @@ invalidations, and test generated delivery variants.
 - **`IdentityRemove` proposal type** — identified as the first likely
   Marmot-custom proposal, not specified or implemented.
 - **KeyPackage refresh/expiry policy** — still a higher-layer production
-  scheduling concern.
+  scheduling concern. The transport adapter can publish a Marmot kind `30443`
+  KeyPackage event when supplied with the required MIP-00 metadata, but deriving
+  that metadata from a fresh engine KeyPackage is still follow-up work.
 
 ## See also
 

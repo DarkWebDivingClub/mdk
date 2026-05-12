@@ -17,6 +17,8 @@ The default core stays relay-client agnostic; the optional `sdk` feature adds a
 - Routes signed kind `1059` giftwraps through the account-inbox plane.
 - Publishes already-wrapped `TransportMessage`s to target endpoints and returns
   endpoint-level publish reports.
+- Builds and publishes Marmot kind `30443` KeyPackage events through the same
+  relay-client boundary when supplied with the MIP-00 metadata.
 - Removes stale group subscriptions when an active account's group set changes.
 - Exposes adapter-local lifecycle metrics for diagnostics.
 - With the `sdk` feature, plans `nostr-sdk` filters/subscription ids, signs
@@ -34,8 +36,8 @@ The default core stays relay-client agnostic; the optional `sdk` feature adds a
   on SDK `RelayOptions` for reconnect, retry interval adjustment, jitter,
   relay sleep/ban/terminate behavior, and connection stats.
 - No full production relay-plane orchestration yet. Relay auth, Nostr-backed
-  transport routing policy, KeyPackage publication, richer telemetry export,
-  and per-platform lifecycle wiring still need hardening.
+  transport routing policy, full KeyPackage metadata derivation, richer
+  telemetry export, and per-platform lifecycle wiring still need hardening.
 
 ## Privacy-safe diagnostics
 
@@ -69,7 +71,9 @@ The likely next expansion is to keep Nostr-specific routing here: derive group
 subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1`, derive KeyPackage publish targets from the
 user's kind `10051` KeyPackage relay list, and publish KeyPackages as Nostr
-kind `30443` events through the same relay-client boundary.
+kind `30443` events through the same relay-client boundary. Kind `30443` is the
+Marmot KeyPackage event kind; do not substitute deprecated NIP-104 key package
+kinds for this path.
 
 ## Run tests
 
