@@ -5,10 +5,12 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance_simulator::{
-    ClientBuilder, EpochChangeObservation, HarnessClient, PendingResolutionObservation,
-    ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
+    ClientBuilder, EpochChangeObservation, GeneratedScenarioCase, HarnessClient,
+    PendingResolutionObservation, ScenarioSpec, ScenarioStep, ScenarioTrace, TraceExpectation,
+    TransportBus, VectorFixture, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
-    run_generated_case_report, run_scenario_report, run_scenario_spec,
+    run_generated_case_report, run_scenario_report, run_scenario_report_with_outcomes,
+    run_scenario_spec, run_vector_fixture_report,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
@@ -615,15 +617,375 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
 }
 
 #[tokio::test]
+async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
+    let cases = generate_convergence_chaos_family(123, 24);
+
+    assert_eq!(cases, generate_convergence_chaos_family(123, 24));
+    assert_eq!(cases.len(), 24);
+    assert!(
+        cases.iter().all(|case| !case.expected_outcomes.is_empty()),
+        "chaos cases should carry semantic expectations"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::SetPartition { .. }))),
+        "chaos cases should include partition windows"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::InviteMembers { .. }))),
+        "chaos cases should include invite races"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::UpdateGroupData { .. }))),
+        "chaos cases should include group-data races"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::FailPending { .. }))),
+        "chaos cases should include publish rollback"
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|case| case.scenario.steps.iter().any(|step| matches!(
+                step,
+                ScenarioStep::DuplicateQueued { .. }
+                    | ScenarioStep::DelayQueued { .. }
+                    | ScenarioStep::ReorderQueued { .. }
+            ))),
+        "chaos cases should include queue schedule faults"
+    );
+    assert!(
+        cases.iter().any(|case| case.scenario.clients.len() >= 21),
+        "chaos cases should include 20+ client groups"
+    );
+    assert!(
+        cases.iter().any(|case| {
+            case.scenario
+                .steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::SendAppMessage { .. }))
+                .count()
+                >= 20
+        }),
+        "chaos cases should include large message storms"
+    );
+    assert!(
+        cases.iter().any(|case| {
+            case.scenario
+                .steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::UpdateGroupData { .. }))
+                .count()
+                >= 4
+        }),
+        "chaos cases should include multi-committer storms"
+    );
+    assert!(
+        cases.iter().any(|case| {
+            let sends = case
+                .scenario
+                .steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::SendAppMessage { .. }))
+                .count();
+            let commits = case
+                .scenario
+                .steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::UpdateGroupData { .. }))
+                .count();
+            case.scenario.clients.len() >= 21 && sends >= 20 && commits >= 4
+        }),
+        "chaos cases should include 20+ client mixed message and commit storms"
+    );
+
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "convergence-chaos/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 123);
+        assert_eq!(case.case_index, case_index as u64);
+
+        let report = run_generated_case_report(case, None)
+            .await
+            .expect("generated convergence chaos report runs");
+        assert_eq!(report.expected_outcomes, case.expected_outcomes);
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {} failed expectations: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
+        assert!(report.invariant_failures.is_empty());
+        assert_eq!(report.scenario, case.scenario);
+    }
+}
+
+#[tokio::test]
+async fn failing_generated_case_records_a_minimized_reproducer() {
+    let scenario = ScenarioSpec {
+        name: "convergence-chaos/minimizer-smoke/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "minimizer".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ClearEvents {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "irrelevant noise".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+    let case = GeneratedScenarioCase {
+        family_name: "convergence-chaos/v1".into(),
+        generator_version: "1".into(),
+        seed: 99,
+        case_index: 0,
+        expected_outcomes: vec![TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 1,
+            member_count: 99,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        }],
+        scenario,
+    };
+
+    let report = run_generated_case_report(&case, None)
+        .await
+        .expect("failing generated case still reports");
+
+    assert_eq!(report.expectation_failures.len(), 1);
+    let minimized = report
+        .metadata
+        .generated
+        .as_ref()
+        .and_then(|generated| generated.minimized_case.as_ref())
+        .expect("failing generated case should record a minimized case");
+    assert!(
+        minimized.steps.len() < case.scenario.steps.len(),
+        "minimized case should remove irrelevant delivery noise"
+    );
+    let minimized_report =
+        run_scenario_report_with_outcomes(minimized, None, case.expected_outcomes.clone())
+            .await
+            .expect("minimized report runs");
+    assert!(
+        minimized_report
+            .expectation_failures
+            .iter()
+            .any(|failure| failure.kind == "client_state_mismatch"),
+        "minimized case should reproduce the failure"
+    );
+}
+
+#[tokio::test]
 async fn scenario_report_records_trace_log_recoveries_and_failures() {
-    // Drives a fork-recovery scenario inline (rather than from a JSON
-    // fixture) because fork-recovery traces are not currently byte-equal
-    // across runs — see the comment in
-    // `canonical_vector_fixtures_match_generated_traces`. The properties
-    // verified here are about the report *machinery*, not specific trace
-    // bytes: step_log length, exactly-one recovery, invariant_failures
-    // empty, JSON serializability.
-    let spec = ScenarioSpec {
+    let spec = deliberate_fork_recovery_spec();
+
+    let report = run_scenario_report(&spec, None)
+        .await
+        .expect("scenario reports");
+
+    assert_eq!(report.metadata.scenario_name, "deliberate-fork-recovery/v1");
+    assert_eq!(report.metadata.step_count, spec.steps.len());
+    assert_eq!(report.step_log.len(), spec.steps.len());
+    assert!(
+        report
+            .step_log
+            .iter()
+            .all(|entry| entry.status.is_completed())
+    );
+    assert_eq!(report.recovery_observations.len(), 1);
+    let recovery = &report.recovery_observations[0];
+    assert_eq!(recovery.source_epoch, 1);
+    assert_eq!(recovery.recovered_epoch, 2);
+    assert_ne!(recovery.winner, recovery.invalidated);
+    assert!(
+        (
+            recovery.winner.source_epoch,
+            recovery.winner.commit_digest.as_str(),
+        ) < (
+            recovery.invalidated.source_epoch,
+            recovery.invalidated.commit_digest.as_str(),
+        )
+    );
+    assert!(report.invariant_failures.is_empty());
+
+    let json = serde_json::to_value(&report).expect("report serializes");
+    assert_eq!(
+        json["metadata"]["scenario_name"],
+        "deliberate-fork-recovery/v1"
+    );
+    assert!(
+        json["step_log"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn group_data_fork_recovery_fixture_uses_semantic_outcomes() {
+    let spec = group_data_fork_recovery_spec();
+    let trace = run_scenario_spec(&spec)
+        .await
+        .expect("group-data fork scenario runs");
+
+    for label in ["alice", "bob"] {
+        let observation = trace
+            .observations
+            .iter()
+            .find(|observation| observation.client == label)
+            .expect("client observation");
+        assert_eq!(observation.epoch, 2);
+        assert_eq!(observation.member_count, 2);
+    }
+    let recoveries = trace
+        .observations
+        .iter()
+        .flat_map(|observation| observation.recoveries.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(recoveries.len(), 1);
+    assert_ne!(
+        recoveries[0].winner, recoveries[0].invalidated,
+        "semantic recovery fixture should not depend on exact commit digest bytes"
+    );
+}
+
+#[tokio::test]
+async fn vector_fixture_report_records_semantic_expectation_failures() {
+    let fixture = VectorFixture {
+        scenario_name: "group-data-fork-recovery/v1".into(),
+        vector_version: "1".into(),
+        conformance_version: env!("CARGO_PKG_VERSION").into(),
+        seed: None,
+        scenario: group_data_fork_recovery_spec(),
+        expected_trace: None,
+        expected_outcomes: vec![TraceExpectation::ClientState {
+            client: "bob".into(),
+            epoch: 99,
+            member_count: 2,
+            received_payloads: Some(vec![]),
+            added_members: None,
+            removed_members: None,
+        }],
+    };
+
+    let report = run_vector_fixture_report(&fixture)
+        .await
+        .expect("fixture report runs");
+
+    assert_eq!(report.expected_outcomes, fixture.expected_outcomes);
+    assert_eq!(report.expectation_failures.len(), 1);
+    assert_eq!(report.expectation_failures[0].kind, "client_state_mismatch");
+    assert_eq!(report.invariant_failures[0].kind, "client_state_mismatch");
+
+    let json = serde_json::to_value(&report).expect("report serializes");
+    assert_eq!(
+        json["metadata"]["fixture"]["scenario_name"],
+        "group-data-fork-recovery/v1"
+    );
+    assert_eq!(
+        json["expectation_failures"][0]["kind"],
+        "client_state_mismatch"
+    );
+    assert!(json["expectation_failures"][0]["expected"].is_object());
+    assert!(json["expectation_failures"][0]["actual"].is_object());
+}
+
+fn group_data_fork_recovery_spec() -> ScenarioSpec {
+    ScenarioSpec {
+        name: "group-data-fork-recovery/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "fork".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ClearEvents {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "alice branch".into(),
+                pending: "alice-update".into(),
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "bob".into(),
+                name: "bob branch".into(),
+                pending: "bob-update".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "alice-update".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "bob".into(),
+                pending: "bob-update".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    }
+}
+
+fn deliberate_fork_recovery_spec() -> ScenarioSpec {
+    ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
         spec_version: "1".into(),
         clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
@@ -672,47 +1034,7 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
                 clients: vec!["alice".into(), "bob".into()],
             },
         ],
-    };
-
-    let report = run_scenario_report(&spec, None)
-        .await
-        .expect("scenario reports");
-
-    assert_eq!(report.metadata.scenario_name, "deliberate-fork-recovery/v1");
-    assert_eq!(report.metadata.step_count, spec.steps.len());
-    assert_eq!(report.step_log.len(), spec.steps.len());
-    assert!(
-        report
-            .step_log
-            .iter()
-            .all(|entry| entry.status.is_completed())
-    );
-    assert_eq!(report.recovery_observations.len(), 1);
-    let recovery = &report.recovery_observations[0];
-    assert_eq!(recovery.source_epoch, 1);
-    assert_eq!(recovery.recovered_epoch, 2);
-    assert_ne!(recovery.winner, recovery.invalidated);
-    assert!(
-        (
-            recovery.winner.source_epoch,
-            recovery.winner.commit_digest.as_str(),
-        ) < (
-            recovery.invalidated.source_epoch,
-            recovery.invalidated.commit_digest.as_str(),
-        )
-    );
-    assert!(report.invariant_failures.is_empty());
-
-    let json = serde_json::to_value(&report).expect("report serializes");
-    assert_eq!(
-        json["metadata"]["scenario_name"],
-        "deliberate-fork-recovery/v1"
-    );
-    assert!(
-        json["step_log"]
-            .as_array()
-            .is_some_and(|steps| !steps.is_empty())
-    );
+    }
 }
 
 #[tokio::test]
@@ -1124,27 +1446,29 @@ async fn scenario_report_records_convergence_e2e_group_events() {
 
 #[tokio::test]
 async fn canonical_vector_fixtures_match_generated_traces() {
-    // Fork-recovery vectors are deliberately absent: under content-derived
-    // ordering (`CommitOrderingKey { source_epoch, commit_digest }`), the
-    // SHA-256 of an OpenMLS commit varies run-to-run because commits include
-    // fresh HPKE path randomness. Both the digest values and the side that
-    // ends up rolling back are non-stable, so byte-equal trace comparison
-    // does not work for fork-recovery scenarios. See
-    // `docs/marmot-architecture/distributed-convergence.md` (Track A) for
-    // the path forward.
-    let fixtures = [
-        (
-            "three-client-message-exchange.v1.json",
-            include_str!("../vectors/three-client-message-exchange.v1.json"),
-        ),
-        (
-            "publish-fail.v1.json",
-            include_str!("../vectors/publish-fail.v1.json"),
-        ),
-    ];
+    // Exact traces remain useful when the observable output is naturally
+    // stable. Fork-recovery fixtures use semantic expectations because commit
+    // digest bytes come from randomized MLS envelopes.
+    let vectors = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors");
+    let mut fixtures = std::fs::read_dir(vectors)
+        .expect("vectors dir exists")
+        .map(|entry| entry.expect("vector entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".v1.json") && name != "manifest.v1.json")
+        })
+        .collect::<Vec<_>>();
+    fixtures.sort();
 
-    for (fixture_name, contents) in fixtures {
-        let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");
+    for path in fixtures {
+        let fixture_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name");
+        let fixture: VectorFixture =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture contents"))
+                .unwrap_or_else(|e| panic!("{fixture_name} parses: {e}"));
         let observed_trace = run_scenario_spec(&fixture.scenario)
             .await
             .expect("fixture scenario runs");
@@ -1337,19 +1661,25 @@ fn assert_vector_fixture_matches(
         "fixture {fixture_name} has stale conformance_version"
     );
     assert_eq!(
-        fixture.scenario_name, fixture.expected_trace.name,
-        "fixture {fixture_name} metadata scenario_name must match expected_trace.name"
-    );
-    assert_eq!(
         fixture.scenario_name, fixture.scenario.name,
         "fixture {fixture_name} metadata scenario_name must match scenario.name"
     );
-    assert_eq!(
-        fixture.expected_trace,
-        observed_trace,
-        "fixture {fixture_name} mismatch\nseed: {:?}\nexpected trace:\n{}\nobserved trace:\n{}",
+    if let Some(expected_trace) = &fixture.expected_trace {
+        assert_eq!(
+            fixture.scenario_name, expected_trace.name,
+            "fixture {fixture_name} metadata scenario_name must match expected_trace.name"
+        );
+    }
+    assert!(
+        fixture.expected_trace.is_some() || !fixture.expected_outcomes.is_empty(),
+        "fixture {fixture_name} must define an exact expected_trace or semantic expected_outcomes"
+    );
+    let mismatches = fixture.compare_observed_trace(&observed_trace);
+    assert!(
+        mismatches.is_empty(),
+        "fixture {fixture_name} mismatch\nseed: {:?}\nmismatches:\n{:#?}\nobserved trace:\n{}",
         fixture.seed,
-        serde_json::to_string_pretty(&fixture.expected_trace).expect("expected trace JSON"),
+        mismatches,
         serde_json::to_string_pretty(&observed_trace).expect("observed trace JSON"),
     );
 }

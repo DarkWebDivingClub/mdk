@@ -11,10 +11,27 @@ wraps over the in-memory bus.
 - `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed delivery (for welcomes), and replay hooks.
 - `HarnessClient` — wraps `Engine<MemoryStorage>` + the real Nostr transport peeler while keeping delivery in memory.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
-- `VectorFixture` — portable JSON fixtures pairing runnable scenario input with expected `ScenarioTrace` output.
+- `VectorFixture` — portable JSON fixtures pairing runnable scenario input
+  with exact traces or semantic expected outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
-- `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families and writes JSON reports.
+- `cgka-conformance-simulator-report` — a small CLI that runs generated
+  scenario families, writes JSON reports, and emits fixture candidates for
+  generated cases.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
+
+## Property Tests
+
+Property tests live in
+[`tests/proptest_invariants.rs`](tests/proptest_invariants.rs). They generate
+many small inputs and assert rules that should hold for every generated shape:
+candidate selection order-invariance, canonicalization disposition
+order-invariance, canonicalization replay idempotence, quiescence gating,
+capability negotiation, send/leave convergence, varied delivery convergence,
+same-message replay, restart equivalence for stored convergence input, upgrade
+publish confirm/fail, and group-data update publish confirm/fail.
+
+Cheap symbolic properties run more cases. Harness-heavy properties use smaller
+default counts and larger `conformance-slow` counts.
 
 ## Run the tests
 
@@ -36,22 +53,24 @@ JSON `VectorFixture` envelope:
 - `conformance_version` — `cgka-conformance-simulator` crate version that produced the fixture.
 - `seed` — `null` for hand-authored deterministic scenarios.
 - `scenario` — the input-side `ScenarioSpec` to execute.
-- `expected_trace` — the `ScenarioTrace` a conforming implementation must
-  produce. The trace records client observations and scenario-level pending
-  publish confirmations or rollbacks.
+- `expected_trace` — an exact `ScenarioTrace` for cases whose output is
+  stable by construction.
+- `expected_outcomes` — semantic checks for cases where randomized MLS bytes
+  make exact trace comparison too brittle.
 
 Non-Rust implementations should read the JSON file, run the named scenario
 from `scenario`, serialize their observed trace into the same shape, and
-compare `expected_trace` by value. The trace intentionally avoids OpenMLS
-internals.
+compare it with either `expected_trace` or `expected_outcomes`. The trace
+intentionally avoids OpenMLS internals.
 
 The next vector pass is tracked in
 [`docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`](../../docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md).
 That pass has started with [`vectors/manifest.v1.json`](vectors/manifest.v1.json)
 and [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json).
-This crate now has first app-component byte fixtures and a portable
-`publish-fail/v1` pending-rollback vector, but not a full byte-level vector
-suite.
+This crate now has first app-component byte fixtures and portable scenario
+vectors for message exchange, pending rollback, invites, group-data updates,
+queue faults, partition repair, leave, delayed past-epoch app delivery, and
+fork recovery. It does not yet have a full byte-level wire-event suite.
 
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr
@@ -66,32 +85,29 @@ peeler cannot unwrap them yet. After canonical branch selection advances the
 MLS context, the engine retries those raw records and emits only the payloads
 that decrypt on the selected branch.
 
-### Fork-recovery vectors are not currently portable
+### Semantic fork-recovery vector
 
 `CommitOrderingKey` is now content-derived (`SHA-256(mls_bytes)` of the
 serialized MLS commit). This makes the engine fully transport-agnostic for
-fork-recovery decisions, but it surfaces a real limitation that the prior
-`(timestamp, message_id)` scheme hid: OpenMLS commits include fresh HPKE path
-randomness, so the same scenario produces *different* commit bytes and thus
-different digests on every run. The lower-digest commit (the fork-recovery
-winner) is effectively a coin flip per run, so neither the digest values nor
-the side that ends up rolling back are stable.
+fork-recovery decisions. Portable scenario fixtures do not assert exact winner
+digest bytes, because those bytes come from randomized MLS envelopes.
 
-Consequence: the previous `deliberate-fork-recovery/v1` fixture has been
-removed. The engine's deterministic fork-recovery property is still asserted
-in-tree (`tests/canonical_scenarios.rs::deliberate_fork_via_harness`,
-`crates/cgka-engine/tests/fork_detection.rs`) and the report machinery is
-exercised inline (`tests/canonical_scenarios.rs::scenario_report_records_trace_log_recoveries_and_failures`).
-Restoring portable fork-recovery vectors requires either deterministic commit
-production or a trace shape that abstracts over which-side-rolled-back. This
-is tracked in
-[`docs/marmot-architecture/distributed-convergence.md`](../../docs/marmot-architecture/distributed-convergence.md).
+The first fork-recovery fixture is
+[`vectors/group-data-fork-recovery.v1.json`](vectors/group-data-fork-recovery.v1.json).
+It models a same-epoch group-data update race and asserts the semantic outcome:
+both clients reach epoch 2 with two members, one client observes recovery from
+epoch 1 to epoch 2, and the winner and invalidated ordering keys are distinct.
+
+`concurrent-invite-fork-recovery/v1` uses the same semantic recovery style for
+an invite race. It checks convergence and recovery without pinning which
+invite branch wins.
 
 `ScenarioSpec` v1 contains ordered client labels and ordered steps. Supported
 steps are:
 
 - `create_group`
 - `invite_members`
+- `update_group_data`
 - `confirm_pending`
 - `fail_pending`
 - `send_app_message`
@@ -128,6 +144,7 @@ of the queue.
 - `seed`
 - `case_index`
 - `scenario`
+- `expected_outcomes`
 
 The generated `scenario` is a normal `ScenarioSpec`, so a failing generated
 case can be serialized and promoted into a fixed fixture without inventing a
@@ -142,14 +159,26 @@ be Bob's single-commit branch at epoch 2 or Alice's deeper branch at epoch 3
 depending on which messages are available before the stability gate. In both
 cases the trace includes exactly the selected branch application payload.
 
+`generate_convergence_chaos_family(seed, cases)` produces deterministic
+adversarial convergence cases with built-in semantic expectations. The first
+generator version rotates through invite forks, group-data forks, publish
+rollback plus delayed duplicates, partition/heal/leave, delayed past-epoch app
+delivery, stable duplicate/delay/reorder queue faults, 20+ client message
+storms, partitioned large-group delivery storms, multi-committer group-data
+storms, and mixed large message/commit storms. These cases are ordinary
+`ScenarioSpec`s, so the same runner and report path can promote any interesting
+case into a fixed vector.
+
 ## Report artifacts
 
 `run_scenario_report(spec, expected_trace)` executes a scenario and returns a
 serializable `ScenarioReport` with:
 
 - `metadata` — scenario name, spec version, step count, and optional generated
-  case metadata.
+  case or fixture metadata.
+- `scenario` — the exact scenario input that was executed.
 - `expected_trace` — the trace being checked, when supplied.
+- `expected_outcomes` — semantic fixture expectations, when supplied.
 - `observed_trace` — the trace produced by the scenario runner.
 - `step_log` — one entry per completed scenario step.
 - `recovery_observations` — flattened fork-recovery events from all client
@@ -158,12 +187,20 @@ serializable `ScenarioReport` with:
   client observations.
 - `app_invalidation_observations` — flattened app invalidation dispositions
   from all client observations.
-- `invariant_failures` — currently records `trace_mismatch` when expected and
-  observed traces differ.
+- `expectation_failures` — exact-trace or semantic expectation mismatches with
+  expected and actual JSON.
+- `invariant_failures` — compatibility field mirroring expectation failures by
+  kind and message.
 
 `run_generated_case_report(case, expected_trace)` adds generated-family
 metadata: family name, generator version, seed, case index, and an optional
-`minimized_case` field for future shrink results.
+`minimized_case` field. Failing generated cases run a conservative greedy
+minimizer that removes removable delivery/app steps only when the same failure
+kinds still reproduce. Generated report runs also write a sibling
+`*-fixture.v1.json` candidate. Cases with semantic expectations keep those
+expectations; cases without them use the observed trace as an exact expected
+trace in the candidate. When a failing generated case has a minimized
+reproducer, the fixture candidate uses that minimized scenario.
 
 To run the current generated family and write JSON reports:
 
@@ -185,8 +222,32 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cgka-conformance-simulator-reports
 ```
 
+To run the broader adversarial convergence chaos family:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --family convergence-chaos/v1 \
+  --seed 42 \
+  --cases 10 \
+  --out target/cgka-conformance-simulator-reports
+```
+
 Reports are written as one file per case, for example
 `target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`.
+Generated family runs also write fixture candidates such as
+`target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.
+
+To run every portable vector fixture and print a pass/fail summary:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --vectors crates/cgka-conformance-simulator/vectors \
+  --out target/cgka-conformance-simulator-reports
+```
+
+The command exits non-zero when any fixture has expectation failures. Each
+report includes the scenario input, observed trace, flattened observations, and
+the exact expectation failures.
 
 ## When to use the harness vs. integration tests
 

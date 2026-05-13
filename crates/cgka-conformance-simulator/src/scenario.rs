@@ -2,11 +2,11 @@
 //!
 //! `ScenarioSpec` is the v1 input-side companion to `ScenarioTrace`: external
 //! implementations can drive the same logical client operations, then compare
-//! their observed trace to the fixture's expected trace.
+//! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    ClientBuilder, HarnessClient, PendingResolutionObservation, ScenarioTrace, TransportBus,
-    observe_client,
+    ClientBuilder, ExpectationFailure, HarnessClient, PendingResolutionObservation, ScenarioTrace,
+    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations, observe_client,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -38,6 +38,11 @@ pub enum ScenarioStep {
     InviteMembers {
         inviter: String,
         invitees: Vec<String>,
+        pending: String,
+    },
+    UpdateGroupData {
+        client: String,
+        name: String,
         pending: String,
     },
     ConfirmPending {
@@ -92,6 +97,7 @@ impl ScenarioStep {
         match self {
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
+            ScenarioStep::UpdateGroupData { .. } => "update_group_data",
             ScenarioStep::ConfirmPending { .. } => "confirm_pending",
             ScenarioStep::FailPending { .. } => "fail_pending",
             ScenarioStep::SendAppMessage { .. } => "send_app_message",
@@ -114,7 +120,10 @@ impl ScenarioStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioReport {
     pub metadata: ScenarioReportMetadata,
+    pub scenario: ScenarioSpec,
     pub expected_trace: Option<ScenarioTrace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_outcomes: Vec<TraceExpectation>,
     pub observed_trace: Option<ScenarioTrace>,
     pub step_log: Vec<ScenarioStepLogEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -122,6 +131,8 @@ pub struct ScenarioReport {
     pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
     pub epoch_change_observations: Vec<EpochChangeReportObservation>,
     pub app_invalidation_observations: Vec<AppInvalidationReportObservation>,
+    #[serde(default)]
+    pub expectation_failures: Vec<ExpectationFailure>,
     pub invariant_failures: Vec<InvariantFailure>,
 }
 
@@ -146,6 +157,15 @@ pub struct ScenarioReportMetadata {
     pub spec_version: String,
     pub step_count: usize,
     pub generated: Option<GeneratedScenarioMetadata>,
+    pub fixture: Option<VectorFixtureMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFixtureMetadata {
+    pub scenario_name: String,
+    pub vector_version: String,
+    pub conformance_version: String,
+    pub seed: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,13 +231,46 @@ pub async fn run_scenario_report(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_inner(spec, expected_trace, vec![], None).await
+}
+
+pub async fn run_scenario_report_with_outcomes(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_inner(spec, expected_trace, expected_outcomes, None).await
+}
+
+pub async fn run_vector_fixture_report(
+    fixture: &VectorFixture,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_inner(
+        &fixture.scenario,
+        fixture.expected_trace.clone(),
+        fixture.expected_outcomes.clone(),
+        Some(VectorFixtureMetadata {
+            scenario_name: fixture.scenario_name.clone(),
+            vector_version: fixture.vector_version.clone(),
+            conformance_version: fixture.conformance_version.clone(),
+            seed: fixture.seed,
+        }),
+    )
+    .await
+}
+
+async fn run_scenario_report_inner(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    fixture: Option<VectorFixtureMetadata>,
+) -> Result<ScenarioReport, ScenarioRunError> {
     if spec.spec_version != "1" {
         return Err(ScenarioRunError {
             step_index: None,
             message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
         });
     }
-
     let bus = TransportBus::ordered();
     let mut clients = BTreeMap::new();
     for label in &spec.clients {
@@ -264,6 +317,15 @@ pub async fn run_scenario_report(
                 let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
                 let inviter = client_mut(&mut clients, inviter, step_index)?;
                 let pending_ref = inviter.invite(key_packages).await;
+                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+            }
+            ScenarioStep::UpdateGroupData {
+                client,
+                name,
+                pending,
+            } => {
+                let client = client_mut(&mut clients, client, step_index)?;
+                let pending_ref = client.update_group_data(name.clone()).await;
                 insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
             }
             ScenarioStep::ConfirmPending { client, pending } => {
@@ -412,7 +474,9 @@ pub async fn run_scenario_report(
             })
         })
         .collect();
-    let invariant_failures = invariant_failures(expected_trace.as_ref(), &observed_trace);
+    let expectation_failures =
+        compare_trace_expectations(expected_trace.as_ref(), &expected_outcomes, &observed_trace);
+    let invariant_failures = invariant_failures(&expectation_failures);
 
     Ok(ScenarioReport {
         metadata: ScenarioReportMetadata {
@@ -420,14 +484,18 @@ pub async fn run_scenario_report(
             spec_version: spec.spec_version.clone(),
             step_count: spec.steps.len(),
             generated: None,
+            fixture,
         },
+        scenario: spec.clone(),
         expected_trace,
+        expected_outcomes,
         observed_trace: Some(observed_trace),
         step_log,
         pending_resolution_observations,
         recovery_observations,
         epoch_change_observations,
         app_invalidation_observations,
+        expectation_failures,
         invariant_failures,
     })
 }
@@ -530,21 +598,12 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
     }
 }
 
-fn invariant_failures(
-    expected_trace: Option<&ScenarioTrace>,
-    observed_trace: &ScenarioTrace,
-) -> Vec<InvariantFailure> {
-    let Some(expected_trace) = expected_trace else {
-        return vec![];
-    };
-    if expected_trace == observed_trace {
-        return vec![];
-    }
-    vec![InvariantFailure {
-        kind: "trace_mismatch".into(),
-        message: format!(
-            "expected trace for {} did not match observed trace",
-            observed_trace.name
-        ),
-    }]
+fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<InvariantFailure> {
+    expectation_failures
+        .iter()
+        .map(|failure| InvariantFailure {
+            kind: failure.kind.clone(),
+            message: failure.message.clone(),
+        })
+        .collect()
 }

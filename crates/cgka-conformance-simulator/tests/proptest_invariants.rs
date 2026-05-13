@@ -19,6 +19,17 @@
 //! - **(f) Canonicalization dispositions**: generated proposal/app batches
 //!   preserve accepted, invalidated, dropped, and already-seen dispositions
 //!   under reordered duplicate delivery.
+//! - **(g) Canonicalization idempotence**: replaying a batch whose message
+//!   ids are already seen produces only already-seen dispositions.
+//! - **(h) Quiescence gate**: convergence-relevant input remains Syncing
+//!   before the stability window and becomes Stable after the window closes.
+//! - **(i) Capability negotiation**: generated capability matrices either
+//!   reject missing required support or report Available / Upgradeable /
+//!   Unavailable consistently.
+//! - **(j) Group-data publish lifecycle**: generated group-data updates
+//!   confirm or roll back projected metadata and leave the group reusable.
+//! - **(k) Restart equivalence**: stored convergence input produces the same
+//!   result before and after rebuilding an engine over the same storage.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,7 +37,8 @@ use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
     DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate, MessageKind,
-    PeeledMessage, PeeledMessageKind, canonicalize_with_materialized_candidates,
+    OutboundIntent, PeeledMessage, PeeledMessageKind, SyncState,
+    canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
@@ -35,13 +47,20 @@ use cgka_conformance_simulator::proptest_support::{
     ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
 };
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
+use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::CgkaEngine;
-use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::capabilities::{
+    Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel, TransportKind,
+};
+use cgka_traits::engine::{CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::storage::{GroupStorage, MessageStorage};
 use proptest::prelude::*;
 
 const REACTIONS_PROPOSAL: u16 = 0xF210;
+const PROP_FEATURE: Feature = Feature("prop-generated-feature");
+const PROP_FEATURE_PROPOSAL: u16 = 0xF211;
 
 fn digest_from_u64(value: u64) -> [u8; 32] {
     let mut digest = [0u8; 32];
@@ -74,6 +93,45 @@ fn registry() -> FeatureRegistry {
             description: "test-only",
         },
     );
+    r
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PropCapabilityLevel {
+    Required,
+    Optional,
+    TransportRequired,
+}
+
+fn prop_capability_level() -> impl Strategy<Value = PropCapabilityLevel> {
+    prop_oneof![
+        Just(PropCapabilityLevel::Required),
+        Just(PropCapabilityLevel::Optional),
+        Just(PropCapabilityLevel::TransportRequired),
+    ]
+}
+
+fn registry_with_generated_feature(
+    level: PropCapabilityLevel,
+    supports_feature: bool,
+) -> FeatureRegistry {
+    let mut r = registry();
+    if supports_feature {
+        r.register(
+            PROP_FEATURE,
+            CapabilityRequirement {
+                requires: Capability::Proposal(PROP_FEATURE_PROPOSAL),
+                level: match level {
+                    PropCapabilityLevel::Required => RequirementLevel::Required,
+                    PropCapabilityLevel::Optional => RequirementLevel::Optional,
+                    PropCapabilityLevel::TransportRequired => RequirementLevel::TransportRequired {
+                        transport: TransportKind::Nostr,
+                    },
+                },
+                description: "generated capability property",
+            },
+        );
+    }
     r
 }
 
@@ -115,6 +173,11 @@ fn prop_assert<T: PartialEq + std::fmt::Debug>(actual: T, expected: T, msg: &str
     if actual != expected {
         panic!("invariant violated: {msg} (actual={actual:?} expected={expected:?})");
     }
+}
+
+fn ascii_label(max_len: usize) -> impl Strategy<Value = String> {
+    prop::collection::vec(b'a'..=b'z', 1..=max_len)
+        .prop_map(|bytes| String::from_utf8(bytes).expect("generated ascii label"))
 }
 
 #[derive(Clone, Debug)]
@@ -621,6 +684,330 @@ proptest! {
     }
 }
 
+// ── Property (g) — canonicalization idempotence ───────────────────────────
+
+fn canonicalization_replay_is_already_seen(case: CanonicalDispositionCase) {
+    let messages = build_canonical_messages(&case);
+    let seen_message_ids = messages
+        .iter()
+        .map(|message| message.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    let observed = canonicalize_with_materialized_candidates(
+        CanonicalizationInput {
+            state: CanonicalizationState {
+                current_tip_epoch: 4,
+                retained_anchor_epoch: 1,
+                last_convergence_relevant_input_ms: 0,
+                seen_message_ids,
+            },
+            pending_messages: messages.clone(),
+            outbound_intents: vec![],
+            candidate_branches: vec![],
+            policy: canonical_policy(),
+            now_ms: 2_000,
+        },
+        vec![],
+    );
+
+    prop_assert(
+        observed.accepted_commits,
+        Vec::<String>::new(),
+        "already-seen replay must not accept commits",
+    );
+    prop_assert(
+        observed.accepted_proposals,
+        Vec::<String>::new(),
+        "already-seen replay must not accept proposals",
+    );
+    prop_assert(
+        observed.accepted_app_messages,
+        Vec::<String>::new(),
+        "already-seen replay must not emit app messages",
+    );
+    prop_assert(
+        observed.invalidated_app_messages,
+        vec![],
+        "already-seen replay must not emit app invalidations",
+    );
+    prop_assert(
+        observed.dropped_messages,
+        vec![],
+        "already-seen replay must not drop messages a second time",
+    );
+    prop_assert(
+        observed.already_seen.len(),
+        messages.len(),
+        "every replayed message occurrence should be AlreadySeen",
+    );
+    let already_seen_ids = observed
+        .already_seen
+        .iter()
+        .map(|seen| seen.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    prop_assert(
+        already_seen_ids,
+        messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect::<BTreeSet<_>>(),
+        "already-seen replay should name the replayed message ids",
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 1000 } else { 128 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (g) — canonicalizing the same batch again after those
+    /// message ids are known must not produce app-visible output twice.
+    #[test]
+    fn prop_canonicalization_replay_is_already_seen(
+        case in canonical_disposition_case()
+    ) {
+        canonicalization_replay_is_already_seen(case);
+    }
+}
+
+// ── Property (h) — quiescence/stability gate ──────────────────────────────
+
+fn commit_message(
+    id: &str,
+    branch_id: &str,
+    fork_epoch: u64,
+    resulting_epoch: u64,
+    digest_rank: u64,
+) -> PeeledMessage {
+    PeeledMessage {
+        message_id: id.into(),
+        group_id: "group".into(),
+        sender: b"alice".to_vec(),
+        source_epoch: fork_epoch,
+        kind: PeeledMessageKind::Commit {
+            branch_id: branch_id.into(),
+            parent_branch_id: None,
+            fork_epoch,
+            resulting_epoch,
+            tip_digest: digest_from_u64(digest_rank),
+            consumed_proposal_ids: vec![],
+        },
+    }
+}
+
+fn canonicalization_quiescence_gate_holds(
+    stable_quiescence_ms: u64,
+    early_elapsed_ms: u64,
+    payload_tag: u8,
+) {
+    let last_input_ms = 10_000;
+    let commit = commit_message("selected-commit", "selected", 1, 2, payload_tag as u64);
+    let candidate = MaterializedCandidate {
+        branch: canonical_branch("selected", 1, 2, payload_tag as u64),
+        commit_message_ids: vec!["selected-commit".into()],
+        consumed_proposal_ids: vec![],
+    };
+    let policy = CanonicalizationPolicy {
+        stable_quiescence_ms,
+        ..canonical_policy()
+    };
+    let input_at = |now_ms| CanonicalizationInput {
+        state: CanonicalizationState {
+            current_tip_epoch: 1,
+            retained_anchor_epoch: 1,
+            last_convergence_relevant_input_ms: last_input_ms,
+            seen_message_ids: BTreeSet::new(),
+        },
+        pending_messages: vec![commit.clone()],
+        outbound_intents: vec![OutboundIntent::SendAppMessage {
+            payload: format!("queued-{payload_tag}"),
+        }],
+        candidate_branches: vec![],
+        policy: policy.clone(),
+        now_ms,
+    };
+
+    let early = canonicalize_with_materialized_candidates(
+        input_at(last_input_ms + early_elapsed_ms),
+        vec![candidate.clone()],
+    );
+    prop_assert(
+        early.sync_state,
+        SyncState::Syncing,
+        "window must stay syncing before quiescence",
+    );
+    prop_assert(
+        early.publishable_outbound_messages,
+        vec![],
+        "outbound work must not publish before quiescence",
+    );
+    prop_assert(
+        early.queued_outbound_intents.len(),
+        1,
+        "outbound work should remain queued before quiescence",
+    );
+
+    let stable = canonicalize_with_materialized_candidates(
+        input_at(last_input_ms + stable_quiescence_ms),
+        vec![candidate],
+    );
+    prop_assert(
+        stable.sync_state,
+        SyncState::Stable,
+        "window should become stable once quiescence elapses",
+    );
+    prop_assert(
+        stable.queued_outbound_intents,
+        vec![],
+        "stable convergence should not keep outbound work queued",
+    );
+    prop_assert(
+        stable.publishable_outbound_messages.len(),
+        1,
+        "stable convergence should release outbound work",
+    );
+    prop_assert(
+        stable.accepted_commits,
+        vec!["selected-commit".into()],
+        "selected commit should be accepted after quiescence",
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 1000 } else { 128 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (h) — convergence input is gated by the stability window:
+    /// before the window closes, output stays queued; once it closes, the
+    /// same fixed point becomes Stable and releases outbound work.
+    #[test]
+    fn prop_quiescence_gate_controls_stability(
+        (stable_quiescence_ms, early_elapsed_ms, payload_tag) in
+            (1u64..=5_000).prop_flat_map(|stable| {
+                (Just(stable), 0..stable, any::<u8>())
+            }),
+    ) {
+        canonicalization_quiescence_gate_holds(
+            stable_quiescence_ms,
+            early_elapsed_ms,
+            payload_tag,
+        );
+    }
+}
+
+// ── Property (i) — capability negotiation matrices ────────────────────────
+
+#[derive(Clone, Debug)]
+struct CapabilityNegotiationCase {
+    level: PropCapabilityLevel,
+    invitee_supports: Vec<bool>,
+    require_feature_at_create: bool,
+}
+
+fn capability_negotiation_case() -> impl Strategy<Value = CapabilityNegotiationCase> {
+    (
+        prop_capability_level(),
+        prop::collection::vec(any::<bool>(), 0..=3),
+        any::<bool>(),
+    )
+        .prop_map(|(level, invitee_supports, require_feature_at_create)| {
+            CapabilityNegotiationCase {
+                level,
+                invitee_supports,
+                require_feature_at_create,
+            }
+        })
+}
+
+fn capability_negotiation_matches_matrix(case: CapabilityNegotiationCase) {
+    rt().block_on(async {
+        let bus = TransportBus::ordered();
+        let mut alice = ClientBuilder::new(pad32(b"cap-alice"))
+            .registry(registry_with_generated_feature(case.level, true))
+            .attach(&bus);
+        let mut key_packages = Vec::with_capacity(case.invitee_supports.len());
+        for (index, supports) in case.invitee_supports.iter().enumerate() {
+            let mut invitee = ClientBuilder::new(pad32(format!("cap-{index}").as_bytes()))
+                .registry(registry_with_generated_feature(case.level, *supports))
+                .attach(&bus);
+            key_packages.push(invitee.fresh_key_package().await);
+        }
+
+        let feature_is_required = matches!(case.level, PropCapabilityLevel::Required)
+            || case.require_feature_at_create;
+        let all_members_support = case.invitee_supports.iter().all(|supports| *supports);
+        let create = alice
+            .engine
+            .create_group(CreateGroupRequest {
+                name: "capability property".into(),
+                description: "".into(),
+                members: key_packages,
+                required_features: case
+                    .require_feature_at_create
+                    .then_some(PROP_FEATURE)
+                    .into_iter()
+                    .collect(),
+                initial_admins: vec![],
+            })
+            .await;
+
+        if feature_is_required && !all_members_support {
+            assert!(
+                matches!(
+                    create,
+                    Err(cgka_traits::EngineError::MissingRequiredCapabilities { .. })
+                ),
+                "missing support for required feature must reject: {case:?}"
+            );
+            return;
+        }
+
+        let (group_id, result) =
+            create.unwrap_or_else(|err| panic!("group should create for {case:?}: {err:?}"));
+        let pending = match result {
+            cgka_traits::engine::SendResult::GroupCreated { pending, .. } => pending,
+            other => panic!("expected GroupCreated for {case:?}, got {other:?}"),
+        };
+        alice.confirm(pending).await;
+
+        let status = alice
+            .engine
+            .feature_status(&group_id, &PROP_FEATURE)
+            .unwrap_or_else(|err| panic!("feature_status should resolve for {case:?}: {err:?}"));
+        match (feature_is_required, all_members_support, status) {
+            (true, true, FeatureStatus::Available) => {}
+            (false, true, FeatureStatus::Upgradeable) => {}
+            (false, false, FeatureStatus::Unavailable { missing }) => {
+                assert!(
+                    missing.proposals.contains(&PROP_FEATURE_PROPOSAL),
+                    "missing set should name generated feature cap for {case:?}: {missing:?}"
+                );
+            }
+            (expected_required, expected_supported, other) => panic!(
+                "wrong feature status for {case:?}: required={expected_required} all_supported={expected_supported} got {other:?}"
+            ),
+        }
+    });
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 200 } else { 24 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (i) — generated capability matrices either reject missing
+    /// required support or report the exact feature availability state.
+    #[test]
+    fn prop_capability_negotiation_matches_matrix(
+        case in capability_negotiation_case()
+    ) {
+        capability_negotiation_matches_matrix(case);
+    }
+}
+
 // ── Property (b) — convergence under send/leave schedules ─────────────────
 
 /// Re-route a `TransportMessage` so its `transport_group_id` matches the
@@ -799,6 +1186,190 @@ proptest! {
         profile in delivery_profile(),
     ) {
         convergence_under_profile(intents, profile);
+    }
+}
+
+// ── Property (k) — restart equivalence for stored convergence input ───────
+
+fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
+    rt().block_on(async {
+        let bus = TransportBus::ordered();
+        let mut clients = setup_group(3, &bus).await;
+        let group_id = clients[0].group_id();
+        let committer_idx = committer_idx % 2;
+        let res = clients[committer_idx]
+            .engine
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(name.clone()),
+                description: None,
+            })
+            .await
+            .expect("committer creates group-data update");
+        let (commit, pending) = match res {
+            SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        clients[committer_idx].confirm(pending).await;
+        let commit = reroute(commit, &group_id);
+        clients[2]
+            .engine
+            .ingest(commit)
+            .await
+            .expect("observer buffers stored convergence input");
+
+        clients[2]
+            .storage()
+            .create_group_snapshot(&group_id, "restart-equivalence")
+            .expect("pre-convergence snapshot");
+        let live_result = clients[2]
+            .engine
+            .converge_stored_openmls_messages(&group_id, 1_000_000)
+            .expect("live convergence");
+        let live_epoch = clients[2].epoch().0;
+        let live_group = clients[2].storage().get_group(&group_id).unwrap();
+
+        clients[2]
+            .storage()
+            .rollback_group_to_snapshot(&group_id, "restart-equivalence")
+            .expect("rollback to pre-convergence snapshot");
+        let restarted_identity = clients[2].member_id().as_slice().to_vec();
+        let restarted_storage = clients[2].storage().clone();
+        let mut restarted = EngineBuilder::new(restarted_storage.clone())
+            .identity(restarted_identity.clone())
+            .feature_registry(registry())
+            .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::new(
+                hex::encode(restarted_identity),
+            )))
+            .build()
+            .expect("restarted engine builds");
+        let restarted_result = restarted
+            .converge_stored_openmls_messages(&group_id, 1_000_000)
+            .expect("restarted convergence");
+        let restarted_group = restarted_storage.get_group(&group_id).unwrap();
+
+        prop_assert(
+            restarted_result,
+            live_result,
+            "restart should not change stored convergence result",
+        );
+        prop_assert(
+            restarted.epoch(&group_id).unwrap().0,
+            live_epoch,
+            "restart should not change converged epoch",
+        );
+        prop_assert(
+            restarted_group.name,
+            live_group.name,
+            "restart should not change converged group name",
+        );
+        prop_assert(
+            restarted_group.members.len(),
+            live_group.members.len(),
+            "restart should not change converged membership",
+        );
+    });
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 40 } else { 8 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (k) — stored convergence input produces the same result
+    /// before and after rebuilding the engine over the same storage snapshot.
+    #[test]
+    fn prop_stored_convergence_restart_equivalence(
+        name in ascii_label(12),
+        committer_idx in 0usize..2,
+    ) {
+        stored_convergence_restart_equivalence(name, committer_idx);
+    }
+}
+
+// ── Property (j) — group-data update publish lifecycle ────────────────────
+
+fn group_data_update_publish_lifecycle(name: String, outcome: ConfirmOutcome) {
+    rt().block_on(async {
+        let bus = TransportBus::ordered();
+        let mut clients = setup_group(2, &bus).await;
+        let group_id = clients[0].group_id();
+        let original = clients[0].storage().get_group(&group_id).unwrap();
+        let epoch_before = clients[0].epoch().0;
+
+        let pending = clients[0].update_group_data(name.clone()).await;
+        prop_assert(
+            clients[0].epoch().0,
+            epoch_before + 1,
+            "group-data update should project next epoch",
+        );
+        prop_assert(
+            clients[0].storage().get_group(&group_id).unwrap().name,
+            name.clone(),
+            "group-data update should project new name",
+        );
+
+        match outcome {
+            ConfirmOutcome::Confirm => {
+                clients[0].confirm(pending).await;
+                prop_assert(
+                    clients[0].epoch().0,
+                    epoch_before + 1,
+                    "confirmed group-data update should stay at projected epoch",
+                );
+                prop_assert(
+                    clients[0].storage().get_group(&group_id).unwrap().name,
+                    name,
+                    "confirmed group-data update should keep projected name",
+                );
+            }
+            ConfirmOutcome::Fail => {
+                clients[0].fail(pending).await;
+                prop_assert(
+                    clients[0].epoch().0,
+                    epoch_before,
+                    "failed group-data update should restore prior epoch",
+                );
+                prop_assert(
+                    clients[0].storage().get_group(&group_id).unwrap().name,
+                    original.name,
+                    "failed group-data update should restore prior name",
+                );
+
+                let retry_name = format!("retry-{name}");
+                let retry = clients[0].update_group_data(retry_name.clone()).await;
+                clients[0].confirm(retry).await;
+                prop_assert(
+                    clients[0].epoch().0,
+                    epoch_before + 1,
+                    "group should be reusable after group-data rollback",
+                );
+                prop_assert(
+                    clients[0].storage().get_group(&group_id).unwrap().name,
+                    retry_name,
+                    "retry after rollback should publish normally",
+                );
+            }
+        }
+    });
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(feature = "conformance-slow") { 200 } else { 12 },
+        .. ProptestConfig::default()
+    })]
+
+    /// Property (j) — group-data update publish success keeps the projected
+    /// state; publish failure restores the prior stable state and permits a
+    /// retry.
+    #[test]
+    fn prop_group_data_update_publish_lifecycle(
+        name in ascii_label(12),
+        outcome in confirm_outcome(),
+    ) {
+        group_data_update_publish_lifecycle(name, outcome);
     }
 }
 

@@ -152,11 +152,14 @@ invalidations, and test generated delivery variants.
   and explicit relay URL safety policy. This is captured as a working note in
   [`nostr-account-transport.md`](./nostr-account-transport.md), but it should
   not pull focus away from the engine work.
-- **Byte-level and scenario vector maturity** — the simulator has portable
-  scenario fixtures and generated chaos families, but the byte-level vector
-  plan is still thin. We need a manifest that names which cases are portable,
-  Rust-only, generated, or byte-level, plus a fixture schema for exact
-  component and wire-format bytes.
+- **Byte-level and scenario vector maturity** — the simulator has a growing
+  portable scenario fixture set, generated chaos families, and a runner that
+  writes JSON reports with expectation failures plus generated fixture
+  candidates. `convergence-chaos/v1` is the first convergence-focused generated
+  family with built-in semantic expectations, 20+ client stress cases, mixed
+  message/commit storms, and conservative generated-failure minimization. The
+  byte-level vector plan is still thin beyond the first app-component encoding
+  fixtures.
 - **whitenoise-rs integration map** — the first integration path is likely a
   shim over `cgka-session` / `marmot-account`, with whitenoise-rs keeping
   account setup, Nostr directory state, relay-list repair, and shared relay
@@ -168,8 +171,10 @@ invalidations, and test generated delivery variants.
   secret tree. We need an explicit policy for how much same-epoch app-message
   reordering the transport/session layer promises to tolerate, and how to
   classify messages outside that window.
-- **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
-  OpenMLS commit randomness makes stable external vectors harder.
+- **Portable fork-recovery vectors** — `group-data-fork-recovery/v1` and
+  `concurrent-invite-fork-recovery/v1` are semantic fixtures. They check
+  recovery outcomes without requiring exact randomized MLS commit bytes. Exact
+  byte fixtures remain for deterministic encodings and transport shapes.
 - **Safe Extensions framework support** — still gated on backend library
   support and migration design.
 - **`IdentityRemove` proposal type** — identified as the first likely

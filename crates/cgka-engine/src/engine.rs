@@ -1,8 +1,8 @@
 //! [`Engine<S>`] is the OpenMLS-backed [`CgkaEngine`] implementation.
 //!
-//! Generic over `S: cgka_traits::StorageProvider`. Holds a `RustCrypto`
-//! instance for the crypto + rand half of OpenMLS's provider surface,
-//! materializing an `EngineOpenMlsProvider` on demand per MLS call.
+//! Generic over `S: cgka_traits::StorageProvider`. Holds OpenMLS RustCrypto
+//! for the crypto + rand half of OpenMLS's provider surface, materializing an
+//! `EngineOpenMlsProvider` on demand per MLS call.
 //!
 //! This file owns construction, trait dispatch, event drains, and small
 //! read-only helpers. Group creation, ingest/send, publish lifecycle,
@@ -124,12 +124,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
         let peeler = self
             .peeler
             .ok_or_else(|| EngineError::Other("TransportPeeler is required".into()))?;
+        let crypto = RustCrypto::default();
         let identity = Identity::load_or_generate(self.ciphersuite, identity_bytes, &self.storage)
             .map_err(EngineError::Other)?;
 
         Ok(Engine {
             storage: self.storage,
-            crypto: RustCrypto::default(),
+            crypto,
             identity,
             registry: self.registry,
             peeler,

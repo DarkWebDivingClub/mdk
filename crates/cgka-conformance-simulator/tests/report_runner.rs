@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use cgka_conformance_simulator::{ReportArgs, ReportCommand, parse_report_command, run_report};
+use cgka_conformance_simulator::{
+    ReportArgs, ReportCommand, ReportInput, parse_report_command, run_report,
+};
 
 #[test]
 fn parse_defaults_to_send_leave_family() {
@@ -9,9 +11,11 @@ fn parse_defaults_to_send_leave_family() {
     assert_eq!(
         command,
         ReportCommand::Run(ReportArgs {
-            family: "send-leave/v1".into(),
-            seed: 0,
-            cases: 1,
+            input: ReportInput::GeneratedFamily {
+                family: "send-leave/v1".into(),
+                seed: 0,
+                cases: 1,
+            },
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
         })
     );
@@ -34,10 +38,33 @@ fn parse_custom_report_args() {
     assert_eq!(
         command,
         ReportCommand::Run(ReportArgs {
-            family: "send-leave/v1".into(),
-            seed: 42,
-            cases: 3,
+            input: ReportInput::GeneratedFamily {
+                family: "send-leave/v1".into(),
+                seed: 42,
+                cases: 3,
+            },
             out: PathBuf::from("target/custom"),
+        })
+    );
+}
+
+#[test]
+fn parse_vector_fixture_report_args() {
+    let command = parse_report_command([
+        "--vectors".into(),
+        "crates/cgka-conformance-simulator/vectors".into(),
+        "--out".into(),
+        "target/vector-reports".into(),
+    ])
+    .expect("vector args parse");
+
+    assert_eq!(
+        command,
+        ReportCommand::Run(ReportArgs {
+            input: ReportInput::VectorFixtures {
+                paths: vec![PathBuf::from("crates/cgka-conformance-simulator/vectors")],
+            },
+            out: PathBuf::from("target/vector-reports"),
         })
     );
 }
@@ -70,14 +97,18 @@ async fn report_runner_writes_send_leave_json_reports() {
         fs::remove_dir_all(&out_dir).expect("remove stale output dir");
     }
 
-    run_report(&ReportArgs {
-        family: "send-leave/v1".into(),
-        seed: 42,
-        cases: 2,
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedFamily {
+            family: "send-leave/v1".into(),
+            seed: 42,
+            cases: 2,
+        },
         out: out_dir.clone(),
     })
     .await
     .expect("runner writes reports");
+    assert_eq!(summary.total(), 2);
+    assert_eq!(summary.failed(), 0);
 
     let case0 = out_dir.join("send-leave-v1-seed-42-case-0.json");
     let case1 = out_dir.join("send-leave-v1-seed-42-case-1.json");
@@ -112,14 +143,18 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         fs::remove_dir_all(&out_dir).expect("remove stale output dir");
     }
 
-    run_report(&ReportArgs {
-        family: "convergence-e2e-delivery/v1".into(),
-        seed: 7,
-        cases: 2,
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedFamily {
+            family: "convergence-e2e-delivery/v1".into(),
+            seed: 7,
+            cases: 2,
+        },
         out: out_dir.clone(),
     })
     .await
     .expect("runner writes convergence delivery reports");
+    assert_eq!(summary.total(), 2);
+    assert_eq!(summary.failed(), 0);
 
     let case0 = out_dir.join("convergence-e2e-delivery-v1-seed-7-case-0.json");
     let case1 = out_dir.join("convergence-e2e-delivery-v1-seed-7-case-1.json");
@@ -144,6 +179,126 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         .map(Vec::len)
         .expect("epoch changes array");
     assert!(matches!(epoch_change_count, 2 | 4));
+
+    fs::remove_dir_all(out_dir).expect("clean output dir");
+}
+
+#[tokio::test]
+async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates() {
+    let out_dir = std::env::temp_dir().join(format!(
+        "darkmatter-cgka-convergence-chaos-report-test-{}",
+        std::process::id()
+    ));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).expect("remove stale output dir");
+    }
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedFamily {
+            family: "convergence-chaos/v1".into(),
+            seed: 13,
+            cases: 2,
+        },
+        out: out_dir.clone(),
+    })
+    .await
+    .expect("runner writes convergence chaos reports");
+    assert_eq!(summary.total(), 2);
+    assert_eq!(summary.failed(), 0);
+    assert!(
+        summary
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.expectation_count > 0),
+        "chaos report summaries should count semantic expectations"
+    );
+
+    let report_path = out_dir.join("convergence-chaos-v1-seed-13-case-0.json");
+    let fixture_path = out_dir.join("convergence-chaos-v1-seed-13-case-0-fixture.v1.json");
+    assert!(report_path.exists(), "case 0 report should exist");
+    assert!(
+        fixture_path.exists(),
+        "case 0 fixture candidate should exist"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).expect("read report"))
+            .expect("report JSON parses");
+    assert_eq!(
+        report["metadata"]["generated"]["family_name"],
+        "convergence-chaos/v1"
+    );
+    assert_eq!(report["metadata"]["generated"]["seed"], 13);
+    assert!(report["scenario"]["steps"].is_array());
+    assert!(
+        report["expected_outcomes"]
+            .as_array()
+            .is_some_and(|expectations| !expectations.is_empty())
+    );
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&fixture_path).expect("read fixture candidate"))
+            .expect("fixture candidate JSON parses");
+    assert_eq!(fixture["scenario_name"], "convergence-chaos/v1/case-0");
+    assert_eq!(fixture["vector_version"], "1");
+    assert_eq!(fixture["seed"], 13);
+    assert!(fixture["scenario"]["steps"].is_array());
+    assert!(
+        fixture["expected_outcomes"]
+            .as_array()
+            .is_some_and(|expectations| !expectations.is_empty())
+    );
+
+    fs::remove_dir_all(out_dir).expect("clean output dir");
+}
+
+#[tokio::test]
+async fn report_runner_writes_vector_fixture_reports_and_summary() {
+    let out_dir = std::env::temp_dir().join(format!(
+        "darkmatter-cgka-vector-report-test-{}",
+        std::process::id()
+    ));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).expect("remove stale output dir");
+    }
+
+    let vectors_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors");
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::VectorFixtures {
+            paths: vec![vectors_dir],
+        },
+        out: out_dir.clone(),
+    })
+    .await
+    .expect("runner writes vector reports");
+
+    assert_eq!(summary.failed(), 0);
+    assert!(summary.total() >= 3);
+    let text = summary.to_human_text();
+    assert!(text.contains("PASS"));
+    assert!(text.contains("group-data-fork-recovery/v1"));
+
+    let report_path = out_dir.join("group-data-fork-recovery-v1-report.json");
+    assert!(
+        report_path.exists(),
+        "group-data fixture report should exist"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).expect("read report"))
+            .expect("report JSON parses");
+    assert_eq!(
+        report["metadata"]["fixture"]["scenario_name"],
+        "group-data-fork-recovery/v1"
+    );
+    assert!(
+        report["expected_outcomes"]
+            .as_array()
+            .is_some_and(|outcomes| !outcomes.is_empty())
+    );
+    assert_eq!(
+        report["expectation_failures"].as_array().map(Vec::len),
+        Some(0)
+    );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }

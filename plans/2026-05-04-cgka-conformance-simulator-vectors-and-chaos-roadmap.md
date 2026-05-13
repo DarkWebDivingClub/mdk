@@ -44,6 +44,14 @@ Current property coverage:
 - Live clients converge after generated `Send` and `Leave` sequences.
 - Convergence holds under ordered, reverse, and seeded-random delivery.
 - Publish confirm advances; publish fail rolls back and leaves the group usable.
+- Candidate graph selection is order-invariant.
+- Canonicalization proposal/app dispositions are order-invariant.
+- Canonicalization replay is idempotent for already-seen message ids.
+- Quiescence gates outbound work until the stability window closes.
+- Capability negotiation matches generated requirement/support matrices.
+- Stored convergence input gives the same result after an engine rebuild.
+- Group-data update publish confirm/fail preserves or rolls back projected
+  metadata and leaves the group reusable.
 
 Current trace surface:
 
@@ -52,37 +60,53 @@ Current trace surface:
   payloads, removals, and recoveries.
 - `ForkRecoveryObservation` records source epoch, recovered epoch, winner
   ordering key, and invalidated ordering key.
+- `VectorFixture` may carry exact `expected_trace` or semantic
+  `expected_outcomes`.
 
 Current fixture coverage:
 
 - External JSON fixtures live in `crates/cgka-conformance-simulator/vectors/`.
-- Each fixture includes a runnable `ScenarioSpec` input and expected
-  `ScenarioTrace` output.
+- Each fixture includes a runnable `ScenarioSpec` input and either exact
+  `ScenarioTrace` output or semantic expected outcomes.
 - `ScenarioSpec` includes fixture-visible queue faults for drop, duplicate,
   delay/release, reorder, partition, and heal.
 - `generate_send_leave_family` emits deterministic generated cases with
   family name, generator version, seed, case index, and runnable
   `ScenarioSpec`.
+- `generate_convergence_chaos_family` emits deterministic adversarial
+  convergence cases with runnable `ScenarioSpec`s and semantic expectations,
+  including large 20+ client message storms, partitioned large-group storms,
+  multi-committer group-data storms, and mixed message/commit storms.
 - `run_scenario_report` emits serializable metadata, expected trace, observed
-  trace, step log, recovery observations, and invariant failures.
-- `run_generated_case_report` adds generated-family metadata and a future
-  `minimized_case` field.
-- `cgka-conformance-simulator-report` writes generated `send-leave/v1` and
-  `convergence-e2e-delivery/v1` scenario reports as JSON artifacts from seed
-  and case-count CLI arguments.
+  trace, executed scenario input, step log, recovery observations, expectation
+  failures, and invariant failures.
+- `run_generated_case_report` adds generated-family metadata and records a
+  minimized case when conservative greedy step removal can reproduce the same
+  failure kinds.
+- `cgka-conformance-simulator-report` writes generated family reports or vector
+  fixture reports as JSON artifacts, writes generated fixture candidates, and
+  prints a pass/fail summary.
 - `three-client-message-exchange/v1` is captured as a fixture.
-- Fork recovery is covered by in-tree scenarios, but not as a portable fixture:
-  OpenMLS commit randomness makes the winner digest intentionally unstable
-  across runs.
-- Fixture-loading tests regenerate portable fixture traces and compare them
-  exactly.
+- Portable scenario fixtures now cover message exchange, create rollback,
+  invite success, invite rollback, group-data update, queue drop,
+  duplicate/delay/reorder queue faults, partition heal with leave, delayed
+  past-epoch app delivery, group-data fork recovery, and concurrent-invite
+  fork recovery.
+- Fixture-loading tests regenerate portable fixture traces and compare either
+  exact traces or semantic expected outcomes.
 
 Current gaps after the generated-delivery slice:
 
-- Generated family coverage includes send/leave and convergence E2E delivery
-  variants, but not invite races, group-data updates, publish confirm/fail
-  families, or restart/storage-loss families.
-- Generated failures do not yet run a shrinker to populate minimized cases.
+- Generated family coverage includes send/leave, convergence E2E delivery
+  variants, and `convergence-chaos/v1` for invite races, group-data races,
+  publish rollback, partition/heal/leave, delayed past-epoch app delivery,
+  queue faults, large-group message storms, partitioned large-group storms, and
+  multi-committer storms. Restart/storage-loss families remain open.
+- Generated failures now run a conservative greedy minimizer. It is useful for
+  dropping removable app/delivery noise, but it is not yet a domain-specific
+  shrinker for joins, commits, or client topology.
+- Fixture reports now expose semantic expectation mismatches directly; the next
+  reporting gap is richer grouping by scenario family and failure kind.
 
 ## Ideas Borrowed From FIPS Chaos
 
@@ -131,15 +155,15 @@ Each fixture should include:
 - Vector version.
 - Conformance crate version.
 - Seed when applicable.
-- Expected `ScenarioTrace`.
+- Exact expected `ScenarioTrace`, or semantic expected outcomes for scenarios
+  with randomized cryptographic bytes.
 
 Add a Rust test that regenerates each fixture from the current conformance runner and
-compares the trace exactly. Failure output must include the fixture name and
-the observed trace.
+compares the trace or semantic outcomes. Failure output must include the fixture
+name and the observed trace.
 
-Status: complete for the portable initial fixture. Fork recovery remains
-scenario-tested in Rust rather than fixture-backed because OpenMLS commit
-randomness makes exact trace bytes unstable.
+Status: complete for the portable initial fixtures and the first semantic
+fork-recovery fixture.
 
 ### Phase 2 - Add a Minimal ScenarioSpec
 
@@ -197,6 +221,33 @@ Generated failures should be convertible into fixed fixtures.
 Status: initial `send-leave/v1` family complete.
 `convergence-e2e-delivery/v1` is also complete for duplicate/delay/reorder
 delivery variants around the real-peeler convergence bridge.
+`convergence-chaos/v1` is complete for first-pass adversarial convergence
+cases with semantic expectations, fixture-candidate output, 20+ client message
+storms, partitioned large-group storms, multi-committer group-data storms, and
+mixed message/commit storms.
+
+### Phase 4A - Use Semantic Scenario Expectations
+
+Do not carry a test-only KAT profile through the engine. It adds provider,
+identity, transport, and scenario-runner code for little conformance value.
+Whole CGKA histories should be portable when their group-state outcomes match.
+Exact randomized MLS envelopes are outside the scenario contract.
+
+The semantic expectation layer should support:
+
+- pending publish confirmations and rollbacks;
+- final client epoch and member count;
+- client convergence on epoch and member count;
+- delivered payload observations;
+- epoch changes;
+- app invalidations;
+- fork-recovery counts and epochs;
+- future selected-branch payload checks for invite races.
+
+Status: started. `group-data-fork-recovery/v1` and
+`convergence-chaos/v1` now use semantic outcomes instead of exact commit digest
+bytes, and fixture reports include `expectation_failures` with expected and
+actual JSON values.
 
 ### Phase 5 - Add Analysis and Failure Minimization
 
@@ -204,6 +255,7 @@ Add a conformance report that writes:
 
 - Scenario metadata.
 - Expected trace.
+- Expected outcomes.
 - Observed trace.
 - Step log.
 - Recovery observations.
@@ -212,8 +264,8 @@ Add a conformance report that writes:
 For generated scenarios, store the seed, generator parameters, and minimized
 case if shrinking found one.
 
-Status: report artifacts complete; shrinking/minimization algorithm remains
-future work.
+Status: report artifacts and first-pass greedy minimization are complete.
+Domain-aware shrinking remains future work.
 
 ### Phase 6 - System-Level Chaos Runner Later
 
@@ -243,10 +295,11 @@ the in-process conformance runner remains the reference conformance layer.
 The roadmap is complete when:
 
 - A fresh checkout can run every canonical vector fixture.
-- Repeated vector runs produce byte-stable JSON output.
-- Fork recovery fixtures compare `ForkRecoveryObservation`, not only final
+- Repeated vector runs either match exact traces or satisfy semantic expected
+  outcomes.
+- Fork recovery fixtures include `ForkRecoveryObservation` along with final
   membership.
-- Failures name the scenario, seed, step index, client, expected trace, and
+- Failures name the scenario, seed, step index, client, expected outcomes, and
   observed trace.
 - Slow or stochastic suites are separated from quick CI.
 - A non-Rust implementation can read the fixture format without depending on

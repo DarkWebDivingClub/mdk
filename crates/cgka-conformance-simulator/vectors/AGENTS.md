@@ -4,8 +4,8 @@ Map for portable JSON vector fixtures.
 
 ## Rules
 
-- Each fixture is a `VectorFixture` with `scenario` input and `expected_trace`
-  output.
+- Each fixture is a `VectorFixture` with `scenario` input and either exact
+  `expected_trace` output or semantic `expected_outcomes`.
 - Keep `manifest.v1.json` updated when adding a scenario, generated family,
   formal case fixture, or byte-level vector.
 - Byte-level fixtures live under `byte-fixtures/` and follow
@@ -14,10 +14,16 @@ Map for portable JSON vector fixtures.
 - Do not store OpenMLS protocol bytes in fixtures.
 - Keep traces implementation-neutral: epochs, members, payload observations,
   pending resolutions, app invalidations, and recovery observations are fine.
+  Use semantic expectations when randomized MLS bytes can change which client
+  observes recovery.
 - After editing a fixture, run the vector fixture test.
+  Use the report CLI when you also want JSON reports and a pass/fail summary.
 
 ## Verification
 
 ```sh
 cargo test -p cgka-conformance-simulator canonical_vector_fixtures_match_generated_traces
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --vectors crates/cgka-conformance-simulator/vectors \
+  --out target/cgka-conformance-simulator-reports
 ```

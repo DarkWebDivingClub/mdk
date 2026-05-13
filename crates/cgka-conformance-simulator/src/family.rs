@@ -5,11 +5,12 @@
 
 use crate::{
     GeneratedScenarioMetadata, ScenarioReport, ScenarioRunError, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, run_scenario_report,
+    ScenarioTrace, TraceExpectation, VectorFixture, run_scenario_report_with_outcomes,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedScenarioCase {
@@ -18,6 +19,26 @@ pub struct GeneratedScenarioCase {
     pub seed: u64,
     pub case_index: u64,
     pub scenario: ScenarioSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_outcomes: Vec<TraceExpectation>,
+}
+
+impl GeneratedScenarioCase {
+    pub fn to_vector_fixture(
+        &self,
+        conformance_version: impl Into<String>,
+        expected_trace: Option<ScenarioTrace>,
+    ) -> VectorFixture {
+        VectorFixture {
+            scenario_name: self.scenario.name.clone(),
+            vector_version: "1".into(),
+            conformance_version: conformance_version.into(),
+            seed: Some(self.seed),
+            scenario: self.scenario.clone(),
+            expected_trace,
+            expected_outcomes: self.expected_outcomes.clone(),
+        }
+    }
 }
 
 pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
@@ -30,6 +51,7 @@ pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScena
             seed,
             case_index: case_index as u64,
             scenario: send_leave_case(&mut rng, case_index as u64),
+            expected_outcomes: vec![],
         });
     }
     out
@@ -48,6 +70,24 @@ pub fn generate_convergence_e2e_delivery_family(
             seed,
             case_index: case_index as u64,
             scenario: convergence_e2e_delivery_case(&mut rng, case_index as u64),
+            expected_outcomes: vec![],
+        });
+    }
+    out
+}
+
+pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
+    let mut out = Vec::with_capacity(cases);
+    for case_index in 0..cases {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_1CE5 ^ ((case_index as u64) << 32));
+        let (scenario, expected_outcomes) = convergence_chaos_case(&mut rng, case_index as u64);
+        out.push(GeneratedScenarioCase {
+            family_name: "convergence-chaos/v1".into(),
+            generator_version: "1".into(),
+            seed,
+            case_index: case_index as u64,
+            scenario,
+            expected_outcomes,
         });
     }
     out
@@ -57,15 +97,784 @@ pub async fn run_generated_case_report(
     case: &GeneratedScenarioCase,
     expected_trace: Option<ScenarioTrace>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut report = run_scenario_report(&case.scenario, expected_trace).await?;
+    let mut report = run_scenario_report_with_outcomes(
+        &case.scenario,
+        expected_trace.clone(),
+        case.expected_outcomes.clone(),
+    )
+    .await?;
+    let minimized_case = if report.expectation_failures.is_empty() {
+        None
+    } else {
+        minimize_failing_case(case, expected_trace.as_ref(), &report).await
+    };
     report.metadata.generated = Some(GeneratedScenarioMetadata {
         family_name: case.family_name.clone(),
         generator_version: case.generator_version.clone(),
         seed: case.seed,
         case_index: case.case_index,
-        minimized_case: None,
+        minimized_case,
     });
     Ok(report)
+}
+
+async fn minimize_failing_case(
+    case: &GeneratedScenarioCase,
+    expected_trace: Option<&ScenarioTrace>,
+    failing_report: &ScenarioReport,
+) -> Option<ScenarioSpec> {
+    let target_failures = failure_kinds(failing_report);
+    if target_failures.is_empty() {
+        return None;
+    }
+
+    let mut candidate = case.scenario.clone();
+    let mut changed = false;
+    let mut index = 0;
+    while index < candidate.steps.len() {
+        if !is_minimizer_removable(&candidate.steps[index]) {
+            index += 1;
+            continue;
+        }
+
+        let mut trial = candidate.clone();
+        trial.steps.remove(index);
+        if reproduces_failure(
+            &trial,
+            expected_trace.cloned(),
+            case.expected_outcomes.clone(),
+            &target_failures,
+        )
+        .await
+        {
+            candidate = trial;
+            changed = true;
+        } else {
+            index += 1;
+        }
+    }
+
+    changed.then_some(candidate)
+}
+
+async fn reproduces_failure(
+    scenario: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    target_failures: &BTreeSet<String>,
+) -> bool {
+    match run_scenario_report_with_outcomes(scenario, expected_trace, expected_outcomes).await {
+        Ok(report) => target_failures.is_subset(&failure_kinds(&report)),
+        Err(_) => false,
+    }
+}
+
+fn failure_kinds(report: &ScenarioReport) -> BTreeSet<String> {
+    report
+        .expectation_failures
+        .iter()
+        .map(|failure| failure.kind.clone())
+        .collect()
+}
+
+fn is_minimizer_removable(step: &ScenarioStep) -> bool {
+    matches!(
+        step,
+        ScenarioStep::SendAppMessage { .. }
+            | ScenarioStep::ClearEvents { .. }
+            | ScenarioStep::DropQueued { .. }
+            | ScenarioStep::DuplicateQueued { .. }
+            | ScenarioStep::DelayQueued { .. }
+            | ScenarioStep::ReleaseDelayed { .. }
+            | ScenarioStep::ReorderQueued { .. }
+            | ScenarioStep::SetPartition { .. }
+            | ScenarioStep::ClearPartition
+    )
+}
+
+fn convergence_chaos_case(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    match case_index % 10 {
+        0 => convergence_chaos_invite_fork(case_index),
+        1 => convergence_chaos_group_data_fork(case_index),
+        2 => convergence_chaos_rollback_queue_faults(rng, case_index),
+        3 => convergence_chaos_partition_leave(case_index),
+        4 => convergence_chaos_delayed_past_epoch_app(case_index),
+        5 => convergence_chaos_stable_queue_faults(case_index),
+        6 => convergence_chaos_large_message_storm(case_index),
+        7 => convergence_chaos_large_partitioned_storm(case_index),
+        8 => convergence_chaos_large_commit_storm(case_index),
+        _ => convergence_chaos_large_mixed_message_commit_storm(case_index),
+    }
+}
+
+fn convergence_chaos_invite_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob", "david", "eve"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("invite-fork-{case_index}"),
+                ["bob"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob"]),
+            clear(["alice", "bob", "david", "eve"]),
+            ScenarioStep::SetPartition {
+                allow: labels(["alice", "bob"]),
+            },
+            invite("alice", ["david"], "alice-invite"),
+            invite("bob", ["eve"], "bob-invite"),
+            confirmed_step("alice", "alice-invite"),
+            confirmed_step("bob", "bob-invite"),
+            ScenarioStep::DeliverAll,
+            tick(["alice", "bob"]),
+            observe(["alice", "bob"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        confirmed(8, "alice", "alice-invite"),
+        confirmed(9, "bob", "bob-invite"),
+        clients_converged(["alice", "bob"], Some(2), Some(3)),
+        client_state("alice", 2, 3, vec![]),
+        client_state("bob", 2, 3, vec![]),
+        recovery_summary(1, Some(1), Some(2)),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_group_data_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("group-data-fork-{case_index}"),
+                ["bob"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob"]),
+            clear(["alice", "bob"]),
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: format!("alice branch {case_index}"),
+                pending: "alice-update".into(),
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "bob".into(),
+                name: format!("bob branch {case_index}"),
+                pending: "bob-update".into(),
+            },
+            confirmed_step("alice", "alice-update"),
+            confirmed_step("bob", "bob-update"),
+            ScenarioStep::DeliverAll,
+            tick(["alice", "bob"]),
+            observe(["alice", "bob"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        confirmed(7, "alice", "alice-update"),
+        confirmed(8, "bob", "bob-update"),
+        clients_converged(["alice", "bob"], Some(2), Some(2)),
+        recovery_summary(1, Some(1), Some(2)),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_rollback_queue_faults(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let bob_payload = format!("bob-after-rollback-{case_index}-{}", rng.r#gen::<u16>());
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("rollback-faults-{case_index}"),
+                ["bob"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob"]),
+            clear(["alice", "bob"]),
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: format!("rolled back {case_index}"),
+                pending: "update".into(),
+            },
+            ScenarioStep::FailPending {
+                client: "alice".into(),
+                pending: "update".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: bob_payload.clone(),
+            },
+            ScenarioStep::DuplicateQueued { index: 0 },
+            ScenarioStep::DelayQueued {
+                index: 1,
+                delayed: "duplicate-app".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            ScenarioStep::ReleaseDelayed {
+                delayed: "duplicate-app".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            observe(["alice", "bob"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        rolled_back(6, "alice", "update"),
+        clients_converged(["alice", "bob"], Some(1), Some(2)),
+        client_state("alice", 1, 2, vec![bob_payload]),
+        client_state("bob", 1, 2, vec![]),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_stable_queue_faults(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let bob_payload = format!("bob-first-{case_index}");
+    let carol_payload = format!("carol-second-{case_index}");
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob", "carol"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("stable-queue-faults-{case_index}"),
+                ["bob", "carol"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob", "carol"]),
+            clear(["alice", "bob", "carol"]),
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: bob_payload.clone(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "carol".into(),
+                payload: carol_payload.clone(),
+            },
+            ScenarioStep::DuplicateQueued { index: 0 },
+            ScenarioStep::DelayQueued {
+                index: 1,
+                delayed: "delayed-copy".into(),
+            },
+            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            ScenarioStep::ReleaseDelayed {
+                delayed: "delayed-copy".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            observe(["alice"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        client_state("alice", 1, 3, vec![carol_payload, bob_payload]),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_partition_leave(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let visible_payload = format!("bob-visible-{case_index}");
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("partition-leave-{case_index}"),
+                ["bob"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob"]),
+            clear(["alice", "bob"]),
+            ScenarioStep::SetPartition {
+                allow: labels(["bob"]),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: format!("bob-hidden-{case_index}"),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            ScenarioStep::ClearPartition,
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: visible_payload.clone(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            ScenarioStep::Leave {
+                client: "bob".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            ScenarioStep::DeliverAll,
+            tick(["bob"]),
+            observe(["alice"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 2,
+            member_count: 1,
+            received_payloads: Some(vec![visible_payload]),
+            added_members: None,
+            removed_members: Some(vec!["bob".into()]),
+        },
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_delayed_past_epoch_app(
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let payload = format!("epoch-one-delayed-{case_index}");
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob", "carol", "david"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("delayed-past-epoch-{case_index}"),
+                ["bob", "carol"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob", "carol"]),
+            clear(["alice", "bob", "carol", "david"]),
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: payload.clone(),
+            },
+            ScenarioStep::DelayQueued {
+                index: 0,
+                delayed: "old-app".into(),
+            },
+            invite("alice", ["david"], "invite-david"),
+            confirmed_step("alice", "invite-david"),
+            ScenarioStep::DeliverAll,
+            tick(["carol", "david"]),
+            ScenarioStep::ReleaseDelayed {
+                delayed: "old-app".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["carol"]),
+            observe(["carol"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        confirmed(8, "alice", "invite-david"),
+        client_state("carol", 2, 4, vec![payload]),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_large_message_storm(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let clients = large_clients(21);
+    let invitees = clients[1..].to_vec();
+    let senders = clients[1..].to_vec();
+    let payloads = senders
+        .iter()
+        .map(|sender| format!("{sender}:large-storm:{case_index}"))
+        .collect::<Vec<_>>();
+    let mut expected_payloads = payloads.clone();
+    expected_payloads.reverse();
+
+    let mut steps = large_group_setup(
+        format!("large-message-storm-{case_index}"),
+        clients.clone(),
+        invitees.clone(),
+    );
+    for (sender, payload) in senders.iter().zip(payloads.iter()) {
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: sender.clone(),
+            payload: payload.clone(),
+        });
+    }
+    steps.push(ScenarioStep::ReorderQueued {
+        order: reversed_order(senders.len()),
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(vec!["alice".into()]));
+    steps.push(observe_vec(vec!["alice".into()]));
+
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients,
+        steps,
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        client_state("alice", 1, 21, expected_payloads),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_large_partitioned_storm(
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let clients = large_clients(25);
+    let invitees = clients[1..].to_vec();
+    let senders = clients[1..].to_vec();
+    let payloads = senders
+        .iter()
+        .map(|sender| format!("{sender}:partitioned-storm:{case_index}"))
+        .collect::<Vec<_>>();
+
+    let mut steps = large_group_setup(
+        format!("large-partitioned-storm-{case_index}"),
+        clients.clone(),
+        invitees.clone(),
+    );
+    steps.push(ScenarioStep::SetPartition {
+        allow: vec!["alice".into()],
+    });
+    for (sender, payload) in senders.iter().zip(payloads.iter()) {
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: sender.clone(),
+            payload: payload.clone(),
+        });
+    }
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(vec!["alice".into()]));
+    steps.push(ScenarioStep::ClearPartition);
+    steps.push(observe_vec(vec!["alice".into()]));
+
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients,
+        steps,
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        client_state("alice", 1, 25, payloads),
+    ];
+    (scenario, expected)
+}
+
+fn convergence_chaos_large_commit_storm(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let clients = large_clients(21);
+    let invitees = clients[1..].to_vec();
+    let committers = clients[..8].to_vec();
+    let mut steps = large_group_setup(
+        format!("large-commit-storm-{case_index}"),
+        clients.clone(),
+        invitees,
+    );
+
+    for committer in &committers {
+        steps.push(ScenarioStep::UpdateGroupData {
+            client: committer.clone(),
+            name: format!("{committer} branch {case_index}"),
+            pending: format!("{committer}-update"),
+        });
+    }
+    for committer in &committers {
+        steps.push(ScenarioStep::ConfirmPending {
+            client: committer.clone(),
+            pending: format!("{committer}-update"),
+        });
+    }
+    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    steps.push(ScenarioStep::ReorderQueued {
+        order: reversed_order(committers.len() + 1),
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(committers.clone()));
+    steps.push(observe_vec(committers.clone()));
+
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients,
+        steps,
+    };
+    let mut expected = vec![
+        confirmed(1, "alice", "create"),
+        clients_converged_vec(committers.clone(), Some(2), Some(21)),
+    ];
+    for (offset, committer) in committers.iter().enumerate() {
+        expected.push(confirmed(
+            13 + offset,
+            committer,
+            &format!("{committer}-update"),
+        ));
+    }
+    (scenario, expected)
+}
+
+fn convergence_chaos_large_mixed_message_commit_storm(
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let clients = large_clients(21);
+    let invitees = clients[1..].to_vec();
+    let senders = clients[1..].to_vec();
+    let committers = clients[..8].to_vec();
+    let mut steps = large_group_setup(
+        format!("large-mixed-message-commit-storm-{case_index}"),
+        clients.clone(),
+        invitees,
+    );
+
+    for sender in &senders {
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: sender.clone(),
+            payload: format!("{sender}:mixed-storm:{case_index}"),
+        });
+    }
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(clients.clone()));
+    steps.push(clear_vec(clients.clone()));
+
+    for committer in &committers {
+        steps.push(ScenarioStep::UpdateGroupData {
+            client: committer.clone(),
+            name: format!("{committer} mixed branch {case_index}"),
+            pending: format!("{committer}-mixed-update"),
+        });
+    }
+    for committer in &committers {
+        steps.push(ScenarioStep::ConfirmPending {
+            client: committer.clone(),
+            pending: format!("{committer}-mixed-update"),
+        });
+    }
+    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    steps.push(ScenarioStep::ReorderQueued {
+        order: reversed_order(committers.len() + 1),
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(committers.clone()));
+    steps.push(observe_vec(committers.clone()));
+
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients,
+        steps,
+    };
+    let mut expected = vec![
+        confirmed(1, "alice", "create"),
+        clients_converged_vec(committers.clone(), Some(2), Some(21)),
+    ];
+    for (offset, committer) in committers.iter().enumerate() {
+        expected.push(confirmed(
+            36 + offset,
+            committer,
+            &format!("{committer}-mixed-update"),
+        ));
+    }
+    (scenario, expected)
+}
+
+fn labels<const N: usize>(items: [&str; N]) -> Vec<String> {
+    items.into_iter().map(String::from).collect()
+}
+
+fn large_clients(count: usize) -> Vec<String> {
+    let mut clients = Vec::with_capacity(count);
+    clients.push("alice".into());
+    for index in 1..count {
+        clients.push(format!("member{index:02}"));
+    }
+    clients
+}
+
+fn large_group_setup(
+    name: String,
+    clients: Vec<String>,
+    invitees: Vec<String>,
+) -> Vec<ScenarioStep> {
+    vec![
+        create_group_vec("alice", name, invitees.clone(), "create"),
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick_vec(invitees),
+        clear_vec(clients),
+    ]
+}
+
+fn create_group<const N: usize>(
+    creator: &str,
+    name: String,
+    invitees: [&str; N],
+    pending: &str,
+) -> ScenarioStep {
+    ScenarioStep::CreateGroup {
+        creator: creator.into(),
+        name,
+        invitees: labels(invitees),
+        required_features: vec![],
+        pending: pending.into(),
+    }
+}
+
+fn create_group_vec(
+    creator: &str,
+    name: String,
+    invitees: Vec<String>,
+    pending: &str,
+) -> ScenarioStep {
+    ScenarioStep::CreateGroup {
+        creator: creator.into(),
+        name,
+        invitees,
+        required_features: vec![],
+        pending: pending.into(),
+    }
+}
+
+fn invite<const N: usize>(inviter: &str, invitees: [&str; N], pending: &str) -> ScenarioStep {
+    ScenarioStep::InviteMembers {
+        inviter: inviter.into(),
+        invitees: labels(invitees),
+        pending: pending.into(),
+    }
+}
+
+fn confirmed_step(client: &str, pending: &str) -> ScenarioStep {
+    ScenarioStep::ConfirmPending {
+        client: client.into(),
+        pending: pending.into(),
+    }
+}
+
+fn tick<const N: usize>(clients: [&str; N]) -> ScenarioStep {
+    ScenarioStep::Tick {
+        clients: labels(clients),
+    }
+}
+
+fn tick_vec(clients: Vec<String>) -> ScenarioStep {
+    ScenarioStep::Tick { clients }
+}
+
+fn clear<const N: usize>(clients: [&str; N]) -> ScenarioStep {
+    ScenarioStep::ClearEvents {
+        clients: labels(clients),
+    }
+}
+
+fn clear_vec(clients: Vec<String>) -> ScenarioStep {
+    ScenarioStep::ClearEvents { clients }
+}
+
+fn observe<const N: usize>(clients: [&str; N]) -> ScenarioStep {
+    ScenarioStep::Observe {
+        clients: labels(clients),
+    }
+}
+
+fn observe_vec(clients: Vec<String>) -> ScenarioStep {
+    ScenarioStep::Observe { clients }
+}
+
+fn confirmed(step_index: usize, client: &str, pending: &str) -> TraceExpectation {
+    TraceExpectation::PendingResolution {
+        step_index,
+        client: client.into(),
+        pending: pending.into(),
+        resolution: "confirmed".into(),
+    }
+}
+
+fn rolled_back(step_index: usize, client: &str, pending: &str) -> TraceExpectation {
+    TraceExpectation::PendingResolution {
+        step_index,
+        client: client.into(),
+        pending: pending.into(),
+        resolution: "rolled_back".into(),
+    }
+}
+
+fn clients_converged<const N: usize>(
+    clients: [&str; N],
+    epoch: Option<u64>,
+    member_count: Option<usize>,
+) -> TraceExpectation {
+    TraceExpectation::ClientsConverged {
+        clients: labels(clients),
+        epoch,
+        member_count,
+    }
+}
+
+fn clients_converged_vec(
+    clients: Vec<String>,
+    epoch: Option<u64>,
+    member_count: Option<usize>,
+) -> TraceExpectation {
+    TraceExpectation::ClientsConverged {
+        clients,
+        epoch,
+        member_count,
+    }
+}
+
+fn client_state(
+    client: &str,
+    epoch: u64,
+    member_count: usize,
+    received_payloads: Vec<String>,
+) -> TraceExpectation {
+    TraceExpectation::ClientState {
+        client: client.into(),
+        epoch,
+        member_count,
+        received_payloads: Some(received_payloads),
+        added_members: None,
+        removed_members: None,
+    }
+}
+
+fn recovery_summary(
+    count: usize,
+    source_epoch: Option<u64>,
+    recovered_epoch: Option<u64>,
+) -> TraceExpectation {
+    TraceExpectation::RecoverySummary {
+        count,
+        source_epoch,
+        recovered_epoch,
+        winner_differs_from_invalidated: true,
+    }
 }
 
 fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {

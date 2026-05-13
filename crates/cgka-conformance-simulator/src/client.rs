@@ -234,6 +234,34 @@ impl HarnessClient {
         }
     }
 
+    pub async fn update_group_data(&mut self, name: impl Into<String>) -> PendingStateRef {
+        let gid = self.default_group.clone().expect("group");
+        let res = self
+            .engine
+            .send(SendIntent::UpdateGroupData {
+                group_id: gid.clone(),
+                name: Some(name.into()),
+                description: None,
+            })
+            .await
+            .expect("update group data");
+        match res {
+            SendResult::GroupEvolution {
+                msg,
+                welcomes,
+                pending,
+            } => {
+                assert!(
+                    welcomes.is_empty(),
+                    "group-data update should not create welcomes"
+                );
+                self.bus.send(self.bus_id, route(msg, &gid));
+                pending
+            }
+            other => panic!("expected GroupEvolution from update_group_data, got {other:?}"),
+        }
+    }
+
     /// Send an application message and return the wrapped TransportMessage
     /// that was put on the bus. Useful for the same-id-replay proptest
     /// property which needs to re-inject that exact message.

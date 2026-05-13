@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-05-11",
+  "updated": "2026-05-12",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -29,6 +29,114 @@
       "next": "Use as the smoke fixture for pending rollback traces."
     },
     {
+      "id": "invite-member/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "invite-member.v1.json",
+      "coverage": [
+        "post-create member invite",
+        "welcome processing for new member",
+        "member-add observation"
+      ],
+      "next": "Use as the basic invite lifecycle fixture."
+    },
+    {
+      "id": "invite-publish-fail/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "invite-publish-fail.v1.json",
+      "coverage": [
+        "invite rollback",
+        "pending publish failure after stable group creation",
+        "pre-invite epoch and member state"
+      ],
+      "next": "Use as the invite-side pending rollback fixture."
+    },
+    {
+      "id": "group-data-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-data-update.v1.json",
+      "coverage": [
+        "group data update commit",
+        "recipient epoch advance",
+        "stable member set across metadata update"
+      ],
+      "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
+    },
+    {
+      "id": "group-data-fork-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-data-fork-recovery.v1.json",
+      "coverage": [
+        "same-epoch group-data update race",
+        "semantic fork recovery outcome",
+        "rollback recovery observation"
+      ],
+      "next": "Use as the first semantic portable fork-recovery fixture and extend this style to invite races."
+    },
+    {
+      "id": "concurrent-invite-fork-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "concurrent-invite-fork-recovery.v1.json",
+      "coverage": [
+        "same-epoch invite race",
+        "semantic fork recovery outcome",
+        "post-recovery member count"
+      ],
+      "next": "Extend the trace format so the selected branch member identity can be asserted portably."
+    },
+    {
+      "id": "drop-queued/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "drop-queued.v1.json",
+      "coverage": [
+        "explicit queue drop fault",
+        "application payload non-delivery",
+        "stable recipient state after loss"
+      ],
+      "next": "Use as the smallest scheduled-delivery-fault fixture."
+    },
+    {
+      "id": "queue-faults/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "queue-faults.v1.json",
+      "coverage": [
+        "duplicate queued message",
+        "delayed queued message",
+        "queued message reorder"
+      ],
+      "next": "Use as the compact queue scheduler fixture."
+    },
+    {
+      "id": "partition-clear-leave/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "partition-clear-leave.v1.json",
+      "coverage": [
+        "partitioned delivery",
+        "partition heal",
+        "self-remove leave flow"
+      ],
+      "next": "Extend with multi-member leave and admin-policy variants."
+    },
+    {
+      "id": "delayed-past-epoch-app-message/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "delayed-past-epoch-app-message.v1.json",
+      "coverage": [
+        "retained epoch context peel",
+        "past-epoch application message acceptance",
+        "late payload delivery after group epoch advance"
+      ],
+      "next": "Use as the retained-anchor app-message fixture."
+    },
+    {
       "id": "convergence-e2e-group-events/v1",
       "kind": "scenario",
       "status": "rust_only_bridge",
@@ -38,17 +146,7 @@
         "canonical branch application payload",
         "losing branch payload exclusion"
       ],
-      "next": "Promote to a portable scenario vector after the trace can abstract over OpenMLS commit randomness."
-    },
-    {
-      "id": "delayed-past-epoch-app-message/v1",
-      "kind": "scenario",
-      "status": "rust_only",
-      "coverage": [
-        "retained epoch context peel",
-        "past-epoch application message acceptance"
-      ],
-      "next": "Promote to a portable scenario vector."
+      "next": "Promote to a portable scenario vector after the trace format covers its selected-branch payload checks."
     },
     {
       "id": "welcome-before-commit-rejects-commit-echo/v1",
@@ -80,7 +178,26 @@
         "delay and release",
         "reorder before convergence observation"
       ],
-      "next": "Promote stable variants into portable vectors after trace expectations can represent both valid selected branches."
+      "next": "Promote stable variants after selecting high-signal generated cases and pinning their semantic recovery outcomes."
+    },
+    {
+      "id": "convergence-chaos/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "same-epoch invite fork recovery",
+        "same-epoch group-data fork recovery",
+        "publish rollback with duplicate delayed delivery",
+        "partition heal and leave",
+        "delayed past-epoch application delivery",
+        "duplicate delay and reorder queue faults",
+        "20+ client message storms",
+        "20+ client partitioned delivery storms",
+        "multi-committer group-data storms",
+        "mixed large message and commit storms",
+        "greedy generated-failure minimization"
+      ],
+      "next": "Run seeded report batches, promote high-signal cases from the emitted fixture candidates, and improve the minimizer with domain-aware shrinking."
     },
     {
       "id": "selector-policy-cases/v1",

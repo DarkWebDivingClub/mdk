@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -16,13 +17,42 @@ fn vector_manifest_artifacts_exist_and_byte_fixtures_are_well_formed() {
     let entries = manifest["entries"].as_array().expect("entries is an array");
     assert!(!entries.is_empty(), "manifest should name current vectors");
 
+    let mut manifest_artifacts = BTreeSet::new();
     for entry in entries {
         if let Some(artifact) = entry.get("artifact").and_then(Value::as_str) {
+            manifest_artifacts.insert(artifact.to_string());
             assert!(
                 vectors.join(artifact).exists(),
                 "manifest artifact {artifact} should exist"
             );
         }
+    }
+
+    for entry in fs::read_dir(&vectors).expect("vectors dir exists") {
+        let path = entry.expect("vector dir entry").path();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !file_name.ends_with(".v1.json") || file_name == "manifest.v1.json" {
+            continue;
+        }
+        assert!(
+            manifest_artifacts.contains(file_name),
+            "manifest should list top-level vector fixture {file_name}"
+        );
+        let fixture: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("fixture exists"))
+                .unwrap_or_else(|e| panic!("{} parses: {e}", path.display()));
+        assert!(
+            fixture.get("expected_trace").is_some()
+                || fixture
+                    .get("expected_outcomes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|outcomes| !outcomes.is_empty()),
+            "{} should define expected_trace or expected_outcomes",
+            path.display()
+        );
     }
 
     let schema_path = vectors.join("byte-fixtures/schema.v1.json");

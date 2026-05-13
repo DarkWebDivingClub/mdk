@@ -37,6 +37,10 @@ pub(crate) fn leaf_capabilities(
             CTCapability::Proposal(t) => proposal_types.push(ProposalType::from(t)),
         }
     }
+    ext_types.sort();
+    ext_types.dedup();
+    proposal_types.sort();
+    proposal_types.dedup();
 
     Capabilities::new(
         None,

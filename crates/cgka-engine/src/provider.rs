@@ -1,9 +1,9 @@
-//! Ephemeral `OpenMlsProvider` adapter composed from the engine's
-//! [`RustCrypto`] and the storage's OpenMLS side.
+//! Ephemeral `OpenMlsProvider` adapter composed from the engine's OpenMLS
+//! crypto/rand provider and the storage's OpenMLS side.
 //!
 //! Per the accessor-composition pattern (see the `feedback` memory on
 //! OpenMLS delegation), the engine does not implement `OpenMlsProvider`
-//! itself — it materializes one per MLS call via [`EngineOpenMlsProvider`].
+//! itself. It materializes one per MLS call via [`EngineOpenMlsProvider`].
 //! Cheap (two refs); lets us avoid hand-forwarding 50+ storage methods.
 
 use cgka_traits::storage::StorageProvider;

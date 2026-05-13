@@ -80,6 +80,10 @@ impl<S: StorageProvider> Engine<S> {
                 req_props.push(*p);
             }
         }
+        req_exts.sort();
+        req_exts.dedup();
+        req_props.sort();
+        req_props.dedup();
         let new_rc = RequiredCapabilitiesExtension::new(
             &req_exts
                 .iter()

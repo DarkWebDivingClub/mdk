@@ -31,17 +31,24 @@ pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient};
 pub use family::{
-    GeneratedScenarioCase, generate_convergence_e2e_delivery_family, generate_send_leave_family,
+    GeneratedScenarioCase, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report,
 };
-pub use report::{ReportArgs, ReportCommand, parse_report_command, report_usage, run_report};
+pub use report::{
+    ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
+    ScenarioReportSummary, parse_report_command, report_usage, run_report,
+};
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
     InvariantFailure, ScenarioReport, ScenarioReportMetadata, ScenarioRunError, ScenarioSpec,
-    ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, run_scenario_report, run_scenario_spec,
+    ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, VectorFixtureMetadata,
+    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_vector_fixture_report,
 };
 pub use vector::{
-    AppInvalidationObservation, ClientObservation, EpochChangeObservation, ForkRecoveryObservation,
-    PendingResolutionObservation, RecoveryOrderingKeyObservation, ScenarioTrace, VectorFixture,
+    AppInvalidationObservation, ClientObservation, EpochChangeObservation, ExpectationFailure,
+    ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
+    ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
     observe_client,
 };

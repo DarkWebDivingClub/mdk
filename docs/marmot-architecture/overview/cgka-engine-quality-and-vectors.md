@@ -88,14 +88,32 @@ must reproduce exactly:
 - error cases for malformed component bytes, invalid relay ordering, duplicate
   relays, and unsupported required components.
 
-OpenMLS commit bytes include fresh randomness, so not every engine scenario can
-be regenerated into stable byte-level vectors. For those cases, use either:
+Whole-scenario byte stability is not the right portability contract for MLS
+group histories. Signatures, HPKE ciphertexts, timestamps, and transport wraps
+are allowed to differ across implementations. Scenario fixtures should compare
+semantic outcomes: epochs, members, pending publish results, delivered payloads,
+invalidations, and recovery events.
 
-- captured fixture bytes with expected outcomes; or
-- scenario vectors that abstract over the random byte values and assert the
-  stable behavior.
+The first semantic recovery fixture is `group-data-fork-recovery/v1`. It covers
+a same-epoch group-data update race and asserts that the recovering client
+reaches epoch 2, observes one recovery from epoch 1 to epoch 2, and records
+distinct winner and invalidated ordering keys. It does not assert exact commit
+digest bytes.
 
-Fork-recovery vectors need special care for this reason.
+The first convergence-focused generated chaos family is
+`convergence-chaos/v1`. It emits ordinary `ScenarioSpec`s with semantic
+expectations for invite forks, group-data forks, publish rollback, partitions
+and leaves, delayed past-epoch app messages, duplicate/delay/reorder queue
+faults, 20+ client message storms, partitioned large-group storms,
+multi-committer group-data storms, and mixed message/commit storms. Each run
+writes both a report and a `*-fixture.v1.json` candidate so a high-signal
+generated case can become a permanent vector after review. Failing generated
+cases also run a conservative greedy minimizer and record a smaller reproducer
+when removable app/delivery steps can be dropped without changing the failure
+kinds.
+
+Exact byte fixtures still matter where bytes are the spec: component encodings,
+transport event shapes, post-peel inputs, and malformed encoding cases.
 
 ## Chaos Coverage
 
@@ -146,5 +164,7 @@ integration map honest.
   [`../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/`](../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/)
 - First pending rollback scenario vector:
   [`../../../crates/cgka-conformance-simulator/vectors/publish-fail.v1.json`](../../../crates/cgka-conformance-simulator/vectors/publish-fail.v1.json)
+- Portable scenario fixtures:
+  [`../../../crates/cgka-conformance-simulator/vectors/`](../../../crates/cgka-conformance-simulator/vectors/)
 - whitenoise-rs shim map and friction list:
   [`whitenoise-integration-map.md`](./whitenoise-integration-map.md)
