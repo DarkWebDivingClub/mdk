@@ -49,6 +49,9 @@ The composer accepts either a plain chat message or a slash command:
 /sync
 /refresh
 /account <npub-or-hex>
+/account create
+/account add <npub-or-hex>
+/account import <nsec>
 /new <name> [member-npub-or-hex ...]
 /invite <npub-or-hex>
 /remove <npub-or-hex>
@@ -56,6 +59,10 @@ The composer accepts either a plain chat message or a slash command:
 /keys fetch <npub-or-hex>
 /quit
 ```
+
+`/account create` generates a local signing account, `/account import <nsec>` imports a local signing account, and
+`/account add <npub-or-hex>` adds a public-only account for relay-list and KeyPackage lookup. Imported `nsec` input is
+redacted in the composer.
 
 Most account-scoped commands resolve the local account in this order:
 

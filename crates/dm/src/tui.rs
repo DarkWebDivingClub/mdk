@@ -175,6 +175,9 @@ enum SlashCommand {
     Refresh,
     Sync,
     Account(String),
+    AccountCreate,
+    AccountAddPublic(String),
+    AccountImportSecret(String),
     NewGroup { name: String, members: Vec<String> },
     Invite(String),
     Remove(String),
@@ -396,14 +399,14 @@ impl TuiApp {
 
     fn render_composer(&self, frame: &mut Frame, area: Rect) {
         let prompt = if self.input.is_empty() {
-            "type a message or /help"
+            "type a message or /help".to_owned()
         } else {
-            &self.input
+            composer_display_text(&self.input)
         };
         let lines = vec![
             Line::from(vec![
                 Span::styled("> ", Style::default().fg(Color::Cyan)),
-                Span::raw(prompt.to_owned()),
+                Span::raw(prompt),
             ]),
             Line::from(self.status.clone()),
         ];
@@ -429,6 +432,9 @@ impl TuiApp {
             Line::from("/sync"),
             Line::from("/refresh"),
             Line::from("/account <npub-or-hex>"),
+            Line::from("/account create"),
+            Line::from("/account add <npub-or-hex>"),
+            Line::from("/account import <nsec>"),
             Line::from("/new <name> [member-npub-or-hex ...]"),
             Line::from("/invite <npub-or-hex>"),
             Line::from("/remove <npub-or-hex>"),
@@ -532,6 +538,13 @@ impl TuiApp {
                 self.refresh_chats()
             }
             SlashCommand::Account(selector) => self.select_account_by_selector(&selector),
+            SlashCommand::AccountCreate => self.create_or_import_account(None, "created account"),
+            SlashCommand::AccountAddPublic(account) => {
+                self.create_or_import_account(Some(account), "added public account")
+            }
+            SlashCommand::AccountImportSecret(secret) => {
+                self.create_or_import_account(Some(secret), "imported account")
+            }
             SlashCommand::NewGroup { name, members } => {
                 let account_id = self.require_selected_local_account()?;
                 let mut args = vec!["group".to_owned(), "create".to_owned(), name];
@@ -611,6 +624,44 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         self.status = publish_status("sent message", &result);
         self.refresh_messages()
+    }
+
+    fn create_or_import_account(
+        &mut self,
+        identity: Option<String>,
+        action: &'static str,
+    ) -> TuiResult<()> {
+        let mut args = vec!["account".to_owned(), "create".to_owned()];
+        args.extend(identity);
+        let result = self.client.run_json(None, &args)?;
+        let selector =
+            value_string(&result, "account_id").or_else(|| value_string(&result, "npub"));
+        let npub = value_string(&result, "npub").unwrap_or_else(|| "unknown".to_owned());
+        let local_signing = result
+            .get("local_signing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        self.refresh_accounts()?;
+        if let Some(selector) = selector.as_deref()
+            && let Some(index) = selected_account_index(&self.accounts, Some(selector))
+        {
+            self.selected_account = index;
+            if local_signing {
+                self.refresh_chats()?;
+            } else {
+                self.chats.clear();
+                self.messages.clear();
+            }
+        }
+
+        let signing = if local_signing {
+            "local-signing"
+        } else {
+            "public-only"
+        };
+        self.status = format!("{action} {} {signing}", shorten(&npub, 18));
+        Ok(())
     }
 
     fn refresh_accounts(&mut self) -> TuiResult<()> {
@@ -759,7 +810,7 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
         "sync" => Ok(SlashCommand::Sync),
-        "account" => one_arg(command, rest).map(SlashCommand::Account),
+        "account" => parse_account_command(rest),
         "new" => {
             let mut rest = rest.into_iter();
             let Some(name) = rest.next() else {
@@ -775,6 +826,30 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "keys" => parse_keys_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
+    }
+}
+
+fn parse_account_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [command] if command == "create" => Ok(SlashCommand::AccountCreate),
+        [command, account] if command == "add" => {
+            Ok(SlashCommand::AccountAddPublic(account.clone()))
+        }
+        [command, secret] if command == "import" => {
+            Ok(SlashCommand::AccountImportSecret(secret.clone()))
+        }
+        [selector] => Ok(SlashCommand::Account(selector.clone())),
+        [] => Err("/account expects a selector, create, add, or import".to_owned()),
+        [command, ..] if command == "create" => {
+            Err("/account create does not accept arguments".to_owned())
+        }
+        [command, ..] if command == "add" => {
+            Err("/account add expects exactly one npub or hex pubkey".to_owned())
+        }
+        [command, ..] if command == "import" => {
+            Err("/account import expects exactly one nsec".to_owned())
+        }
+        _ => Err("/account expects a selector, create, add, or import".to_owned()),
     }
 }
 
@@ -937,6 +1012,16 @@ fn shorten(value: &str, max_len: usize) -> String {
     format!("{prefix}...{suffix}")
 }
 
+fn composer_display_text(input: &str) -> String {
+    const ACCOUNT_IMPORT_PREFIX: &str = "/account import ";
+    if let Some(secret) = input.strip_prefix(ACCOUNT_IMPORT_PREFIX)
+        && !secret.is_empty()
+    {
+        return format!("{ACCOUNT_IMPORT_PREFIX}<hidden nsec>");
+    }
+    input.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1054,34 @@ mod tests {
             Ok(SlashCommand::KeysFetch("npub1bob".to_owned()))
         );
         assert!(parse_slash_command("/keys").is_err());
+    }
+
+    #[test]
+    fn slash_command_parser_handles_account_onboarding_commands() {
+        assert_eq!(
+            parse_slash_command("/account create"),
+            Ok(SlashCommand::AccountCreate)
+        );
+        assert_eq!(
+            parse_slash_command("/account add npub1bob"),
+            Ok(SlashCommand::AccountAddPublic("npub1bob".to_owned()))
+        );
+        assert_eq!(
+            parse_slash_command("/account import nsec1secret"),
+            Ok(SlashCommand::AccountImportSecret("nsec1secret".to_owned()))
+        );
+    }
+
+    #[test]
+    fn composer_redacts_nsec_imports_without_hiding_other_input() {
+        assert_eq!(
+            composer_display_text("/account import nsec1secret"),
+            "/account import <hidden nsec>"
+        );
+        assert_eq!(
+            composer_display_text("/account add npub1bob"),
+            "/account add npub1bob"
+        );
     }
 
     #[test]
