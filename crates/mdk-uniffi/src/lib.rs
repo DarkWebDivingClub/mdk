@@ -722,15 +722,13 @@ impl Mdk {
     ///
     /// * `public_key` - The Nostr public key (hex) for the credential
     /// * `relays` - Relay URLs where the key package will be published
-    /// * `protected` - Whether to add the NIP-70 protected tag. When `true`, relays that
-    ///   implement NIP-70 will reject republishing by third parties. However, many popular
-    ///   relays reject protected events entirely. Set to `false` for maximum relay
-    ///   compatibility.
+    /// * `options` - Event-construction options ([`KeyPackageOptions`]). Use the default
+    ///   value for "no protected tag, freshly generated `d` tag" behavior.
     pub fn create_key_package_for_event_with_options(
         &self,
         public_key: String,
         relays: Vec<String>,
-        protected: bool,
+        options: KeyPackageOptions,
     ) -> Result<KeyPackageResult, MdkUniffiError> {
         let pubkey = parse_public_key(&public_key)?;
         let relay_urls = parse_relay_urls(&relays)?;
@@ -742,7 +740,11 @@ impl Mdk {
             tags_443,
             hash_ref,
             d_tag,
-        } = mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
+        } = mdk.create_key_package_for_event_with_options(
+            &pubkey,
+            relay_urls,
+            options.try_into()?,
+        )?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
         let tags_legacy: Vec<Vec<String>> =
@@ -1516,6 +1518,59 @@ impl Mdk {
     }
 }
 
+/// Options for creating a key package event.
+///
+/// Mirrors `mdk_core::key_packages::KeyPackageOptions`. Both fields carry FFI-level
+/// defaults via `#[uniffi(default = ...)]`, so foreign callers (Kotlin / Swift /
+/// Python) can omit either or both for the standard behavior — e.g. in Kotlin,
+/// `KeyPackageOptions()` is equivalent to
+/// `KeyPackageOptions(protected = false, existingDTag = null)`. Or skip options
+/// entirely by calling `create_key_package_for_event` instead.
+#[derive(uniffi::Record, Default, Clone)]
+pub struct KeyPackageOptions {
+    /// Add the NIP-70 protected tag (`["-"]`).
+    ///
+    /// When `true`, relays that implement NIP-70 will reject republishing of this
+    /// event by third parties. Many popular relays (Damus, Primal, nos.lol) reject
+    /// protected events entirely — only enable when publishing to relays known to
+    /// accept NIP-70 protected events. Defaults to `false` for max relay compat.
+    #[uniffi(default = false)]
+    pub protected: bool,
+
+    /// Reuse an existing `d` tag value instead of generating a new one.
+    ///
+    /// Pass a previously stored `d_tag` here to rotate a KeyPackage while keeping
+    /// the NIP-33 addressable slot stable — relays replace the previous event under
+    /// the same `(kind, pubkey, d)` coordinate.
+    ///
+    /// Must be exactly 64 ASCII hex digits (per MIP-00). Validation runs at the FFI
+    /// boundary; malformed input surfaces as `MdkUniffiError::InvalidInput` before
+    /// crossing into `mdk_core`, matching how `parse_public_key` / `parse_relay_urls`
+    /// report parameter errors. When `None` (the default), a fresh random 32-byte
+    /// hex value is generated.
+    #[uniffi(default = None)]
+    pub existing_d_tag: Option<String>,
+}
+
+impl TryFrom<KeyPackageOptions> for mdk_core::key_packages::KeyPackageOptions {
+    type Error = MdkUniffiError;
+
+    fn try_from(opts: KeyPackageOptions) -> Result<Self, Self::Error> {
+        // Pre-validate at the FFI boundary so a malformed `existing_d_tag` surfaces
+        // as `InvalidInput` (parameter error) rather than as a generic `Mdk` error
+        // bubbling out of core. Delegates to the canonical core validator so the
+        // accepted-value rule stays in one place.
+        if let Some(d) = opts.existing_d_tag.as_deref() {
+            mdk_core::key_packages::validate_existing_d_tag(d)
+                .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
+        }
+        Ok(Self {
+            protected: opts.protected,
+            existing_d_tag: opts.existing_d_tag,
+        })
+    }
+}
+
 /// Result of creating a key package
 #[derive(uniffi::Record)]
 pub struct KeyPackageResult {
@@ -1527,10 +1582,12 @@ pub struct KeyPackageResult {
     pub tags_legacy: Vec<Vec<String>>,
     /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
     pub hash_ref: Vec<u8>,
-    /// The `d` tag value (32-byte hex string) for this KeyPackage slot.
-    /// Callers SHOULD store this and, when rotating, replace the generated
-    /// `["d", ...]` entry in `tags` with the stored value before signing.
-    /// Reusing the same `(kind, pubkey, d)` tuple lets relays replace the old event.
+    /// The `d` tag value (hex string) for this KeyPackage slot.
+    ///
+    /// Callers SHOULD store this and, when rotating, pass it back via
+    /// [`KeyPackageOptions::existing_d_tag`] so MDK emits the same `d` value
+    /// directly — no need to post-edit the tag list. Reusing the same
+    /// `(kind, pubkey, d)` tuple lets relays replace the old event.
     pub d_tag: String,
 }
 
@@ -2711,6 +2768,87 @@ mod tests {
 
         let result = mdk.create_key_package_for_event(pubkey_hex, invalid_relays);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    /// Valid `existing_d_tag` round-trips through the binding: the supplied value must
+    /// appear as `KeyPackageResult.d_tag` AND as the value of the `d` tag in `tags`,
+    /// so callers can rotate a KeyPackage by passing back a stored slot id directly.
+    #[test]
+    fn test_create_key_package_with_options_existing_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let stored_d_tag =
+            "deadbeefcafef00d0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        let options = KeyPackageOptions {
+            protected: false,
+            existing_d_tag: Some(stored_d_tag.clone()),
+        };
+
+        let result = mdk
+            .create_key_package_for_event_with_options(pubkey_hex, relays, options)
+            .expect("Failed to create key package with existing_d_tag");
+
+        assert_eq!(result.d_tag, stored_d_tag);
+
+        let d_tag_entry = result
+            .tags
+            .iter()
+            .find(|tag| tag.first().map(|s| s.as_str()) == Some("d"))
+            .expect("tags should contain a `d` tag for kind:30443");
+        assert_eq!(
+            d_tag_entry.get(1).map(|s| s.as_str()),
+            Some(stored_d_tag.as_str())
+        );
+    }
+
+    /// Malformed `existing_d_tag` (wrong length here) must surface as
+    /// `MdkUniffiError::InvalidInput` at the FFI boundary — matching the pattern
+    /// used by `parse_public_key` / `parse_relay_urls` — rather than as a generic
+    /// `Mdk` error bubbling out of core.
+    #[test]
+    fn test_create_key_package_with_options_invalid_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let options = KeyPackageOptions {
+            protected: false,
+            existing_d_tag: Some("not-hex-and-not-64-chars".to_string()),
+        };
+
+        let result = mdk.create_key_package_for_event_with_options(pubkey_hex, relays, options);
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    /// `protected: true` must still emit the NIP-70 protected tag (`["-"]`) in `tags`
+    /// — the new options struct preserves the previous bool's behavior.
+    #[test]
+    fn test_create_key_package_with_options_protected_tag() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let options = KeyPackageOptions {
+            protected: true,
+            existing_d_tag: None,
+        };
+
+        let result = mdk
+            .create_key_package_for_event_with_options(pubkey_hex, relays, options)
+            .expect("Failed to create key package with protected=true");
+
+        assert!(
+            result
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(|s| s.as_str()) == Some("-")),
+            "protected=true should emit a NIP-70 protected tag (`[\"-\"]`)"
+        );
     }
 
     #[test]
