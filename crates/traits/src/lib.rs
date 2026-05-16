@@ -5,6 +5,7 @@
 //!
 //! This crate is the one dependency anything crossing a seam should import.
 
+pub mod agent_text_stream;
 pub mod app_components;
 pub mod capabilities;
 pub mod engine;
@@ -21,6 +22,18 @@ pub mod transport_adapter;
 pub mod types;
 pub mod welcome;
 
+pub use agent_text_stream::{
+    AGENT_TEXT_STREAM_KEY_CONTEXT_VERSION, AGENT_TEXT_STREAM_MAX_PADDING_BUCKET_BYTES,
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_MAX_REPLAY_TTL_SECS,
+    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AGENT_TEXT_STREAM_RECORD_ABORT,
+    AGENT_TEXT_STREAM_RECORD_CHECKPOINT, AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+    AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, AGENT_TEXT_STREAM_ROLE_FANOUT,
+    AGENT_TEXT_STREAM_ROLE_MASK, AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
+    AGENT_TEXT_STREAM_TRANSCRIPT_HASH_CONTEXT, AgentTextStreamFinalV1, AgentTextStreamKeyContextV1,
+    AgentTextStreamPolicyError, AgentTextStreamQuicPolicyV1, AgentTextStreamTranscriptV1,
+};
 pub use app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,

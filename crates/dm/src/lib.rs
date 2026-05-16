@@ -783,6 +783,7 @@ async fn group_command(
                     "profile": group.profile,
                     "image": group.image,
                     "admin_policy": group.admin_policy,
+                    "agent_text_stream": group.agent_text_stream,
                     "members": members,
                 }),
             })
@@ -1077,6 +1078,7 @@ fn group_json(group: AppGroupRecord) -> Value {
         "profile": group.profile,
         "image": group.image,
         "admin_policy": group.admin_policy,
+        "agent_text_stream": group.agent_text_stream,
         "archived": group.archived,
     })
 }

@@ -397,6 +397,18 @@ pub trait CgkaEngine: Send + Sync {
     /// underlying type varies with the storage parameter.
     fn group_context(&self, group_id: &GroupId) -> Result<Box<dyn GroupContext + '_>, EngineError>;
 
+    /// Derive and consume a forward-secure MLS app-component export secret.
+    ///
+    /// This is OpenMLS's SafeExportSecret(ComponentID) path. It mutates the
+    /// MLS application export tree so the same component secret cannot be
+    /// derived twice in the same epoch. Returned bytes are key material and
+    /// must not be logged, persisted in plaintext, or surfaced in diagnostics.
+    fn safe_export_secret(
+        &mut self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<Vec<u8>, EngineError>;
+
     /// Signed app-component bytes from the group's current
     /// `app_data_dictionary`.
     fn app_component(

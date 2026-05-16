@@ -5,9 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 
 use crate::{
-    AccountState, AppError, AppGroupAdminPolicyComponent, AppGroupImageInput,
-    AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
-    AppMessageRecord, NOSTR_ROUTING_COMPONENT_ID,
+    AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
+    AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupNostrRoutingComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppMessageRecord,
+    NOSTR_ROUTING_COMPONENT_ID,
 };
 
 pub(crate) struct AccountProjectionDb {
@@ -22,6 +23,7 @@ struct RawGroupRow {
     admin_keys_hex: String,
     archived: bool,
     nostr_routing_data_hex: String,
+    agent_text_stream_data_hex: String,
 }
 
 impl AccountProjectionDb {
@@ -152,12 +154,21 @@ impl AccountProjectionDb {
                         SELECT component_data_hex FROM group_app_components c
                         WHERE c.group_id_hex = groups.group_id_hex
                           AND c.component_id = ?1
-                    ), '') AS nostr_routing_data_hex
+                    ), '') AS nostr_routing_data_hex,
+                    COALESCE((
+                        SELECT component_data_hex FROM group_app_components c
+                        WHERE c.group_id_hex = groups.group_id_hex
+                          AND c.component_id = ?2
+                    ), '') AS agent_text_stream_data_hex
              FROM groups
              ORDER BY updated_at, group_id_hex",
         )?;
-        let group_rows =
-            group_statement.query_map([i64::from(NOSTR_ROUTING_COMPONENT_ID)], |row| {
+        let group_rows = group_statement.query_map(
+            params![
+                i64::from(NOSTR_ROUTING_COMPONENT_ID),
+                i64::from(AGENT_TEXT_STREAM_COMPONENT_ID)
+            ],
+            |row| {
                 Ok(RawGroupRow {
                     group_id_hex: row.get(0)?,
                     profile_name: row.get(2)?,
@@ -172,8 +183,10 @@ impl AccountProjectionDb {
                     admin_keys_hex: row.get(9)?,
                     archived: row.get::<_, i64>(10)? != 0,
                     nostr_routing_data_hex: row.get(11)?,
+                    agent_text_stream_data_hex: row.get(12)?,
                 })
-            })?;
+            },
+        )?;
         let mut groups = Vec::new();
         for row in group_rows {
             let row = row?;
@@ -186,6 +199,11 @@ impl AccountProjectionDb {
                 row.image,
                 AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&row.admin_keys_hex)),
             );
+            if !row.agent_text_stream_data_hex.is_empty() {
+                let agent_text_stream_bytes = hex::decode(&row.agent_text_stream_data_hex)?;
+                group.agent_text_stream =
+                    AppAgentTextStreamComponent::from_bytes(&agent_text_stream_bytes);
+            }
             group.archived = row.archived;
             groups.push(group);
         }
@@ -320,6 +338,25 @@ impl AccountProjectionDb {
                     unix_now_seconds() as i64
                 ],
             )?;
+            if group.agent_text_stream.required {
+                tx.execute(
+                    "INSERT INTO group_app_components (
+                        group_id_hex, component_id, component_name, component_data_hex, updated_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
+                        component_name = excluded.component_name,
+                        component_data_hex = excluded.component_data_hex,
+                        updated_at = excluded.updated_at",
+                    params![
+                        &group.group_id_hex,
+                        i64::from(group.agent_text_stream.component_id),
+                        &group.agent_text_stream.component,
+                        &group.agent_text_stream.data_hex,
+                        unix_now_seconds() as i64
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -516,6 +553,37 @@ mod tests {
         assert_eq!(restored.seen_events, original.seen_events);
         assert_eq!(restored.groups[0].group_id_hex, "aa");
         assert_eq!(restored.groups[0].profile.name, "before");
+    }
+
+    #[test]
+    fn load_state_uses_agent_text_stream_component_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let mut group = AppGroupRecord::new(
+            "aa".to_owned(),
+            test_routing([0xAA; 32], "marmot-local://group/aa"),
+            "agent".to_owned(),
+            "".to_owned(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+        );
+        group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&[
+            0x01, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let state = AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            groups: vec![group],
+        };
+
+        db.save_state(&state).unwrap();
+        let restored = db.load_state("alice").unwrap();
+
+        assert!(restored.groups[0].agent_text_stream.required);
+        assert_eq!(
+            restored.groups[0].agent_text_stream.data_hex,
+            "010300001000000000000000"
+        );
     }
 
     fn test_routing(nostr_group_id: [u8; 32], relay: &str) -> AppGroupNostrRoutingComponent {

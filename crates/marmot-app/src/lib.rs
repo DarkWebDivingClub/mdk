@@ -11,17 +11,26 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::{FeatureRegistry, canonicalization::CanonicalizationPolicy};
 use cgka_session::{AccountDeviceSession, SessionConfig};
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AGENT_TEXT_STREAM_ROLE_FANOUT,
+    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
+};
 use cgka_traits::app_components::{
-    AppComponentData, NostrRoutingV1, decode_nostr_routing_v1, default_group_components,
-    encode_component_vectors, encode_nostr_routing_v1, encode_quic_varint,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
+    NostrRoutingV1, decode_nostr_routing_v1, default_group_components, encode_component_vectors,
+    encode_nostr_routing_v1, encode_quic_varint,
 };
 pub use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
     NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
 };
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -338,6 +347,8 @@ pub struct AppGroupRecord {
     pub image: AppGroupImageComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
     #[serde(default)]
+    pub agent_text_stream: AppAgentTextStreamComponent,
+    #[serde(default)]
     pub archived: bool,
 }
 
@@ -387,6 +398,25 @@ pub struct AppGroupNostrRoutingComponent {
     pub data_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppAgentTextStreamComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub required: bool,
+    pub required_member_roles: Vec<String>,
+    pub allowed_member_roles: Vec<String>,
+    pub max_plaintext_frame_len: u32,
+    pub replay_ttl_secs: u32,
+    pub padding_bucket_bytes: u16,
+    pub data_hex: String,
+}
+
+impl Default for AppAgentTextStreamComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 impl AppGroupRecord {
     fn new(
         group_id_hex: String,
@@ -404,6 +434,7 @@ impl AppGroupRecord {
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
             admin_policy,
+            agent_text_stream: AppAgentTextStreamComponent::disabled(),
             archived: false,
         }
     }
@@ -413,18 +444,21 @@ impl AppGroupRecord {
         nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
+        agent_text_stream: AppAgentTextStreamComponent,
     ) -> Self {
         let (profile_name, profile_description) = group
             .map(|group| (group.name.clone(), group.description.clone()))
             .unwrap_or_default();
-        Self::new(
+        let mut record = Self::new(
             hex::encode(group_id.as_slice()),
             nostr_routing,
             profile_name,
             profile_description,
             AppGroupImageInput::default(),
             admin_policy,
-        )
+        );
+        record.agent_text_stream = agent_text_stream;
+        record
     }
 
     fn refresh_from_group(
@@ -432,10 +466,12 @@ impl AppGroupRecord {
         nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
+        agent_text_stream: AppAgentTextStreamComponent,
     ) {
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
         self.admin_policy = admin_policy;
+        self.agent_text_stream = agent_text_stream;
         if let Some(group) = group {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
@@ -535,6 +571,53 @@ impl AppGroupNostrRoutingComponent {
     }
 }
 
+impl AppAgentTextStreamComponent {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        match AgentTextStreamQuicPolicyV1::decode_component_state(bytes) {
+            Ok(policy) => Self::from_policy(policy, bytes.to_vec()),
+            Err(_) => Self {
+                component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+                component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+                required: true,
+                required_member_roles: Vec::new(),
+                allowed_member_roles: Vec::new(),
+                max_plaintext_frame_len: 0,
+                replay_ttl_secs: 0,
+                padding_bucket_bytes: 0,
+                data_hex: hex::encode(bytes),
+            },
+        }
+    }
+
+    fn from_policy(policy: AgentTextStreamQuicPolicyV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+            required: true,
+            required_member_roles: role_names(policy.required_member_roles),
+            allowed_member_roles: role_names(policy.allowed_member_roles),
+            max_plaintext_frame_len: policy.max_plaintext_frame_len,
+            replay_ttl_secs: policy.replay_ttl_secs,
+            padding_bucket_bytes: policy.padding_bucket_bytes,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+            required: false,
+            required_member_roles: Vec::new(),
+            allowed_member_roles: Vec::new(),
+            max_plaintext_frame_len: 0,
+            replay_ttl_secs: 0,
+            padding_bucket_bytes: 0,
+            data_hex: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AppGroupImageInput {
     image_hash_hex: String,
@@ -588,6 +671,8 @@ pub enum AppError {
     InvalidGroupProfile(String),
     #[error("invalid Nostr routing component: {0}")]
     InvalidNostrRouting(String),
+    #[error("invalid agent text stream policy: {0}")]
+    InvalidAgentTextStreamPolicy(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1334,6 +1419,7 @@ impl MarmotApp {
                 account_id.as_slice().to_vec(),
                 Box::new(peeler),
             )
+            .feature_registry(app_feature_registry())
             .supported_app_components(self.supported_app_component_ids())
             .convergence_policy(CanonicalizationPolicy {
                 stable_quiescence_ms: 0,
@@ -1790,6 +1876,7 @@ impl MarmotApp {
     fn supported_app_component_ids(&self) -> Vec<u16> {
         let mut components = default_group_components();
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
+        components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
         components.into_iter().collect()
     }
 
@@ -1826,6 +1913,15 @@ impl AppClient {
         let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
             encode_nostr_routing_v1(&nostr_routing).map_err(AppError::InvalidNostrRouting)?;
+        let mut app_components = vec![AppComponentData {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            data: nostr_routing_bytes,
+        }];
+        app_components.push(
+            AgentTextStreamQuicPolicyV1::user_to_agent_default()
+                .to_app_component_data()
+                .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
+        );
 
         let (group_id, effects) = self
             .runtime
@@ -1834,10 +1930,7 @@ impl AppClient {
                 description: String::new(),
                 members,
                 required_features: Vec::new(),
-                app_components: vec![AppComponentData {
-                    component_id: NOSTR_ROUTING_COMPONENT_ID,
-                    data: nostr_routing_bytes,
-                }],
+                app_components,
                 initial_admins: Vec::new(),
             })
             .await?;
@@ -1865,6 +1958,15 @@ impl AppClient {
                 }
             })
             .collect())
+    }
+
+    pub fn safe_export_secret(
+        &mut self,
+        group_id: &GroupId,
+        component_id: cgka_traits::AppComponentId,
+    ) -> Result<Vec<u8>, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }
 
     pub async fn invite_members(
@@ -1987,6 +2089,7 @@ impl AppClient {
             .collect::<Vec<_>>();
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
             &mut self.state,
@@ -1994,6 +2097,7 @@ impl AppClient {
             nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
+            agent_text_stream,
         );
         self.app.save_state(&self.state)?;
         Ok(SendSummary {
@@ -2121,6 +2225,7 @@ impl AppClient {
                             .admin_pubkeys(group_id)
                             .map(AppGroupAdminPolicyComponent::new)
                             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
+                        agent_text_stream: self.agent_text_stream_for_group(group_id),
                     })
                 })
                 .transpose()?;
@@ -2167,6 +2272,7 @@ impl AppClient {
     fn refresh_group(&mut self, group_id: &GroupId) {
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
             return;
         };
@@ -2176,12 +2282,14 @@ impl AppClient {
             nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
+            agent_text_stream,
         );
     }
 
     fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
             &mut self.state,
@@ -2189,6 +2297,7 @@ impl AppClient {
             nostr_routing.clone(),
             group_metadata.as_ref(),
             admin_policy,
+            agent_text_stream,
         );
         self.routing
             .add_group(nostr_routing.subscription(group_id)?);
@@ -2200,6 +2309,15 @@ impl AppClient {
             .admin_pubkeys(group_id)
             .map(AppGroupAdminPolicyComponent::new)
             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new()))
+    }
+
+    fn agent_text_stream_for_group(&self, group_id: &GroupId) -> AppAgentTextStreamComponent {
+        self.runtime
+            .app_component(group_id, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppAgentTextStreamComponent::disabled)
     }
 
     fn refresh_group_routes(&mut self) -> Result<(), AppError> {
@@ -2233,6 +2351,48 @@ impl Drop for AppClient {
             handle.abort();
         }
     }
+}
+
+fn app_feature_registry() -> FeatureRegistry {
+    let mut registry = FeatureRegistry::new();
+    for (feature, description) in [
+        (
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
+            "receive QUIC-backed agent text stream previews",
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_SEND_FEATURE.clone(),
+            "send QUIC-backed agent text stream frames",
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE.clone(),
+            "fan out QUIC-backed agent text stream frames",
+        ),
+    ] {
+        registry.register(
+            feature,
+            CapabilityRequirement {
+                requires: Capability::AppComponent(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID),
+                level: RequirementLevel::Optional,
+                description,
+            },
+        );
+    }
+    registry
+}
+
+fn role_names(mask: u8) -> Vec<String> {
+    let mut roles = Vec::new();
+    if mask & AGENT_TEXT_STREAM_ROLE_RECEIVE != 0 {
+        roles.push("receive".to_owned());
+    }
+    if mask & AGENT_TEXT_STREAM_ROLE_SEND != 0 {
+        roles.push("send".to_owned());
+    }
+    if mask & AGENT_TEXT_STREAM_ROLE_FANOUT != 0 {
+        roles.push("fanout".to_owned());
+    }
+    roles
 }
 
 #[derive(Clone)]
@@ -2882,6 +3042,7 @@ struct EventGroupProjection<'a> {
     nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&'a Group>,
     admin_policy: AppGroupAdminPolicyComponent,
+    agent_text_stream: AppAgentTextStreamComponent,
 }
 
 fn observe_event(
@@ -2901,6 +3062,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.agent_text_stream.clone(),
                 );
             }
             summary.joined_groups.push(group_id.clone());
@@ -2919,6 +3081,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.agent_text_stream.clone(),
                 );
             }
             let sender_hex = hex::encode(sender.as_slice());
@@ -2942,6 +3105,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.agent_text_stream.clone(),
                 );
             }
             summary.events.push(event.clone());
@@ -2969,6 +3133,7 @@ fn add_group(
     nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&Group>,
     admin_policy: AppGroupAdminPolicyComponent,
+    agent_text_stream: AppAgentTextStreamComponent,
 ) {
     let group_id_hex = hex::encode(group_id.as_slice());
     if let Some(existing) = state
@@ -2976,7 +3141,12 @@ fn add_group(
         .iter_mut()
         .find(|group| group.group_id_hex == group_id_hex)
     {
-        existing.refresh_from_group(nostr_routing, group_metadata, admin_policy);
+        existing.refresh_from_group(
+            nostr_routing,
+            group_metadata,
+            admin_policy,
+            agent_text_stream,
+        );
         return;
     }
     state.groups.push(AppGroupRecord::from_group(
@@ -2984,6 +3154,7 @@ fn add_group(
         nostr_routing,
         group_metadata,
         admin_policy,
+        agent_text_stream,
     ));
 }
 

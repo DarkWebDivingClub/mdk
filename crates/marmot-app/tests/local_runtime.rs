@@ -1,6 +1,9 @@
 use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
-use marmot_app::{AccountRelayListBootstrap, MarmotApp, UserDirectorySearch, UserProfileMetadata};
+use marmot_app::{
+    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
+    UserProfileMetadata,
+};
 
 #[tokio::test]
 async fn local_app_runtime_exchanges_messages_without_lab() {
@@ -29,6 +32,68 @@ async fn local_app_runtime_exchanges_messages_without_lab() {
     assert_eq!(received.messages[0].sender, "alice");
     assert_eq!(received.messages[0].group_id, group_id);
     assert_eq!(received.messages[0].plaintext, "hello from app runtime");
+}
+
+#[tokio::test]
+async fn local_app_runtime_creates_default_agent_text_stream_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let app = MarmotApp::local(dir.path());
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("agent", &["bob"]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();
+    assert!(alice_group.agent_text_stream.required);
+    assert_eq!(alice_group.agent_text_stream.component_id, 0x8006);
+    assert_eq!(
+        alice_group.agent_text_stream.component,
+        "marmot.group.agent-text-stream.quic.v1"
+    );
+    assert_eq!(
+        alice_group.agent_text_stream.required_member_roles,
+        vec!["receive".to_owned()]
+    );
+    assert_eq!(
+        alice_group.agent_text_stream.allowed_member_roles,
+        vec!["receive".to_owned(), "send".to_owned()]
+    );
+    assert_eq!(
+        alice_group.agent_text_stream.data_hex,
+        "010300001000000000000000"
+    );
+
+    bob.sync().await.unwrap();
+    let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
+    assert!(bob_group.agent_text_stream.required);
+
+    alice.send(&group_id, b"write a summary").await.unwrap();
+    let prompt = bob.sync().await.unwrap();
+    assert_eq!(prompt.messages.len(), 1);
+    assert_eq!(prompt.messages[0].sender, "alice");
+    assert_eq!(prompt.messages[0].plaintext, "write a summary");
+
+    let alice_secret = alice
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
+        .unwrap();
+    let bob_secret = bob
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
+        .unwrap();
+    let repeated_alice_secret = alice
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
+        .unwrap_err();
+
+    assert_eq!(alice_secret, bob_secret);
+    assert!(
+        repeated_alice_secret.to_string().contains("PuncturedInput"),
+        "{repeated_alice_secret}"
+    );
 }
 
 #[tokio::test]

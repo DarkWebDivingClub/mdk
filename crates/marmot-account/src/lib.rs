@@ -820,6 +820,14 @@ where
         Ok(self.session.app_component(group_id, component_id)?)
     }
 
+    pub fn safe_export_secret(
+        &mut self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> AccountResult<Vec<u8>> {
+        Ok(self.session.safe_export_secret(group_id, component_id)?)
+    }
+
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {
         tracing::debug!(
             target: TRACE_TARGET,

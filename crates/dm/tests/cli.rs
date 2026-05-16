@@ -544,6 +544,35 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
 }
 
 #[test]
+fn group_create_includes_agent_text_streams_by_default() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "agent", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    assert_eq!(created_group["agent_text_stream"]["required"], true);
+    assert_eq!(created_group["agent_text_stream"]["component_id"], 0x8006);
+    assert_eq!(
+        created_group["agent_text_stream"]["component"],
+        "marmot.group.agent-text-stream.quic.v1"
+    );
+    assert_eq!(
+        created_group["agent_text_stream"]["data_hex"],
+        "010300001000000000000000"
+    );
+
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_group = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
+    assert_eq!(bob_group["group"]["agent_text_stream"]["required"], true);
+}
+
+#[test]
 fn message_send_accepts_hyphen_leading_text_after_group_flag() {
     let home = tempfile::tempdir().expect("tempdir");
 
