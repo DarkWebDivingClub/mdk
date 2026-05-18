@@ -108,6 +108,7 @@ impl NostrRelayClient for FakeRelayClient {
             .take()
             .unwrap_or(endpoints.len());
         Ok(NostrPublishOutcome {
+            message_id: None,
             accepted: endpoints
                 .iter()
                 .take(accepted_limit)

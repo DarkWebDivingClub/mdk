@@ -877,12 +877,14 @@ dependencies = [
  "marmot-account",
  "marmot-app",
  "nostr",
+ "nostr-relay-builder",
  "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2220,33 +2222,10 @@ dependencies = [
  "hex",
  "marmot-account",
  "nostr",
+ "nostr-relay-builder",
  "nostr-sdk",
  "rand 0.8.6",
  "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "storage-sqlite",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "transport-nostr-adapter",
- "transport-nostr-peeler",
-]
-
-[[package]]
-name = "marmot-lab"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cgka-engine",
- "cgka-session",
- "cgka-traits",
- "hex",
- "marmot-account",
- "nostr",
- "nostr-relay-builder",
- "nostr-sdk",
  "serde",
  "serde_json",
  "sha2",

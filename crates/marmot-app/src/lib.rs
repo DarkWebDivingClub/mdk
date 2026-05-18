@@ -2,7 +2,7 @@
 //!
 //! This crate wires `AccountHome` into the concrete local runtime pieces needed by
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
-//! transport publishing, and a local file relay for deterministic development.
+//! transport publishing, and relay-backed app projections.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -35,8 +35,8 @@ use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, Timestamp, TransportAdapter, TransportAdapterError, TransportEndpoint,
-    TransportEndpointReceipt, TransportGroupSubscription, TransportPublishTarget,
+    GroupId, MemberId, TransportAdapter, TransportAdapterError, TransportEndpoint,
+    TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
@@ -56,12 +56,9 @@ use transport_nostr_adapter::{
     KEY_PACKAGE_ENCODING_HEX, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE,
     KIND_MARMOT_KEY_PACKAGE_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
     NostrAccountRelayListPublication, NostrKeyPackagePublication, NostrKeyPackagePublisher,
-    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSdkRelayClient,
-    NostrTransportAdapter,
+    NostrRelayClient, NostrSdkRelayClient, NostrTransportAdapter,
 };
-use transport_nostr_peeler::{
-    KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NostrMlsPeeler, NostrTransportEvent,
-};
+use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod directory_cache;
 mod projection;
@@ -71,11 +68,9 @@ use projection::AccountProjectionDb;
 
 const ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
-const LOCAL_RELAY_DIR: &str = "local-relay";
 const KEY_PACKAGE_DIR: &str = "key-packages";
-const EVENT_DIR: &str = "events";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
-const SDK_DRAIN_WAIT: Duration = Duration::from_millis(50);
+const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
@@ -86,14 +81,8 @@ type AppRuntime =
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
-    relay: AppRelay,
+    relay_urls: Vec<String>,
     account_home: AccountHome,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AppRelay {
-    Local,
-    Sdk { urls: Vec<String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -739,23 +728,6 @@ pub struct AppClient {
 }
 
 impl MarmotApp {
-    pub fn local(root: impl AsRef<Path>) -> Self {
-        let root = root.as_ref().to_path_buf();
-        Self {
-            account_home: AccountHome::open(&root),
-            root,
-            relay: AppRelay::Local,
-        }
-    }
-
-    pub fn local_with_account_home(root: impl AsRef<Path>, account_home: AccountHome) -> Self {
-        Self {
-            root: root.as_ref().to_path_buf(),
-            relay: AppRelay::Local,
-            account_home,
-        }
-    }
-
     pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
         Self::with_relays(root, vec![relay_url.into()])
     }
@@ -765,7 +737,7 @@ impl MarmotApp {
         Self {
             account_home: AccountHome::open(&root),
             root,
-            relay: AppRelay::Sdk { urls: relay_urls },
+            relay_urls,
         }
     }
 
@@ -776,7 +748,7 @@ impl MarmotApp {
     ) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            relay: AppRelay::Sdk { urls: relay_urls },
+            relay_urls,
             account_home,
         }
     }
@@ -900,31 +872,9 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
-        if bootstrap_relays.is_empty() || bootstrap_relays.iter().all(is_local_relay_endpoint) {
-            let records = self
-                .relay_events()?
-                .into_iter()
-                .filter(|record| {
-                    bootstrap_relays.is_empty()
-                        || record
-                            .endpoints
-                            .iter()
-                            .any(|endpoint| bootstrap_relays.contains(endpoint))
-                })
-                .collect::<Vec<_>>();
-            let mut status = relay_list_status_from_records(account_id_hex, records);
-            if !bootstrap_relays.is_empty() {
-                status.bootstrap_relays = bootstrap_relays
-                    .into_iter()
-                    .map(|endpoint| endpoint.0)
-                    .collect();
-            }
-            self.remember_directory_relay_lists(account_id_hex, &status)?;
-            return Ok(status);
-        }
-
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
         let relay_urls = relay_urls_from_endpoints(&bootstrap_relays)?;
         let client = NostrSdkClient::builder().build();
         for relay_url in &relay_urls {
@@ -960,7 +910,13 @@ impl MarmotApp {
                     .map_err(|e| AppError::RelayDirectory(format!("map relay-list event: {e}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let status = relay_list_status_from_records(account_id_hex, records);
+        let mut status = relay_list_status_from_records(account_id_hex, records);
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = bootstrap_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
         self.remember_directory_relay_lists(account_id_hex, &status)?;
         Ok(status)
     }
@@ -1213,10 +1169,10 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
     ) -> Result<AccountRelayListStatus, AppError> {
-        Ok(relay_list_status_from_records(
-            account_id_hex,
-            self.relay_events()?,
-        ))
+        Ok(self
+            .directory_entry_for_account_id(account_id_hex)?
+            .map(|entry| entry.relay_lists)
+            .unwrap_or_else(AccountRelayListStatus::empty))
     }
 
     async fn fetch_key_package_events_for_account_id(
@@ -1224,26 +1180,10 @@ impl MarmotApp {
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
     ) -> Result<Vec<RelayEventRecord>, AppError> {
-        if source_relays.is_empty() || source_relays.iter().all(is_local_relay_endpoint) {
-            let records = self
-                .relay_events()?
-                .into_iter()
-                .filter(|record| {
-                    record.event.kind == KIND_MARMOT_KEY_PACKAGE
-                        && record.event.pubkey == account_id_hex
-                        && (source_relays.is_empty()
-                            || record
-                                .endpoints
-                                .iter()
-                                .any(|endpoint| source_relays.contains(endpoint)))
-                })
-                .collect();
-            return Ok(records);
-        }
-
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
-        let relay_urls = relay_urls_from_endpoints(source_relays)?;
+        let source_relays = self.directory_source_relays(source_relays);
+        let relay_urls = relay_urls_from_endpoints(&source_relays)?;
         let client = NostrSdkClient::builder().build();
         for relay_url in &relay_urls {
             client
@@ -1336,23 +1276,6 @@ impl MarmotApp {
             .iter()
             .map(|account_id| parse_account_id_hex(account_id))
             .collect::<Result<Vec<_>, _>>()?;
-        if source_relays.is_empty() || source_relays.iter().all(is_local_relay_endpoint) {
-            let account_set = account_ids.iter().cloned().collect::<HashSet<_>>();
-            return Ok(self
-                .relay_events()?
-                .into_iter()
-                .filter(|record| {
-                    record.event.kind == kind
-                        && account_set.contains(&record.event.pubkey)
-                        && (source_relays.is_empty()
-                            || record
-                                .endpoints
-                                .iter()
-                                .any(|endpoint| source_relays.contains(endpoint)))
-                })
-                .collect());
-        }
-
         let public_keys = account_ids
             .iter()
             .map(|account_id| PublicKey::parse(account_id).map_err(|_| AppError::InvalidPublicKey))
@@ -1400,10 +1323,7 @@ impl MarmotApp {
         if !source_relays.is_empty() {
             return source_relays.to_vec();
         }
-        match &self.relay {
-            AppRelay::Local => Vec::new(),
-            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
-        }
+        self.relay_endpoints()
     }
 
     fn open_account(&self, label: &str) -> Result<OpenAppAccount, AppError> {
@@ -1427,21 +1347,11 @@ impl MarmotApp {
             }),
         )?;
 
-        let (adapter, notification_forwarder) = match &self.relay {
-            AppRelay::Local => {
-                let relay_client = Arc::new(FileRelayClient {
-                    root: self.local_relay_dir(),
-                });
-                (NostrTransportAdapter::new(relay_client), None)
-            }
-            AppRelay::Sdk { .. } => {
-                let client = NostrSdkClient::builder().signer(keys.clone()).build();
-                let relay_client = NostrSdkRelayClient::new(client);
-                let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
-                let forwarder = relay_client.spawn_notification_forwarder(adapter.clone());
-                (adapter, Some(forwarder))
-            }
-        };
+        let client = NostrSdkClient::builder().signer(keys.clone()).build();
+        let relay_client = NostrSdkRelayClient::new(client);
+        let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
+        let notification_forwarder =
+            Some(relay_client.spawn_notification_forwarder(adapter.clone()));
 
         let key_packages = AppKeyPackagePublisher {
             app: self.clone(),
@@ -1513,7 +1423,7 @@ impl MarmotApp {
 
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
         let path = self
-            .local_relay_dir()
+            .key_package_cache_dir()
             .join(KEY_PACKAGE_DIR)
             .join(format!("{label}.json"));
         if !path.exists() {
@@ -1589,22 +1499,6 @@ impl MarmotApp {
             .collect())
     }
 
-    fn relay_events(&self) -> Result<Vec<RelayEventRecord>, AppError> {
-        let dir = self.local_relay_dir().join(EVENT_DIR);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths = fs::read_dir(dir)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        paths.sort();
-        paths
-            .into_iter()
-            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
-            .map(read_json)
-            .collect()
-    }
-
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
         self.account_projection(label)?.load_state(label)
@@ -1663,10 +1557,8 @@ impl MarmotApp {
                 .map(TransportEndpoint)
                 .collect();
         }
-        match &self.relay {
-            AppRelay::Local => vec![TransportEndpoint(format!("marmot-local://inbox/{label}"))],
-            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
-        }
+        let _ = label;
+        self.relay_endpoints()
     }
 
     fn key_package_endpoints(
@@ -1682,17 +1574,11 @@ impl MarmotApp {
                 .map(TransportEndpoint)
                 .collect();
         }
-        match &self.relay {
-            AppRelay::Local => vec![TransportEndpoint("marmot-local://key-packages".into())],
-            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
-        }
+        self.relay_endpoints()
     }
 
     fn transport_label(&self) -> &'static str {
-        match self.relay {
-            AppRelay::Local => "local",
-            AppRelay::Sdk { .. } => "relay",
-        }
+        "relay"
     }
 
     fn account_dir(&self, label: &str) -> PathBuf {
@@ -1728,8 +1614,16 @@ impl MarmotApp {
         }
     }
 
-    fn local_relay_dir(&self) -> PathBuf {
-        self.root.join(LOCAL_RELAY_DIR)
+    fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.relay_urls
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect()
+    }
+
+    fn key_package_cache_dir(&self) -> PathBuf {
+        self.root.clone()
     }
 
     fn remember_directory_relay_lists(
@@ -1849,24 +1743,9 @@ impl MarmotApp {
         keys: &nostr::Keys,
         endpoints: &[TransportEndpoint],
     ) -> Arc<dyn NostrRelayClient> {
-        if !endpoints.is_empty() {
-            if endpoints.iter().all(is_local_relay_endpoint) {
-                return Arc::new(FileRelayClient {
-                    root: self.local_relay_dir(),
-                });
-            }
-            let client = NostrSdkClient::builder().signer(keys.clone()).build();
-            return Arc::new(NostrSdkRelayClient::new(client));
-        }
-        match &self.relay {
-            AppRelay::Local => Arc::new(FileRelayClient {
-                root: self.local_relay_dir(),
-            }),
-            AppRelay::Sdk { .. } => {
-                let client = NostrSdkClient::builder().signer(keys.clone()).build();
-                Arc::new(NostrSdkRelayClient::new(client))
-            }
-        }
+        let _ = endpoints;
+        let client = NostrSdkClient::builder().signer(keys.clone()).build();
+        Arc::new(NostrSdkRelayClient::new(client))
     }
 
     fn account_home(&self) -> AccountHome {
@@ -1883,13 +1762,7 @@ impl MarmotApp {
     fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = match &self.relay {
-            AppRelay::Local => vec![format!(
-                "marmot-local://group/{}",
-                hex::encode(nostr_group_id)
-            )],
-            AppRelay::Sdk { urls } => urls.clone(),
-        };
+        let relays = self.relay_urls.clone();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
     }
 }
@@ -1935,6 +1808,7 @@ impl AppClient {
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
         self.add_group(&group_id)?;
         self.runtime.sync_transport_groups(None).await?;
         self.app.save_state(&self.state)?;
@@ -1989,6 +1863,7 @@ impl AppClient {
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
@@ -2014,6 +1889,7 @@ impl AppClient {
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
@@ -2035,6 +1911,7 @@ impl AppClient {
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
         let plaintext = String::from_utf8_lossy(payload).to_string();
         let message_ids = effects
@@ -2052,6 +1929,7 @@ impl AppClient {
                 plaintext: plaintext.clone(),
             })?;
         }
+        self.app.save_state(&self.state)?;
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
@@ -2082,6 +1960,7 @@ impl AppClient {
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
         let message_ids = effects
             .reports
             .iter()
@@ -2108,63 +1987,16 @@ impl AppClient {
 
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
         self.runtime.sync_transport_groups(None).await?;
-        match self.app.relay {
-            AppRelay::Local => self.sync_file_relay().await,
-            AppRelay::Sdk { .. } => self.sync_sdk_relay().await,
-        }
-    }
-
-    async fn sync_file_relay(&mut self) -> Result<SyncSummary, AppError> {
-        let profiles = self.app.profiles_by_id()?;
-        let mut summary = SyncSummary::default();
-        let mut seen = self
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-
-        for record in self.app.relay_events()? {
-            if seen.contains(&record.event.id) {
-                continue;
-            }
-            if !is_transport_delivery_event(&record.event) {
-                continue;
-            }
-
-            let mut delivered_total = 0;
-            for endpoint in &record.endpoints {
-                let delivered = self
-                    .adapter
-                    .handle_relay_event(NostrRelayEvent {
-                        endpoint: endpoint.clone(),
-                        subscription_id: Some(format!("file-relay:{}", record.event.id)),
-                        event: record.event.clone(),
-                    })
-                    .await?;
-                delivered_total += delivered;
-            }
-
-            for _ in 0..delivered_total {
-                let delivery = self
-                    .adapter
-                    .receive()
-                    .await?
-                    .ok_or_else(|| AppError::Publish("adapter delivery queue closed".into()))?;
-                self.ingest_delivery(delivery, &profiles, &mut summary)
-                    .await?;
-            }
-
-            seen.insert(record.event.id.clone());
-            self.state.seen_events.push(record.event.id);
-        }
-
-        self.app.save_state(&self.state)?;
-        Ok(summary)
+        self.sync_sdk_relay().await
     }
 
     async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
         let profiles = self.app.profiles_by_id()?;
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
         let mut summary = SyncSummary::default();
         let mut seen = self
             .state
@@ -2189,6 +2021,9 @@ impl AppClient {
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+                continue;
+            }
             if seen.contains(&event_id) {
                 continue;
             }
@@ -2329,6 +2164,15 @@ impl AppClient {
         Ok(())
     }
 
+    fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        for report in &effects.reports {
+            let event_id = hex::encode(report.message_id.as_slice());
+            if !self.state.seen_events.contains(&event_id) {
+                self.state.seen_events.push(event_id);
+            }
+        }
+    }
+
     fn nostr_routing_for_group(
         &self,
         group_id: &GroupId,
@@ -2343,6 +2187,20 @@ impl AppClient {
             })?;
         AppGroupNostrRoutingComponent::from_bytes(&bytes)
     }
+}
+
+fn is_own_relay_echo(
+    delivery: &cgka_traits::TransportDelivery,
+    local_account_id_hex: &str,
+    known_event_ids: &HashSet<String>,
+) -> bool {
+    let event_id = hex::encode(delivery.message.id.as_slice());
+    if !known_event_ids.contains(&event_id) {
+        return false;
+    }
+    NostrTransportEvent::from_transport_message(&delivery.message)
+        .ok()
+        .is_some_and(|event| event.pubkey == local_account_id_hex)
 }
 
 impl Drop for AppClient {
@@ -2529,7 +2387,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .await
             .map_err(|e| KeyPackagePublishError(e.to_string()))?;
 
-        let dir = self.app.local_relay_dir().join(KEY_PACKAGE_DIR);
+        let dir = self.app.key_package_cache_dir().join(KEY_PACKAGE_DIR);
         fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError(e.to_string()))?;
         write_json(
             dir.join(format!("{}.json", self.account_label)),
@@ -2948,14 +2806,6 @@ fn relay_urls_from_endpoints(endpoints: &[TransportEndpoint]) -> Result<Vec<Rela
         .collect()
 }
 
-fn is_local_relay_endpoint(endpoint: &TransportEndpoint) -> bool {
-    endpoint.as_str().starts_with("marmot-local://")
-}
-
-fn is_transport_delivery_event(event: &NostrTransportEvent) -> bool {
-    matches!(event.kind, KIND_MARMOT_GROUP_MESSAGE | KIND_NIP59_GIFT_WRAP)
-}
-
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
     let tag_name = match event.kind {
         KIND_NIP65_RELAY_LIST => "r",
@@ -2978,63 +2828,6 @@ fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<I
         if !values.contains(&candidate) {
             values.push(candidate);
         }
-    }
-}
-
-#[derive(Clone)]
-struct FileRelayClient {
-    root: PathBuf,
-}
-
-#[async_trait]
-impl NostrRelayClient for FileRelayClient {
-    async fn subscribe(
-        &self,
-        _subscription: transport_nostr_adapter::NostrSubscription,
-    ) -> Result<(), TransportAdapterError> {
-        Ok(())
-    }
-
-    async fn unsubscribe(
-        &self,
-        _subscription: transport_nostr_adapter::NostrSubscription,
-    ) -> Result<(), TransportAdapterError> {
-        Ok(())
-    }
-
-    async fn unsubscribe_account(
-        &self,
-        _account_id: &MemberId,
-    ) -> Result<(), TransportAdapterError> {
-        Ok(())
-    }
-
-    async fn publish_event(
-        &self,
-        endpoints: &[TransportEndpoint],
-        event: &NostrTransportEvent,
-        required_acks: usize,
-    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        let dir = self.root.join(EVENT_DIR);
-        fs::create_dir_all(&dir).map_err(|e| TransportAdapterError::Backend(e.to_string()))?;
-        let _ = required_acks;
-        let record = RelayEventRecord {
-            endpoints: endpoints.to_vec(),
-            event: event.clone(),
-        };
-        let file = dir.join(format!("{}-{}.json", event.created_at, event.id));
-        write_json(file, &record).map_err(|e| TransportAdapterError::Backend(e.to_string()))?;
-        Ok(NostrPublishOutcome {
-            accepted: endpoints
-                .iter()
-                .cloned()
-                .map(|endpoint| TransportEndpointReceipt {
-                    endpoint,
-                    accepted_at: Some(Timestamp(event.created_at)),
-                })
-                .collect(),
-            failed: Vec::new(),
-        })
     }
 }
 
@@ -3216,6 +3009,30 @@ fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), App
 mod tests {
     use super::*;
 
+    fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDelivery {
+        let event = NostrTransportEvent {
+            id: event_id,
+            pubkey,
+            created_at: 1,
+            kind: transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".to_owned(), "aa".to_owned()]],
+            content: "ciphertext".to_owned(),
+            sig: None,
+        };
+        cgka_traits::TransportDelivery {
+            account_id: MemberId::new(vec![0; 32]),
+            group_id_hint: None,
+            message: event.to_transport_message().unwrap(),
+            received_at: cgka_traits::transport::Timestamp(1),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+            },
+        }
+    }
+
     #[test]
     fn relay_list_discovery_builds_one_limited_filter_per_required_kind() {
         let public_key =
@@ -3242,5 +3059,34 @@ mod tests {
                 KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
             ]
         );
+    }
+
+    #[test]
+    fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
+        let local_pubkey = "11".repeat(32);
+        let known_event_id = "22".repeat(32);
+        let new_cross_device_event_id = "33".repeat(32);
+        let known_event_ids = HashSet::from([known_event_id.clone()]);
+
+        let known_local_delivery = relay_delivery(known_event_id.clone(), local_pubkey.clone());
+        assert!(is_own_relay_echo(
+            &known_local_delivery,
+            &local_pubkey,
+            &known_event_ids
+        ));
+
+        let same_pubkey_new_event = relay_delivery(new_cross_device_event_id, local_pubkey.clone());
+        assert!(!is_own_relay_echo(
+            &same_pubkey_new_event,
+            &local_pubkey,
+            &known_event_ids
+        ));
+
+        let known_other_pubkey_delivery = relay_delivery(known_event_id, "44".repeat(32));
+        assert!(!is_own_relay_echo(
+            &known_other_pubkey_delivery,
+            &local_pubkey,
+            &known_event_ids
+        ));
     }
 }

@@ -3,8 +3,8 @@
 `marmot-app` is the first non-lab app runtime bridge.
 
 It wires the app-owned `AccountHome` to encrypted session storage, the Nostr MLS peeler, the Nostr transport adapter, and
-a local file relay for deterministic CLI/TUI development. The crate is intentionally below presentation layers like `dm`
-and above the generic account/session/engine crates.
+relay-backed transport state. The crate is intentionally below presentation layers like `dm` and above the generic
+account/session/engine crates.
 
 It owns the first app projections:
 
@@ -27,11 +27,7 @@ radius search over cached follow edges for future TUI/mobile pickers. That searc
 bounded; it is not a crawler for the whole Nostr social graph.
 
 Group creation and invites still take pubkeys at the action boundary. If a member's KeyPackage is not already cached but
-the directory or local relay state knows where their KeyPackages are published, the app fetches the latest package before
-building the MLS add. New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the
-component bytes in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group
-subscriptions and publish targets.
-
-The local file relay models relay boundaries by endpoint. Fetching account relay lists or KeyPackages from specific
-`marmot-local://...` bootstrap/source relays only sees records published to those endpoints, which keeps CLI and future
-TUI discovery behavior honest during local tests.
+the directory knows where their KeyPackages are published, the app fetches the latest package before building the MLS
+add. New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes in
+signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
+targets.

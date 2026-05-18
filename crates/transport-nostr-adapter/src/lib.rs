@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cgka_traits::MessageId;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
@@ -121,6 +122,7 @@ pub struct NostrAdapterMetrics {
 /// Successful/failed endpoint-level result from a relay client publish.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NostrPublishOutcome {
+    pub message_id: Option<MessageId>,
     pub accepted: Vec<TransportEndpointReceipt>,
     pub failed: Vec<TransportEndpointFailure>,
 }
@@ -128,6 +130,7 @@ pub struct NostrPublishOutcome {
 impl NostrPublishOutcome {
     pub fn accepted(endpoints: impl IntoIterator<Item = TransportEndpoint>) -> Self {
         Self {
+            message_id: None,
             accepted: endpoints
                 .into_iter()
                 .map(|endpoint| TransportEndpointReceipt {
@@ -431,7 +434,7 @@ impl TransportAdapter for NostrTransportAdapter {
         };
 
         Ok(TransportPublishReport {
-            message_id: request.message.id,
+            message_id: outcome.message_id.unwrap_or(request.message.id),
             accepted: outcome.accepted,
             failed: outcome.failed,
             required_acks: request.required_acks,

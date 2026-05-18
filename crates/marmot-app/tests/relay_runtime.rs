@@ -4,15 +4,32 @@ use marmot_app::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
     UserProfileMetadata,
 };
+use nostr_relay_builder::MockRelay;
+
+async fn mock_relay() -> (MockRelay, String) {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    (relay, url)
+}
+
+async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    let (relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay(dir.path(), url.clone());
+    (relay, app, url)
+}
+
+fn endpoint(url: &str) -> TransportEndpoint {
+    TransportEndpoint(url.to_owned())
+}
 
 #[tokio::test]
-async fn local_app_runtime_exchanges_messages_without_lab() {
+async fn relay_app_runtime_exchanges_messages_without_lab() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
 
-    let app = MarmotApp::local(dir.path());
+    let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
 
@@ -35,13 +52,13 @@ async fn local_app_runtime_exchanges_messages_without_lab() {
 }
 
 #[tokio::test]
-async fn local_app_runtime_creates_default_agent_text_stream_group() {
+async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
 
-    let app = MarmotApp::local(dir.path());
+    let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
 
@@ -97,13 +114,13 @@ async fn local_app_runtime_creates_default_agent_text_stream_group() {
 }
 
 #[tokio::test]
-async fn local_app_runtime_reopens_account_state() {
+async fn relay_app_runtime_reopens_account_state() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
 
-    let app = MarmotApp::local(dir.path());
+    let (_relay, app, url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
 
@@ -113,7 +130,7 @@ async fn local_app_runtime_reopens_account_state() {
     drop(alice);
     drop(bob);
 
-    let reopened = MarmotApp::local(dir.path());
+    let reopened = MarmotApp::with_relay(dir.path(), url);
     let status = reopened.status("bob").unwrap();
     assert_eq!(status.account, "bob");
     assert_eq!(
@@ -132,11 +149,11 @@ async fn local_app_runtime_reopens_account_state() {
 }
 
 #[tokio::test]
-async fn local_app_publishes_account_relay_lists_for_setup() {
+async fn relay_app_publishes_account_relay_lists_for_setup() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
-    let app = MarmotApp::local(dir.path());
+    let (_seed, app, seed_url) = mock_app(&dir).await;
 
     let status = app
         .publish_account_relay_lists(
@@ -146,7 +163,7 @@ async fn local_app_publishes_account_relay_lists_for_setup() {
                     TransportEndpoint("wss://relay1.example".into()),
                     TransportEndpoint("wss://relay2.example".into()),
                 ],
-                vec![TransportEndpoint("marmot-local://seed".into())],
+                vec![endpoint(&seed_url)],
             ),
         )
         .await
@@ -160,45 +177,39 @@ async fn local_app_publishes_account_relay_lists_for_setup() {
             "wss://relay2.example".to_owned()
         ]
     );
-    assert_eq!(status.bootstrap_relays, vec!["marmot-local://seed"]);
+    assert_eq!(status.bootstrap_relays, vec![seed_url.clone()]);
     assert_eq!(status.nip65.kind, 10002);
     assert_eq!(status.inbox.kind, 10050);
     assert_eq!(status.key_package.kind, 10051);
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
-        .fetch_account_relay_list_status_for_account_id(
-            &account_id,
-            vec![TransportEndpoint("marmot-local://seed".into())],
-        )
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
     assert_eq!(fetched, status);
 }
 
 #[tokio::test]
-async fn local_relay_list_fetch_only_uses_requested_bootstrap_relays() {
+async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
-    let app = MarmotApp::local(dir.path());
+    let (seed_a, seed_a_url) = mock_relay().await;
+    let (seed_b, seed_b_url) = mock_relay().await;
+    let _relays = (seed_a, seed_b);
+    let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
 
     app.publish_account_relay_lists(
         "alice",
-        AccountRelayListBootstrap::new(
-            vec![TransportEndpoint("marmot-local://key-packages".into())],
-            vec![TransportEndpoint("marmot-local://seed-a".into())],
-        ),
+        AccountRelayListBootstrap::new(vec![endpoint(&seed_a_url)], vec![endpoint(&seed_a_url)]),
     )
     .await
     .unwrap();
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let missing_from_seed_b = app
-        .fetch_account_relay_list_status_for_account_id(
-            &account_id,
-            vec![TransportEndpoint("marmot-local://seed-b".into())],
-        )
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
         .await
         .unwrap();
 
@@ -207,10 +218,7 @@ async fn local_relay_list_fetch_only_uses_requested_bootstrap_relays() {
         missing_from_seed_b.missing,
         vec!["nip65", "inbox", "key_package"]
     );
-    assert_eq!(
-        missing_from_seed_b.bootstrap_relays,
-        vec!["marmot-local://seed-b"]
-    );
+    assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
 }
 
 #[tokio::test]
@@ -218,20 +226,17 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
-    let app = MarmotApp::local(dir.path());
+    let (_seed, app, seed_url) = mock_app(&dir).await;
     let account_id = home.account("alice").unwrap().account_id_hex;
 
     app.publish_account_relay_lists(
         "alice",
-        AccountRelayListBootstrap::new(
-            vec![TransportEndpoint("marmot-local://key-packages".into())],
-            vec![TransportEndpoint("marmot-local://seed".into())],
-        ),
+        AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]),
     )
     .await
     .unwrap();
 
-    let reopened = MarmotApp::local(dir.path());
+    let reopened = MarmotApp::with_relay(dir.path(), seed_url);
     let cached = reopened
         .directory_entry_for_account_id(&account_id)
         .unwrap()
@@ -253,11 +258,9 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     let alice_id = home.account("alice").unwrap().account_id_hex;
     let bob_id = home.account("bob").unwrap().account_id_hex;
     let carol_id = home.account("carol").unwrap().account_id_hex;
-    let app = MarmotApp::local(dir.path());
-    let bootstrap = AccountRelayListBootstrap::new(
-        vec![TransportEndpoint("marmot-local://social".into())],
-        vec![TransportEndpoint("marmot-local://seed".into())],
-    );
+    let (_seed, app, seed_url) = mock_app(&dir).await;
+    let bootstrap =
+        AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]);
 
     app.publish_user_profile(
         "bob",
@@ -297,20 +300,14 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
         .unwrap();
 
     let alice_refresh = app
-        .refresh_user_directory_for_account_id(
-            &alice_id,
-            vec![TransportEndpoint("marmot-local://seed".into())],
-        )
+        .refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
     assert_eq!(alice_refresh.follow_count, 1);
     assert_eq!(alice_refresh.profile_count, 1);
 
     let bob_refresh = app
-        .refresh_user_directory_for_account_id(
-            &bob_id,
-            vec![TransportEndpoint("marmot-local://seed".into())],
-        )
+        .refresh_user_directory_for_account_id(&bob_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
     assert_eq!(bob_refresh.follow_count, 1);
@@ -377,7 +374,7 @@ async fn account_projection_db_records_received_messages() {
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
 
-    let app = MarmotApp::local(dir.path());
+    let (_relay, app, url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
 
@@ -408,19 +405,25 @@ async fn account_projection_db_records_received_messages() {
         .send(&group_id, b"persist this projection")
         .await
         .unwrap();
-    let alice_messages = MarmotApp::local(dir.path()).messages("alice").unwrap();
+    let alice_messages = MarmotApp::with_relay(dir.path(), url.clone())
+        .messages("alice")
+        .unwrap();
     assert_eq!(alice_messages.len(), 1);
     assert_eq!(alice_messages[0].direction, "sent");
     assert_eq!(alice_messages[0].sender, "alice");
     assert_eq!(alice_messages[0].plaintext, "persist this projection");
 
     alice.sync().await.unwrap();
-    let alice_messages = MarmotApp::local(dir.path()).messages("alice").unwrap();
+    let alice_messages = MarmotApp::with_relay(dir.path(), url.clone())
+        .messages("alice")
+        .unwrap();
     assert_eq!(alice_messages.len(), 1);
 
     bob.sync().await.unwrap();
 
-    let messages = MarmotApp::local(dir.path()).messages("bob").unwrap();
+    let messages = MarmotApp::with_relay(dir.path(), url)
+        .messages("bob")
+        .unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].direction, "received");
     assert_eq!(messages[0].sender, "alice");

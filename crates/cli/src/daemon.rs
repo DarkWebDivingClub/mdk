@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
@@ -90,6 +92,25 @@ struct DaemonState {
     pid: u32,
     started_at: u64,
     last_sync: Option<DaemonSyncReport>,
+}
+
+#[derive(Default)]
+struct LiveSyncWorkers {
+    handles: HashMap<String, JoinHandle<()>>,
+}
+
+impl LiveSyncWorkers {
+    fn abort_account(&mut self, account_id: &str) {
+        if let Some(handle) = self.handles.remove(account_id) {
+            handle.abort();
+        }
+    }
+
+    fn abort_all(&mut self) {
+        for (_, handle) in self.handles.drain() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,7 +280,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         socket: socket.clone(),
         pid_path: pid_path.clone(),
         log_path,
-        relay: args.relay,
+        relay: Some(crate::resolve_relay(args.relay)?.ok_or(crate::DmError::MissingRelay)?),
         secret_store: args.secret_store,
         keychain_service: args.keychain_service,
         sync_interval: Duration::from_millis(args.sync_interval_ms.max(1)),
@@ -269,6 +290,8 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         started_at: unix_now(),
         last_sync: None,
     }));
+    let mut live_workers = LiveSyncWorkers::default();
+    reconcile_live_sync_workers(&defaults, state.clone(), &mut live_workers).await;
     let mut sync_interval = tokio::time::interval(defaults.sync_interval);
     sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -276,20 +299,20 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         tokio::select! {
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
-                let should_shutdown = handle_connection(&mut stream, &defaults, state.clone()).await?;
+                let should_shutdown =
+                    handle_connection(&mut stream, &defaults, state.clone(), &mut live_workers)
+                        .await?;
                 if should_shutdown {
                     break Ok(());
                 }
             }
             _ = sync_interval.tick() => {
-                let report = sync_accounts(&defaults, None).await;
-                if let Ok(mut state) = state.lock() {
-                    state.last_sync = Some(report);
-                }
+                reconcile_live_sync_workers(&defaults, state.clone(), &mut live_workers).await;
             }
         }
     };
 
+    live_workers.abort_all();
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pid_path);
     shutdown_result
@@ -299,6 +322,7 @@ async fn handle_connection(
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
+    live_workers: &mut LiveSyncWorkers,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await?;
@@ -333,9 +357,7 @@ async fn handle_connection(
         ),
         DaemonRequest::SyncNow { account } => {
             let report = sync_accounts(defaults, account).await;
-            if let Ok(mut state) = state.lock() {
-                state.last_sync = Some(report.clone());
-            }
+            record_sync_report(&state, report.clone());
             (
                 false,
                 CliOutput {
@@ -347,7 +369,12 @@ async fn handle_connection(
         }
         DaemonRequest::Execute { mut cli } => {
             apply_defaults(&mut cli, defaults);
-            (false, crate::run_cli_local(*cli).await)
+            let refresh = live_sync_refresh_after_execute(&cli);
+            let output = crate::run_cli_local(*cli).await;
+            if output.code == 0 {
+                refresh_live_sync_workers(defaults, state.clone(), live_workers, refresh).await;
+            }
+            (false, output)
         }
     };
 
@@ -358,13 +385,201 @@ async fn handle_connection(
     Ok(shutdown)
 }
 
+#[derive(Clone, Debug)]
+enum LiveSyncRefresh {
+    None,
+    Reconcile,
+    RestartSelected(Option<String>),
+}
+
+fn live_sync_enabled(defaults: &DaemonDefaults) -> bool {
+    defaults.relay.is_some()
+}
+
+fn live_sync_refresh_after_execute(cli: &Cli) -> LiveSyncRefresh {
+    match &cli.command {
+        crate::Command::Account {
+            command: crate::AccountCommand::Create { .. },
+        } => LiveSyncRefresh::Reconcile,
+        crate::Command::Group { .. } => LiveSyncRefresh::RestartSelected(cli.account.clone()),
+        crate::Command::Sync => LiveSyncRefresh::RestartSelected(cli.account.clone()),
+        _ => LiveSyncRefresh::None,
+    }
+}
+
+async fn refresh_live_sync_workers(
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    workers: &mut LiveSyncWorkers,
+    refresh: LiveSyncRefresh,
+) {
+    if !live_sync_enabled(defaults) {
+        return;
+    }
+    match refresh {
+        LiveSyncRefresh::None => {}
+        LiveSyncRefresh::Reconcile => {
+            reconcile_live_sync_workers(defaults, state, workers).await;
+        }
+        LiveSyncRefresh::RestartSelected(selector) => {
+            if let Some(account_id) = resolve_live_sync_account_id(defaults, selector).await {
+                workers.abort_account(&account_id);
+            }
+            reconcile_live_sync_workers(defaults, state, workers).await;
+        }
+    }
+}
+
+async fn resolve_live_sync_account_id(
+    defaults: &DaemonDefaults,
+    selector: Option<String>,
+) -> Option<String> {
+    let secret_store = crate::resolve_secret_store(defaults.secret_store).ok()?;
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home =
+        crate::open_account_home(&defaults.home, secret_store, &keychain_service).ok()?;
+    crate::resolve_account(&account_home, selector)
+        .ok()
+        .map(|account| account.account_id_hex)
+}
+
+async fn reconcile_live_sync_workers(
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    workers: &mut LiveSyncWorkers,
+) {
+    if !live_sync_enabled(defaults) {
+        return;
+    }
+    workers.handles.retain(|_, handle| !handle.is_finished());
+
+    let sync_result = async {
+        let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
+        let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+        let account_home =
+            crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
+        Ok::<_, crate::DmError>(account_home.accounts()?)
+    }
+    .await;
+
+    let accounts = match sync_result {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            record_sync_error(&state, err.to_string());
+            return;
+        }
+    };
+
+    for account in accounts.into_iter().filter(|account| account.local_signing) {
+        if workers.handles.contains_key(&account.account_id_hex) {
+            continue;
+        }
+        let defaults = defaults.clone();
+        let account_id = account.account_id_hex.clone();
+        let worker_state = state.clone();
+        let handle = tokio::spawn(async move {
+            live_sync_account(defaults, account_id, worker_state).await;
+        });
+        workers.handles.insert(account.account_id_hex, handle);
+    }
+}
+
+async fn live_sync_account(
+    defaults: DaemonDefaults,
+    account_id: String,
+    state: Arc<Mutex<DaemonState>>,
+) {
+    let setup = async {
+        let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
+        let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+        let account_home =
+            crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
+        let app = crate::app_for(
+            defaults.home.clone(),
+            defaults.relay.clone(),
+            account_home.clone(),
+        );
+        let account = crate::resolve_account(&account_home, Some(account_id.clone()))?;
+        let client = app.client(&account.label).await?;
+        Ok::<_, crate::DmError>((account, client))
+    }
+    .await;
+
+    let (_account, mut client) = match setup {
+        Ok(open) => open,
+        Err(err) => {
+            record_sync_error(&state, err.to_string());
+            return;
+        }
+    };
+
+    loop {
+        let started_at = unix_now();
+        match client.sync().await {
+            Ok(summary) => {
+                let report = sync_report_from_summary(started_at, 1, &summary);
+                record_sync_report(&state, report);
+            }
+            Err(err) => {
+                let mut report = empty_sync_report(started_at);
+                report.accounts = 1;
+                report.errors.push(format!("live sync failed: {err}"));
+                report.finished_at = unix_now();
+                record_sync_report(&state, report);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+fn empty_sync_report(started_at: u64) -> DaemonSyncReport {
+    DaemonSyncReport {
+        started_at,
+        finished_at: started_at,
+        accounts: 0,
+        events: 0,
+        joined_groups: 0,
+        messages: 0,
+        directory_accounts: 0,
+        directory_follows: 0,
+        directory_profiles: 0,
+        errors: Vec::new(),
+    }
+}
+
+fn sync_report_from_summary(
+    started_at: u64,
+    accounts: usize,
+    summary: &marmot_app::SyncSummary,
+) -> DaemonSyncReport {
+    let mut report = empty_sync_report(started_at);
+    report.finished_at = unix_now();
+    report.accounts = accounts;
+    report.events = summary.events.len();
+    report.joined_groups = summary.joined_groups.len();
+    report.messages = summary.messages.len();
+    report
+}
+
+fn record_sync_error(state: &Arc<Mutex<DaemonState>>, error: String) {
+    let started_at = unix_now();
+    let mut report = empty_sync_report(started_at);
+    report.finished_at = unix_now();
+    report.errors.push(error);
+    record_sync_report(state, report);
+}
+
+fn record_sync_report(state: &Arc<Mutex<DaemonState>>, report: DaemonSyncReport) {
+    if let Ok(mut state) = state.lock() {
+        state.last_sync = Some(report);
+    }
+}
+
 fn apply_defaults(cli: &mut Cli, defaults: &DaemonDefaults) {
     if cli.home.is_none() {
         cli.home = Some(defaults.home.clone());
     }
-    if cli.relay.is_none() {
-        cli.relay = defaults.relay.clone();
-    }
+    cli.relay = defaults.relay.clone();
     if cli.secret_store.is_none() {
         cli.secret_store = defaults.secret_store;
     }
@@ -388,6 +603,17 @@ async fn start_daemon(
             0,
         );
     }
+    let relay = match crate::resolve_relay(cli.relay.clone()) {
+        Ok(Some(relay)) => relay,
+        Ok(None) => {
+            return daemon_error(
+                cli.json,
+                "missing_relay_url",
+                crate::DmError::MissingRelay.to_string(),
+            );
+        }
+        Err(err) => return daemon_error(cli.json, relay_error_code(&err), err.to_string()),
+    };
 
     let executable = match daemon_executable() {
         Ok(path) => path,
@@ -404,9 +630,7 @@ async fn start_daemon(
             .arg("--sync-interval-ms")
             .arg(sync_interval_ms.to_string());
     }
-    if let Some(relay) = &cli.relay {
-        command.arg("--relay").arg(relay);
-    }
+    command.arg("--relay").arg(relay);
     if let Some(secret_store) = cli.secret_store {
         command.arg("--secret-store").arg(secret_store.as_str());
     }
@@ -777,6 +1001,14 @@ async fn remove_stale_socket(
     }
 }
 
+fn relay_error_code(err: &crate::DmError) -> &'static str {
+    match err {
+        crate::DmError::EmptyRelayUrl => "empty_relay_url",
+        crate::DmError::InvalidRelayUrl(_) => "invalid_relay_url",
+        _ => "relay_url_error",
+    }
+}
+
 fn daemon_executable() -> Result<PathBuf, String> {
     if let Ok(current) = std::env::current_exe()
         && let Some(parent) = current.parent()
@@ -795,4 +1027,38 @@ fn daemon_executable() -> Result<PathBuf, String> {
             })
         })
         .ok_or_else(|| "dmd not found; ensure it is built and on PATH".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
+        let defaults = DaemonDefaults {
+            home: PathBuf::from("/tmp/dm-daemon-home"),
+            socket: PathBuf::from("/tmp/dm-daemon.sock"),
+            pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
+            log_path: PathBuf::from("/tmp/dm-daemon.log"),
+            relay: Some("wss://daemon.example".to_owned()),
+            secret_store: Some(crate::SecretStoreKind::File),
+            keychain_service: Some("daemon-keychain".to_owned()),
+            sync_interval: Duration::from_millis(1000),
+        };
+        let mut cli = Cli {
+            home: None,
+            socket: Some(PathBuf::from("/tmp/forwarded.sock")),
+            relay: Some("wss://client.example".to_owned()),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command: crate::Command::Sync,
+        };
+
+        apply_defaults(&mut cli, &defaults);
+
+        assert_eq!(cli.relay.as_deref(), Some("wss://daemon.example"));
+        assert_eq!(cli.socket, None);
+    }
 }

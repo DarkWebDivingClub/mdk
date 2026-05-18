@@ -1,14 +1,59 @@
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Output};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use nostr_relay_builder::MockRelay;
 use serde_json::Value;
+
+const POLL_TIMEOUT: Duration = Duration::from_secs(8);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+struct TestRelay {
+    _runtime: tokio::runtime::Runtime,
+    _relay: MockRelay,
+    url: String,
+}
+
+impl TestRelay {
+    fn new() -> Self {
+        let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
+        let mut last_error = None;
+        let relay = (0..8)
+            .find_map(|attempt| match runtime.block_on(MockRelay::run()) {
+                Ok(relay) => Some(relay),
+                Err(err) => {
+                    eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
+                    last_error = Some(err);
+                    std::thread::sleep(Duration::from_millis(25));
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("mock relay should start: {last_error:?}"));
+        let url = runtime.block_on(relay.url()).to_string();
+        Self {
+            _runtime: runtime,
+            _relay: relay,
+            url,
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+fn test_relay_url() -> &'static str {
+    static RELAY: OnceLock<TestRelay> = OnceLock::new();
+    RELAY.get_or_init(TestRelay::new).url()
+}
 
 fn dm(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dm"));
     command.arg("--home").arg(home).arg("--json");
     command.env("DM_SECRET_STORE", "file");
+    command.env("DM_RELAY", test_relay_url());
     command
 }
 
@@ -20,10 +65,12 @@ fn dm_with_relay(home: &std::path::Path, relay: &str) -> Command {
 
 fn command_output_summary(output: &Output) -> String {
     format!(
-        "status={}\nstdout_len={}\nstderr_len={}",
+        "status={}\nstdout_len={}\nstderr_len={}\nstdout={}\nstderr={}",
         output.status,
         output.stdout.len(),
-        output.stderr.len()
+        output.stderr.len(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     )
 }
 
@@ -38,7 +85,7 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
         .expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\n{}",
+        "dm failed\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -53,7 +100,7 @@ fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Va
         .expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\nrelay=<REDACTED_RELAY>\n{}",
+        "dm failed\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -68,7 +115,7 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
         .expect("dm command should start");
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\n{}",
+        "dm unexpectedly succeeded\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -85,7 +132,7 @@ fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)
     let output = command.output().expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\n{}",
+        "dm failed\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -231,7 +278,7 @@ fn create_account_with_real_relay(home: &std::path::Path, relay: &str) -> String
 }
 
 fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_id: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
@@ -242,7 +289,7 @@ fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_i
             return sync;
         }
         last = sync;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not join <REDACTED_GROUP> via <REDACTED_RELAY>; {}",
@@ -256,7 +303,7 @@ fn sync_until_message(
     account: &str,
     plaintext: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
@@ -267,11 +314,87 @@ fn sync_until_message(
             return sync;
         }
         last = sync;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not receive <REDACTED_MESSAGE> via <REDACTED_RELAY>; {}",
         json_value_summary("last_sync", &last)
+    );
+}
+
+fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, member: &str) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let _ = run_json(home, &["--account", account, "sync"]);
+        let members = run_json(home, &["--account", account, "group", "members", group_id]);
+        if member_accounts(&members)
+            .iter()
+            .any(|candidate| candidate == member)
+        {
+            return members;
+        }
+        last = members;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not see expected member in <REDACTED_GROUP>; {}",
+        json_value_summary("last_members", &last)
+    );
+}
+
+fn wait_until_chat_visible(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    group_id: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let chats = run_json_with_relay(home, relay, &["--account", account, "chats", "list"]);
+        if chats["chats"]
+            .as_array()
+            .is_some_and(|chats| chats.iter().any(|chat| chat["group_id"] == group_id))
+        {
+            return chats;
+        }
+        last = chats;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not project <REDACTED_GROUP> via daemon; {}",
+        json_value_summary("last_chats", &last)
+    );
+}
+
+fn wait_until_projected_message(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    group_id: &str,
+    plaintext: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let messages = run_json_with_relay(
+            home,
+            relay,
+            &["--account", account, "message", "list", "--group", group_id],
+        );
+        if message_plaintexts(&messages)
+            .iter()
+            .any(|message| message == plaintext)
+        {
+            return messages;
+        }
+        last = messages;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not project <REDACTED_MESSAGE> via daemon; {}",
+        json_value_summary("last_messages", &last)
     );
 }
 
@@ -318,6 +441,7 @@ fn stop_daemon(socket: &std::path::Path, child: &mut Child) {
 #[test]
 fn account_create_list_and_status_are_json_addressable() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
     let created = run_json(home.path(), &["account", "create"]);
     let account_id = created["account_id"].as_str().expect("account id");
@@ -331,12 +455,17 @@ fn account_create_list_and_status_are_json_addressable() {
     let status = run_json(home.path(), &["account", "status", account_id]);
     assert_eq!(status["account_id"], account_id);
     assert_eq!(status["npub"], created["npub"]);
-    assert_eq!(status["relay_lists"]["complete"], false);
+    assert_eq!(status["relay_lists"]["complete"], true);
+    assert_eq!(
+        status["relay_lists"]["default_relays"],
+        serde_json::json!([relay])
+    );
 }
 
 #[test]
 fn account_create_accepts_nsec_without_echoing_it() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
     let output = dm(home.path())
@@ -347,7 +476,8 @@ fn account_create_accepts_nsec_without_echoing_it() {
             "--default-relays",
             "wss://relay.example",
             "--bootstrap-relays",
-            "marmot-local://seed",
+            relay,
+            "--publish-missing-relay-lists",
         ])
         .output()
         .expect("dm command should start");
@@ -367,6 +497,49 @@ fn account_create_accepts_nsec_without_echoing_it() {
 
     let status = run_json(home.path(), &["account", "status", account_id]);
     assert_eq!(status["account_id"], account_id);
+}
+
+#[test]
+fn account_create_uses_global_relay_for_required_relay_lists() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
+
+    let created = run_json_with_relay(home.path(), relay, &["account", "create"]);
+
+    assert_eq!(created["relay_lists"]["complete"], true);
+    assert_eq!(
+        created["relay_lists"]["default_relays"],
+        serde_json::json!([relay])
+    );
+    assert_eq!(
+        created["relay_lists"]["bootstrap_relays"],
+        serde_json::json!([relay])
+    );
+    assert_eq!(created["relay_lists"]["nip65"]["kind"], 10002);
+    assert_eq!(created["relay_lists"]["inbox"]["kind"], 10050);
+    assert_eq!(created["relay_lists"]["key_package"]["kind"], 10051);
+}
+
+#[test]
+fn account_create_requires_relay_setup() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--json")
+        .arg("--secret-store")
+        .arg("file")
+        .args(["account", "create"])
+        .output()
+        .expect("dm command should start");
+
+    assert!(
+        !output.status.success(),
+        "dm unexpectedly succeeded\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["error"]["code"], "missing_relay_url");
 }
 
 #[test]
@@ -392,11 +565,12 @@ fn account_create_accepts_public_nostr_identity_without_signing() {
 #[test]
 fn account_create_publishes_required_relay_lists_from_default_relays() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
     let created = create_account_with_relays(
         home.path(),
         "wss://relay1.example,wss://relay2.example",
-        "marmot-local://seed",
+        relay,
     );
     assert_eq!(created["relay_lists"]["complete"], true);
     assert_eq!(
@@ -405,7 +579,7 @@ fn account_create_publishes_required_relay_lists_from_default_relays() {
     );
     assert_eq!(
         created["relay_lists"]["bootstrap_relays"],
-        serde_json::json!(["marmot-local://seed"])
+        serde_json::json!([relay])
     );
     assert_eq!(created["relay_lists"]["nip65"]["kind"], 10002);
     assert_eq!(created["relay_lists"]["inbox"]["kind"], 10050);
@@ -419,17 +593,12 @@ fn account_create_publishes_required_relay_lists_from_default_relays() {
 #[test]
 fn account_create_reports_missing_relay_lists_without_storing_the_nsec() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
     let error = run_json_error(
         home.path(),
-        &[
-            "account",
-            "create",
-            nsec,
-            "--bootstrap-relays",
-            "marmot-local://seed",
-        ],
+        &["account", "create", nsec, "--bootstrap-relays", relay.url()],
     );
     assert_eq!(error["code"], "missing_relay_lists");
     assert_eq!(
@@ -460,6 +629,7 @@ fn account_create_rolls_back_when_relay_list_publication_fails() {
 #[test]
 fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
     let imported = run_json(
@@ -471,7 +641,8 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
             "--default-relays",
             "wss://relay1.example,wss://relay2.example",
             "--bootstrap-relays",
-            "marmot-local://seed",
+            relay.url(),
+            "--publish-missing-relay-lists",
         ],
     );
 
@@ -482,6 +653,40 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     );
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"][0]["account_id"], imported["account_id"]);
+}
+
+#[test]
+fn account_import_requires_explicit_repair_before_publishing_missing_relay_lists() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let error = run_json_error(
+        home.path(),
+        &[
+            "account",
+            "create",
+            nsec,
+            "--default-relays",
+            relay.url(),
+            "--bootstrap-relays",
+            relay.url(),
+        ],
+    );
+
+    assert_eq!(error["code"], "missing_relay_lists");
+    assert_eq!(
+        error["missing"],
+        serde_json::json!(["nip65", "inbox", "key_package"])
+    );
+    assert_eq!(
+        error["repair"]["publish_missing"],
+        "--publish-missing-relay-lists"
+    );
+    assert!(!error.to_string().contains(nsec));
+
+    let listed = run_json(home.path(), &["account", "list"]);
+    assert_eq!(listed["accounts"], serde_json::json!([]));
 }
 
 #[test]
@@ -509,11 +714,12 @@ fn account_create_rolls_back_when_missing_relay_list_publication_fails() {
 #[test]
 fn account_relay_lists_checks_a_pubkey_from_bootstrap_relays() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
     let created = create_account_with_relays(
         home.path(),
         "wss://relay1.example,wss://relay2.example",
-        "marmot-local://seed",
+        relay,
     );
     let account_id = created["account_id"].as_str().expect("account id");
 
@@ -524,7 +730,7 @@ fn account_relay_lists_checks_a_pubkey_from_bootstrap_relays() {
             "relay-lists",
             account_id,
             "--bootstrap-relays",
-            "marmot-local://seed",
+            relay,
         ],
     );
 
@@ -532,19 +738,16 @@ fn account_relay_lists_checks_a_pubkey_from_bootstrap_relays() {
     assert_eq!(checked["relay_lists"]["complete"], true);
     assert_eq!(
         checked["relay_lists"]["bootstrap_relays"],
-        serde_json::json!(["marmot-local://seed"])
+        serde_json::json!([relay])
     );
 }
 
 #[test]
 fn key_package_fetches_latest_package_via_relay_list_discovery() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
-    let created = create_account_with_relays(
-        home.path(),
-        "marmot-local://key-packages",
-        "marmot-local://seed",
-    );
+    let created = create_account_with_relays(home.path(), relay, relay);
     let account_id = created["account_id"].as_str().expect("account id");
 
     let published = run_json(home.path(), &["--account", account_id, "keys", "publish"]);
@@ -553,36 +756,24 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
 
     let fetched = run_json(
         home.path(),
-        &[
-            "keys",
-            "fetch",
-            account_id,
-            "--bootstrap-relays",
-            "marmot-local://seed",
-        ],
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
     );
 
     assert_eq!(fetched["account_id"], account_id);
     assert_eq!(fetched["key_package_bytes"].as_u64(), Some(published_bytes));
     assert_eq!(
         fetched["relay_lists"]["key_package"]["relays"],
-        serde_json::json!(["marmot-local://key-packages"])
+        serde_json::json!([relay])
     );
-    assert_eq!(
-        fetched["source_relays"],
-        serde_json::json!(["marmot-local://key-packages"])
-    );
+    assert_eq!(fetched["source_relays"], serde_json::json!([relay]));
 }
 
 #[test]
 fn global_account_selects_subject_for_keys_fetch_and_relay_lists() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
-    let created = create_account_with_relays(
-        home.path(),
-        "marmot-local://key-packages",
-        "marmot-local://seed",
-    );
+    let created = create_account_with_relays(home.path(), relay, relay);
     let account_id = created["account_id"].as_str().expect("account id");
 
     let relay_lists = run_json(
@@ -593,7 +784,7 @@ fn global_account_selects_subject_for_keys_fetch_and_relay_lists() {
             "account",
             "relay-lists",
             "--bootstrap-relays",
-            "marmot-local://seed",
+            relay,
         ],
     );
     assert_eq!(relay_lists["account_id"], account_id);
@@ -736,7 +927,7 @@ fn group_create_includes_agent_text_streams_by_default() {
         "010300001000000000000000"
     );
 
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
     let bob_group = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
     assert_eq!(bob_group["group"]["agent_text_stream"]["required"], true);
 }
@@ -754,7 +945,7 @@ fn message_send_accepts_hyphen_leading_text_after_group_flag() {
         &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
 
     run_json(
         home.path(),
@@ -786,7 +977,7 @@ fn chats_list_exposes_visible_groups() {
         &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
 
     let chats = run_json(home.path(), &["--account", &bob, "chats", "list"]);
     assert_eq!(chats["chats"][0]["group_id"], group_id);
@@ -802,6 +993,8 @@ fn daemon_executes_cli_commands_over_socket() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
+        .arg("--relay")
+        .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
         .spawn()
@@ -843,6 +1036,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
+        .env("DM_RELAY", test_relay_url())
         .arg("--secret-store")
         .arg("file")
         .arg("--json")
@@ -922,6 +1116,7 @@ fn daemon_background_sync_updates_local_accounts() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
+        .env("DM_RELAY", test_relay_url())
         .arg("--secret-store")
         .arg("file")
         .arg("--json")
@@ -1000,13 +1195,10 @@ fn missing_key_package_errors_include_repair_guidance() {
 #[test]
 fn group_create_can_invite_a_member_by_fetched_pubkey() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
     let alice = create_account(home.path());
-    let bob = create_account_with_relays(
-        home.path(),
-        "marmot-local://key-packages",
-        "marmot-local://seed",
-    );
+    let bob = create_account_with_relays(home.path(), relay, relay);
     let bob_account_id = bob["account_id"].as_str().expect("bob account id");
 
     run_json(
@@ -1015,13 +1207,7 @@ fn group_create_can_invite_a_member_by_fetched_pubkey() {
     );
     run_json(
         home.path(),
-        &[
-            "keys",
-            "fetch",
-            bob_account_id,
-            "--bootstrap-relays",
-            "marmot-local://seed",
-        ],
+        &["keys", "fetch", bob_account_id, "--bootstrap-relays", relay],
     );
 
     let created_group = run_json(
@@ -1044,13 +1230,10 @@ fn group_create_can_invite_a_member_by_fetched_pubkey() {
 #[test]
 fn group_create_fetches_missing_key_package_for_pubkey_members() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
 
     let alice = create_account(home.path());
-    let bob = create_account_with_relays(
-        home.path(),
-        "marmot-local://key-packages",
-        "marmot-local://seed",
-    );
+    let bob = create_account_with_relays(home.path(), relay, relay);
     let bob_account_id = bob["account_id"].as_str().expect("bob account id");
 
     run_json(
@@ -1264,7 +1447,7 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
         ],
     );
     assert!(second_send["message_ids"][0].as_str().is_some());
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    sync_until_message(home.path(), test_relay_url(), &bob, "second");
 
     let messages = run_json(
         home.path(),
@@ -1276,13 +1459,18 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
             "--group",
             group_id,
             "--limit",
-            "1",
+            "2",
         ],
     );
-    assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(messages["messages"][0]["direction"], "received");
-    assert!(messages["messages"][0]["message_id"].as_str().is_some());
-    assert_eq!(messages["messages"][0]["plaintext"], "second");
+    assert_eq!(messages["messages"].as_array().unwrap().len(), 2);
+    assert_message_plaintexts(&messages, &["first", "second"]);
+    assert!(
+        messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["direction"] == "received")
+    );
 
     let status = run_json(home.path(), &["account", "status", &bob]);
     assert_eq!(status["counts"]["groups"], 1);
@@ -1406,7 +1594,8 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
         &["--account", &alice, "group", "invite", group_id, &carol],
     );
     assert_eq!(invite["published"], 2);
-    run_json(home.path(), &["--account", &carol, "sync"]);
+    sync_until_member(home.path(), &bob, group_id, &carol);
+    sync_until_joined(home.path(), test_relay_url(), &carol, group_id);
 
     let invited_members = run_json(
         home.path(),
@@ -1430,8 +1619,8 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
             "stays",
         ],
     );
-    run_json(home.path(), &["--account", &bob, "sync"]);
-    run_json(home.path(), &["--account", &carol, "sync"]);
+    sync_until_message(home.path(), test_relay_url(), &bob, "history stays");
+    sync_until_message(home.path(), test_relay_url(), &carol, "history stays");
 
     let remove = run_json(
         home.path(),
@@ -1506,7 +1695,7 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
             "carol",
         ],
     );
-    let bob_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_sync = sync_until_message(home.path(), test_relay_url(), &bob, "before carol");
     assert_message_plaintexts(&bob_sync, &["before carol"]);
 
     let invite = run_json(
@@ -1515,7 +1704,7 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
     );
     assert_eq!(invite["published"], 2);
     run_json(home.path(), &["--account", &bob, "sync"]);
-    let carol_join = run_json(home.path(), &["--account", &carol, "sync"]);
+    let carol_join = sync_until_joined(home.path(), test_relay_url(), &carol, group_id);
     assert_eq!(carol_join["joined_groups"][0], group_id);
 
     run_json(
@@ -1531,9 +1720,10 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
             "joined",
         ],
     );
-    let alice_after_carol = run_json(home.path(), &["--account", &alice, "sync"]);
+    let alice_after_carol =
+        sync_until_message(home.path(), test_relay_url(), &alice, "carol joined");
     assert_message_plaintexts(&alice_after_carol, &["carol joined"]);
-    let bob_after_carol = run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_after_carol = sync_until_message(home.path(), test_relay_url(), &bob, "carol joined");
     assert_message_plaintexts(&bob_after_carol, &["carol joined"]);
 
     let remove = run_json(
@@ -1558,7 +1748,8 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
             "removed",
         ],
     );
-    let alice_after_remove = run_json(home.path(), &["--account", &alice, "sync"]);
+    let alice_after_remove =
+        sync_until_message(home.path(), test_relay_url(), &alice, "after bob removed");
     assert_message_plaintexts(&alice_after_remove, &["after bob removed"]);
     let bob_after_remove = run_json(home.path(), &["--account", &bob, "sync"]);
     assert_no_message_plaintext(&bob_after_remove, "after bob removed");
@@ -1647,4 +1838,68 @@ fn real_local_relays_deliver_cli_messages_over_sdk_path() {
         );
         assert_message_plaintexts(&bob_messages, &[&body]);
     }
+}
+
+#[test]
+fn daemon_real_relay_keeps_live_subscriptions_between_sync_intervals() {
+    let relays = real_relay_urls();
+    let Some(relay) = relays.iter().find(|relay| local_relay_available(relay)) else {
+        assert!(
+            !require_real_relays(),
+            "live daemon relay E2E requires one of these relays to be reachable: {relays:?}"
+        );
+        eprintln!("skipping live daemon relay E2E: no local relay ports are reachable");
+        return;
+    };
+    let relay = relay.as_str();
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+
+    let alice = create_account_with_real_relay(home.path(), relay);
+    let bob = create_account_with_real_relay(home.path(), relay);
+    run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
+
+    let start = dm_with_relay(home.path(), relay)
+        .args(["daemon", "start", "--sync-interval-ms", "60000"])
+        .output()
+        .expect("dm daemon start should run");
+    assert!(
+        start.status.success(),
+        "daemon start failed\n{}",
+        command_output_summary(&start)
+    );
+    wait_for_daemon(&socket);
+
+    let group_name = format!(
+        "live-daemon-{}",
+        relay.rsplit(':').next().unwrap_or("unknown")
+    );
+    let created_group = run_json_with_relay(
+        home.path(),
+        relay,
+        &["--account", &alice, "group", "create", &group_name, &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    wait_until_chat_visible(home.path(), relay, &bob, group_id);
+
+    let body = format!("daemon live hello over {relay}");
+    run_json_with_relay(
+        home.path(),
+        relay,
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            &body,
+        ],
+    );
+
+    let messages = wait_until_projected_message(home.path(), relay, &bob, group_id, &body);
+    assert_message_plaintexts(&messages, &[&body]);
+
+    let _ = dm(home.path()).args(["daemon", "stop"]).output();
 }

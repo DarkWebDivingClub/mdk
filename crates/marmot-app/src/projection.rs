@@ -515,7 +515,7 @@ mod tests {
             seen_events: vec!["event-before".to_owned()],
             groups: vec![AppGroupRecord::new(
                 "aa".to_owned(),
-                test_routing([0xAA; 32], "marmot-local://group/aa"),
+                test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
                 "before".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
@@ -539,7 +539,7 @@ mod tests {
             seen_events: vec!["event-after".to_owned()],
             groups: vec![AppGroupRecord::new(
                 "bb".to_owned(),
-                test_routing([0xBB; 32], "marmot-local://group/bb"),
+                test_routing([0xBB; 32], "ws://127.0.0.1:18081"),
                 "after".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
@@ -561,7 +561,7 @@ mod tests {
         let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
         let mut group = AppGroupRecord::new(
             "aa".to_owned(),
-            test_routing([0xAA; 32], "marmot-local://group/aa"),
+            test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
             "agent".to_owned(),
             "".to_owned(),
             AppGroupImageInput::default(),

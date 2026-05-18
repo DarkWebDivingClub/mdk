@@ -26,4 +26,5 @@ transport-nostr-adapter = { workspace = true, features = ["sdk"] }
 transport-nostr-peeler.workspace = true
 
 [dev-dependencies]
+nostr-relay-builder.workspace = true
 tempfile.workspace = true

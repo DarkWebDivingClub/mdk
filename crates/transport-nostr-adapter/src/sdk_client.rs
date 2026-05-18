@@ -331,6 +331,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .map_err(|e| TransportAdapterError::Publish(format!("send event: {e}")))?;
 
         Ok(NostrPublishOutcome {
+            message_id: Some(cgka_traits::MessageId::new(event.id.to_bytes().to_vec())),
             accepted: output
                 .success
                 .into_iter()

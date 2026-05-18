@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- `dmd` now keeps long-lived per-account relay subscriptions for real WebSocket relays instead of rebuilding
+  subscriptions on every sync interval.
+- `dm account create --relay <url>` now publishes the required NIP-65, inbox, and KeyPackage relay lists for
+  new local signing accounts when command-specific relay-list flags are omitted.
+- Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay
+  lists discovered from bootstrap relays.
+- Removed the file-backed local transport and Marmot Lab crate; local tests now use Nostr SDK mock relays and
+  product flows require relay-backed setup.
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
   `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
 

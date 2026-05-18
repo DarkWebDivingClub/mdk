@@ -90,7 +90,6 @@ Integration prototypes:
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
 - `crates/cli` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
   groups, messages, and background sync.
-- `crates/marmot-lab` - two-client CLI checks over a file-backed fake relay.
 
 Reference and model support:
 

@@ -7,7 +7,8 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - Keep `dm` product-facing. Do not add smoke-test-only commands here.
 - Keep `dm`, `dmd`, and `dm tui` on the real account/session/transport path through `marmot-account` and
   `marmot-app`.
-- Do not depend on `marmot-lab` for product account, group, message, key, daemon, sync, or TUI behavior.
+- Use relay-backed test support for local coverage. Prefer `nostr-relay-builder::MockRelay` in crate tests and Docker
+  local relays for true CLI/daemon end-to-end checks.
 - Keep Nostr public keys as the CLI identity layer. Do not introduce user-label account selection in product
   commands.
 - Do not add a CLI address-book or user-directory browsing namespace unless the product direction changes. Pubkeys are
@@ -85,10 +86,4 @@ just fmt-check
 just check
 just clippy
 just test
-```
-
-Run the lab regression only if legacy lab wiring changed:
-
-```sh
-cargo test -p marmot-lab
 ```
