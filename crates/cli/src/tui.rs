@@ -258,6 +258,20 @@ impl Drop for ChatSubscription {
     }
 }
 
+struct GroupStateSubscription {
+    account_id: String,
+    group_id: String,
+    child: Child,
+    rx: Receiver<SubscriptionEvent>,
+}
+
+impl Drop for GroupStateSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Accounts,
@@ -358,6 +372,7 @@ struct TuiApp {
     live_stream_previews: Vec<LiveStreamPreview>,
     chat_subscription: Option<ChatSubscription>,
     message_subscription: Option<MessageSubscription>,
+    group_state_subscription: Option<GroupStateSubscription>,
     daemon: DaemonView,
     group_diagnostics: Option<GroupDiagnostics>,
     input: String,
@@ -468,6 +483,7 @@ impl TuiApp {
             live_stream_previews: Vec::new(),
             chat_subscription: None,
             message_subscription: None,
+            group_state_subscription: None,
             daemon: DaemonView::default(),
             group_diagnostics: None,
             input: String::new(),
@@ -503,6 +519,7 @@ impl TuiApp {
     fn tick(&mut self) {
         let now = Instant::now();
         self.drain_chat_subscription();
+        self.drain_group_state_subscription();
         self.drain_message_subscription();
         if let Err(err) = self.flush_stream_append_if_due(now) {
             self.status = format!("stream append failed: {err}");
@@ -1458,6 +1475,7 @@ impl TuiApp {
         self.daemon = parse_daemon_view(&result);
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
+        self.ensure_selected_group_state_subscription();
         Ok(())
     }
 
@@ -1467,6 +1485,7 @@ impl TuiApp {
         self.daemon = parse_daemon_view(&result);
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
+        self.ensure_selected_group_state_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }
@@ -1476,6 +1495,7 @@ impl TuiApp {
         self.daemon = parse_daemon_view(&result);
         self.chat_subscription = None;
         self.message_subscription = None;
+        self.group_state_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
     }
@@ -1498,6 +1518,7 @@ impl TuiApp {
             self.messages.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
+            self.group_state_subscription = None;
             self.group_diagnostics = None;
             self.status = "no identities yet; create one with dm create-identity".to_owned();
             return Ok(());
@@ -1511,6 +1532,7 @@ impl TuiApp {
             self.messages.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
+            self.group_state_subscription = None;
             self.group_diagnostics = None;
             self.status = "no account selected".to_owned();
             return Ok(());
@@ -1520,6 +1542,7 @@ impl TuiApp {
             self.messages.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
+            self.group_state_subscription = None;
             self.group_diagnostics = None;
             self.status =
                 "selected account is public-only; choose a local signing account".to_owned();
@@ -1545,6 +1568,7 @@ impl TuiApp {
         if self.chats.is_empty() {
             self.messages.clear();
             self.message_subscription = None;
+            self.group_state_subscription = None;
             self.group_diagnostics = None;
             self.status = format!(
                 "loaded account {}; no chats",
@@ -1577,8 +1601,13 @@ impl TuiApp {
             self.status = format!("message subscription failed: {err}");
             return Ok(());
         }
+        let group_state_subscription_error = self
+            .ensure_group_state_subscription(&account_id, &group_id)
+            .err()
+            .map(|err| format!("group state subscription failed: {err}"));
         self.refresh_group_diagnostics(&account_id, &group_id);
-        self.status = format!("loaded {} message(s)", self.messages.len());
+        self.status = group_state_subscription_error
+            .unwrap_or_else(|| format!("loaded {} message(s)", self.messages.len()));
         Ok(())
     }
 
@@ -1662,6 +1691,42 @@ impl TuiApp {
         Ok(())
     }
 
+    fn ensure_group_state_subscription(
+        &mut self,
+        account_id: &str,
+        group_id: &str,
+    ) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.group_state_subscription = None;
+            return Ok(());
+        }
+        if self
+            .group_state_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.account_id == account_id && subscription.group_id == group_id
+            })
+        {
+            return Ok(());
+        }
+
+        self.group_state_subscription = None;
+        let args = vec![
+            "groups".to_owned(),
+            "subscribe-state".to_owned(),
+            group_id.to_owned(),
+        ];
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let rx = spawn_subscription_reader(&mut child, "group state")?;
+        self.group_state_subscription = Some(GroupStateSubscription {
+            account_id: account_id.to_owned(),
+            group_id: group_id.to_owned(),
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
     fn ensure_selected_chat_subscription(&mut self) {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chat_subscription = None;
@@ -1691,6 +1756,24 @@ impl TuiApp {
         };
         if let Err(err) = self.ensure_message_subscription(&account.account_id, &group_id) {
             self.status = format!("message subscription failed: {err}");
+        }
+    }
+
+    fn ensure_selected_group_state_subscription(&mut self) {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.group_state_subscription = None;
+            return;
+        };
+        if !account.local_signing {
+            self.group_state_subscription = None;
+            return;
+        }
+        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+            self.group_state_subscription = None;
+            return;
+        };
+        if let Err(err) = self.ensure_group_state_subscription(&account.account_id, &group_id) {
+            self.status = format!("group state subscription failed: {err}");
         }
     }
 
@@ -1738,8 +1821,60 @@ impl TuiApp {
             if previous_group_id != selected_group_id {
                 self.messages.clear();
                 self.message_subscription = None;
+                self.group_state_subscription = None;
             }
             self.ensure_selected_message_subscription();
+            self.ensure_selected_group_state_subscription();
+        }
+    }
+
+    fn drain_group_state_subscription(&mut self) {
+        let Some((account_id, group_id, events)) = ({
+            let Some(subscription) = self.group_state_subscription.as_ref() else {
+                return;
+            };
+            let mut events = Vec::new();
+            loop {
+                match subscription.rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        events.push(SubscriptionEvent::Ended);
+                        break;
+                    }
+                }
+            }
+            if events.is_empty() {
+                None
+            } else {
+                Some((
+                    subscription.account_id.clone(),
+                    subscription.group_id.clone(),
+                    events,
+                ))
+            }
+        }) else {
+            return;
+        };
+
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    if let Some(update) = group_state_subscription_update(&result, &group_id) {
+                        self.refresh_group_diagnostics(&account_id, &update.group_id);
+                        if let Some(status) = update.status {
+                            self.status = status;
+                        }
+                    }
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.status = format!("group state subscription failed: {err}");
+                }
+                SubscriptionEvent::Ended => {
+                    self.group_state_subscription = None;
+                    break;
+                }
+            }
         }
     }
 
@@ -2374,6 +2509,46 @@ fn apply_chat_subscription_result(
     *selected_chat = selected_chat_index(chats, previous_group_id.as_deref())
         .unwrap_or_else(|| (*selected_chat).min(chats.len().saturating_sub(1)));
     Some(format!("live chat update: chats={}", chats.len()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupStateSubscriptionUpdate {
+    group_id: String,
+    status: Option<String>,
+}
+
+fn group_state_subscription_update(
+    result: &Value,
+    selected_group_id: &str,
+) -> Option<GroupStateSubscriptionUpdate> {
+    if result.get("type").and_then(Value::as_str) != Some("group_state") {
+        return None;
+    }
+    let group_id = value_string(result, "group_id").or_else(|| {
+        result
+            .get("group")
+            .and_then(|group| value_string(group, "group_id"))
+    })?;
+    if group_id != selected_group_id {
+        return None;
+    }
+    let status = if result.get("trigger").and_then(Value::as_str) == Some("InitialGroupState") {
+        None
+    } else {
+        Some(format!(
+            "live group state update: {}",
+            group_state_subscription_label(result, &group_id)
+        ))
+    };
+    Some(GroupStateSubscriptionUpdate { group_id, status })
+}
+
+fn group_state_subscription_label(result: &Value, group_id: &str) -> String {
+    result
+        .get("group")
+        .and_then(parse_chat)
+        .map(|chat| shorten(&chat.name, 18))
+        .unwrap_or_else(|| shorten(group_id, 18))
 }
 
 fn upsert_chat(chats: &mut Vec<ChatRow>, chat: ChatRow, show_archived_chats: bool) {
@@ -3310,6 +3485,65 @@ mod tests {
             rendered
                 .iter()
                 .any(|line| line == "marmot.group.agent-text-stream.quic.v1 id=32774 data=ffee")
+        );
+    }
+
+    #[test]
+    fn group_state_subscription_update_triggers_selected_group_refresh() {
+        let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let update = group_state_subscription_update(
+            &serde_json::json!({
+                "trigger": "GroupStateUpdated",
+                "type": "group_state",
+                "group_id": selected_group_id,
+                "group": {
+                    "group_id": selected_group_id,
+                    "profile": {"name": "renamed room"},
+                    "archived": false
+                }
+            }),
+            selected_group_id,
+        )
+        .expect("selected group update");
+        assert_eq!(update.group_id, selected_group_id);
+        assert_eq!(
+            update.status.as_deref(),
+            Some("live group state update: renamed room")
+        );
+
+        let initial = group_state_subscription_update(
+            &serde_json::json!({
+                "trigger": "InitialGroupState",
+                "type": "group_state",
+                "group_id": selected_group_id,
+                "group": {
+                    "group_id": selected_group_id,
+                    "profile": {"name": "renamed room"},
+                    "archived": false
+                }
+            }),
+            selected_group_id,
+        )
+        .expect("initial selected group state");
+        assert_eq!(initial.status, None);
+
+        assert_eq!(
+            group_state_subscription_update(
+                &serde_json::json!({
+                    "trigger": "GroupStateUpdated",
+                    "type": "group_state",
+                    "group_id": other_group_id,
+                    "group": {
+                        "group_id": other_group_id,
+                        "profile": {"name": "other room"},
+                        "archived": false
+                    }
+                }),
+                selected_group_id,
+            ),
+            None
         );
     }
 
