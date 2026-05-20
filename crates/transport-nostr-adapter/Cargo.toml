@@ -8,7 +8,7 @@ description = "Nostr transport adapter for Marmot CGKA transport messages."
 
 [features]
 default = []
-sdk = ["dep:nostr-sdk", "dep:sha2"]
+sdk = ["dep:nostr-sdk"]
 
 [dependencies]
 async-trait.workspace = true
@@ -16,7 +16,7 @@ cgka-traits.workspace = true
 hex.workspace = true
 nostr-sdk = { workspace = true, optional = true }
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 transport-nostr-peeler.workspace = true

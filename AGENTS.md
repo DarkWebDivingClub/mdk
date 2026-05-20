@@ -9,7 +9,7 @@ This repo owns the candidate CGKA engine workspace:
 - shared traits and cross-boundary types,
 - OpenMLS-backed engine implementation,
 - production-shaped account-device session wrapper,
-- future app-core account orchestration,
+- account orchestration,
 - first app runtime bridge,
 - in-memory and SQLCipher-backed storage backends,
 - Nostr transport adapter and peeler,

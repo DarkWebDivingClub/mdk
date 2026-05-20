@@ -14,6 +14,7 @@ use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
+use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -40,6 +41,21 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn encode_admin_policy_for_test(admins: &[Vec<u8>]) -> Vec<u8> {
+    let mut admins = admins.to_vec();
+    admins.sort();
+    admins.dedup();
+    let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+    for admin in admins {
+        assert_eq!(admin.len(), 32);
+        admin_bytes.extend_from_slice(&admin);
+    }
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    out
 }
 
 struct MockPeeler;
@@ -231,6 +247,172 @@ async fn non_admin_cannot_update_group_data() {
         .unwrap();
 
     assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
+#[tokio::test]
+async fn admin_policy_update_promotes_member_who_can_update_group_data() {
+    let (mut alice, mut bob, gid) = create_pair().await;
+    let alice_id = pad32(b"alice");
+    let bob_id = pad32(b"bob");
+
+    let res = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice_id, bob_id]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    assert_eq!(bob.admin_pubkeys(&gid).unwrap().len(), 2);
+
+    let bob_update = bob
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid,
+            name: Some("bob can rename".into()),
+            description: None,
+        })
+        .await;
+    assert!(
+        matches!(bob_update, Ok(SendResult::GroupEvolution { .. })),
+        "promoted Bob should be allowed to update admin-gated group data: {bob_update:?}"
+    );
+}
+
+#[tokio::test]
+async fn promoted_member_group_data_update_converges_for_original_admin() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let alice_id = pad32(b"alice");
+    let bob_id = pad32(b"bob");
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "orig description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome = welcomes.into_iter().next().unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+
+    let promoted = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice_id, bob_id]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (promote_commit, pending) = match promoted {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..promote_commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    let bob_update = bob
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("bob rename".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (bob_commit, pending) = match bob_update {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    bob.confirm_published(pending).await.unwrap();
+    let routed_bob_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..bob_commit
+    };
+    alice.ingest(routed_bob_commit).await.unwrap();
+    converge_buffered_commit(&mut alice, &gid);
+
+    let alice_group = alice_storage.get_group(&gid).unwrap();
+    assert_eq!(alice_group.name, "bob rename");
+}
+
+#[tokio::test]
+async fn non_admin_cannot_update_admin_policy_component() {
+    let (_alice, mut bob, gid) = create_pair().await;
+    let alice_id = pad32(b"alice");
+    let bob_id = pad32(b"bob");
+
+    let err = bob
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice_id, bob_id]),
+            }],
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
+#[tokio::test]
+async fn invalid_admin_policy_component_is_rejected() {
+    let (mut alice, _bob, gid) = create_pair().await;
+    let mut empty_admin_policy = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(0, &mut empty_admin_policy);
+
+    let err = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: empty_admin_policy,
+            }],
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::Serialize(_)));
 }
 
 // ── Partial update ──────────────────────────────────────────────────────────

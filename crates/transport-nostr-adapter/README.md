@@ -30,8 +30,9 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 - No account key custody. The `sdk` client uses the signer already configured on the supplied `nostr-sdk::Client`.
 - No duplicate reconnect/backoff loop. The optional `nostr-sdk` client relies on SDK `RelayOptions` for reconnect, retry
   interval adjustment, jitter, relay sleep/ban/terminate behavior, and connection stats.
-- No full production relay-plane orchestration yet. Relay auth, Nostr-backed transport routing policy, full KeyPackage
-  metadata derivation, richer telemetry export, and per-platform lifecycle wiring still need hardening.
+- No full production relay-plane orchestration yet. Relay auth, relay scoring, full KeyPackage metadata derivation, and
+  per-platform lifecycle wiring still need hardening. Runtime-level endpoint safety, bounded subscription replay, group
+  fanout, and redacted aggregate relay health live in `marmot-app`'s relay plane.
 
 ## Privacy-safe diagnostics
 
@@ -60,10 +61,10 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrSdkRelayClient` behind the `sdk` feature.
 
 The app-runtime layer now projects group subscriptions and group-message publish targets from
-`marmot.transport.nostr.routing.v1`. The next expansion is to harden relay safety policy, derive KeyPackage publish
-targets from the user's kind `10051` KeyPackage relay list, and publish KeyPackages as Nostr kind `30443` events through
-the same relay-client boundary. Kind `30443` is the Marmot KeyPackage event kind; do not substitute deprecated NIP-104
-key package kinds for this path.
+`marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
+The next expansion is to derive KeyPackage publish targets from the user's kind `10051` KeyPackage relay list and keep
+directory/profile discovery coalesced in the shared runtime relay plane. Kind `30443` is the Marmot KeyPackage event
+kind; do not substitute deprecated NIP-104 key package kinds for this path.
 
 ## Run tests
 

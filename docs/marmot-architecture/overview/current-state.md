@@ -77,14 +77,14 @@ This repository now has the main engine candidate:
 - `crates/traits` — cross-boundary value types and traits, including the account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
 - `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteStorage>`.
-- `crates/marmot-account` — thin future app-core shell over a session and transport adapter. It activates the transport
+- `crates/marmot-account` — account/session orchestration over a session and transport adapter. It activates the transport
   account, uses static transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary,
   and confirms or rolls back pending session work from adapter publish reports.
-- `crates/marmot-app` — first app-core bridge over account home, per-account app projections, shared relay/directory
-  cache, relay-list setup, KeyPackage lookup, local development relay support, and app-facing group/message/member
-  methods.
-- `crates/cli` — first real CLI app surface over `marmot-app`. It is intentionally product-facing rather than a lab
-  harness, and its JSON envelope is shaped for future TUI/testing callers.
+- `crates/marmot-app` — first multi-account app runtime over account home, per-account projections, shared
+  relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
+  group/message/member methods.
+- `crates/cli` — first real CLI, daemon, and TUI surface over `marmot-app`. It is intentionally product-facing rather
+  than a lab harness, and its JSON envelope is shaped for daemon/TUI/testing callers.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations
   for schema/data evolution.

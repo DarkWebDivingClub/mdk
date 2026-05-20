@@ -110,10 +110,14 @@ impl ForkRecoveryManager {
         );
     }
 
-    fn promote_pending(&mut self, pending: PendingStateRef) {
+    fn promote_pending(&mut self, pending: PendingStateRef) -> Option<MessageId> {
         if let Some(record) = self.pending.remove(&pending) {
+            let storage_id = record.storage_id.clone();
             self.incumbents
                 .insert((record.group_id.clone(), record.source_epoch), record);
+            Some(storage_id)
+        } else {
+            None
         }
     }
 
@@ -186,8 +190,11 @@ impl<S: StorageProvider> Engine<S> {
         );
     }
 
-    pub(crate) fn promote_pending_commit_for_recovery(&mut self, pending: PendingStateRef) {
-        self.fork_recovery.promote_pending(pending);
+    pub(crate) fn promote_pending_commit_for_recovery(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Option<MessageId> {
+        self.fork_recovery.promote_pending(pending)
     }
 
     pub(crate) fn forget_pending_commit_for_recovery(

@@ -15,6 +15,7 @@ use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_components::AppComponentData;
 use cgka_traits::engine::{AutoPublish, CommitOrderingKey, GroupEvent, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
@@ -676,6 +677,9 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_remove_members(group_id, members).await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
+            SendIntent::UpdateAppComponents { group_id, updates } => {
+                self.do_send_update_app_components(group_id, updates).await
+            }
             SendIntent::UpdateGroupData {
                 group_id,
                 name,
@@ -1374,12 +1378,25 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
             if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
                 match update.operation() {
                     AppDataUpdateOperation::Update(data) => {
+                        crate::app_components::validate_app_component_update(&AppComponentData {
+                            component_id: update.component_id(),
+                            data: data.as_slice().to_vec(),
+                        })
+                        .map_err(|_| {
+                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                        })?;
                         updater.set(ComponentData::from_parts(
                             update.component_id(),
                             data.clone(),
                         ));
                     }
                     AppDataUpdateOperation::Remove => {
+                        crate::app_components::validate_app_component_remove(update.component_id())
+                            .map_err(|_| {
+                                ProcessMessageError::ValidationError(
+                                    ValidationError::WrongWireFormat,
+                                )
+                            })?;
                         updater.remove(&update.component_id());
                     }
                 }
@@ -1437,6 +1454,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }
 }

@@ -13,6 +13,7 @@ pub enum ScenarioStimulus {
     CreateGroup,
     InviteMembers,
     GroupDataUpdate,
+    AdminPolicyUpdate,
     PublishConfirm,
     PublishFail,
     AppMessage,
@@ -42,6 +43,8 @@ pub enum ScenarioStimulus {
 pub enum OracleBehavior {
     PendingConfirmed,
     PendingRolledBack,
+    ExpectedError,
+    AdminPolicyObserved,
     ClientState,
     ClientConvergence,
     DeliveredPayload,
@@ -67,6 +70,8 @@ pub struct BehaviorEvidenceSummary {
     pub max_member_count: usize,
     pub pending_confirmed: usize,
     pub pending_rolled_back: usize,
+    pub expected_errors: usize,
+    pub admin_policy_observations: usize,
     pub delivered_payloads: usize,
     pub member_additions: usize,
     pub member_removals: usize,
@@ -257,6 +262,13 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
                 commits += 1;
             }
+            ScenarioStep::UpdateAdminPolicy { .. } => {
+                stimuli.insert(ScenarioStimulus::AdminPolicyUpdate);
+                commits += 1;
+            }
+            ScenarioStep::ExpectUpdateAdminPolicyError { .. } => {
+                stimuli.insert(ScenarioStimulus::AdminPolicyUpdate);
+            }
             ScenarioStep::ConfirmPending { .. } => {
                 stimuli.insert(ScenarioStimulus::PublishConfirm);
             }
@@ -291,6 +303,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::DeliverAll
             | ScenarioStep::Tick { .. }
             | ScenarioStep::Observe { .. }
+            | ScenarioStep::ObserveAdminPolicy { .. }
             | ScenarioStep::ClearEvents { .. } => {}
         }
     }
@@ -334,6 +347,12 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     }
     if evidence.pending_rolled_back > 0 {
         behaviors.insert(OracleBehavior::PendingRolledBack);
+    }
+    if evidence.expected_errors > 0 {
+        behaviors.insert(OracleBehavior::ExpectedError);
+    }
+    if evidence.admin_policy_observations > 0 {
+        behaviors.insert(OracleBehavior::AdminPolicyObserved);
     }
     if evidence.delivered_payloads > 0 {
         behaviors.insert(OracleBehavior::DeliveredPayload);
@@ -380,6 +399,8 @@ pub fn behavior_evidence(trace: &ScenarioTrace) -> BehaviorEvidenceSummary {
             _ => {}
         }
     }
+    evidence.expected_errors += trace.errors.len();
+    evidence.admin_policy_observations += trace.admin_policies.len();
     for observation in &trace.observations {
         evidence.max_member_count = evidence.max_member_count.max(observation.member_count);
         evidence.delivered_payloads += observation.received_payloads.len();
@@ -405,6 +426,12 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 }
                 _ => {}
             };
+        }
+        TraceExpectation::ExpectedError { .. } => {
+            behaviors.insert(OracleBehavior::ExpectedError);
+        }
+        TraceExpectation::AdminPolicy { .. } => {
+            behaviors.insert(OracleBehavior::AdminPolicyObserved);
         }
         TraceExpectation::ClientState {
             member_count,
@@ -498,6 +525,12 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::PendingRolledBack,
             OracleBehavior::ForkRecovered,
             OracleBehavior::EpochChanged,
+            OracleBehavior::ClientConvergence,
+        ],
+        ScenarioStimulus::AdminPolicyUpdate => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::ExpectedError,
+            OracleBehavior::AdminPolicyObserved,
             OracleBehavior::ClientConvergence,
         ],
         ScenarioStimulus::PublishConfirm => vec![OracleBehavior::PendingConfirmed],

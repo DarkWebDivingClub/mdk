@@ -31,6 +31,9 @@ relay-down:
 relay-logs:
     docker compose logs -f
 
+tui-reset:
+    ./scripts/reset_tui_dev.sh
+
 e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail

@@ -11,10 +11,32 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    Extensions, KeyPackage as MlsKeyPackage, MlsMessageBodyIn, MlsMessageOut, ProtocolVersion,
+    Extensions, KeyPackage as MlsKeyPackage, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProtocolVersion,
 };
+use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use tls_codec::{Deserialize as _, Serialize as _};
+
+/// Parse and validate a transported KeyPackage and report whether it carries
+/// the MLS last-resort extension.
+pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+        .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
+    let kp_in = match msg.extract() {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        _ => {
+            return Err(EngineError::Serialize(
+                "MLS message did not carry a KeyPackage".into(),
+            ));
+        }
+    };
+    let crypto = RustCrypto::default();
+    let key_package = kp_in
+        .validate(&crypto, ProtocolVersion::Mls10)
+        .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+    Ok(key_package.last_resort())
+}
 
 impl<S: StorageProvider> Engine<S> {
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
@@ -29,6 +51,7 @@ impl<S: StorageProvider> Engine<S> {
         let bundle = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)
             .leaf_node_extensions(leaf_extensions)
+            .mark_as_last_resort()
             .build(
                 self.ciphersuite,
                 &provider,
@@ -48,7 +71,7 @@ impl<S: StorageProvider> Engine<S> {
     /// [`MlsKeyPackage`], running the MLS 1.0 validation pass. Used by
     /// `create_group` and `invite`.
     pub(crate) fn parse_key_package(&self, kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
-        let msg = openmls::prelude::MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+        let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
             .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
 
         let kp_in = match msg.extract() {

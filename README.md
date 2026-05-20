@@ -90,10 +90,10 @@ Integration prototypes:
 
 - `crates/cgka-session` - account-device session wrapper over `Engine<SqliteStorage>`.
 - `crates/marmot-account` - app-core home, account records, key storage, and transport adapter orchestration.
-- `crates/marmot-app` - first non-lab app runtime bridge used by the CLI, daemon, and TUI.
+- `crates/marmot-app` - first non-lab multi-account app runtime bridge used by the CLI, daemon, and TUI.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
 - `crates/cli` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
-  groups, messages, and background sync.
+  groups, messages, live runtime subscriptions, and diagnostic catch-up.
 
 Reference and model support:
 
@@ -155,8 +155,9 @@ just relay-down
 ```
 
 By default the stack binds `nostr-rs-relay` to `ws://127.0.0.1:28080` and `strfry` to
-`ws://127.0.0.1:27777`. To reuse another relay stack, set `DARKMATTER_E2E_RELAYS` to a comma-separated list, for
-example `DARKMATTER_E2E_RELAYS=ws://127.0.0.1:8080,ws://127.0.0.1:7777 just e2e-test`.
+`ws://127.0.0.1:27777`. The CLI E2E defaults use `27777` because it reliably ACKs the relay-list publishes used during
+account setup on macOS Docker Desktop. To reuse another relay stack, set `DARKMATTER_E2E_RELAYS` to a comma-separated
+list, for example `DARKMATTER_E2E_RELAYS=ws://127.0.0.1:8080,ws://127.0.0.1:7777 just e2e-test`.
 
 Run vector reports when you want saved JSON reports plus a pass/fail summary:
 

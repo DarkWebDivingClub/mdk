@@ -9,13 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_components::AppComponentData;
 use cgka_traits::group::Member;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
-use openmls::group::{MlsGroup, ProcessMessageError};
+use openmls::group::{MlsGroup, ProcessMessageError, ValidationError};
 use openmls::messages::proposals::{AppDataUpdateOperation, Proposal, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
@@ -1384,12 +1385,25 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
             if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
                 match update.operation() {
                     AppDataUpdateOperation::Update(data) => {
+                        crate::app_components::validate_app_component_update(&AppComponentData {
+                            component_id: update.component_id(),
+                            data: data.as_slice().to_vec(),
+                        })
+                        .map_err(|_| {
+                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                        })?;
                         updater.set(ComponentData::from_parts(
                             update.component_id(),
                             data.clone(),
                         ));
                     }
                     AppDataUpdateOperation::Remove => {
+                        crate::app_components::validate_app_component_remove(update.component_id())
+                            .map_err(|_| {
+                                ProcessMessageError::ValidationError(
+                                    ValidationError::WrongWireFormat,
+                                )
+                            })?;
                         updater.remove(&update.component_id());
                     }
                 }

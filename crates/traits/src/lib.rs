@@ -7,6 +7,7 @@
 
 pub mod agent_text_stream;
 pub mod app_components;
+pub mod app_payload;
 pub mod capabilities;
 pub mod engine;
 pub mod engine_state;
@@ -49,6 +50,11 @@ pub use app_components::{
     NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_components_list,
     decode_nostr_routing_v1, decode_quic_varint, default_group_components,
     encode_component_vectors, encode_components_list, encode_nostr_routing_v1,
+};
+pub use app_payload::{
+    MARMOT_APP_MESSAGE_PAYLOAD_V1, MarmotAppMessageEnvelopeV1, MarmotAppMessagePayloadV1,
+    MarmotMediaReferenceV1, MarmotReactionActionV1, MarmotRetryScopeV1,
+    display_text_for_app_message,
 };
 pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,

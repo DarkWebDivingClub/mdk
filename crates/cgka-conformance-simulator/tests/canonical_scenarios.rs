@@ -227,6 +227,8 @@ async fn three_client_message_exchange_vector_is_stable() {
             pending: "create".into(),
             resolution: "confirmed".into(),
         }],
+        errors: vec![],
+        admin_policies: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -244,6 +246,8 @@ async fn three_client_message_exchange_vector_is_stable() {
                 pending: "create".into(),
                 resolution: "confirmed".into(),
             }],
+            errors: vec![],
+            admin_policies: vec![],
             observations: vec![
                 cgka_conformance_simulator::ClientObservation {
                     client: "alice".into(),
@@ -307,6 +311,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
                 name: "vector-smoke".into(),
                 invitees: vec!["bob".into(), "carol".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -356,6 +361,7 @@ async fn scenario_spec_supports_publish_fail() {
                 name: "publish-fail".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::FailPending {
@@ -396,6 +402,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
                 name: "partition".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -463,6 +470,7 @@ async fn scenario_spec_can_drop_queued_message() {
                 name: "drop".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -508,6 +516,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
                 name: "faults".into(),
                 invitees: vec!["bob".into(), "carol".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -767,6 +776,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
                 name: "minimizer".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -962,6 +972,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
                 name: "fork".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -1015,6 +1026,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
                 name: "fork".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -1069,6 +1081,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
                 name: "report-mismatch".into(),
                 invitees: vec!["bob".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {
@@ -1087,6 +1100,8 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
     let expected = ScenarioTrace {
         name: spec.name.clone(),
         pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
         observations: vec![],
     };
 
@@ -1159,6 +1174,8 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
             pending: "create".into(),
             resolution: "confirmed".into(),
         }],
+        errors: vec![],
+        admin_policies: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1286,6 +1303,8 @@ async fn deliberate_fork_via_harness() {
     let trace = ScenarioTrace {
         name: "deliberate-fork-recovery/v1".into(),
         pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1522,6 +1541,7 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
                 name: "convergence-e2e".into(),
                 invitees: vec!["bob".into(), "carol".into(), "frank".into()],
                 required_features: vec![],
+                initial_admins: None,
                 pending: "create".into(),
             },
             ScenarioStep::ConfirmPending {

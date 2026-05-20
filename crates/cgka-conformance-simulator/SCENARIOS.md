@@ -57,6 +57,15 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: normal metadata commit path.
 - Expected: recipients advance one epoch and keep the same member set.
 
+### `admin-policy-update/v1`
+
+- File: `vectors/admin-policy-update.v1.json`
+- Setup: Alice creates a group with Bob as a non-admin, rejects Bob's first admin-policy edit, promotes Bob, lets Bob
+  make an admin-gated group-data update, and then Bob removes himself from the admin set.
+- Pressure: admin-policy app-component validation, admin authorization, role convergence, and post-demotion denial.
+- Expected: empty admin policies fail, non-admin updates fail, both clients observe Bob's promotion and later
+  self-demotion, and both clients converge at epoch 4 with Alice as the sole admin.
+
 ### `group-data-fork-recovery/v1`
 
 - File: `vectors/group-data-fork-recovery.v1.json`

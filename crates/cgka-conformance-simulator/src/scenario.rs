@@ -6,10 +6,12 @@
 
 use crate::{
     ClientBuilder, ExpectationFailure, HarnessClient, PendingResolutionObservation,
-    ScenarioOracleReport, ScenarioTrace, TraceExpectation, TransportBus, VectorFixture,
-    build_scenario_oracle_report, compare_trace_expectations, observe_client,
+    ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
+    TraceExpectation, TransportBus, VectorFixture, build_scenario_oracle_report,
+    compare_trace_expectations, observe_client,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::engine_state::PendingStateRef;
@@ -35,6 +37,8 @@ pub enum ScenarioStep {
         invitees: Vec<String>,
         #[serde(default)]
         required_features: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_admins: Option<Vec<String>>,
         pending: String,
     },
     InviteMembers {
@@ -46,6 +50,16 @@ pub enum ScenarioStep {
         client: String,
         name: String,
         pending: String,
+    },
+    UpdateAdminPolicy {
+        client: String,
+        admins: Vec<String>,
+        pending: String,
+    },
+    ExpectUpdateAdminPolicyError {
+        client: String,
+        admins: Vec<String>,
+        error: String,
     },
     ConfirmPending {
         client: String,
@@ -67,6 +81,9 @@ pub enum ScenarioStep {
         clients: Vec<String>,
     },
     Observe {
+        clients: Vec<String>,
+    },
+    ObserveAdminPolicy {
         clients: Vec<String>,
     },
     ClearEvents {
@@ -103,6 +120,8 @@ impl ScenarioStep {
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
             ScenarioStep::UpdateGroupData { .. } => "update_group_data",
+            ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
+            ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
             ScenarioStep::ConfirmPending { .. } => "confirm_pending",
             ScenarioStep::FailPending { .. } => "fail_pending",
             ScenarioStep::SendAppMessage { .. } => "send_app_message",
@@ -110,6 +129,7 @@ impl ScenarioStep {
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
             ScenarioStep::Observe { .. } => "observe",
+            ScenarioStep::ObserveAdminPolicy { .. } => "observe_admin_policy",
             ScenarioStep::ClearEvents { .. } => "clear_events",
             ScenarioStep::DropQueued { .. } => "drop_queued",
             ScenarioStep::DuplicateQueued { .. } => "duplicate_queued",
@@ -296,6 +316,8 @@ async fn run_scenario_report_inner(
     let mut pending_refs = HashMap::new();
     let mut pending_resolutions = Vec::new();
     let mut observations = Vec::new();
+    let mut admin_policy_observations = Vec::new();
+    let mut error_observations = Vec::new();
     let mut step_log = Vec::new();
 
     for (step_index, step) in spec.steps.iter().enumerate() {
@@ -305,9 +327,12 @@ async fn run_scenario_report_inner(
                 name,
                 invitees,
                 required_features,
+                initial_admins,
                 pending,
             } => {
-                let initial_admin_labels = scenario_initial_admins(spec, step_index, invitees);
+                let initial_admin_labels = initial_admins
+                    .clone()
+                    .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
                 let initial_admins = member_ids(&clients, &initial_admin_labels, step_index)?;
                 let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
                 let required_features =
@@ -336,6 +361,55 @@ async fn run_scenario_report_inner(
                 let client = client_mut(&mut clients, client, step_index)?;
                 let pending_ref = client.update_group_data(name.clone()).await;
                 insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+            }
+            ScenarioStep::UpdateAdminPolicy {
+                client,
+                admins,
+                pending,
+            } => {
+                let admin_ids = member_ids(&clients, admins, step_index)?;
+                let client = client_mut(&mut clients, client, step_index)?;
+                let pending_ref = client.update_admin_policy(admin_ids).await.map_err(|e| {
+                    err(
+                        step_index,
+                        format!("update_admin_policy unexpectedly failed: {e}"),
+                    )
+                })?;
+                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+            }
+            ScenarioStep::ExpectUpdateAdminPolicyError {
+                client,
+                admins,
+                error,
+            } => {
+                let admin_ids = member_ids(&clients, admins, step_index)?;
+                let client_label = client.clone();
+                let client = client_mut(&mut clients, client, step_index)?;
+                match client.update_admin_policy(admin_ids).await {
+                    Ok(_) => {
+                        return Err(err(
+                            step_index,
+                            format!("update_admin_policy unexpectedly succeeded; expected {error}"),
+                        ));
+                    }
+                    Err(actual) => {
+                        let actual = observe_engine_error(&actual);
+                        if &actual != error {
+                            return Err(err(
+                                step_index,
+                                format!(
+                                    "update_admin_policy failed with {actual}; expected {error}"
+                                ),
+                            ));
+                        }
+                        error_observations.push(ScenarioErrorObservation {
+                            step_index,
+                            client: client_label,
+                            operation: "update_admin_policy".into(),
+                            error: actual,
+                        });
+                    }
+                }
             }
             ScenarioStep::ConfirmPending { client, pending } => {
                 let pending_ref = take_pending(&mut pending_refs, pending, step_index)?;
@@ -380,6 +454,15 @@ async fn run_scenario_report_inner(
                 for label in labels {
                     let client = client_mut(&mut clients, label, step_index)?;
                     observations.push(observe_client(label.clone(), client));
+                }
+            }
+            ScenarioStep::ObserveAdminPolicy { clients: labels } => {
+                for label in labels {
+                    let client = client_ref(&clients, label, step_index)?;
+                    admin_policy_observations.push(ScenarioAdminPolicyObservation {
+                        client: label.clone(),
+                        admins: client.admin_labels(),
+                    });
                 }
             }
             ScenarioStep::ClearEvents { clients: labels } => {
@@ -451,6 +534,8 @@ async fn run_scenario_report_inner(
     let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
         pending_resolutions,
+        errors: error_observations,
+        admin_policies: admin_policy_observations,
         observations,
     };
     let pending_resolution_observations = observed_trace.pending_resolutions.clone();
@@ -565,6 +650,7 @@ fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
     match step {
         ScenarioStep::InviteMembers { inviter, .. } => Some(inviter),
         ScenarioStep::UpdateGroupData { client, .. } => Some(client),
+        ScenarioStep::UpdateAdminPolicy { client, .. } => Some(client),
         _ => None,
     }
 }
@@ -654,6 +740,28 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
     }
 }
 
+fn observe_engine_error(error: &EngineError) -> String {
+    match error {
+        EngineError::NotGroupAdmin { .. } => "not_group_admin",
+        EngineError::AdminCannotSelfRemove { .. } | EngineError::AdminDepletion { .. } => {
+            "admin_policy"
+        }
+        EngineError::Serialize(_) => "invalid_admin_policy",
+        EngineError::InvalidTransition(_) => "invalid_transition",
+        EngineError::UnknownGroup(_) => "unknown_group",
+        EngineError::UnknownMember { .. } => "unknown_member",
+        EngineError::NotAMember { .. } => "not_a_member",
+        EngineError::Other(_) => "other",
+        EngineError::Backend(_) => "backend",
+        EngineError::Storage(_) => "storage",
+        EngineError::Peeler(_) => "peeler",
+        EngineError::ForkedEpoch { .. } => "forked_epoch",
+        EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::UnknownPending => "unknown_pending",
+    }
+    .into()
+}
+
 fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<InvariantFailure> {
     expectation_failures
         .iter()
@@ -662,4 +770,38 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
             message: failure.message.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_initial_admins_include_future_admin_policy_actors() {
+        let spec = ScenarioSpec {
+            name: "admin policy fallback".to_owned(),
+            spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".to_owned(),
+                    name: "agent".to_owned(),
+                    invitees: vec!["bob".to_owned(), "carol".to_owned()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".to_owned(),
+                },
+                ScenarioStep::UpdateAdminPolicy {
+                    client: "bob".to_owned(),
+                    admins: vec!["alice".to_owned(), "bob".to_owned()],
+                    pending: "admins".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            scenario_initial_admins(&spec, 0, &["bob".to_owned(), "carol".to_owned()]),
+            vec!["bob".to_owned()]
+        );
+    }
 }

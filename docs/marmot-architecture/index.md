@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-05-15
+updated: 2026-05-19
 tags: [marmot, architecture, index]
 ---
 
@@ -53,6 +53,10 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** The boundary between `dm`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
     bindings.
 
+- **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
+  - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
+    plane, and the daemon, CLI, TUI boundary.
+
 - **Doc:** [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md)
   - **What it covers:** Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors,
     and byte-level vectors.
@@ -71,8 +75,8 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Where we're going after the CGKA engine/convergence work.
 
 **Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation
-→ nostr-role → app-core-boundary → cgka-engine-quality-and-vectors → whitenoise-integration-map → observability →
-custom-extensions → current-state → direction.
+→ nostr-role → app-core-boundary → marmot-app-runtime → cgka-engine-quality-and-vectors → whitenoise-integration-map →
+observability → custom-extensions → current-state → direction.
 
 ---
 

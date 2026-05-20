@@ -3,7 +3,7 @@ title: "Target Architecture — Four Components"
 created: 2026-04-19
 tags: [marmot, overview, architecture, components]
 status: overview
-updated: 2026-05-10
+updated: 2026-05-20
 ---
 
 # Target Architecture — Four Components
@@ -126,7 +126,7 @@ The active workspace proves the shape without the old prototype tree:
   group sync, publish requests/reports, and delivery metadata.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
 - `crates/cgka-session` wires the engine to encrypted account-device storage.
-- `crates/marmot-account` starts the future app-core shell: it combines an account-device session, a transport adapter,
+- `crates/marmot-account` owns account/session orchestration: it combines an account-device session, a `TransportAdapter`,
   transport routing policy, KeyPackage publication, and pending publish confirmation.
 - `crates/storage-memory` provides in-memory storage and rollback snapshots.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot metadata and group-scoped OpenMLS state.

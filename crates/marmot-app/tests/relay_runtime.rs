@@ -1,10 +1,13 @@
 use cgka_traits::TransportEndpoint;
+use cgka_traits::{MarmotAppMessagePayloadV1, MarmotMediaReferenceV1, MarmotReactionActionV1};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
-    UserProfileMetadata,
+    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
+    AppMessageQuery, MarmotApp, MarmotAppEvent, MarmotAppRuntime, RuntimeMessageUpdate,
+    UserDirectorySearch, UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
+use tokio::time::{Duration, timeout};
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -23,11 +26,588 @@ fn endpoint(url: &str) -> TransportEndpoint {
 }
 
 #[tokio::test]
+async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(created.account.local_signing);
+    assert!(created.relay_lists.complete);
+    assert!(created.key_package_bytes.is_some_and(|bytes| bytes > 0));
+    let directory_entry = app
+        .directory_entry_for_account_id(&created.account.account_id_hex)
+        .unwrap()
+        .expect("directory entry");
+    let profile = directory_entry.profile.expect("created identity profile");
+    assert_eq!(
+        profile.name,
+        Some(format!("marmot_{}", &created.account.account_id_hex[..8]))
+    );
+    assert!(profile.display_name.is_some());
+    assert_eq!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .into_iter()
+            .filter(|account| account.account_id_hex == created.account.account_id_hex)
+            .count(),
+        1
+    );
+    let relay_health = runtime.shared_services().relay_plane().relay_health().await;
+    assert!(
+        relay_health.directory_completed_fetches > 0,
+        "identity setup should use the runtime shared relay plane for directory discovery"
+    );
+
+    let fetched = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.key_package.0.len(),
+        created.key_package_bytes.unwrap()
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_reuses_initial_key_package_when_republishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let first = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    let republished_bytes = runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let second = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(republished_bytes, first.key_package.0.len());
+    assert_eq!(second.key_package_id, first.key_package_id);
+    assert_eq!(second.key_package, first.key_package);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_can_rotate_key_package_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let first = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    let rotated_bytes = runtime
+        .rotate_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let rotated = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let republished = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rotated_bytes, rotated.key_package.0.len());
+    assert_ne!(rotated.key_package_id, first.key_package_id);
+    assert_eq!(republished.key_package_id, rotated.key_package_id);
+    assert_eq!(republished.key_package, rotated.key_package);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_rotate_repairs_missing_key_package_relay_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("bob").unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+
+    app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let incomplete = app
+        .publish_account_relay_list_kind("bob", "inbox", vec![endpoint(&url)], vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert_eq!(incomplete.missing, vec!["key_package"]);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let bob = home.account("bob").unwrap().account_id_hex;
+    let rotated_bytes = runtime.rotate_key_package("bob").await.unwrap();
+    let repaired = app
+        .fetch_account_relay_list_status_for_account_id(&bob, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let fetched = app
+        .fetch_latest_key_package_for_account_id(&bob, vec![endpoint(&url)])
+        .await
+        .unwrap();
+
+    assert!(repaired.complete);
+    assert_eq!(repaired.key_package.relays, vec![url]);
+    assert_eq!(fetched.key_package.0.len(), rotated_bytes);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_replaces_invalid_cached_key_package_when_republishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let cache_path = dir
+        .path()
+        .join("key-packages")
+        .join(format!("{}.json", created.account.label));
+    std::fs::write(
+        &cache_path,
+        serde_json::json!({
+            "account_label": created.account.label,
+            "account_id_hex": created.account.account_id_hex,
+            "key_package_id": "legacy-invalid",
+            "key_package_hex": "010203",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let republished_bytes = runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let cache: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+
+    assert!(republished_bytes > 3);
+    assert_ne!(cache["key_package_id"], "legacy-invalid");
+    assert_ne!(cache["key_package_hex"], "010203");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime intents",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"hello through runtime intents".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "hello through runtime intents"
+        )
+    })
+    .await;
+
+    let stream_id = [0x44; 32];
+    runtime
+        .start_agent_text_stream(
+            &alice.account.account_id_hex,
+            &group_id,
+            &stream_id,
+            123,
+            vec!["quic://127.0.0.1:4450".to_owned()],
+        )
+        .await
+        .unwrap();
+    let stream_event = wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::AgentStreamStarted(stream)
+                if stream.account_id_hex == bob_id
+                    && stream.message.group_id == group_id
+                    && stream.payload.kind() == "start"
+                    && stream.payload.stream_id() == hex::encode(stream_id)
+        )
+    })
+    .await;
+    assert!(matches!(
+        stream_event,
+        MarmotAppEvent::AgentStreamStarted(_)
+    ));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob_setup = app.client("bob").await.unwrap();
+    bob_setup.publish_key_package().await.unwrap();
+    drop(bob_setup);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.start().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("live", &["bob"]).await.unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    alice
+        .send(&group_id, b"hello through the app runtime")
+        .await
+        .unwrap();
+    let received = wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "hello through the app runtime"
+        )
+    })
+    .await;
+
+    assert!(matches!(received, MarmotAppEvent::MessageReceived(_)));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "message subscriptions",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"already projected".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut subscription = runtime
+        .subscribe_messages(
+            &bob.account.account_id_hex,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+    assert_eq!(subscription.snapshot.len(), 1);
+    assert_eq!(subscription.snapshot[0].plaintext, "already projected");
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"live through runtime subscription".to_vec(),
+        )
+        .await
+        .unwrap();
+    let update = wait_for_message_update(&mut subscription, |update| {
+        matches!(
+            update,
+            RuntimeMessageUpdate::Message(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "live through runtime subscription"
+        )
+    })
+    .await;
+    assert!(matches!(update, RuntimeMessageUpdate::Message(_)));
+
+    runtime.shutdown().await;
+}
+
+async fn wait_for_event<F>(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    mut matches_event: F,
+) -> MarmotAppEvent
+where
+    F: FnMut(&MarmotAppEvent) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches_event(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("runtime event")
+}
+
+async fn wait_for_message_update<F>(
+    subscription: &mut marmot_app::RuntimeMessagesSubscription,
+    mut matches_update: F,
+) -> RuntimeMessageUpdate
+where
+    F: FnMut(&RuntimeMessageUpdate) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("message update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime message update")
+}
+
+#[tokio::test]
+async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+
+    let mut bob_chats = runtime
+        .subscribe_chats(&bob.account.account_id_hex, false)
+        .unwrap();
+    assert!(bob_chats.snapshot.is_empty());
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime chats",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let chat = wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
+    assert_eq!(chat.profile.name, "runtime chats");
+
+    let mut group_state = runtime
+        .subscribe_group_state(&bob.account.account_id_hex, &group_id_hex)
+        .unwrap();
+    assert_eq!(group_state.snapshot.group_id_hex, group_id_hex);
+
+    runtime
+        .update_group_profile(
+            &alice.account.account_id_hex,
+            &group_id,
+            Some("renamed runtime chat".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let updated = wait_for_group_state_update(&mut group_state, |group| {
+        group.profile.name == "renamed runtime chat"
+    })
+    .await;
+    assert_eq!(updated.group_id_hex, group_id_hex);
+
+    runtime.shutdown().await;
+}
+
+async fn wait_for_chat_update<F>(
+    subscription: &mut marmot_app::RuntimeChatsSubscription,
+    mut matches_update: F,
+) -> marmot_app::AppGroupRecord
+where
+    F: FnMut(&marmot_app::AppGroupRecord) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("chat update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime chat update")
+}
+
+async fn wait_for_group_state_update<F>(
+    subscription: &mut marmot_app::RuntimeGroupStateSubscription,
+    mut matches_update: F,
+) -> marmot_app::AppGroupRecord
+where
+    F: FnMut(&marmot_app::AppGroupRecord) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("group state update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime group state update")
+}
+
+#[tokio::test]
 async fn relay_app_runtime_exchanges_messages_without_lab() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -46,9 +626,136 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
 
     let received = bob.sync().await.unwrap();
     assert_eq!(received.messages.len(), 1);
-    assert_eq!(received.messages[0].sender, "alice");
+    assert_eq!(received.messages[0].sender, alice_id);
+    assert_eq!(
+        received.messages[0].sender_display_name.as_deref(),
+        Some("alice")
+    );
     assert_eq!(received.messages[0].group_id, group_id);
     assert_eq!(received.messages[0].plaintext, "hello from app runtime");
+}
+
+#[tokio::test]
+async fn relay_app_runtime_publishes_member_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let leave = bob.leave_group(&group_id).await.unwrap();
+    assert_eq!(leave.published, 1);
+
+    let alice_sync = alice.sync().await.unwrap();
+    assert!(alice_sync.events.iter().any(|event| matches!(
+        event,
+        cgka_traits::GroupEvent::MemberRemoved { group_id: removed_group, .. }
+            if removed_group == &group_id
+    )));
+}
+
+#[tokio::test]
+async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("updates", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let sent = alice
+        .send(&group_id, b"message with lifecycle")
+        .await
+        .unwrap();
+    let target_message_id = sent.message_ids[0].clone();
+    bob.sync().await.unwrap();
+
+    bob.react_to_message(&group_id, &target_message_id, "+")
+        .await
+        .unwrap();
+    let reaction = alice.sync().await.unwrap();
+    assert_eq!(reaction.messages.len(), 1);
+    assert_eq!(
+        reaction.messages[0].plaintext,
+        format!("reacted + to {target_message_id}")
+    );
+    assert_eq!(
+        reaction.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Reaction {
+            target_message_id: target_message_id.clone(),
+            emoji: "+".to_owned(),
+            action: MarmotReactionActionV1::Add,
+        })
+    );
+
+    let empty_reaction = bob
+        .react_to_message(&group_id, &target_message_id, "")
+        .await
+        .unwrap_err();
+    assert!(empty_reaction.to_string().contains("non-empty emoji"));
+
+    bob.delete_message(&group_id, &target_message_id)
+        .await
+        .unwrap();
+    let deletion = alice.sync().await.unwrap();
+    assert_eq!(
+        deletion.messages[0].plaintext,
+        format!("deleted {target_message_id}")
+    );
+    assert_eq!(
+        deletion.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Delete { target_message_id })
+    );
+
+    bob.send_media_reference(
+        &group_id,
+        MarmotMediaReferenceV1 {
+            file_hash_hex: hex::encode([0x42_u8; 32]),
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            size_bytes: 1234,
+        },
+        Some("launch diagram".to_owned()),
+    )
+    .await
+    .unwrap();
+    let media = alice.sync().await.unwrap();
+    assert_eq!(
+        media.messages[0].plaintext,
+        "media diagram.png: launch diagram"
+    );
+    assert!(matches!(
+        media.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Media { .. })
+    ));
+
+    let bad_media = bob
+        .send_media_reference(
+            &group_id,
+            MarmotMediaReferenceV1 {
+                file_hash_hex: "not-hex".to_owned(),
+                file_name: "diagram.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                size_bytes: 1234,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(bad_media.to_string().contains("media hash"));
 }
 
 #[tokio::test]
@@ -57,6 +764,7 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -101,7 +809,11 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     alice.send(&group_id, b"write a summary").await.unwrap();
     let prompt = bob.sync().await.unwrap();
     assert_eq!(prompt.messages.len(), 1);
-    assert_eq!(prompt.messages[0].sender, "alice");
+    assert_eq!(prompt.messages[0].sender, alice_id);
+    assert_eq!(
+        prompt.messages[0].sender_display_name.as_deref(),
+        Some("alice")
+    );
     assert_eq!(prompt.messages[0].plaintext, "write a summary");
 
     let alice_secret = alice
@@ -278,6 +990,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             about: Some("Can we fix it".into()),
             picture: None,
             nip05: Some("bob@example.test".into()),
+            lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
         },
@@ -293,6 +1006,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             about: None,
             picture: None,
             nip05: None,
+            lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
         },
@@ -381,6 +1095,7 @@ async fn account_projection_db_records_received_messages() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -418,7 +1133,7 @@ async fn account_projection_db_records_received_messages() {
         .unwrap();
     assert_eq!(alice_messages.len(), 1);
     assert_eq!(alice_messages[0].direction, "sent");
-    assert_eq!(alice_messages[0].sender, "alice");
+    assert_eq!(alice_messages[0].sender, alice_id);
     assert_eq!(alice_messages[0].plaintext, "persist this projection");
 
     alice.sync().await.unwrap();
@@ -434,7 +1149,7 @@ async fn account_projection_db_records_received_messages() {
         .unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].direction, "received");
-    assert_eq!(messages[0].sender, "alice");
+    assert_eq!(messages[0].sender, alice_id);
     assert_eq!(messages[0].group_id_hex, hex::encode(group_id.as_slice()));
     assert_eq!(messages[0].plaintext, "persist this projection");
 }

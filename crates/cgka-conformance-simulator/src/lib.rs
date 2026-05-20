@@ -56,6 +56,7 @@ pub use scenario::{
 pub use vector::{
     AppInvalidationObservation, ClientEventCounts, ClientObservation, EpochChangeObservation,
     ExpectationFailure, ForkRecoveryObservation, PendingResolutionObservation,
-    RecoveryOrderingKeyObservation, ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch,
-    compare_trace_expectations, observe_client,
+    RecoveryOrderingKeyObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
+    ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
+    observe_client,
 };

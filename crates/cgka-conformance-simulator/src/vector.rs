@@ -76,6 +76,16 @@ pub enum TraceExpectation {
         pending: String,
         resolution: String,
     },
+    ExpectedError {
+        step_index: usize,
+        client: String,
+        operation: String,
+        error: String,
+    },
+    AdminPolicy {
+        client: String,
+        admins: Vec<String>,
+    },
     ClientState {
         client: String,
         epoch: u64,
@@ -143,6 +153,54 @@ impl TraceExpectation {
                         expected: json!(expected),
                         actual: json!(observed.pending_resolutions),
                     });
+                }
+            }
+            TraceExpectation::ExpectedError {
+                step_index,
+                client,
+                operation,
+                error,
+            } => {
+                let expected = ScenarioErrorObservation {
+                    step_index: *step_index,
+                    client: client.clone(),
+                    operation: operation.clone(),
+                    error: error.clone(),
+                };
+                if !observed.errors.contains(&expected) {
+                    mismatches.push(ExpectationFailure {
+                        kind: "missing_expected_error".into(),
+                        message: format!(
+                            "missing expected {operation} error {error} for {client}"
+                        ),
+                        expected: json!(expected),
+                        actual: json!(observed.errors),
+                    });
+                }
+            }
+            TraceExpectation::AdminPolicy { client, admins } => {
+                match observed
+                    .admin_policies
+                    .iter()
+                    .rev()
+                    .find(|policy| policy.client == *client)
+                {
+                    Some(policy) if &policy.admins == admins => {}
+                    Some(policy) => mismatches.push(ExpectationFailure {
+                        kind: "admin_policy_mismatch".into(),
+                        message: format!(
+                            "client {client} admin policy was {:?}",
+                            policy.admins
+                        ),
+                        expected: json!({"client": client, "admins": admins}),
+                        actual: json!(policy),
+                    }),
+                    None => mismatches.push(ExpectationFailure {
+                        kind: "missing_admin_policy_observation".into(),
+                        message: format!("missing admin policy observation for {client}"),
+                        expected: json!(self),
+                        actual: json!(observed.admin_policies),
+                    }),
                 }
             }
             TraceExpectation::ClientState {
@@ -385,6 +443,10 @@ pub struct ScenarioTrace {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_resolutions: Vec<PendingResolutionObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ScenarioErrorObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_policies: Vec<ScenarioAdminPolicyObservation>,
     pub observations: Vec<ClientObservation>,
 }
 
@@ -394,6 +456,20 @@ pub struct PendingResolutionObservation {
     pub client: String,
     pub pending: String,
     pub resolution: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioErrorObservation {
+    pub step_index: usize,
+    pub client: String,
+    pub operation: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioAdminPolicyObservation {
+    pub client: String,
+    pub admins: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

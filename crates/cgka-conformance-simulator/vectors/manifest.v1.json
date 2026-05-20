@@ -65,6 +65,21 @@
       "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
     },
     {
+      "id": "admin-policy-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "admin-policy-update.v1.json",
+      "coverage": [
+        "non-admin admin-policy update rejection",
+        "invalid empty admin-policy rejection",
+        "admin promotion through app-component update",
+        "promoted member group-data update",
+        "admin self-demotion through app-component update",
+        "admin-policy convergence across clients"
+      ],
+      "next": "Extend with fork-recovery races between competing admin-policy updates."
+    },
+    {
       "id": "group-data-fork-recovery/v1",
       "kind": "scenario_vector",
       "status": "portable",

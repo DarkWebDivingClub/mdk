@@ -12,11 +12,12 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rand::{RngCore, rngs::OsRng};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
+const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -192,8 +193,9 @@ pub async fn send_text_stream(
     }
 
     send.finish()?;
-    send.stopped().await?;
-    connection.close(0_u32.into(), b"done");
+    if timeout(SEND_CLOSE_WAIT, connection.closed()).await.is_err() {
+        connection.close(0_u32.into(), b"done");
+    }
     endpoint.wait_idle().await;
     Ok(SentTextStream {
         stream_id: transcript.stream_id().to_vec(),

@@ -5,6 +5,7 @@
 use crate::bus::{ClientId, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
@@ -285,6 +286,51 @@ impl HarnessClient {
         }
     }
 
+    pub async fn update_admin_policy(
+        &mut self,
+        admins: Vec<MemberId>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self.default_group.clone().expect("group");
+        let data = encode_admin_policy(admins)?;
+        let res = self
+            .engine
+            .send(SendIntent::UpdateAppComponents {
+                group_id: gid.clone(),
+                updates: vec![AppComponentData {
+                    component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    data,
+                }],
+            })
+            .await?;
+        match res {
+            SendResult::GroupEvolution {
+                msg,
+                welcomes,
+                pending,
+            } => {
+                assert!(
+                    welcomes.is_empty(),
+                    "admin policy update should not create welcomes"
+                );
+                self.bus.send(self.bus_id, route(msg, &gid));
+                Ok(pending)
+            }
+            other => Err(EngineError::Backend(format!(
+                "expected GroupEvolution from update_admin_policy, got {other:?}"
+            ))),
+        }
+    }
+
+    pub fn admin_labels(&self) -> Vec<String> {
+        let gid = self.default_group.clone().expect("group");
+        self.engine
+            .admin_pubkeys(&gid)
+            .expect("admin pubkeys")
+            .into_iter()
+            .map(|admin| logical_label_for_member_id(&admin).unwrap_or_else(|| hex::encode(admin)))
+            .collect()
+    }
+
     /// Send an application message and return the wrapped TransportMessage
     /// that was put on the bus. Useful for the same-id-replay proptest
     /// property which needs to re-inject that exact message.
@@ -521,4 +567,31 @@ fn route(msg: TransportMessage, gid: &GroupId) -> TransportMessage {
             ..msg
         },
     }
+}
+
+fn encode_admin_policy(admins: Vec<MemberId>) -> Result<Vec<u8>, EngineError> {
+    let mut admins = admins
+        .into_iter()
+        .map(|admin| {
+            let bytes = admin.as_slice();
+            let admin: [u8; 32] = bytes.try_into().map_err(|_| {
+                EngineError::Other(format!(
+                    "admin policy requires 32-byte member identities; got {}",
+                    bytes.len()
+                ))
+            })?;
+            Ok(admin)
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    admins.sort();
+    admins.dedup();
+
+    let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+    for admin in admins {
+        admin_bytes.extend_from_slice(&admin);
+    }
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    Ok(out)
 }

@@ -8,7 +8,8 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrTransportAdapter,
+    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
+    NostrTransportAdapter,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
@@ -61,6 +62,95 @@ impl NostrRelayClient for FakeRelayClient {
             .push((endpoints.to_vec(), event.clone(), required_acks));
         Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
     }
+}
+
+#[tokio::test]
+async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_again() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xC3; 32]);
+    let transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let subscription = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: alice.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://alice-inbox.example".into())],
+            group_subscriptions: vec![subscription.clone()],
+            since: None,
+        })
+        .await
+        .expect("alice activation succeeds");
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: bob.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            group_subscriptions: vec![subscription.clone()],
+            since: None,
+        })
+        .await
+        .expect("bob activation succeeds");
+
+    let alice_subscription_id = NostrSubscription::Group {
+        account_id: alice.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let bob_subscription_id = NostrSubscription::Group {
+        account_id: bob.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(alice_subscription_id),
+            event: group_event("20", &transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+
+    assert_eq!(delivered, 2);
+    let first = adapter.receive().await.unwrap().unwrap();
+    let second = adapter.receive().await.unwrap().unwrap();
+    let accounts = [first.account_id.clone(), second.account_id.clone()];
+    assert!(accounts.contains(&alice));
+    assert!(accounts.contains(&bob));
+    assert_eq!(first.group_id_hint, Some(group_id.clone()));
+    assert_eq!(second.group_id_hint, Some(group_id));
+
+    let replayed = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some(bob_subscription_id),
+            event: group_event("20", &transport_group_id),
+        })
+        .await
+        .expect("duplicate relay event handled");
+
+    assert_eq!(replayed, 2);
+    let first_replay = adapter.receive().await.unwrap().unwrap();
+    let second_replay = adapter.receive().await.unwrap().unwrap();
+    let replay_accounts = [
+        first_replay.account_id.clone(),
+        second_replay.account_id.clone(),
+    ];
+    assert!(replay_accounts.contains(&alice));
+    assert!(replay_accounts.contains(&bob));
 }
 
 #[tokio::test]

@@ -790,6 +790,7 @@ fn create_group<const N: usize>(
         name,
         invitees: labels(invitees),
         required_features: vec![],
+        initial_admins: None,
         pending: pending.into(),
     }
 }
@@ -805,6 +806,7 @@ fn create_group_vec(
         name,
         invitees,
         required_features: vec![],
+        initial_admins: None,
         pending: pending.into(),
     }
 }
@@ -1017,6 +1019,7 @@ fn convergence_e2e_prefix_steps(case_index: u64) -> Vec<ScenarioStep> {
             name: format!("convergence-e2e-delivery-{case_index}"),
             invitees: vec!["bob".into(), "carol".into(), "frank".into()],
             required_features: vec![],
+            initial_admins: None,
             pending: "create".into(),
         },
         ScenarioStep::ConfirmPending {
@@ -1093,6 +1096,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
             name: format!("send-leave-{case_index}"),
             invitees: vec!["bob".into(), "carol".into()],
             required_features: vec![],
+            initial_admins: None,
             pending: "create".into(),
         },
         ScenarioStep::ConfirmPending {

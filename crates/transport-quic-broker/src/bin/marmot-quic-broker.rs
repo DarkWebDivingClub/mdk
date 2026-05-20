@@ -14,6 +14,8 @@ struct Args {
     bind: SocketAddr,
     #[arg(long, default_value_t = transport_quic_broker::DEFAULT_SUBSCRIBER_QUEUE_DEPTH)]
     per_subscriber_queue: usize,
+    #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_BACKLOG_DEPTH)]
+    max_backlog: usize,
     #[arg(long, value_name = "PATH", requires = "key_pem")]
     cert_pem: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires = "cert_pem")]
@@ -42,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = QuicBrokerServer::bind(QuicBrokerConfig {
         bind_addr: args.bind,
         per_subscriber_queue: args.per_subscriber_queue,
+        max_backlog: args.max_backlog,
         tls,
     })?;
     let local_addr = server.local_addr()?;
@@ -58,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "tls": tls_mode,
                     "persistence": "none",
                     "per_subscriber_queue": args.per_subscriber_queue,
+                    "max_backlog": args.max_backlog,
                 }
             }))?
         );
@@ -66,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("server_cert_der_hex={server_cert_der_hex}");
         eprintln!("tls={tls_mode}");
         eprintln!("persistence=none");
+        eprintln!("max_backlog={}", args.max_backlog);
     }
 
     server

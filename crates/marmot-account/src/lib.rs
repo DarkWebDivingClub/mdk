@@ -896,6 +896,14 @@ where
         self.publish_session_effects(effects).await
     }
 
+    pub async fn advance_convergence(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let effects = self.session.advance_convergence(group_id).await?;
+        self.publish_session_effects(effects).await
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }

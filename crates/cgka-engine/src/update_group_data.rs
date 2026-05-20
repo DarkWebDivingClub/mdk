@@ -3,6 +3,7 @@
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_components::{AppComponentData, GROUP_PROFILE_COMPONENT_ID};
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -12,6 +13,7 @@ use cgka_traits::types::{EpochId, GroupId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use std::collections::BTreeSet;
 use tls_codec::Serialize as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -27,16 +29,58 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
+        let current_profile = self
+            .storage
+            .get_group(&group_id)
+            .ok()
+            .map(|g| (g.name, g.description))
+            .unwrap_or_default();
+        let projected_name = name.unwrap_or(current_profile.0);
+        let projected_description = description.unwrap_or(current_profile.1);
+        let profile_bytes =
+            crate::app_components::encode_group_profile(&projected_name, &projected_description)?;
+
+        self.do_send_update_app_components(
+            group_id,
+            vec![AppComponentData {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                data: profile_bytes,
+            }],
+        )
+        .await
+    }
+
+    pub(crate) async fn do_send_update_app_components(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+    ) -> Result<SendResult, EngineError> {
+        if updates.is_empty() {
+            return Err(EngineError::Other(
+                "UpdateAppComponents requires at least one component update".into(),
+            ));
+        }
+
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: state.name(),
-                    to: "UpdateGroupData",
-                    reason: "update_group_data requires Stable",
+                    to: "UpdateAppComponents",
+                    reason: "update_app_components requires Stable",
                 },
             ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for update in &updates {
+            if !seen.insert(update.component_id) {
+                return Err(EngineError::Other(
+                    "UpdateAppComponents contains duplicate component ids".into(),
+                ));
+            }
+            crate::app_components::validate_app_component_update(update)?;
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -48,19 +92,6 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
-
-        let current_profile = crate::app_components::group_profile_of_group(&mls_group)?
-            .or_else(|| {
-                self.storage
-                    .get_group(&group_id)
-                    .ok()
-                    .map(|g| (g.name, g.description))
-            })
-            .unwrap_or_default();
-        let projected_name = name.unwrap_or(current_profile.0);
-        let projected_description = description.unwrap_or(current_profile.1);
-        let profile_bytes =
-            crate::app_components::encode_group_profile(&projected_name, &projected_description)?;
 
         // Fork-detection bookkeeping (pre-stage epoch is the commit
         // origin).
@@ -74,14 +105,18 @@ impl<S: StorageProvider> Engine<S> {
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
         // Stage the AppDataUpdate commit. Don't merge — confirm path does that.
+        let proposals = updates
+            .iter()
+            .map(|update| {
+                Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                    update.component_id,
+                    update.data.clone(),
+                )))
+            })
+            .collect::<Vec<_>>();
         let mut builder = mls_group
             .commit_builder()
-            .add_proposals(vec![Proposal::AppDataUpdate(Box::new(
-                AppDataUpdateProposal::update(
-                    cgka_traits::app_components::GROUP_PROFILE_COMPONENT_ID,
-                    profile_bytes.clone(),
-                ),
-            ))])
+            .add_proposals(proposals)
             .load_psks(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
                     &provider,
@@ -142,11 +177,17 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        // Mirror the projected name/description in the Marmot record at send
-        // time. Rollback re-derives from the unmerged MLS app component.
+        // Mirror projected app-facing fields at send time. Rollback
+        // re-derives from the unmerged MLS app component.
         if let Ok(mut g) = self.storage.get_group(&group_id) {
-            g.name = projected_name;
-            g.description = projected_description;
+            for update in &updates {
+                if update.component_id == GROUP_PROFILE_COMPONENT_ID {
+                    let (name, description) =
+                        crate::app_components::decode_group_profile(&update.data)?;
+                    g.name = name;
+                    g.description = description;
+                }
+            }
             self.storage.put_group(&g)?;
         }
 

@@ -107,6 +107,10 @@ pub(crate) fn group_profile_of_group(
     let Some(bytes) = app_component_bytes(mls_group, GROUP_PROFILE_COMPONENT_ID) else {
         return Ok(None);
     };
+    decode_group_profile(bytes).map(Some)
+}
+
+pub(crate) fn decode_group_profile(bytes: &[u8]) -> Result<(String, String), EngineError> {
     let mut cursor = bytes;
     let name = decode_var_bytes(&mut cursor, 256, "profile name")?;
     let description = decode_var_bytes(&mut cursor, 4096, "profile description")?;
@@ -119,7 +123,7 @@ pub(crate) fn group_profile_of_group(
         .map_err(|e| EngineError::Serialize(format!("profile name is not UTF-8: {e}")))?;
     let description = String::from_utf8(description)
         .map_err(|e| EngineError::Serialize(format!("profile description is not UTF-8: {e}")))?;
-    Ok(Some((name, description)))
+    Ok((name, description))
 }
 
 pub(crate) fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, EngineError> {
@@ -271,6 +275,36 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_app_component_update(
+    component: &AppComponentData,
+) -> Result<(), EngineError> {
+    match component.component_id {
+        APP_COMPONENTS_COMPONENT_ID => Err(EngineError::Other(
+            "app_components component is managed by the engine".into(),
+        )),
+        GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
+        GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
+        NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
+            .map(|_| ())
+            .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_app_component_remove(
+    component_id: AppComponentId,
+) -> Result<(), EngineError> {
+    match component_id {
+        APP_COMPONENTS_COMPONENT_ID
+        | GROUP_PROFILE_COMPONENT_ID
+        | GROUP_ADMIN_POLICY_COMPONENT_ID
+        | NOSTR_ROUTING_COMPONENT_ID => Err(EngineError::Other(
+            "required Marmot app components cannot be removed".into(),
+        )),
         _ => Ok(()),
     }
 }

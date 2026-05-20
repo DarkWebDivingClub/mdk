@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
@@ -344,6 +345,14 @@ async fn fresh_key_package_roundtrips_bytes() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
     assert!(!kp.0.is_empty(), "key package bytes should be non-empty");
+}
+
+#[tokio::test]
+async fn fresh_key_package_is_mls_last_resort() {
+    let mut alice = build_client(b"a", selfremove_registry());
+    let kp = alice.fresh_key_package().await.unwrap();
+
+    assert!(is_last_resort_key_package(&kp).unwrap());
 }
 
 #[tokio::test]

@@ -56,6 +56,16 @@ pub enum SendIntent {
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
+    /// Update one or more MLS app-component dictionary entries.
+    ///
+    /// This is the generic path for group settings such as profile,
+    /// admin policy, routing, image metadata, retention, and stream policy.
+    /// Component-specific validation and admin authorization live in the
+    /// engine and are checked on outbound send and inbound commit ingest.
+    UpdateAppComponents {
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+    },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {
         group_id: GroupId,

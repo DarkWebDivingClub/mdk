@@ -4,7 +4,7 @@ Agent-facing map for the Marmot account orchestration crate.
 
 ## Scope
 
-This crate owns the thin future app-core shell around:
+This crate owns the account/session orchestration layer around:
 
 - account home layout;
 - local account records and signing-key storage;

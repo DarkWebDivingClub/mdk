@@ -32,6 +32,7 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
+use cgka_traits::message::MessageState;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::types::EpochId;
 use openmls::group::MlsGroup;
@@ -85,6 +86,7 @@ impl<S: StorageProvider> Engine<S> {
             &mls_group,
             self.identity.self_id(),
         )?;
+        self.retain_current_epoch_snapshot_for_group(&group_id)?;
 
         // State-machine transition + event. Kind discriminates create
         // (always `GroupCreated`) from evolution (always `EpochChanged`).
@@ -93,7 +95,10 @@ impl<S: StorageProvider> Engine<S> {
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
-        self.promote_pending_commit_for_recovery(pending);
+        if let Some(message_id) = self.promote_pending_commit_for_recovery(pending) {
+            self.storage
+                .update_message_state(&message_id, MessageState::Processed)?;
+        }
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
