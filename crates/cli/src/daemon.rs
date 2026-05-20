@@ -884,7 +884,7 @@ async fn handle_messages_subscription(
     let mut runtime_subscription = match runtime.subscribe_messages(
         &account_ref,
         marmot_app::AppMessageQuery {
-            group_id_hex: Some(group_id.clone()),
+            group_id_hex: group_id.clone(),
             limit,
         },
     ) {
@@ -905,7 +905,7 @@ async fn handle_messages_subscription(
         &DaemonStreamResponse::ok(serde_json::json!({
             "trigger": "SubscriptionReady",
             "type": "subscription_ready",
-            "group_id": group_id,
+            "group_id": group_id.clone(),
         })),
     )
     .await
@@ -931,7 +931,7 @@ async fn handle_messages_subscription(
         if !write_message_subscription_event(
             stream,
             response,
-            &group_id,
+            group_id.as_deref(),
             &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
@@ -947,7 +947,7 @@ async fn handle_messages_subscription(
         if !write_message_subscription_event(
             stream,
             response,
-            &group_id,
+            group_id.as_deref(),
             &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
@@ -958,16 +958,18 @@ async fn handle_messages_subscription(
         }
     }
 
-    for preview in stream_manager.previews_for_group(Some(&account_ref), &group_id) {
-        let preview =
-            serde_json::to_value(preview).expect("stream preview serialization cannot fail");
-        let fingerprint = stream_preview_fingerprint(&preview);
-        if !seen_stream_previews.insert(fingerprint) {
-            continue;
-        }
-        let response = stream_preview_response(preview, true);
-        if !write_stream_response(stream, &response).await {
-            return Ok(());
+    if let Some(group_id) = group_id.as_deref() {
+        for preview in stream_manager.previews_for_group(Some(&account_ref), group_id) {
+            let preview =
+                serde_json::to_value(preview).expect("stream preview serialization cannot fail");
+            let fingerprint = stream_preview_fingerprint(&preview);
+            if !seen_stream_previews.insert(fingerprint) {
+                continue;
+            }
+            let response = stream_preview_response(preview, true);
+            if !write_stream_response(stream, &response).await {
+                return Ok(());
+            }
         }
     }
 
@@ -981,7 +983,7 @@ async fn handle_messages_subscription(
                 if !write_message_subscription_event(
                     stream,
                     response,
-                    &group_id,
+                    group_id.as_deref(),
                     &account_ref,
                     &mut seen_messages,
                     &mut seen_stream_previews,
@@ -997,7 +999,7 @@ async fn handle_messages_subscription(
                         if !write_message_subscription_event(
                             stream,
                             response,
-                            &group_id,
+                            group_id.as_deref(),
                             &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
@@ -1025,7 +1027,7 @@ async fn handle_messages_subscription(
                         if !write_message_subscription_event(
                             stream,
                             response,
-                            &group_id,
+                            group_id.as_deref(),
                             &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
@@ -1131,7 +1133,7 @@ fn group_state_stream_response(
 async fn write_message_subscription_event(
     stream: &mut UnixStream,
     response: DaemonStreamResponse,
-    group_id: &str,
+    group_id: Option<&str>,
     account_id: &str,
     seen_messages: &mut HashSet<String>,
     seen_stream_previews: &mut HashSet<String>,
@@ -1281,7 +1283,7 @@ fn chats_subscribe_args(cli: &Cli) -> Result<bool, String> {
     }
 }
 
-fn messages_subscribe_args(cli: &Cli) -> Result<(String, Option<usize>), String> {
+fn messages_subscribe_args(cli: &Cli) -> Result<(Option<String>, Option<usize>), String> {
     let (group, limit) = match &cli.command {
         crate::Command::Message {
             command: crate::MessageCommand::Subscribe { group, limit },
@@ -1291,7 +1293,11 @@ fn messages_subscribe_args(cli: &Cli) -> Result<(String, Option<usize>), String>
         } => (group, *limit),
         _ => return Err("messages subscribe requires dm messages subscribe".to_owned()),
     };
-    let group_id = crate::normalize_group_id_hex(group).map_err(|err| err.to_string())?;
+    let group_id = group
+        .as_deref()
+        .map(crate::normalize_group_id_hex)
+        .transpose()
+        .map_err(|err| err.to_string())?;
     Ok((group_id, Some(limit.unwrap_or(50).min(200))))
 }
 
@@ -1420,7 +1426,7 @@ fn message_stream_type(message: &serde_json::Value) -> &'static str {
 
 fn stream_response_matches_subscription(
     response: &DaemonStreamResponse,
-    group_id: &str,
+    group_id: Option<&str>,
     account_id: &str,
 ) -> bool {
     let Some(result) = &response.result else {
@@ -1456,15 +1462,16 @@ fn stream_response_matches_subscription(
 
 fn value_matches_group_and_account(
     value: &serde_json::Value,
-    group_id: &str,
+    group_id: Option<&str>,
     account_id: &str,
 ) -> bool {
-    value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
-        && value
-            .get("account")
-            .or_else(|| value.get("account_id"))
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|event_account| event_account == account_id)
+    group_id.is_none_or(|group_id| {
+        value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
+    }) && value
+        .get("account")
+        .or_else(|| value.get("account_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|event_account| event_account == account_id)
 }
 
 fn mark_stream_response_seen(
@@ -3550,14 +3557,42 @@ mod tests {
 
         assert!(!stream_response_matches_subscription(
             &response,
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         assert!(stream_response_matches_subscription(
             &response,
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+        assert!(stream_response_matches_subscription(
+            &response,
+            None,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+    }
+
+    #[test]
+    fn messages_subscribe_args_allow_all_groups() {
+        let cli = Cli {
+            home: None,
+            socket: None,
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command: crate::Command::Messages {
+                command: crate::MessageCommand::Subscribe {
+                    group: None,
+                    limit: Some(250),
+                },
+            },
+        };
+
+        assert_eq!(messages_subscribe_args(&cli), Ok((None, Some(200))));
     }
 
     #[test]
@@ -3583,17 +3618,17 @@ mod tests {
 
         assert!(!stream_response_matches_subscription(
             &scoped_delta,
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         assert!(stream_response_matches_subscription(
             &scoped_delta,
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
         assert!(stream_response_matches_subscription(
             &accountless_preview,
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
     }

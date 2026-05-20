@@ -626,8 +626,8 @@ enum MessageCommand {
     },
     #[command(about = "Subscribe to live message updates through the daemon")]
     Subscribe {
-        #[arg(help = "Group id to watch")]
-        group: String,
+        #[arg(help = "Group id to watch; omit to watch all local groups")]
+        group: Option<String>,
         #[arg(long, help = "Initial replay limit")]
         limit: Option<usize>,
     },

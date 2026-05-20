@@ -45,11 +45,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   durable start message.
 - Added `dm stream receive` and `dm stream send` for provisional raw QUIC agent text stream previews.
 - Added `dm keys rotate` as an explicit repair command that force-mints and publishes a fresh replacement KeyPackage.
+- Added TUI unread badges for chats that receive messages while another chat is selected.
 
 ### Changed
 
 - Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-hosted
   runtime subscription model. The older singular `dm message` spelling still works during the transition.
+- `dm messages subscribe` can now omit the group argument to stream live updates across all local groups for the
+  selected account.
 - `dm create-identity` and `dm login <nsec>` now publish the initial local KeyPackage automatically after relay-list
   setup, so the normal invite path does not require a separate `keys publish` repair step.
 - `dm keys publish` now republishes the cached initial KeyPackage instead of minting a replacement package during
