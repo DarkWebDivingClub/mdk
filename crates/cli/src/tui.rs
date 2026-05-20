@@ -1667,12 +1667,13 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     if !trimmed.starts_with('/') {
         return Err("slash command must start with /".to_owned());
     }
-    let mut parts = trimmed[1..].split_whitespace();
-    let Some(command) = parts.next() else {
+    let mut parts = split_slash_command_words(&trimmed[1..])?;
+    if parts.is_empty() {
         return Err("empty slash command".to_owned());
-    };
-    let rest = parts.map(str::to_owned).collect::<Vec<_>>();
-    match command {
+    }
+    let command = parts.remove(0);
+    let rest = parts;
+    match command.as_str() {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
         "sync" => {
@@ -1704,6 +1705,48 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
     }
+}
+
+fn split_slash_command_words(input: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut word_started = false;
+
+    for ch in input.chars() {
+        match quote {
+            Some(quote_ch) if ch == quote_ch => {
+                quote = None;
+                word_started = true;
+            }
+            Some(_) => {
+                word.push(ch);
+                word_started = true;
+            }
+            None if ch.is_whitespace() => {
+                if word_started {
+                    words.push(std::mem::take(&mut word));
+                    word_started = false;
+                }
+            }
+            None if matches!(ch, '"' | '\'') && !word_started => {
+                quote = Some(ch);
+                word_started = true;
+            }
+            None => {
+                word.push(ch);
+                word_started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err("unterminated quoted string".to_owned());
+    }
+    if word_started {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 fn parse_chat_command(args: Vec<String>) -> Result<SlashCommand, String> {
@@ -2824,9 +2867,21 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_slash_command("/chat new \"Project Room\" npub1bob deadbeef"),
+            Ok(SlashCommand::ChatNew {
+                name: "Project Room".to_owned(),
+                members: vec!["npub1bob".to_owned(), "deadbeef".to_owned()],
+            })
+        );
+        assert_eq!(
             parse_slash_command("/chat rename Project Room"),
             Ok(SlashCommand::ChatRename("Project Room".to_owned()))
         );
+        assert_eq!(
+            parse_slash_command("/chat rename Jeff's Room"),
+            Ok(SlashCommand::ChatRename("Jeff's Room".to_owned()))
+        );
+        assert!(parse_slash_command("/chat new \"Project Room npub1bob").is_err());
         assert_eq!(
             parse_slash_command("/chat describe planning space"),
             Ok(SlashCommand::ChatDescribe("planning space".to_owned()))
