@@ -58,6 +58,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   and the TUI uses those names in account chrome and received-message authors before falling back to npubs.
 - The TUI now tails daemon-backed `messages subscribe` updates for the selected chat, so incoming messages and QUIC
   stream-preview deltas can render without timer-driven message-list refreshes.
+- The TUI now tails daemon-backed `chats subscribe` updates for the selected account, so newly processed invites appear
+  in the chat list without switching accounts.
 - Removed the daemon runtime maintenance timer and the TUI's periodic daemon/account/chat/message refresh paths; runtime
   state now advances from startup, explicit CLI/TUI intents, and subscription events.
 - TUI stream compose typing now batches append calls instead of blocking the interface on a daemon round-trip for every
