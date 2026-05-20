@@ -3168,6 +3168,8 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
             && line["result"]["group"]["group_id"] == group_id
     });
     assert_eq!(initial["result"]["group"]["profile"]["name"], "general");
+    assert_eq!(initial["result"]["mls"]["group_id"], group_id);
+    assert_eq!(initial["result"]["mls"]["member_count"], 2);
 
     run_json(
         home.path(),
@@ -3187,6 +3189,8 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
             && line["result"]["group"]["profile"]["name"] == "general-renamed"
     });
     assert_eq!(updated["result"]["group_id"], group_id);
+    assert_eq!(updated["result"]["mls"]["group_id"], group_id);
+    assert_eq!(updated["result"]["mls"]["member_count"], 2);
 
     drop(subscription);
     stop_daemon(&socket, &mut child);

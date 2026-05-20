@@ -367,6 +367,8 @@ struct TuiApp {
     selected_account: usize,
     chats: Vec<ChatRow>,
     selected_chat: usize,
+    messages_account_id: Option<String>,
+    messages_group_id: Option<String>,
     unread_counts: HashMap<String, usize>,
     show_archived_chats: bool,
     messages: Vec<MessageRow>,
@@ -479,6 +481,8 @@ impl TuiApp {
             selected_account: 0,
             chats: Vec::new(),
             selected_chat: 0,
+            messages_account_id: None,
+            messages_group_id: None,
             unread_counts: HashMap::new(),
             show_archived_chats: false,
             messages: Vec::new(),
@@ -658,9 +662,12 @@ impl TuiApp {
         let mut lines = if self.messages.is_empty() {
             vec![Line::from("no messages")]
         } else {
-            message_lines(&self.messages, self.selected_account_row())
+            message_lines(&self.messages, self.message_account_row())
         };
-        let group_id = self.selected_chat_row().map(|chat| chat.group_id.as_str());
+        let group_id = self
+            .messages_group_id
+            .as_deref()
+            .or_else(|| self.selected_chat_row().map(|chat| chat.group_id.as_str()));
         for preview in stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id) {
             lines.push(preview);
         }
@@ -947,8 +954,8 @@ impl TuiApp {
     }
 
     fn send_message(&mut self, text: String) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
         let args = vec!["message", "send", &group_id, &text];
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("sent message", &result);
@@ -1510,6 +1517,8 @@ impl TuiApp {
         if self.accounts.is_empty() {
             self.chats.clear();
             self.messages.clear();
+            self.messages_account_id = None;
+            self.messages_group_id = None;
             self.unread_counts.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
@@ -1525,6 +1534,8 @@ impl TuiApp {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
             self.messages.clear();
+            self.messages_account_id = None;
+            self.messages_group_id = None;
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
@@ -1535,6 +1546,8 @@ impl TuiApp {
         if !account.local_signing {
             self.chats.clear();
             self.messages.clear();
+            self.messages_account_id = None;
+            self.messages_group_id = None;
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
@@ -1563,6 +1576,8 @@ impl TuiApp {
         }
         if self.chats.is_empty() {
             self.messages.clear();
+            self.messages_account_id = Some(account.account_id.clone());
+            self.messages_group_id = None;
             self.group_state_subscription = None;
             if let Err(err) = self.ensure_message_subscription(&account.account_id) {
                 self.status = format!("message subscription failed: {err}");
@@ -1594,6 +1609,8 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|messages| messages.iter().filter_map(parse_message).collect())
             .unwrap_or_default();
+        self.messages_account_id = Some(account_id.clone());
+        self.messages_group_id = Some(group_id.clone());
         self.unread_counts.remove(&group_id);
         sort_messages_chronologically(&mut self.messages);
         if let Err(err) = self.ensure_message_subscription(&account_id) {
@@ -1604,7 +1621,20 @@ impl TuiApp {
             .ensure_group_state_subscription(&account_id, &group_id)
             .err()
             .map(|err| format!("group state subscription failed: {err}"));
-        self.refresh_group_diagnostics(&account_id, &group_id);
+        if self.daemon.running && group_state_subscription_error.is_none() {
+            if self
+                .group_diagnostics
+                .as_ref()
+                .is_none_or(|diagnostics| diagnostics.group_id != group_id)
+            {
+                self.group_diagnostics = Some(GroupDiagnostics::unavailable(
+                    &group_id,
+                    "loading group state",
+                ));
+            }
+        } else {
+            self.refresh_group_diagnostics(&account_id, &group_id);
+        }
         self.status = group_state_subscription_error
             .unwrap_or_else(|| format!("loaded {} message(s)", self.messages.len()));
         Ok(())
@@ -1670,12 +1700,7 @@ impl TuiApp {
         }
 
         self.message_subscription = None;
-        let args = vec![
-            "messages".to_owned(),
-            "subscribe".to_owned(),
-            "--limit".to_owned(),
-            "200".to_owned(),
-        ];
+        let args = message_subscription_args();
         let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
         let rx = spawn_subscription_reader(&mut child, "message")?;
         self.message_subscription = Some(MessageSubscription {
@@ -1811,6 +1836,8 @@ impl TuiApp {
             let selected_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
             if previous_group_id != selected_group_id {
                 self.messages.clear();
+                self.messages_account_id = None;
+                self.messages_group_id = None;
                 self.message_subscription = None;
                 self.group_state_subscription = None;
             }
@@ -1820,7 +1847,7 @@ impl TuiApp {
     }
 
     fn drain_group_state_subscription(&mut self) {
-        let Some((account_id, group_id, events)) = ({
+        let Some((group_id, events)) = ({
             let Some(subscription) = self.group_state_subscription.as_ref() else {
                 return;
             };
@@ -1838,11 +1865,7 @@ impl TuiApp {
             if events.is_empty() {
                 None
             } else {
-                Some((
-                    subscription.account_id.clone(),
-                    subscription.group_id.clone(),
-                    events,
-                ))
+                Some((subscription.group_id.clone(), events))
             }
         }) else {
             return;
@@ -1852,7 +1875,14 @@ impl TuiApp {
             match event {
                 SubscriptionEvent::Result(result) => {
                     if let Some(update) = group_state_subscription_update(&result, &group_id) {
-                        self.refresh_group_diagnostics(&account_id, &update.group_id);
+                        if let Some(diagnostics) = update.diagnostics {
+                            self.group_diagnostics = Some(diagnostics);
+                        } else {
+                            self.group_diagnostics = Some(GroupDiagnostics::unavailable(
+                                &update.group_id,
+                                "group state update did not include diagnostics",
+                            ));
+                        }
                         if let Some(status) = update.status {
                             self.status = status;
                         }
@@ -1947,8 +1977,33 @@ impl TuiApp {
         self.accounts.get(self.selected_account)
     }
 
+    fn message_account_row(&self) -> Option<&AccountRow> {
+        self.messages_account_id
+            .as_deref()
+            .and_then(|account_id| {
+                self.accounts
+                    .iter()
+                    .find(|account| account.account_id == account_id)
+            })
+            .or_else(|| self.selected_account_row())
+    }
+
     fn selected_chat_row(&self) -> Option<&ChatRow> {
         self.chats.get(self.selected_chat)
+    }
+
+    fn message_account_id(&self) -> TuiResult<String> {
+        if let Some(account_id) = &self.messages_account_id {
+            return Ok(account_id.clone());
+        }
+        self.require_selected_local_account()
+    }
+
+    fn message_group_id(&self) -> TuiResult<String> {
+        if let Some(group_id) = &self.messages_group_id {
+            return Ok(group_id.clone());
+        }
+        self.require_selected_group()
     }
 
     fn require_selected_local_account(&self) -> TuiResult<String> {
@@ -2510,6 +2565,7 @@ fn apply_chat_subscription_result(
 struct GroupStateSubscriptionUpdate {
     group_id: String,
     status: Option<String>,
+    diagnostics: Option<GroupDiagnostics>,
 }
 
 fn group_state_subscription_update(
@@ -2535,7 +2591,12 @@ fn group_state_subscription_update(
             group_state_subscription_label(result, &group_id)
         ))
     };
-    Some(GroupStateSubscriptionUpdate { group_id, status })
+    let diagnostics = parse_group_diagnostics(result);
+    Some(GroupStateSubscriptionUpdate {
+        group_id,
+        status,
+        diagnostics,
+    })
 }
 
 fn group_state_subscription_label(result: &Value, group_id: &str) -> String {
@@ -3295,6 +3356,15 @@ fn composer_display_text(input: &str) -> String {
     input.to_owned()
 }
 
+fn message_subscription_args() -> Vec<String> {
+    vec![
+        "messages".to_owned(),
+        "subscribe".to_owned(),
+        "--limit".to_owned(),
+        "0".to_owned(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3590,6 +3660,10 @@ mod tests {
                     "group_id": selected_group_id,
                     "profile": {"name": "renamed room"},
                     "archived": false
+                },
+                "mls": {
+                    "epoch": 8,
+                    "member_count": 2
                 }
             }),
             selected_group_id,
@@ -3600,6 +3674,10 @@ mod tests {
             update.status.as_deref(),
             Some("live group state update: renamed room")
         );
+        let diagnostics = update.diagnostics.expect("diagnostics");
+        assert_eq!(diagnostics.group_id, selected_group_id);
+        assert_eq!(diagnostics.epoch, Some(8));
+        assert_eq!(diagnostics.member_count, Some(2));
 
         let initial = group_state_subscription_update(
             &serde_json::json!({
@@ -3616,6 +3694,7 @@ mod tests {
         )
         .expect("initial selected group state");
         assert_eq!(initial.status, None);
+        assert!(initial.diagnostics.is_some());
 
         assert_eq!(
             group_state_subscription_update(
@@ -4196,6 +4275,19 @@ mod tests {
     }
 
     #[test]
+    fn message_subscription_skips_initial_replay() {
+        assert_eq!(
+            message_subscription_args(),
+            vec![
+                "messages".to_owned(),
+                "subscribe".to_owned(),
+                "--limit".to_owned(),
+                "0".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn composer_redacts_nsec_imports_without_hiding_other_input() {
         assert_eq!(
             composer_display_text("/login nsec1secret"),
@@ -4298,6 +4390,53 @@ mod tests {
     }
 
     #[test]
+    fn message_account_row_uses_loaded_account_not_highlighted_account() {
+        let alice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let bob = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut app = test_tui_app(test_unused_client(), alice);
+        app.accounts.push(AccountRow {
+            account_id: bob.to_owned(),
+            npub: "npub1bob".to_owned(),
+            display_name: Some("Bob".to_owned()),
+            local_signing: true,
+        });
+        app.selected_account = 1;
+        app.messages_account_id = Some(alice.to_owned());
+
+        let rendered = message_lines(
+            &[
+                MessageRow {
+                    message_id: "01".to_owned(),
+                    direction: "sent".to_owned(),
+                    from: alice.to_owned(),
+                    from_display_name: None,
+                    plaintext: "from alice".to_owned(),
+                    display_text: "from alice".to_owned(),
+                    recorded_at: 1,
+                    received_at: 1,
+                },
+                MessageRow {
+                    message_id: "02".to_owned(),
+                    direction: "received".to_owned(),
+                    from: bob.to_owned(),
+                    from_display_name: Some("Bob".to_owned()),
+                    plaintext: "from bob".to_owned(),
+                    display_text: "from bob".to_owned(),
+                    recorded_at: 2,
+                    received_at: 2,
+                },
+            ],
+            app.message_account_row(),
+        )
+        .iter()
+        .map(line_text)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["me: from alice", "Bob: from bob"]);
+    }
+
+    #[test]
     fn account_selection_matches_npub_or_hex_pubkey() {
         let account = AccountRow {
             account_id: "abc123".to_owned(),
@@ -4341,6 +4480,8 @@ mod tests {
             selected_account: 0,
             chats: Vec::new(),
             selected_chat: 0,
+            messages_account_id: None,
+            messages_group_id: None,
             unread_counts: HashMap::new(),
             show_archived_chats: false,
             messages: Vec::new(),

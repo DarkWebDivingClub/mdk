@@ -17,6 +17,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
 
+use cgka_traits::GroupId;
+
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
@@ -913,11 +915,15 @@ async fn handle_messages_subscription(
         return Ok(());
     }
 
+    let mut display_names_by_sender: HashMap<String, Option<String>> = HashMap::new();
     for message in runtime_subscription.snapshot.drain(..) {
         if !message.message_id_hex.is_empty() {
             seen_messages.insert(message.message_id_hex.clone());
         }
-        let display_name = runtime.display_name_for_account_id(&message.sender);
+        let display_name = display_names_by_sender
+            .entry(message.sender.clone())
+            .or_insert_with(|| runtime.display_name_for_account_id(&message.sender))
+            .clone();
         let response = message_stream_response(
             app_message_record_json(message, display_name),
             "InitialMessage",
@@ -1120,14 +1126,19 @@ fn chat_stream_response(group: marmot_app::AppGroupRecord, trigger: &str) -> Dae
 fn group_state_stream_response(
     group: marmot_app::AppGroupRecord,
     trigger: &str,
+    mls: Option<serde_json::Value>,
 ) -> DaemonStreamResponse {
     let group_id = group.group_id_hex.clone();
-    DaemonStreamResponse::ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "trigger": trigger,
         "type": "group_state",
         "group": crate::group_json(group),
         "group_id": group_id,
-    }))
+    });
+    if let Some(mls) = mls {
+        result["mls"] = mls;
+    }
+    DaemonStreamResponse::ok(result)
 }
 
 async fn write_message_subscription_event(
@@ -1241,18 +1252,33 @@ async fn handle_group_state_subscription(
             return Ok(());
         }
     };
+    let group_id_value = GroupId::new(hex::decode(&group_id)?);
+    let initial_mls = runtime
+        .group_mls_state(&account_ref, &group_id_value)
+        .await
+        .ok()
+        .map(crate::group_mls_state_json);
     if !write_stream_response(
         stream,
-        &group_state_stream_response(subscription.snapshot.clone(), "InitialGroupState"),
+        &group_state_stream_response(
+            subscription.snapshot.clone(),
+            "InitialGroupState",
+            initial_mls,
+        ),
     )
     .await
     {
         return Ok(());
     }
     while let Some(group) = subscription.recv().await {
+        let mls = runtime
+            .group_mls_state(&account_ref, &group_id_value)
+            .await
+            .ok()
+            .map(crate::group_mls_state_json);
         if !write_stream_response(
             stream,
-            &group_state_stream_response(group, "GroupStateUpdated"),
+            &group_state_stream_response(group, "GroupStateUpdated", mls),
         )
         .await
         {

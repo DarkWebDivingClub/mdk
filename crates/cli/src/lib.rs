@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -1495,7 +1496,6 @@ fn whoami_command(
     if account_flag.is_some() {
         let account = resolve_account(account_home, account_flag)?;
         let status = if account.local_signing {
-            app.status(&account.label)?;
             dm_status_json(app.status(&account.label)?, &runtime_info)
         } else {
             public_account_status_json(
@@ -2299,7 +2299,6 @@ pub(crate) async fn groups_command_with_runtime(
         GroupsCommand::Show { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
             let mls = runtime
@@ -4205,10 +4204,14 @@ fn message_list_plain(messages: &[AppMessageRecord]) -> String {
 }
 
 fn message_list_json_with_profiles(app: &MarmotApp, messages: Vec<AppMessageRecord>) -> Vec<Value> {
+    let mut display_names_by_sender: HashMap<String, Option<String>> = HashMap::new();
     messages
         .into_iter()
         .map(|message| {
-            let from_display_name = display_name_for_sender(app, &message.sender);
+            let from_display_name = display_names_by_sender
+                .entry(message.sender.clone())
+                .or_insert_with(|| display_name_for_sender(app, &message.sender))
+                .clone();
             message_record_json(message, from_display_name)
         })
         .collect()
