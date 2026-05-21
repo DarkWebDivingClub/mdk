@@ -2467,24 +2467,29 @@ impl MarmotApp {
         }
         let keys = self.account_home().load_signing_keys(label)?;
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let relay_client = self.relay_client_for_endpoints(&keys, &bootstrap.bootstrap_relays);
+        let account_id_hex = keys.public_key().to_hex();
+        // Outbox routing: publish relay-list events to the account's own NIP-65
+        // write relays; fall back to the bootstrap/seed relays on first publish
+        // (no NIP-65 yet). The declared list (content) is `default_relays`, but
+        // the relays we publish *through* must be reachable — the account's own
+        // relays or the seed, never the (possibly not-yet-reachable) declared set.
+        let endpoints = self.outbox_endpoints(
+            &account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        let relay_client = self.relay_client_for_endpoints(&keys, &endpoints);
         for list_kind in list_kinds {
             let publication = NostrAccountRelayListPublication {
                 account_id: account_id.clone(),
                 list_kind: *list_kind,
                 relays: bootstrap.default_relays.clone(),
-                publish_endpoints: bootstrap.bootstrap_relays.clone(),
+                publish_endpoints: endpoints.clone(),
             };
             let event = publication.to_event()?;
-            relay_client
-                .publish_event(&bootstrap.bootstrap_relays, &event, 1)
-                .await?;
+            relay_client.publish_event(&endpoints, &event, 1).await?;
         }
-        self.fetch_account_relay_list_status_for_account_id(
-            &keys.public_key().to_hex(),
-            bootstrap.bootstrap_relays,
-        )
-        .await
+        self.fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints)
+            .await
     }
 
     pub async fn fetch_account_relay_list_status_for_account_id(
@@ -2602,6 +2607,27 @@ impl MarmotApp {
         })
     }
 
+    /// Outbox routing for account-scoped events. Prefers the account's own
+    /// declared NIP-65 write relays (read from the local relay-list cache, no
+    /// network), so e.g. republishing your relay lists / profile goes to *your*
+    /// relays rather than whatever defaults the caller passed. Falls back to
+    /// `fallback` only when the account has no NIP-65 list yet (cold start).
+    fn outbox_endpoints(
+        &self,
+        account_id_hex: &str,
+        fallback: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let nip65 = self
+            .account_relay_list_status_for_account_id(account_id_hex)
+            .map(|status| status.nip65.relays)
+            .unwrap_or_default();
+        if nip65.is_empty() {
+            fallback
+        } else {
+            nip65.into_iter().map(TransportEndpoint).collect()
+        }
+    }
+
     pub async fn publish_user_profile(
         &self,
         label: &str,
@@ -2609,7 +2635,10 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints = self.outbox_endpoints(
+            &keys.public_key().to_hex(),
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
         let content = serde_json::to_string(&profile_content_json(&profile))?;
         let event = NostrTransportEvent::new_unsigned(
             keys.public_key().to_hex(),
@@ -2630,7 +2659,10 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints = self.outbox_endpoints(
+            &keys.public_key().to_hex(),
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
         let tags = follows
             .iter()
             .map(|follow| {
@@ -2845,6 +2877,20 @@ impl MarmotApp {
         Ok(profiles.len())
     }
 
+    /// Fetch and cache a single account's own Nostr kind:0 profile from
+    /// relays. Unlike `refresh_user_directory_for_account_id` (which refreshes
+    /// the account's *follows'* profiles), this targets the account itself, so
+    /// its display name / avatar become locally available right away.
+    pub async fn refresh_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        self.refresh_directory_profiles(&[account_id_hex.to_owned()], &source_relays)
+            .await?;
+        Ok(())
+    }
+
     async fn fetch_events_for_account_ids(
         &self,
         account_ids: &[String],
@@ -3008,8 +3054,12 @@ impl MarmotApp {
     }
 
     async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
-        if self.account_home().account(member_ref).is_ok() {
-            return self.latest_key_package(member_ref);
+        // Local accounts: cache files are keyed by the account's canonical
+        // label, so resolve the ref (which may be an npub or hex pubkey)
+        // before looking up the cached key package. Using the raw ref here
+        // would miss the file when inviting a local account by npub.
+        if let Ok(account) = self.account_home().account(member_ref) {
+            return self.latest_key_package(&account.label);
         }
         let account_id = PublicKey::parse(member_ref)
             .map_err(|_| AppError::MissingKeyPackage(member_ref.to_owned()))?
@@ -4923,13 +4973,21 @@ fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileM
     ))
 }
 
+/// Defensive cap on any single ingested profile field. Nostr kind:0 content
+/// is attacker-controlled (anyone can publish any metadata to a relay), so we
+/// bound each field to keep a malicious multi-megabyte value from bloating the
+/// directory cache and downstream consumers. 4096 chars is generous for any
+/// legitimate name/about/url. Char-based (not byte) truncation keeps the
+/// result valid UTF-8.
+const MAX_PROFILE_FIELD_CHARS: usize = 4096;
+
 fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
     value
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|value| value.chars().take(MAX_PROFILE_FIELD_CHARS).collect())
 }
 
 fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -5078,11 +5136,21 @@ fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, AppError> {
     Ok(values)
 }
 
-fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
+/// Convert a hex Nostr public key (account id) into its `npub…` bech32 form.
+/// Public so embedders (FFI/UI) can render npubs instead of raw hex.
+pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
     PublicKey::parse(account_id_hex)
         .map_err(|_| AppError::InvalidPublicKey)?
         .to_bech32()
         .map_err(|_| AppError::InvalidPublicKey)
+}
+
+/// Normalize any public-key reference (npub bech32 or hex) into canonical
+/// hex account id. Public so embedders can resolve scanned/typed npubs.
+pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
+    Ok(PublicKey::parse(reference)
+        .map_err(|_| AppError::InvalidPublicKey)?
+        .to_hex())
 }
 
 fn npub_for_account_id_lossy(account_id_hex: &str) -> String {

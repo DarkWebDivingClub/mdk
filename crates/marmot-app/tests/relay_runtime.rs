@@ -1153,3 +1153,75 @@ async fn account_projection_db_records_received_messages() {
     assert_eq!(messages[0].group_id_hex, hex::encode(group_id.as_slice()));
     assert_eq!(messages[0].plaintext, "persist this projection");
 }
+
+#[tokio::test]
+async fn account_publishes_route_to_own_nip65_not_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_home, home_url) = mock_relay().await;
+    let (_other, other_url) = mock_relay().await;
+    let app = MarmotApp::with_relay(dir.path(), home_url.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    // The account's NIP-65 write relay is the home relay.
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&home_url)],
+            bootstrap_relays: vec![endpoint(&home_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let id = created.account.account_id_hex.clone();
+    let label = created.account.label.clone();
+
+    let status = app.account_relay_list_status_for_account_id(&id).unwrap();
+    assert!(
+        status.nip65.relays.iter().any(|r| r == &home_url),
+        "nip65 should include the home relay, got {:?}",
+        status.nip65.relays
+    );
+
+    // Publish a distinct profile, passing the OTHER relay as bootstrap.
+    // Outbox routing must send it to the account's NIP-65 (home), not other.
+    app.publish_user_profile(
+        &label,
+        UserProfileMetadata {
+            name: Some("OutboxTest".to_owned()),
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(vec![endpoint(&other_url)], vec![endpoint(&other_url)]),
+    )
+    .await
+    .unwrap();
+
+    // The bootstrap relay must NOT have the profile (outbox ignored it).
+    app.refresh_profile_for_account_id(&id, vec![endpoint(&other_url)])
+        .await
+        .unwrap();
+    let from_other = app
+        .directory_entry_for_account_id(&id)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .and_then(|profile| profile.name);
+    assert_ne!(
+        from_other.as_deref(),
+        Some("OutboxTest"),
+        "profile must not be on the bootstrap relay; outbox should target nip65"
+    );
+
+    // The account's NIP-65 (home) relay SHOULD have it.
+    app.refresh_profile_for_account_id(&id, vec![endpoint(&home_url)])
+        .await
+        .unwrap();
+    let from_home = app
+        .directory_entry_for_account_id(&id)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .and_then(|profile| profile.name);
+    assert_eq!(
+        from_home.as_deref(),
+        Some("OutboxTest"),
+        "profile should be retrievable from the account's nip65 (home) relay"
+    );
+}

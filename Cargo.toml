@@ -13,6 +13,7 @@ members = [
     "crates/transport-quic-broker",
     "crates/marmot-account",
     "crates/marmot-app",
+    "crates/marmot-uniffi",
     "crates/cli",
 ]
 
@@ -79,4 +80,5 @@ transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
+marmot-uniffi = { path = "crates/marmot-uniffi" }
 darkmatter-cli = { path = "crates/cli" }

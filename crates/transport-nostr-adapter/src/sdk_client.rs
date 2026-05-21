@@ -24,6 +24,11 @@ use crate::{
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(5);
+/// Publishing to relays is best-effort over a flaky network: retry the send a
+/// few times (with a short backoff) before giving up, so a single slow relay
+/// doesn't fail the whole publish.
+const SDK_RELAY_PUBLISH_ATTEMPTS: usize = 3;
+const SDK_RELAY_PUBLISH_RETRY_BACKOFF: Duration = Duration::from_millis(600);
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
 #[derive(Clone, Debug)]
@@ -323,13 +328,36 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .map_err(|_| TransportAdapterError::Publish("connect relay timed out".to_owned()))?
             .map_err(|e| TransportAdapterError::Publish(format!("connect relay: {e}")))?;
         }
-        let output = timeout(
-            SDK_RELAY_PUBLISH_WAIT,
-            self.client.send_event_to(parsed_endpoints, &event),
-        )
-        .await
-        .map_err(|_| TransportAdapterError::Publish("send event timed out".to_owned()))?
-        .map_err(|e| TransportAdapterError::Publish(format!("send event: {e}")))?;
+        let mut last_error: Option<TransportAdapterError> = None;
+        let mut send_output = None;
+        for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
+            match timeout(
+                SDK_RELAY_PUBLISH_WAIT,
+                self.client.send_event_to(parsed_endpoints.clone(), &event),
+            )
+            .await
+            {
+                Ok(Ok(output)) => {
+                    send_output = Some(output);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_error = Some(TransportAdapterError::Publish(format!("send event: {e}")));
+                }
+                Err(_) => {
+                    last_error = Some(TransportAdapterError::Publish(
+                        "send event timed out".to_owned(),
+                    ));
+                }
+            }
+            if attempt < SDK_RELAY_PUBLISH_ATTEMPTS {
+                tokio::time::sleep(SDK_RELAY_PUBLISH_RETRY_BACKOFF).await;
+            }
+        }
+        let output = send_output.ok_or_else(|| {
+            last_error
+                .unwrap_or_else(|| TransportAdapterError::Publish("send event failed".to_owned()))
+        })?;
 
         Ok(NostrPublishOutcome {
             message_id: Some(cgka_traits::MessageId::new(event.id.to_bytes().to_vec())),
