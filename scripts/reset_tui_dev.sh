@@ -123,7 +123,7 @@ require_command jq
 require_command curl
 stop_daemon_if_running
 
-echo "==> stopping local relays and QUIC broker"
+echo "==> stopping local compose services"
 require_docker_compose
 docker compose down -v --remove-orphans
 
@@ -135,14 +135,9 @@ echo "==> rebuilding dm and dmd"
 require_command cargo
 cargo build -p darkmatter-cli --bins
 
-echo "==> starting local relays and QUIC broker"
-docker compose up -d --build
+echo "==> starting local relays"
+docker compose up -d setup nostr-rs-relay strfry-nostr-relay
 DARKMATTER_E2E_RELAYS="$RELAYS" ./scripts/wait_for_relays.sh
-if ! docker compose ps --status running --services | grep -qx 'quic-broker'; then
-    echo "error: quic-broker is not running" >&2
-    docker compose ps >&2
-    exit 1
-fi
 
 echo "==> starting daemon"
 daemon_start="$(start_daemon)"
@@ -191,10 +186,10 @@ cat <<EOF
 
 Local TUI daemon test setup is ready.
 
-Alice account_id: $ALICE_ACCOUNT_ID
+Alice pubkey:     $ALICE_ACCOUNT_ID
 Alice npub:       $ALICE_NPUB
 
-Bob account_id:   $BOB_ACCOUNT_ID
+Bob pubkey:       $BOB_ACCOUNT_ID
 Bob npub:         $BOB_NPUB
 
 Open TUIs:

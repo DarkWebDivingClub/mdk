@@ -79,6 +79,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   state now advances from startup, explicit CLI/TUI intents, and subscription events.
 - TUI stream compose typing now batches append calls instead of blocking the interface on a daemon round-trip for every
   character.
+- TUI stream compose now keeps a daemon-side transcript and treats live QUIC publishing as best-effort, so finishing a
+  stream still publishes the full durable final message when the broker is slow or unreachable.
 - The TUI uses higher-contrast neutral account labels and green focus accents instead of the low-contrast cyan account
   treatment; daemon controls stay focused on start, status, and stop.
 - TUI slash commands now accept quoted multi-word names for `/chat new`, so group names with spaces no longer consume
