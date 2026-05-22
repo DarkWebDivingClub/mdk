@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,9 @@ use cgka_traits::GroupId;
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
+const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
+const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
+const DAEMON_SOCKET_MODE: u32 = 0o600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonClientError {
@@ -565,7 +568,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .map(|logs_dir| logs_dir.join("dmd.log"))
         .unwrap_or_else(|| default_log_path(&home));
     if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
+        prepare_socket_dir(parent, &home)?;
     }
     if let Some(parent) = pid_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -574,6 +577,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     remove_stale_pid(&pid_path).await?;
 
     let listener = UnixListener::bind(&socket)?;
+    harden_socket_permissions(&socket)?;
     write_pid_file(&pid_path)?;
     let hidden_relay = crate::resolve_relay(args.relay)?;
     let mut discovery_relays = normalize_relay_list(args.discovery_relays)?;
@@ -623,6 +627,18 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     .await;
     let shutdown_result = loop {
         let (mut stream, _) = listener.accept().await?;
+        if let Err(err) = authorize_daemon_peer(&stream) {
+            write_daemon_output(
+                &mut stream,
+                &CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("error: {err}\n"),
+                },
+            )
+            .await;
+            continue;
+        }
         let request = read_daemon_request(&mut stream).await?;
         match request {
             DaemonRequest::MessagesSubscribe { mut cli } => {
@@ -702,6 +718,47 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pid_path);
     shutdown_result
+}
+
+fn prepare_socket_dir(parent: &Path, home: &Path) -> std::io::Result<()> {
+    let existed = parent.try_exists()?;
+    std::fs::create_dir_all(parent)?;
+    if !existed || is_daemon_owned_socket_dir(parent, home) {
+        std::fs::set_permissions(
+            parent,
+            std::fs::Permissions::from_mode(DAEMON_SOCKET_DIR_MODE),
+        )?;
+    }
+    Ok(())
+}
+
+fn is_daemon_owned_socket_dir(parent: &Path, home: &Path) -> bool {
+    let dev_dir = home.join("dev");
+    parent == dev_dir || parent.starts_with(dev_dir)
+}
+
+fn harden_socket_permissions(socket: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(DAEMON_SOCKET_MODE))
+}
+
+fn authorize_daemon_peer(stream: &UnixStream) -> std::io::Result<()> {
+    let peer_uid = stream.peer_cred()?.uid();
+    let server_uid = current_effective_uid();
+    if daemon_peer_uid_authorized(peer_uid, server_uid) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        ErrorKind::PermissionDenied,
+        "daemon peer UID does not match server UID",
+    ))
+}
+
+fn current_effective_uid() -> libc::uid_t {
+    unsafe { libc::geteuid() }
+}
+
+fn daemon_peer_uid_authorized(peer_uid: libc::uid_t, server_uid: libc::uid_t) -> bool {
+    peer_uid == server_uid
 }
 
 async fn handle_connection(
@@ -788,6 +845,10 @@ async fn handle_connection(
         ),
         DaemonRequest::Execute { mut cli } => {
             apply_defaults(&mut cli, defaults);
+            if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
+                write_daemon_output(stream, &output).await;
+                return Ok(false);
+            }
             if let Some(output) = handle_stream_compose_request(
                 &cli,
                 defaults,
@@ -845,6 +906,51 @@ async fn handle_connection(
     Ok(shutdown)
 }
 
+fn blocked_daemon_execute_output(cli: &Cli) -> Option<CliOutput> {
+    let (command, reason) = blocked_daemon_execute_command(&cli.command)?;
+    let message = format!("{command} cannot be run through dmd: {reason}");
+    if cli.json {
+        return Some(CliOutput {
+            code: 1,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "daemon_forbidden",
+                        "message": message,
+                        "command": command,
+                        "reason": reason,
+                    },
+                }))
+                .expect("JSON response serialization cannot fail")
+            ),
+            stderr: String::new(),
+        });
+    }
+    Some(CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: format!("error: {message}\n"),
+    })
+}
+
+fn blocked_daemon_execute_command(
+    command: &crate::Command,
+) -> Option<(&'static str, &'static str)> {
+    match command {
+        crate::Command::Reset { .. } => Some((
+            "reset",
+            "it deletes the daemon home; run dm reset directly after stopping the daemon",
+        )),
+        crate::Command::Logout { .. } => Some((
+            "logout",
+            "it removes a local account; run dm logout directly without --socket",
+        )),
+        _ => None,
+    }
+}
+
 async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
     let Ok(mut response) = serde_json::to_vec(output) else {
         return;
@@ -857,13 +963,29 @@ async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
 async fn read_daemon_request(
     stream: &mut UnixStream,
 ) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream);
-    let read = reader.read_line(&mut line).await?;
-    if read == 0 {
-        return Err(DaemonClientError::EmptyResponse.into());
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await?;
+        if read == 0 {
+            if request.is_empty() {
+                return Err(DaemonClientError::EmptyResponse.into());
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if request.len() == MAX_DAEMON_REQUEST_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("daemon request exceeds {MAX_DAEMON_REQUEST_BYTES} bytes"),
+            )
+            .into());
+        }
+        request.push(byte[0]);
     }
-    Ok(serde_json::from_str(line.trim_end())?)
+    Ok(serde_json::from_slice(&request)?)
 }
 
 async fn handle_messages_subscription(
@@ -3532,6 +3654,82 @@ mod tests {
         };
         assert_eq!(default_relays, vec!["wss://account.example"]);
         assert_eq!(bootstrap_relays, vec!["wss://discovery.example"]);
+    }
+
+    #[test]
+    fn destructive_execute_commands_are_refused_over_daemon() {
+        let reset = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Reset {
+            confirm: true,
+        }))
+        .expect("reset should be blocked");
+        let reset_json: serde_json::Value =
+            serde_json::from_str(reset.stdout.trim()).expect("reset error JSON");
+        assert_eq!(reset.code, 1);
+        assert_eq!(reset_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(reset_json["error"]["command"], "reset");
+
+        let logout = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Logout {
+            pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        }))
+        .expect("logout should be blocked");
+        let logout_json: serde_json::Value =
+            serde_json::from_str(logout.stdout.trim()).expect("logout error JSON");
+        assert_eq!(logout.code, 1);
+        assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(logout_json["error"]["command"], "logout");
+    }
+
+    #[tokio::test]
+    async fn daemon_peer_authorization_accepts_current_uid() {
+        let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
+
+        authorize_daemon_peer(&stream).expect("same-uid peer should be authorized");
+    }
+
+    #[test]
+    fn daemon_peer_authorization_rejects_mismatched_uid_value() {
+        let current_uid = current_effective_uid();
+        let other_uid = current_uid.checked_add(1).unwrap_or(current_uid - 1);
+
+        assert!(!daemon_peer_uid_authorized(other_uid, current_uid));
+    }
+
+    #[tokio::test]
+    async fn daemon_request_reader_rejects_oversized_requests() {
+        let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
+        let writer = tokio::spawn(async move {
+            let oversized = vec![b'{'; MAX_DAEMON_REQUEST_BYTES + 1];
+            client
+                .write_all(&oversized)
+                .await
+                .expect("write oversized request");
+            client.shutdown().await.expect("shutdown client");
+        });
+
+        let err = read_daemon_request(&mut server)
+            .await
+            .expect_err("oversized request should fail");
+
+        assert!(
+            err.to_string().contains("daemon request exceeds"),
+            "unexpected error: {err}"
+        );
+        writer.await.expect("writer task");
+    }
+
+    fn daemon_test_cli(command: crate::Command) -> Cli {
+        Cli {
+            home: None,
+            socket: None,
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command,
+        }
     }
 
     #[test]

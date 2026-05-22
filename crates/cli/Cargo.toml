@@ -19,6 +19,7 @@ cgka-session.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 hex.workspace = true
+libc.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
 nostr.workspace = true

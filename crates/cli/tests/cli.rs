@@ -1,6 +1,8 @@
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -3256,6 +3258,88 @@ fn daemon_executes_cli_commands_over_socket() {
             .unwrap()
             .starts_with("npub1")
     );
+
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_socket_path_is_private() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .spawn()
+        .expect("dmd should start");
+
+    wait_for_daemon(&socket);
+
+    let socket_mode = socket
+        .metadata()
+        .expect("daemon socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_dir_mode = socket
+        .parent()
+        .expect("socket parent")
+        .metadata()
+        .expect("daemon socket dir metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    stop_daemon(&socket, &mut child);
+
+    assert_eq!(socket_dir_mode, 0o700);
+    assert_eq!(socket_mode, 0o600);
+}
+
+#[test]
+fn daemon_refuses_reset_over_socket() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .spawn()
+        .expect("dmd should start");
+
+    wait_for_daemon(&socket);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["reset", "--confirm"])
+        .output()
+        .expect("dm reset should start");
+    assert!(
+        !output.status.success(),
+        "daemon reset unexpectedly succeeded\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["error"]["code"], "daemon_forbidden");
+    assert_eq!(value["error"]["command"], "reset");
+    assert!(home.path().exists(), "daemon home should not be deleted");
 
     stop_daemon(&socket, &mut child);
 }

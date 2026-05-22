@@ -48,6 +48,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added TUI unread badges for chats that receive messages while another chat is selected.
 - Added a TUI slash-command suggestion popup that opens on `/` and filters as the composer input narrows.
 
+### Security
+
+- Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
+  peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
+
 ### Changed
 
 - Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-hosted

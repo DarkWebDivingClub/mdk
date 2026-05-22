@@ -1032,6 +1032,7 @@ dependencies = [
  "clap",
  "crossterm",
  "hex",
+ "libc",
  "marmot-account",
  "marmot-app",
  "nostr",
