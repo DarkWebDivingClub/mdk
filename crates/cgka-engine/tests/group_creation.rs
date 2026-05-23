@@ -14,6 +14,7 @@ use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
     NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_nostr_routing_v1,
 };
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
@@ -201,6 +202,19 @@ fn build_client_on_storage(
         .expect("build engine")
 }
 
+fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
 #[tokio::test]
 async fn create_group_rejects_invitee_keypackage_with_non_secp256k1_identity() {
     // A peer with a non-conformant client sends a KeyPackage whose credential
@@ -353,7 +367,7 @@ async fn nostr_routing_component_drives_group_message_route() {
     let sent = alice
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"hello".to_vec(),
+            payload: app_payload_for(&alice, b"hello"),
         })
         .await
         .unwrap();

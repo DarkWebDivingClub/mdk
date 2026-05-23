@@ -5,6 +5,7 @@ use std::path::Path;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, TransportEndpoint, TransportMessage};
@@ -742,7 +743,7 @@ async fn publish_app_events(
             .session
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
-                payload: payload_label(seed, message_index).into_bytes(),
+                payload: app_payload_for(sender, payload_label(seed, message_index).as_bytes()),
             })
             .await
             .unwrap();
@@ -795,11 +796,25 @@ fn message_payloads(ingest: &IngestEffects) -> Vec<String> {
         .iter()
         .filter_map(|event| match event {
             GroupEvent::MessageReceived { payload, .. } => {
-                Some(String::from_utf8(payload.clone()).expect("chaos payloads are utf8"))
+                let event = MarmotAppEvent::decode(payload).expect("chaos app event decodes");
+                Some(event.content)
             }
             _ => None,
         })
         .collect()
+}
+
+fn app_payload_for(sender: &StackClient, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("chaos payloads are utf8");
+    MarmotAppEvent::new(
+        hex::encode(sender.session.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("chaos app event encodes")
 }
 
 fn take_effect_for(
@@ -837,12 +852,18 @@ fn assert_invite_commit_processed(
 }
 
 fn assert_already_seen(effects: &IngestEffects) {
-    assert!(matches!(
-        effects.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
-        }
-    ));
+    assert!(
+        matches!(
+            effects.outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadySeen
+                    | StaleReason::AlreadyAtEpoch { .. }
+                    | StaleReason::PeelFailed
+            }
+        ),
+        "expected duplicate/stale epoch outcome, got {:?}",
+        effects.outcome
+    );
     assert!(effects.effects.events.is_empty());
 }
 

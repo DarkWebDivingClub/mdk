@@ -758,6 +758,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::ForkedEpoch { .. } => "forked_epoch",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
+        EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
+        EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
     }
     .into()

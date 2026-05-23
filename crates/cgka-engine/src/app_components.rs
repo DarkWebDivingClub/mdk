@@ -1,17 +1,20 @@
 //! Marmot app-component state carried in OpenMLS `app_data_dictionary`.
 
+use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
+use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_components_list, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, decode_components_list, decode_nostr_routing_v1, decode_quic_varint,
+    encode_component_vectors, encode_components_list,
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
 use openmls::group::{MlsGroup, StagedCommit};
 use openmls::messages::proposals::Proposal;
-use openmls::prelude::LeafNode;
+use openmls::prelude::{BasicCredential, LeafNode, Sender};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +183,7 @@ pub(crate) fn require_admin_for_staged_commit(
     sender: Option<&MemberId>,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
+    reject_admin_self_remove_proposals(mls_group, group_id, staged)?;
     if !staged_commit_requires_admin(staged) {
         return Ok(());
     }
@@ -189,6 +193,43 @@ pub(crate) fn require_admin_for_staged_commit(
         });
     };
     require_admin(mls_group, group_id, sender)
+}
+
+fn reject_admin_self_remove_proposals(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    let admins = admins_of_group(mls_group)?;
+    if admins.is_empty() {
+        return Ok(());
+    }
+    for queued in staged.queued_proposals() {
+        if !matches!(queued.proposal(), Proposal::SelfRemove) {
+            continue;
+        }
+        let Some(sender) = member_id_of_sender(queued.sender(), mls_group) else {
+            continue;
+        };
+        let sender_pubkey = admin_pubkey_from_member_id(&sender)?;
+        if admins.iter().any(|admin| admin == &sender_pubkey) {
+            return Err(EngineError::AdminCannotSelfRemove {
+                group_id: group_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
+    match sender {
+        Sender::Member(leaf_idx) => {
+            let member = group.member_at(*leaf_idx)?;
+            let basic = BasicCredential::try_from(member.credential).ok()?;
+            Some(MemberId::new(basic.identity().to_vec()))
+        }
+        _ => None,
+    }
 }
 
 /// Does this staged commit require the sender to be a group admin?
@@ -355,6 +396,9 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
+        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(&component.data),
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
         _ => Ok(()),
     }
 }
@@ -363,30 +407,87 @@ pub(crate) fn validate_app_component_update(
     component: &AppComponentData,
 ) -> Result<(), EngineError> {
     match component.component_id {
-        APP_COMPONENTS_COMPONENT_ID => Err(EngineError::Other(
-            "app_components component is managed by the engine".into(),
-        )),
+        APP_COMPONENTS_COMPONENT_ID => decode_components_list(&component.data)
+            .map(|_| ())
+            .map_err(|e| EngineError::Serialize(format!("invalid app_components component: {e}"))),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
+        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(&component.data),
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
         _ => Ok(()),
     }
 }
 
 pub(crate) fn validate_app_component_remove(
+    mls_group: &MlsGroup,
     component_id: AppComponentId,
 ) -> Result<(), EngineError> {
-    match component_id {
-        APP_COMPONENTS_COMPONENT_ID
-        | GROUP_PROFILE_COMPONENT_ID
-        | GROUP_ADMIN_POLICY_COMPONENT_ID
-        | NOSTR_ROUTING_COMPONENT_ID => Err(EngineError::Other(
-            "required Marmot app components cannot be removed".into(),
-        )),
-        _ => Ok(()),
+    if component_id == APP_COMPONENTS_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "app_components component cannot be removed".into(),
+        ));
     }
+    if required_app_components_of_group(mls_group)?.contains(component_id) {
+        return Err(EngineError::Other(
+            "required Marmot app components cannot be removed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_group_image(bytes: &[u8]) -> Result<(), EngineError> {
+    let mut cursor = bytes;
+    let image_hash = decode_var_bytes(&mut cursor, 32, "group image hash")?;
+    let image_key = decode_var_bytes(&mut cursor, 32, "group image key")?;
+    let image_nonce = decode_var_bytes(&mut cursor, 12, "group image nonce")?;
+    let image_upload_key = decode_var_bytes(&mut cursor, 32, "group image upload key")?;
+    let media_type = decode_var_bytes(&mut cursor, 128, "group image media type")?;
+    if !cursor.is_empty() {
+        return Err(EngineError::Serialize(
+            "group image component has trailing bytes".into(),
+        ));
+    }
+    let present = !image_hash.is_empty()
+        || !image_key.is_empty()
+        || !image_nonce.is_empty()
+        || !image_upload_key.is_empty()
+        || !media_type.is_empty();
+    if !present {
+        return Ok(());
+    }
+    if image_hash.len() != 32
+        || image_key.len() != 32
+        || image_nonce.len() != 12
+        || image_upload_key.len() != 32
+        || media_type.is_empty()
+    {
+        return Err(EngineError::Serialize(
+            "group image component has invalid partial state".into(),
+        ));
+    }
+    std::str::from_utf8(&media_type)
+        .map_err(|e| EngineError::Serialize(format!("group image media type is not UTF-8: {e}")))?;
+    Ok(())
+}
+
+fn validate_message_retention(bytes: &[u8]) -> Result<(), EngineError> {
+    if bytes.len() != 8 {
+        return Err(EngineError::Serialize(format!(
+            "message-retention component must be 8 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_text_stream_policy(bytes: &[u8]) -> Result<(), EngineError> {
+    AgentTextStreamQuicPolicyV1::decode_component_state(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid agent text stream component: {e}")))
 }
 
 fn decode_var_bytes(

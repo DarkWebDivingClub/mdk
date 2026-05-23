@@ -33,12 +33,8 @@ pub enum EngineError {
     #[error("invalid credential identity: {0}")]
     InvalidCredentialIdentity(String),
 
-    /// MIP-03 §149 — an admin cannot SelfRemove if doing so would leave the
-    /// group with zero admins. Demote (or transfer admin status) before
-    /// leaving.
-    #[error(
-        "admin cannot self-remove from group {group_id}: would leave the group with zero admins"
-    )]
+    /// Admins must leave the admin set before using SelfRemove.
+    #[error("admin cannot self-remove from group {group_id}: leave the admin set first")]
     AdminCannotSelfRemove { group_id: GroupId },
 
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
@@ -54,6 +50,18 @@ pub enum EngineError {
         required: Box<GroupCapabilities>,
         had: Box<GroupCapabilities>,
     },
+
+    /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
+    /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
+    /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an
+    /// engine or creating a group with any other ciphersuite is rejected.
+    #[error("unsupported MLS ciphersuite {got:#06x}: Marmot requires {required:#06x}")]
+    UnsupportedCiphersuite { got: u16, required: u16 },
+
+    /// MLS application-message plaintext is not a Marmot app event:
+    /// unsigned Nostr-shaped JSON with a canonical NIP-01 `id` and no `sig`.
+    #[error("invalid Marmot app message payload: {0}")]
+    InvalidAppMessagePayload(String),
 
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.

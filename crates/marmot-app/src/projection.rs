@@ -6,9 +6,9 @@ use rusqlite::{Connection, params, types::Type};
 
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
-    AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupNostrRoutingComponent,
-    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppMessageRecord,
-    NOSTR_ROUTING_COMPONENT_ID,
+    AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupMessageRetentionComponent,
+    AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
+    AppMessageRecord, NOSTR_ROUTING_COMPONENT_ID,
 };
 
 pub(crate) struct AccountProjectionDb {
@@ -224,6 +224,7 @@ impl AccountProjectionDb {
                 row.profile_description,
                 row.image,
                 AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&row.admin_keys_hex)),
+                AppGroupMessageRetentionComponent::disabled(),
             );
             if !row.agent_text_stream_data_hex.is_empty() {
                 let agent_text_stream_bytes = hex::decode(&row.agent_text_stream_data_hex)?;
@@ -521,6 +522,23 @@ impl AccountProjectionDb {
             })?;
         Ok(count.try_into().unwrap_or_default())
     }
+
+    pub(crate) fn prune_group_messages_before(
+        &self,
+        group_id_hex: &str,
+        cutoff_recorded_at: u64,
+    ) -> Result<usize, AppError> {
+        let pruned = self.conn.execute(
+            "DELETE FROM messages
+             WHERE group_id_hex = ?1
+               AND COALESCE(recorded_at, received_at) < ?2",
+            params![
+                group_id_hex,
+                i64::try_from(cutoff_recorded_at).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(pruned)
+    }
 }
 
 fn unix_now_seconds() -> u64 {
@@ -606,6 +624,7 @@ mod tests {
                 "".to_owned(),
                 AppGroupImageInput::default(),
                 AppGroupAdminPolicyComponent::new(Vec::new()),
+                AppGroupMessageRetentionComponent::disabled(),
             )],
         };
         db.save_state(&original).unwrap();
@@ -631,6 +650,7 @@ mod tests {
                 "".to_owned(),
                 AppGroupImageInput::default(),
                 AppGroupAdminPolicyComponent::new(Vec::new()),
+                AppGroupMessageRetentionComponent::disabled(),
             )],
         };
 
@@ -657,9 +677,10 @@ mod tests {
             "".to_owned(),
             AppGroupImageInput::default(),
             AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
         );
         group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&[
-            0x01, 0x03, 0x02, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
         let state = AccountState {
             label: "alice".to_owned(),
@@ -675,7 +696,7 @@ mod tests {
         assert_eq!(restored.last_transport_timestamp, Some(1_700_000_003));
         assert_eq!(
             restored.groups[0].agent_text_stream.data_hex,
-            "0103020200001000000000000000"
+            "010300001000000000000000"
         );
     }
 
@@ -697,6 +718,7 @@ mod tests {
                 "".to_owned(),
                 AppGroupImageInput::default(),
                 AppGroupAdminPolicyComponent::new(Vec::new()),
+                AppGroupMessageRetentionComponent::disabled(),
             )],
         };
 
@@ -713,6 +735,48 @@ mod tests {
             restored.seen_events.last().map(String::as_str),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn prune_group_messages_before_removes_only_expired_group_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        for (message_id_hex, group_id_hex, recorded_at) in [
+            ("old-aa", "aa", 10),
+            ("new-aa", "aa", 20),
+            ("old-bb", "bb", 10),
+        ] {
+            db.record_message(&AppMessageProjection {
+                message_id_hex: message_id_hex.to_owned(),
+                direction: "received".to_owned(),
+                group_id_hex: group_id_hex.to_owned(),
+                sender: "sender".to_owned(),
+                plaintext: message_id_hex.to_owned(),
+                kind: 9,
+                tags: Vec::new(),
+                recorded_at: Some(recorded_at),
+            })
+            .unwrap();
+        }
+
+        assert_eq!(db.prune_group_messages_before("aa", 15).unwrap(), 1);
+
+        let aa = db
+            .messages(AppMessageQuery {
+                group_id_hex: Some("aa".to_owned()),
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(aa.len(), 1);
+        assert_eq!(aa[0].message_id_hex, "new-aa");
+        let bb = db
+            .messages(AppMessageQuery {
+                group_id_hex: Some("bb".to_owned()),
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(bb.len(), 1);
+        assert_eq!(bb[0].message_id_hex, "old-bb");
     }
 
     fn test_routing(nostr_group_id: [u8; 32], relay: &str) -> AppGroupNostrRoutingComponent {

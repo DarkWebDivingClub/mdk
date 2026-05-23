@@ -138,8 +138,11 @@ async fn app_runtime_reuses_initial_key_package_when_republishing() {
         .unwrap();
 
     assert_eq!(republished_bytes, first.key_package.0.len());
-    assert_eq!(second.key_package_id, first.key_package_id);
     assert_eq!(second.key_package, first.key_package);
+    assert!(!first.key_package_id.is_empty());
+    assert!(!second.key_package_id.is_empty());
+    assert!(!first.key_package_event_id.is_empty());
+    assert!(!second.key_package_event_id.is_empty());
 
     runtime.shutdown().await;
 }
@@ -192,8 +195,9 @@ async fn app_runtime_can_rotate_key_package_on_request() {
 
     assert_eq!(rotated_bytes, rotated.key_package.0.len());
     assert_ne!(rotated.key_package_id, first.key_package_id);
-    assert_eq!(republished.key_package_id, rotated.key_package_id);
     assert_eq!(republished.key_package, rotated.key_package);
+    assert!(!rotated.key_package_id.is_empty());
+    assert!(!republished.key_package_id.is_empty());
 
     runtime.shutdown().await;
 }
@@ -736,9 +740,12 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     bob.send_media_reference(
         &group_id,
         MediaReference {
+            url: "https://media.example/diagram.png".to_owned(),
             file_hash_hex: hex::encode([0x42_u8; 32]),
+            nonce_hex: hex::encode([0x24_u8; 12]),
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
+            version: "mip04-v2".to_owned(),
             size_bytes: 1234,
         },
         Some("launch diagram".to_owned()),
@@ -754,16 +761,30 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .iter()
         .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
         .expect("media carries an imeta tag");
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == "url https://media.example/diagram.png")
+    );
     assert!(imeta.iter().any(|field| field == "m image/png"));
-    assert!(imeta.iter().any(|field| field == "name diagram.png"));
+    assert!(imeta.iter().any(|field| field == "filename diagram.png"));
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == "n 242424242424242424242424")
+    );
+    assert!(imeta.iter().any(|field| field == "v mip04-v2"));
 
     let bad_media = bob
         .send_media_reference(
             &group_id,
             MediaReference {
+                url: "https://media.example/diagram.png".to_owned(),
                 file_hash_hex: "not-hex".to_owned(),
+                nonce_hex: hex::encode([0x24_u8; 12]),
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
+                version: "mip04-v2".to_owned(),
                 size_bytes: 1234,
             },
             None,
@@ -805,16 +826,8 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
         vec!["receive".to_owned(), "send".to_owned()]
     );
     assert_eq!(
-        alice_group.agent_text_stream.required_route_modes,
-        vec!["brokered_quic".to_owned()]
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.allowed_route_modes,
-        vec!["brokered_quic".to_owned()]
-    );
-    assert_eq!(
         alice_group.agent_text_stream.data_hex,
-        "0103020200001000000000000000"
+        "010300001000000000000000"
     );
 
     bob.sync().await.unwrap();

@@ -472,10 +472,10 @@ async fn admin_cannot_self_remove_when_only_admin() {
 }
 
 #[tokio::test]
-async fn admin_can_self_remove_when_co_admin_present() {
+async fn admin_cannot_self_remove_even_when_co_admin_present() {
     // Alice creates a group with bob, bootstrapping bob as a co-admin.
-    // Alice (admin) tries to leave. §149 should NOT fire — leaving keeps
-    // bob as the remaining admin, so the admin set is non-empty.
+    // The Marmot admin policy now requires admins to leave the admin set
+    // before sending a SelfRemove proposal.
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -506,25 +506,26 @@ async fn admin_can_self_remove_when_co_admin_present() {
     };
     bob.join_welcome(welcome_for_bob).await.unwrap();
 
-    // Alice (admin) leaves — succeeds because bob is also admin.
     let res = alice
         .send(SendIntent::Leave {
             group_id: group_id.clone(),
         })
         .await;
     match res {
-        Ok(SendResult::Proposal { .. }) => {} // expected
-        Ok(other) => panic!("expected Proposal, got {other:?}"),
-        Err(e) => panic!("admin should be able to self-remove with co-admin present; got {e:?}"),
+        Err(cgka_traits::EngineError::AdminCannotSelfRemove {
+            group_id: err_group,
+        }) => {
+            assert_eq!(err_group, group_id)
+        }
+        other => panic!("expected AdminCannotSelfRemove, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn auto_committer_commits_admin_self_remove_when_co_admin_present() {
+async fn auto_committer_never_sees_locally_blocked_admin_self_remove() {
     // Alice + bob both admins; carol is non-admin.
-    // Alice leaves; bob (lowest-index remaining non-target admin) should
-    // auto-commit successfully — the §150 guard does NOT fire because the
-    // post-commit admin set still has bob.
+    // Alice's local engine rejects the admin SelfRemove before a proposal
+    // exists, so there is nothing for bob to auto-commit.
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -555,32 +556,17 @@ async fn auto_committer_commits_admin_self_remove_when_co_admin_present() {
     bob.join_welcome(welcome_for_bob).await.unwrap();
 
     // Alice leaves.
-    let proposal = match alice
+    let res = alice
         .send(SendIntent::Leave {
             group_id: group_id.clone(),
         })
-        .await
-        .unwrap()
-    {
-        SendResult::Proposal { msg } => msg,
-        _ => unreachable!(),
-    };
-
-    // Bob ingests; auto-commit fires (post-commit admin set still has bob).
-    let routed = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..proposal
-    };
-    let outcome = bob.ingest(routed).await.unwrap();
-    assert!(matches!(outcome, IngestOutcome::Processed));
-
-    // Bob's epoch advanced; alice removed.
-    assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
-    assert_eq!(bob.members(&group_id).unwrap().len(), 2);
-    let auto = bob.drain_auto_publish();
-    assert_eq!(auto.len(), 1, "bob should have produced an auto-commit");
+        .await;
+    assert!(matches!(
+        res,
+        Err(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+    ));
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 1);
+    assert!(bob.drain_auto_publish().is_empty());
     let _ = carol;
 }
 

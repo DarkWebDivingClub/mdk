@@ -8,8 +8,8 @@ This crate owns the Nostr transport-edge peeler:
 
 - Nostr-shaped event DTOs,
 - mapping kind `445` / `1059` events into `TransportMessage`,
-- kind `445` group envelope encryption and decryption,
-- source-epoch metadata for kind `445` group envelopes,
+- kind `445` group envelope encryption and decryption (`content = base64(nonce || ciphertext)`, empty AAD),
+- per-event ephemeral signing of outbound kind `445` events,
 - NIP-59 welcome wrapping/peeling with injected signer/decrypter,
 - explicit errors for malformed or unsupported Nostr boundary input.
 
@@ -27,12 +27,17 @@ storage. Keep those in adapters or the app layer above this crate.
 
 ## Current limits
 
-- Group messages are wrapped and peeled.
-- New kind `445` group outputs include `source_epoch`. The engine uses this hint to classify pre-join stale messages as
-  terminal when no retained epoch context can peel them.
+- Group messages are wrapped and peeled. Each outbound kind `445` event is signed by a fresh ephemeral Nostr key
+  generated per event (`spec/transports/nostr.md:32-34`); the account identity never appears as the outer event pubkey.
+- Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. There
+  is no source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
+  snapshots / deferred-peel retry rather than a transport-carried epoch.
 - Welcomes are wrapped and peeled through NIP-59 when callers inject the local signer/decrypter. This crate must not
-  decide where that signer comes from.
-- Kind `445` group outputs carry a pre-signing id; final relay publication may replace it after signing.
+  decide where that signer comes from. The kind `444` rumor carries base64 content plus `["encoding","base64"]`.
+- FOLLOW-UP: the kind `444` welcome rumor still lacks the spec-required `["e", <keypackage event id>]` and
+  `["relays", ...]` tags. Those values are not available at the `TransportPeeler::wrap_welcome` boundary and need a
+  trait-signature change to plumb through.
+- Outbound kind `445` events are signed at wrap time, so their event id is final (no pre-signing-id replacement).
 
 ## Verification
 

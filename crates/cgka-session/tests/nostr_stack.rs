@@ -3,6 +3,7 @@ mod support;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::{EpochId, TransportAdapterError, TransportEndpoint, TransportPublishReport};
@@ -31,7 +32,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .session
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: b"hello through the nostr stack".to_vec(),
+            payload: app_payload_for(&alice, b"hello through the nostr stack"),
         })
         .await
         .unwrap();
@@ -55,7 +56,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
             sender: alice.session.self_id(),
-            payload: b"hello through the nostr stack".to_vec(),
+            payload: app_payload_for(&alice, b"hello through the nostr stack"),
         }]
     );
 }
@@ -157,7 +158,7 @@ async fn group_delivery_requires_synced_group_subscription() {
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
             sender: alice.session.self_id(),
-            payload: b"sync gated".to_vec(),
+            payload: app_payload_for(&alice, b"sync gated"),
         }]
     );
 }
@@ -408,7 +409,7 @@ async fn send_app_message(
         .session
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: payload.to_vec(),
+            payload: app_payload_for(sender, payload),
         })
         .await
         .unwrap();
@@ -424,10 +425,30 @@ fn message_payloads(ingest: &IngestEffects) -> Vec<Vec<u8>> {
         .events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            GroupEvent::MessageReceived { payload, .. } => Some(app_content(payload)),
             _ => None,
         })
         .collect()
+}
+
+fn app_payload_for(sender: &StackClient, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(sender.session.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+fn app_content(payload: &[u8]) -> Vec<u8> {
+    MarmotAppEvent::decode(payload)
+        .expect("test app event decodes")
+        .content
+        .into_bytes()
 }
 
 async fn publish_confirm_and_deliver_welcome(

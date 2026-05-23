@@ -587,7 +587,8 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             .iter()
             .filter_map(|e| match e {
                 GroupEvent::MessageReceived { payload, .. } => {
-                    Some(String::from_utf8_lossy(payload).into_owned())
+                    let content = crate::client::decode_harness_app_payload(payload);
+                    Some(String::from_utf8_lossy(&content).into_owned())
                 }
                 _ => None,
             })

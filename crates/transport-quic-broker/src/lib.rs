@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{sleep, timeout};
-use transport_quic_stream::{ReceivedTextChunk, ReceivedTextStream, SentTextStream};
+use transport_quic_stream::{
+    AgentTextStreamCrypto, ReceivedTextChunk, ReceivedTextStream, SentTextStream, decrypt_record,
+    encrypt_record,
+};
 
 pub const QUIC_BROKER_PROTOCOL_V1: &str = "marmot.quic_broker.v1";
 pub const DEFAULT_SUBSCRIBER_QUEUE_DEPTH: usize = 32;
@@ -236,6 +239,7 @@ pub struct PublishTextToBroker {
     pub text: String,
     pub max_chunk_bytes: usize,
     pub chunk_delay: Duration,
+    pub crypto: Option<AgentTextStreamCrypto>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +249,7 @@ pub struct OpenBrokerTextPublisher {
     pub trust: BrokerServerTrust,
     pub stream_id: Vec<u8>,
     pub start_event_id: MessageId,
+    pub crypto: Option<AgentTextStreamCrypto>,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +259,7 @@ pub struct SubscribeTextFromBroker {
     pub trust: BrokerServerTrust,
     pub stream_id: Vec<u8>,
     pub start_event_id: MessageId,
+    pub crypto: Option<AgentTextStreamCrypto>,
 }
 
 pub struct BrokerTextPublisher {
@@ -262,6 +268,7 @@ pub struct BrokerTextPublisher {
     send: quinn::SendStream,
     transcript: AgentTextStreamTranscriptV1,
     next_seq: u64,
+    crypto: Option<AgentTextStreamCrypto>,
 }
 
 impl BrokerTextPublisher {
@@ -283,6 +290,7 @@ impl BrokerTextPublisher {
             send,
             transcript: AgentTextStreamTranscriptV1::new(config.stream_id, config.start_event_id),
             next_seq: 1,
+            crypto: config.crypto,
         })
     }
 
@@ -307,7 +315,12 @@ impl BrokerTextPublisher {
                 chunk,
             );
             self.next_seq += 1;
-            write_record_frame(&mut self.send, &record).await?;
+            let wire_record = if let Some(crypto) = &self.crypto {
+                encrypt_record(crypto, &record)?
+            } else {
+                record.clone()
+            };
+            write_record_frame(&mut self.send, &wire_record).await?;
             self.transcript
                 .append(record.seq, record.record_type, &record.plaintext_frame);
             appended += 1;
@@ -345,6 +358,7 @@ pub async fn publish_text_to_broker(
         trust: config.trust,
         stream_id: config.stream_id,
         start_event_id: config.start_event_id,
+        crypto: config.crypto,
     })
     .await?;
     publisher
@@ -385,6 +399,11 @@ where
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
 
     while let Some(record) = read_record_frame(&mut recv).await? {
+        let record = if let Some(crypto) = &config.crypto {
+            decrypt_record(crypto, &record)?
+        } else {
+            record
+        };
         if record.stream_id != config.stream_id {
             return Err(QuicBrokerError::MixedStreamIds);
         }
@@ -984,6 +1003,8 @@ pub enum QuicBrokerError {
     Hex(#[from] hex::FromHexError),
     #[error(transparent)]
     Utf8(#[from] str::Utf8Error),
+    #[error(transparent)]
+    StreamCrypto(#[from] transport_quic_stream::QuicTextStreamError),
     #[error("certificate setup failed: {0}")]
     Certificate(String),
     #[error("certificate PEM file did not contain any certificates")]
@@ -1058,6 +1079,7 @@ mod tests {
             trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
             stream_id: stream_id.clone(),
             start_event_id: start_event_id.clone(),
+            crypto: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
@@ -1070,6 +1092,7 @@ mod tests {
             text: "hello broker stream".to_owned(),
             max_chunk_bytes: 6,
             chunk_delay: Duration::ZERO,
+            crypto: None,
         })
         .await
         .unwrap();
@@ -1114,6 +1137,7 @@ mod tests {
             trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
             stream_id: stream_id.clone(),
             start_event_id: start_event_id.clone(),
+            crypto: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
@@ -1123,6 +1147,7 @@ mod tests {
             trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
             stream_id: stream_id.clone(),
             start_event_id: start_event_id.clone(),
+            crypto: None,
         })
         .await
         .unwrap();
@@ -1137,6 +1162,7 @@ mod tests {
             trust: BrokerServerTrust::CertificateDer(server_cert),
             stream_id: stream_id.clone(),
             start_event_id,
+            crypto: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
@@ -1176,6 +1202,7 @@ mod tests {
             trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
             stream_id: stream_id.clone(),
             start_event_id: start_event_id.clone(),
+            crypto: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
@@ -1187,6 +1214,7 @@ mod tests {
             start_event_id: start_event_id.clone(),
             text: "finished transcript".to_owned(),
             max_chunk_bytes: 4,
+            crypto: None,
             chunk_delay: Duration::ZERO,
         })
         .await
@@ -1202,6 +1230,7 @@ mod tests {
                 trust: BrokerServerTrust::CertificateDer(server_cert),
                 stream_id,
                 start_event_id,
+                crypto: None,
             }),
         )
         .await
@@ -1325,6 +1354,7 @@ mod tests {
             text: "hello".to_owned(),
             max_chunk_bytes: 5,
             chunk_delay: Duration::ZERO,
+            crypto: None,
         })
         .await
         .unwrap_err();

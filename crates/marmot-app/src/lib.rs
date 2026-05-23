@@ -13,16 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_engine::{
-    FeatureRegistry, canonicalization::CanonicalizationPolicy,
-    key_package::is_last_resort_key_package,
+    FeatureRegistry,
+    canonicalization::CanonicalizationPolicy,
+    key_package::{is_last_resort_key_package, key_package_metadata},
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
     AGENT_TEXT_STREAM_ROLE_FANOUT, AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
-    AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC, AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC,
-    AgentTextStreamQuicPolicyV1,
+    AgentTextStreamKeyContextV1, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
@@ -33,7 +33,8 @@ pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
     NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_event::{
@@ -56,6 +57,8 @@ use marmot_account::{
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
 use nostr::ToBech32;
+use nostr::base64::Engine as _;
+use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_sdk::prelude::{Client as NostrSdkClient, PublicKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -67,7 +70,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    KEY_PACKAGE_ENCODING_HEX, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE,
+    KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE,
     KIND_MARMOT_KEY_PACKAGE_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
     NostrAccountRelayListPublication, NostrKeyPackagePublication, NostrKeyPackagePublisher,
     NostrRelayClient, NostrSdkRelayClient,
@@ -76,6 +79,7 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 use transport_quic_broker::{
     BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_updates,
 };
+use transport_quic_stream::AgentTextStreamCrypto;
 
 mod agent_streams;
 mod directory_cache;
@@ -216,6 +220,11 @@ enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    SafeExportSecret {
+        group_id: GroupId,
+        component_id: cgka_traits::AppComponentId,
+        respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    },
     InviteMembers {
         group_id: GroupId,
         members: Vec<String>,
@@ -248,6 +257,11 @@ enum AccountWorkerCommand {
         group_id: GroupId,
         name: Option<String>,
         description: Option<String>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    UpdateMessageRetention {
+        group_id: GroupId,
+        disappearing_message_secs: u64,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessage {
@@ -311,6 +325,10 @@ pub struct AccountSetupResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTextStreamFinishRequest {
     pub stream_id: Vec<u8>,
+    /// Hex-encoded MLS message id of the kind-1200 stream-start event. Carried
+    /// on the kind-9 stream-final as the `["stream-start", <start_event_id>]`
+    /// tag (`spec/features/agent-text-streams-quic.md:310-318`).
+    pub start_event_id: String,
     pub final_text_or_reference: String,
     pub transcript_hash: [u8; 32],
     pub chunk_count: u64,
@@ -320,9 +338,12 @@ pub struct AgentTextStreamFinishRequest {
 /// A media attachment carried as a NIP-92 `imeta` tag on a kind-9 chat event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaReference {
+    pub url: String,
     pub file_hash_hex: String,
+    pub nonce_hex: String,
     pub file_name: String,
     pub media_type: String,
+    pub version: String,
     pub size_bytes: u64,
 }
 
@@ -333,6 +354,18 @@ impl MediaReference {
         if hash.len() != 32 {
             return Err(AppError::InvalidAppMessagePayload(
                 "media hash must be 32 bytes".into(),
+            ));
+        }
+        let nonce = hex::decode(&self.nonce_hex)
+            .map_err(|_| AppError::InvalidAppMessagePayload("media nonce must be hex".into()))?;
+        if nonce.len() != 12 {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media nonce must be 12 bytes".into(),
+            ));
+        }
+        if self.url.trim().is_empty() {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media URL cannot be empty".into(),
             ));
         }
         if self.file_name.trim().is_empty() {
@@ -350,6 +383,11 @@ impl MediaReference {
                 "media size must be greater than zero".into(),
             ));
         }
+        if self.version != "mip04-v2" {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media version must be mip04-v2".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -357,10 +395,13 @@ impl MediaReference {
     fn imeta_tag(&self) -> Vec<String> {
         vec![
             "imeta".to_owned(),
+            format!("url {}", self.url),
             format!("m {}", self.media_type),
+            format!("filename {}", self.file_name),
             format!("x {}", self.file_hash_hex),
+            format!("n {}", self.nonce_hex),
+            format!("v {}", self.version),
             format!("size {}", self.size_bytes),
-            format!("name {}", self.file_name),
         ]
     }
 }
@@ -876,7 +917,7 @@ impl MarmotAppRuntime {
     /// connects to the broker named in its `quic://` candidate, and streams
     /// incremental text chunks until the stream finishes. Must be called from
     /// within a tokio runtime (it spawns the QUIC subscriber task).
-    pub fn watch_agent_text_stream(
+    pub async fn watch_agent_text_stream(
         &self,
         account_ref: &str,
         group_id: &GroupId,
@@ -890,7 +931,7 @@ impl MarmotAppRuntime {
                 limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
             },
         )?;
-        let (start_message_id_hex, start) =
+        let (start_message_id_hex, start, sender_hex) =
             latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
         if start_message_id_hex.is_empty() {
             // The latest start hasn't been echoed back with a message id yet, so
@@ -907,6 +948,25 @@ impl MarmotAppRuntime {
         let stream_id = hex::decode(&start.stream_id_hex)?;
         let stream_id_hex = start.stream_id_hex.clone();
         let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+        let account = self.accounts.app.account_home().account(account_ref)?;
+        let group_state = self.group_mls_state(&account.label, group_id).await?;
+        let component_secret = self
+            .safe_export_secret(
+                &account.label,
+                group_id,
+                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            )
+            .await?;
+        let crypto = AgentTextStreamCrypto::new(
+            component_secret,
+            AgentTextStreamKeyContextV1::new(
+                group_id.clone(),
+                stream_id.clone(),
+                cgka_traits::EpochId(group_state.epoch),
+                MemberId::new(hex::decode(sender_hex)?),
+                start_event_id.clone(),
+            ),
+        );
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
         let handle = tokio::spawn(async move {
@@ -916,6 +976,7 @@ impl MarmotAppRuntime {
                 insecure_local,
                 stream_id,
                 start_event_id,
+                Some(crypto),
                 updates_tx.clone(),
             )
             .await;
@@ -980,6 +1041,17 @@ impl MarmotAppRuntime {
         self.accounts.group_mls_state(account_ref, group_id).await
     }
 
+    pub async fn safe_export_secret(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: cgka_traits::AppComponentId,
+    ) -> Result<Vec<u8>, AppError> {
+        self.accounts
+            .safe_export_secret(account_ref, group_id, component_id)
+            .await
+    }
+
     pub async fn invite_members(
         &self,
         account_ref: &str,
@@ -1019,6 +1091,17 @@ impl MarmotAppRuntime {
     ) -> Result<SendSummary, AppError> {
         self.accounts
             .update_group_profile(account_ref, group_id, name, description)
+            .await
+    }
+
+    pub async fn update_message_retention(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        disappearing_message_secs: u64,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_message_retention(account_ref, group_id, disappearing_message_secs)
             .await
     }
 
@@ -1513,6 +1596,25 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn safe_export_secret(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: cgka_traits::AppComponentId,
+    ) -> Result<Vec<u8>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SafeExportSecret {
+                group_id: group_id.clone(),
+                component_id,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn invite_members(
         &self,
         account_ref: &str,
@@ -1565,6 +1667,27 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::LeaveGroup {
                 group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        Ok(summary)
+    }
+
+    pub async fn update_message_retention(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        disappearing_message_secs: u64,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpdateMessageRetention {
+                group_id: group_id.clone(),
+                disappearing_message_secs,
                 respond,
             })
             .await
@@ -2090,6 +2213,7 @@ pub struct FetchedKeyPackage {
     pub account_id_hex: String,
     pub key_package: KeyPackage,
     pub key_package_id: String,
+    pub key_package_event_id: String,
     pub created_at: u64,
     pub source_relays: Vec<String>,
     pub relay_lists: AccountRelayListStatus,
@@ -2180,6 +2304,8 @@ impl UserDirectorySearch {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryKeyPackage {
     pub key_package_id: String,
+    #[serde(default)]
+    pub key_package_event_id: String,
     pub key_package_hex: String,
     pub created_at: u64,
     pub source_relays: Vec<String>,
@@ -2193,6 +2319,8 @@ pub struct AppGroupRecord {
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
+    #[serde(default)]
+    pub message_retention: AppGroupMessageRetentionComponent,
     #[serde(default)]
     pub agent_text_stream: AppAgentTextStreamComponent,
     #[serde(default)]
@@ -2245,6 +2373,14 @@ pub struct AppGroupAdminPolicyComponent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMessageRetentionComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub disappearing_message_secs: u64,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupNostrRoutingComponent {
     pub component_id: u16,
     pub component: String,
@@ -2260,8 +2396,6 @@ pub struct AppAgentTextStreamComponent {
     pub required: bool,
     pub required_member_roles: Vec<String>,
     pub allowed_member_roles: Vec<String>,
-    pub required_route_modes: Vec<String>,
-    pub allowed_route_modes: Vec<String>,
     pub max_plaintext_frame_len: u32,
     pub replay_ttl_secs: u32,
     pub padding_bucket_bytes: u16,
@@ -2269,6 +2403,12 @@ pub struct AppAgentTextStreamComponent {
 }
 
 impl Default for AppAgentTextStreamComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl Default for AppGroupMessageRetentionComponent {
     fn default() -> Self {
         Self::disabled()
     }
@@ -2282,6 +2422,7 @@ impl AppGroupRecord {
         profile_description: String,
         image: AppGroupImageInput,
         admin_policy: AppGroupAdminPolicyComponent,
+        message_retention: AppGroupMessageRetentionComponent,
     ) -> Self {
         let endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         Self {
@@ -2291,6 +2432,7 @@ impl AppGroupRecord {
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
             admin_policy,
+            message_retention,
             agent_text_stream: AppAgentTextStreamComponent::disabled(),
             archived: false,
         }
@@ -2301,6 +2443,7 @@ impl AppGroupRecord {
         nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
+        message_retention: AppGroupMessageRetentionComponent,
         agent_text_stream: AppAgentTextStreamComponent,
     ) -> Self {
         let (profile_name, profile_description) = group
@@ -2313,6 +2456,7 @@ impl AppGroupRecord {
             profile_description,
             AppGroupImageInput::default(),
             admin_policy,
+            message_retention,
         );
         record.agent_text_stream = agent_text_stream;
         record
@@ -2323,11 +2467,13 @@ impl AppGroupRecord {
         nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
+        message_retention: AppGroupMessageRetentionComponent,
         agent_text_stream: AppAgentTextStreamComponent,
     ) {
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
         self.admin_policy = admin_policy;
+        self.message_retention = message_retention;
         self.agent_text_stream = agent_text_stream;
         if let Some(group) = group {
             self.profile =
@@ -2409,6 +2555,42 @@ impl AppGroupAdminPolicyComponent {
     }
 }
 
+impl AppGroupMessageRetentionComponent {
+    fn new(disappearing_message_secs: u64) -> Self {
+        Self {
+            component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            component: GROUP_MESSAGE_RETENTION_COMPONENT.to_owned(),
+            disappearing_message_secs,
+            data_hex: hex::encode(disappearing_message_secs.to_be_bytes()),
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() != 8 {
+            return Self {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                component: GROUP_MESSAGE_RETENTION_COMPONENT.to_owned(),
+                disappearing_message_secs: 0,
+                data_hex: hex::encode(bytes),
+            };
+        }
+        let mut value = [0_u8; 8];
+        value.copy_from_slice(bytes);
+        Self::new(u64::from_be_bytes(value))
+    }
+
+    fn disabled() -> Self {
+        Self::new(0)
+    }
+
+    fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+}
+
 impl AppGroupNostrRoutingComponent {
     fn new(routing: NostrRoutingV1) -> Result<Self, AppError> {
         let data = encode_nostr_routing_v1(&routing).map_err(AppError::InvalidNostrRouting)?;
@@ -2445,8 +2627,6 @@ impl AppAgentTextStreamComponent {
                 required: true,
                 required_member_roles: Vec::new(),
                 allowed_member_roles: Vec::new(),
-                required_route_modes: Vec::new(),
-                allowed_route_modes: Vec::new(),
                 max_plaintext_frame_len: 0,
                 replay_ttl_secs: 0,
                 padding_bucket_bytes: 0,
@@ -2462,8 +2642,6 @@ impl AppAgentTextStreamComponent {
             required: true,
             required_member_roles: role_names(policy.required_member_roles),
             allowed_member_roles: role_names(policy.allowed_member_roles),
-            required_route_modes: route_mode_names(policy.required_route_modes),
-            allowed_route_modes: route_mode_names(policy.allowed_route_modes),
             max_plaintext_frame_len: policy.max_plaintext_frame_len,
             replay_ttl_secs: policy.replay_ttl_secs,
             padding_bucket_bytes: policy.padding_bucket_bytes,
@@ -2478,8 +2656,6 @@ impl AppAgentTextStreamComponent {
             required: false,
             required_member_roles: Vec::new(),
             allowed_member_roles: Vec::new(),
-            required_route_modes: Vec::new(),
-            allowed_route_modes: Vec::new(),
             max_plaintext_frame_len: 0,
             replay_ttl_secs: 0,
             padding_bucket_bytes: 0,
@@ -2597,6 +2773,8 @@ struct KeyPackageRecord {
     account_id_hex: String,
     #[serde(default)]
     key_package_id: String,
+    #[serde(default)]
+    key_package_event_id: String,
     key_package_hex: String,
 }
 
@@ -3276,8 +3454,7 @@ impl MarmotApp {
         let state = self.load_state(label)?;
         let keys = self.account_home().load_signing_keys(label)?;
         let account_id = MemberId::new(keys.public_key().to_bytes());
-        let peeler =
-            NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys.clone());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(keys.clone());
         let session = AccountDeviceSession::open(
             SessionConfig::new(
                 self.account_dir(label).join("session.sqlite"),
@@ -3651,6 +3828,7 @@ impl MarmotApp {
         entry.relay_lists = fetched.relay_lists.clone();
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
+            key_package_event_id: fetched.key_package_event_id.clone(),
             key_package_hex: hex::encode(&fetched.key_package.0),
             created_at: fetched.created_at,
             source_relays: fetched.source_relays.clone(),
@@ -3864,6 +4042,24 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                         let result = client.group_mls_state(&group_id);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::UpdateMessageRetention {
+                        group_id,
+                        disappearing_message_secs,
+                        respond,
+                    }) => {
+                        let result = client
+                            .update_message_retention(&group_id, disappearing_message_secs)
+                            .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::SafeExportSecret {
+                        group_id,
+                        component_id,
+                        respond,
+                    }) => {
+                        let result = client.safe_export_secret(&group_id, component_id);
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::InviteMembers {
@@ -4142,14 +4338,14 @@ impl StreamStartView {
 fn latest_agent_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
-) -> Result<(String, StreamStartView), AppError> {
+) -> Result<(String, StreamStartView, String), AppError> {
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
             let start = StreamStartView::from_event(message.kind, &message.tags)?;
             if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
-                Some((message.message_id_hex, start))
+                Some((message.message_id_hex, start, message.sender))
             } else {
                 None
             }
@@ -4205,6 +4401,7 @@ async fn watch_broker_candidates(
     insecure_local: bool,
     stream_id: Vec<u8>,
     start_event_id: MessageId,
+    crypto: Option<AgentTextStreamCrypto>,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
 ) -> RuntimeAgentStreamUpdate {
     let mut last_error = None;
@@ -4226,6 +4423,7 @@ async fn watch_broker_candidates(
                     trust,
                     stream_id: stream_id.clone(),
                     start_event_id: start_event_id.clone(),
+                    crypto: crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
                 match subscribe_text_from_broker_with_updates(config, |chunk| {
@@ -4505,6 +4703,7 @@ impl AppClient {
         fail_if_publish_failed(&effects.failures)?;
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
+        self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
     }
@@ -4607,6 +4806,31 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    pub async fn update_message_retention(
+        &mut self,
+        group_id: &GroupId,
+        disappearing_message_secs: u64,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
+            .to_app_component_data()?;
+
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![component],
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.prune_plaintext_retention_for_group(group_id)?;
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
     pub async fn send(
         &mut self,
         group_id: &GroupId,
@@ -4665,30 +4889,25 @@ impl AppClient {
         fail_if_publish_failed(&effects.failures)?;
         self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
-        let message_ids = effects
-            .reports
-            .iter()
-            .map(|report| hex::encode(report.message_id.as_slice()))
-            .collect::<Vec<_>>();
+        let app_event_id = event.id.clone();
         let projection = self.app.account_projection(&self.state.label)?;
-        for message_id_hex in &message_ids {
-            projection.record_message(&AppMessageProjection {
-                message_id_hex: message_id_hex.clone(),
-                direction: "sent".to_owned(),
-                group_id_hex: group_id_hex.clone(),
-                sender: sender.clone(),
-                plaintext: event.content.clone(),
-                kind: event.kind,
-                tags: event.tags.clone(),
-                recorded_at: None,
-            })?;
-        }
+        projection.record_message(&AppMessageProjection {
+            message_id_hex: app_event_id.clone(),
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: sender.clone(),
+            plaintext: event.content.clone(),
+            kind: event.kind,
+            tags: event.tags.clone(),
+            recorded_at: None,
+        })?;
+        self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok((
             event,
             SendSummary {
                 published: effects.reports.len(),
-                message_ids,
+                message_ids: vec![app_event_id],
             },
         ))
     }
@@ -4839,6 +5058,7 @@ impl AppClient {
         fail_if_publish_failed(&effects.failures)?;
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
+        self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
     }
@@ -4875,6 +5095,7 @@ impl AppClient {
             .collect::<Vec<_>>();
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let message_retention = self.message_retention_for_group(group_id);
         let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
@@ -4883,6 +5104,7 @@ impl AppClient {
             nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
+            message_retention,
             agent_text_stream,
         );
         self.app.save_state(&self.state)?;
@@ -5019,6 +5241,7 @@ impl AppClient {
                             .admin_pubkeys(group_id)
                             .map(AppGroupAdminPolicyComponent::new)
                             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
+                        message_retention: self.message_retention_for_group(group_id),
                         agent_text_stream: self.agent_text_stream_for_group(group_id),
                     })
                 })
@@ -5043,6 +5266,7 @@ impl AppClient {
                         tags: message.tags.clone(),
                         recorded_at: Some(source_recorded_at),
                     })?;
+                self.prune_plaintext_retention_for_group(&message.group_id)?;
             }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;
@@ -5069,6 +5293,7 @@ impl AppClient {
     fn refresh_group(&mut self, group_id: &GroupId) {
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let message_retention = self.message_retention_for_group(group_id);
         let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
             return;
@@ -5079,6 +5304,7 @@ impl AppClient {
             nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
+            message_retention,
             agent_text_stream,
         );
     }
@@ -5086,6 +5312,7 @@ impl AppClient {
     fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let message_retention = self.message_retention_for_group(group_id);
         let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
@@ -5094,6 +5321,7 @@ impl AppClient {
             nostr_routing.clone(),
             group_metadata.as_ref(),
             admin_policy,
+            message_retention,
             agent_text_stream,
         );
         self.routing
@@ -5106,6 +5334,27 @@ impl AppClient {
             .admin_pubkeys(group_id)
             .map(AppGroupAdminPolicyComponent::new)
             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new()))
+    }
+
+    fn message_retention_for_group(&self, group_id: &GroupId) -> AppGroupMessageRetentionComponent {
+        self.runtime
+            .app_component(group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
+    }
+
+    fn prune_plaintext_retention_for_group(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let retention = self.message_retention_for_group(group_id);
+        if retention.disappearing_message_secs == 0 {
+            return Ok(());
+        }
+        let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
+        self.app
+            .account_projection(&self.state.label)?
+            .prune_group_messages_before(&hex::encode(group_id.as_slice()), cutoff)?;
+        Ok(())
     }
 
     fn agent_text_stream_for_group(&self, group_id: &GroupId) -> AppAgentTextStreamComponent {
@@ -5226,17 +5475,6 @@ fn role_names(mask: u8) -> Vec<String> {
         roles.push("fanout".to_owned());
     }
     roles
-}
-
-fn route_mode_names(mask: u8) -> Vec<String> {
-    let mut modes = Vec::new();
-    if mask & AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC != 0 {
-        modes.push("direct_quic".to_owned());
-    }
-    if mask & AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC != 0 {
-        modes.push("brokered_quic".to_owned());
-    }
-    modes
 }
 
 #[derive(Clone)]
@@ -5364,14 +5602,24 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         &self,
         publication: KeyPackagePublication,
     ) -> Result<(), KeyPackagePublishError> {
-        let key_package_id = key_package_id(&publication.key_package);
+        let metadata = key_package_metadata(&publication.key_package)
+            .map_err(|e| KeyPackagePublishError(e.to_string()))?;
+        if metadata.credential_identity_hex != hex::encode(publication.account_id.as_slice()) {
+            return Err(KeyPackagePublishError(
+                "KeyPackage credential identity does not match publication account".into(),
+            ));
+        }
+        let mut slot_id = [0_u8; 32];
+        OsRng.fill_bytes(&mut slot_id);
+        let key_package_id = hex::encode(slot_id);
         let relay_client = self
             .app
             .relay_client_for_endpoints(&self.keys, &publication.endpoints);
         let nostr_publication = NostrKeyPackagePublication {
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
-            key_package_id: key_package_id.clone(),
+            key_package_slot_id: key_package_id.clone(),
+            key_package_ref: metadata.key_package_ref_hex,
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
@@ -5379,10 +5627,14 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             advertised_relays: publication.endpoints.clone(),
             publish_endpoints: publication.endpoints.clone(),
         };
-        NostrKeyPackagePublisher::new(relay_client)
+        let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_key_package(&nostr_publication)
             .await
             .map_err(|e| KeyPackagePublishError(e.to_string()))?;
+        let key_package_event_id = outcome
+            .message_id
+            .map(|message_id| hex::encode(message_id.as_slice()))
+            .unwrap_or_default();
 
         let dir = self.app.key_package_cache_dir().join(KEY_PACKAGE_DIR);
         fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError(e.to_string()))?;
@@ -5392,6 +5644,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 account_label: self.account_label.clone(),
                 account_id_hex: hex::encode(publication.account_id.as_slice()),
                 key_package_id,
+                key_package_event_id,
                 key_package_hex: hex::encode(publication.key_package.0),
             },
         )
@@ -5465,23 +5718,49 @@ fn latest_key_package_from_records(
 
 fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage, AppError> {
     let event = record.event;
+    require_key_package_tag(&event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
         .tag_value("d")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing d tag".into()))?
         .to_owned();
+    let key_package_ref = event
+        .tag_value("i")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing i tag".into()))?
+        .to_owned();
+    require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
+    require_multi_value_key_package_tag(&event, "mls_extensions")?;
+    require_multi_value_key_package_tag(&event, "mls_proposals")?;
+    require_multi_value_key_package_tag(&event, "app_components")?;
+    require_multi_value_key_package_tag(&event, "relays")?;
     let encoding = event
         .tag_value("encoding")
         .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing encoding tag".into()))?;
-    if encoding != KEY_PACKAGE_ENCODING_HEX {
+    if encoding != KEY_PACKAGE_ENCODING_BASE64 {
         return Err(AppError::InvalidKeyPackageEvent(format!(
             "unsupported encoding: {encoding}"
         )));
     }
-    let key_package_bytes = hex::decode(&event.content)?;
+    let key_package_bytes = BASE64_STANDARD
+        .decode(event.content.as_bytes())
+        .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
     if key_package_bytes.is_empty() {
         return Err(AppError::InvalidKeyPackageEvent(
             "empty key package content".into(),
+        ));
+    }
+    let key_package = KeyPackage(key_package_bytes);
+    let metadata = key_package_metadata(&key_package)
+        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    if metadata.credential_identity_hex != event.pubkey {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "transport author does not match KeyPackage credential identity".into(),
+        ));
+    }
+    if metadata.key_package_ref_hex != key_package_ref {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "i tag does not match decoded KeyPackageRef".into(),
         ));
     }
     let mut source_relays = Vec::new();
@@ -5495,16 +5774,51 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
     );
     Ok(FetchedKeyPackage {
         account_id_hex: event.pubkey,
-        key_package: KeyPackage(key_package_bytes),
+        key_package,
         key_package_id,
+        key_package_event_id: event.id,
         created_at: event.created_at,
         source_relays,
         relay_lists: AccountRelayListStatus::empty(),
     })
 }
 
-fn key_package_id(key_package: &KeyPackage) -> String {
-    hex::encode(Sha256::digest(&key_package.0))
+fn require_key_package_tag(
+    event: &NostrTransportEvent,
+    name: &str,
+    predicate: impl FnOnce(&str) -> bool,
+) -> Result<(), AppError> {
+    match event.tag_value(name) {
+        Some(value) if predicate(value) => Ok(()),
+        Some(value) => Err(AppError::InvalidKeyPackageEvent(format!(
+            "invalid {name} tag: {value}"
+        ))),
+        None => Err(AppError::InvalidKeyPackageEvent(format!(
+            "missing {name} tag"
+        ))),
+    }
+}
+
+fn require_multi_value_key_package_tag(
+    event: &NostrTransportEvent,
+    name: &str,
+) -> Result<(), AppError> {
+    let Some(tag) = event
+        .tags
+        .iter()
+        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+    else {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "missing {name} tag"
+        )));
+    };
+    if tag.iter().skip(1).any(|value| !value.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidKeyPackageEvent(format!(
+            "empty {name} tag"
+        )))
+    }
 }
 
 fn publish_endpoints_from_bootstrap(
@@ -5880,6 +6194,7 @@ struct EventGroupProjection<'a> {
     nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&'a Group>,
     admin_policy: AppGroupAdminPolicyComponent,
+    message_retention: AppGroupMessageRetentionComponent,
     agent_text_stream: AppAgentTextStreamComponent,
 }
 
@@ -5892,7 +6207,7 @@ fn decode_received_event(
     sender_hex: &str,
     sender_display_name: Option<String>,
     group_id: &GroupId,
-    source_message_id_hex: &str,
+    _source_message_id_hex: &str,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -5913,8 +6228,22 @@ fn decode_received_event(
         );
         return None;
     }
+    if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+        && event
+            .tags
+            .iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        && !media_imeta_is_valid(&event.tags)
+    {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: invalid encrypted media reference",
+        );
+        return None;
+    }
     Some(ReceivedMessage {
-        message_id_hex: source_message_id_hex.to_owned(),
+        message_id_hex: event.id,
         sender: sender_hex.to_owned(),
         sender_display_name,
         group_id: group_id.clone(),
@@ -5922,6 +6251,39 @@ fn decode_received_event(
         kind: event.kind,
         tags: event.tags,
     })
+}
+
+fn media_imeta_is_valid(tags: &[Vec<String>]) -> bool {
+    let Some(imeta) = tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
+    else {
+        return true;
+    };
+    let fields = imeta
+        .iter()
+        .skip(1)
+        .filter_map(|field| field.split_once(' '))
+        .collect::<HashMap<_, _>>();
+    let required = ["url", "m", "filename", "x", "n", "v"];
+    if required
+        .iter()
+        .any(|name| fields.get(name).is_none_or(|value| value.trim().is_empty()))
+    {
+        return false;
+    }
+    if fields.get("v") != Some(&"mip04-v2") {
+        return false;
+    }
+    match hex::decode(fields["x"]) {
+        Ok(hash) if hash.len() == 32 => {}
+        _ => return false,
+    }
+    match hex::decode(fields["n"]) {
+        Ok(nonce) if nonce.len() == 12 => {}
+        _ => return false,
+    }
+    true
 }
 
 fn observe_event(
@@ -5941,6 +6303,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.message_retention.clone(),
                     projection.agent_text_stream.clone(),
                 );
             }
@@ -5960,6 +6323,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.message_retention.clone(),
                     projection.agent_text_stream.clone(),
                 );
             }
@@ -5991,6 +6355,7 @@ fn observe_event(
                     projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
+                    projection.message_retention.clone(),
                     projection.agent_text_stream.clone(),
                 );
             }
@@ -6020,6 +6385,7 @@ fn add_group(
     nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&Group>,
     admin_policy: AppGroupAdminPolicyComponent,
+    message_retention: AppGroupMessageRetentionComponent,
     agent_text_stream: AppAgentTextStreamComponent,
 ) {
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -6032,6 +6398,7 @@ fn add_group(
             nostr_routing,
             group_metadata,
             admin_policy,
+            message_retention,
             agent_text_stream,
         );
         return;
@@ -6041,6 +6408,7 @@ fn add_group(
         nostr_routing,
         group_metadata,
         admin_policy,
+        message_retention,
         agent_text_stream,
     ));
 }
@@ -6196,8 +6564,22 @@ fn build_inner_event(
                     "agent text stream id length is out of range".into(),
                 ));
             }
+            // spec/features/agent-text-streams-quic.md:310-318 — the stream-final
+            // MUST carry the kind-1200 start event id so receivers can bind the
+            // final message to the live preview stream.
+            let start_event_id = hex::decode(&request.start_event_id).map_err(|_| {
+                AppError::InvalidAppMessagePayload(
+                    "agent text stream start event id must be 32-byte hex".into(),
+                )
+            })?;
+            if start_event_id.len() != 32 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream start event id must be 32-byte hex".into(),
+                ));
+            }
             let tags = vec![
                 vec![STREAM_TAG.to_owned(), hex::encode(&request.stream_id)],
+                vec![STREAM_START_TAG.to_owned(), request.start_event_id.clone()],
                 vec![
                     STREAM_HASH_TAG.to_owned(),
                     hex::encode(request.transcript_hash),
@@ -6528,9 +6910,12 @@ mod tests {
     fn media_intent_builds_kind_nine_with_imeta_tag() {
         let event = build(AppMessageIntent::Media {
             reference: MediaReference {
+                url: "https://media.example/a.png".to_owned(),
                 file_hash_hex: hex::encode([0x11_u8; 32]),
+                nonce_hex: hex::encode([0x22_u8; 12]),
                 file_name: "a.png".to_owned(),
                 media_type: "image/png".to_owned(),
+                version: "mip04-v2".to_owned(),
                 size_bytes: 7,
             },
             caption: Some("cap".to_owned()),
@@ -6542,9 +6927,20 @@ mod tests {
             .iter()
             .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
             .unwrap();
+        assert!(
+            imeta
+                .iter()
+                .any(|field| field == "url https://media.example/a.png")
+        );
         assert!(imeta.iter().any(|field| field == "m image/png"));
         assert!(imeta.iter().any(|field| field == "size 7"));
-        assert!(imeta.iter().any(|field| field == "name a.png"));
+        assert!(imeta.iter().any(|field| field == "filename a.png"));
+        assert!(
+            imeta
+                .iter()
+                .any(|field| field == "n 222222222222222222222222")
+        );
+        assert!(imeta.iter().any(|field| field == "v mip04-v2"));
     }
 
     #[test]
@@ -6587,9 +6983,11 @@ mod tests {
 
     #[test]
     fn stream_final_intent_builds_kind_nine_stream_final() {
+        let start_event_id = "aa".repeat(32);
         let event = build(AppMessageIntent::StreamFinal {
             request: AgentTextStreamFinishRequest {
                 stream_id: vec![0xcd; 32],
+                start_event_id: start_event_id.clone(),
                 final_text_or_reference: "done".to_owned(),
                 transcript_hash: [0xee; 32],
                 chunk_count: 3,
@@ -6602,6 +7000,10 @@ mod tests {
         assert_eq!(
             tag_value(&event.tags, STREAM_TAG),
             Some(hex::encode([0xcd; 32]).as_str())
+        );
+        assert_eq!(
+            tag_value(&event.tags, STREAM_START_TAG),
+            Some(start_event_id.as_str())
         );
         assert_eq!(
             tag_value(&event.tags, STREAM_HASH_TAG),

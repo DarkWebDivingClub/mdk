@@ -64,6 +64,7 @@ async fn round_trip_public_broker_addr(broker_addr: SocketAddr) -> Result<(), St
             trust: BrokerServerTrust::Platform,
             stream_id: subscriber_stream_id,
             start_event_id: subscriber_start_event_id,
+            crypto: None,
         })
         .await
     });
@@ -79,6 +80,7 @@ async fn round_trip_public_broker_addr(broker_addr: SocketAddr) -> Result<(), St
         text: text.clone(),
         max_chunk_bytes: 1024,
         chunk_delay: Duration::ZERO,
+        crypto: None,
     })
     .await
     .map_err(|err| format!("publish to {broker_addr} failed: {err}"))?;

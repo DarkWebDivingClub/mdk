@@ -86,8 +86,9 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
         return AutoCommitDecision::Observe;
     }
 
-    // (4) MIP-03 §150 admin-depletion guard. If the leaver is the only
-    //     admin, committing this SelfRemove would deplete admins. Refuse.
+    // (4) member-departure.md:23-26 — an admin must leave the admin set before
+    //     SelfRemove. Refuse to auto-commit any SelfRemove whose sender is
+    //     still an active admin in the prior epoch.
     //
     // Fail-closed: if we cannot read the admin set or the leaver's
     // pubkey (e.g. malformed admin extension, non-32-byte credential),
@@ -102,8 +103,7 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
         PubkeyResult::LeafMissing => None,
     };
     if let Some(leaver_pubkey) = leaver_pubkey
-        && admins.len() == 1
-        && admins[0] == leaver_pubkey
+        && admins.iter().any(|admin| admin == &leaver_pubkey)
     {
         return AutoCommitDecision::Observe;
     }

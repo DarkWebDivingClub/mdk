@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
@@ -157,6 +158,19 @@ fn welcome_for(welcomes: &[TransportMessage], recipient: &MemberId) -> Transport
         .expect("welcome for recipient")
 }
 
+fn app_payload_for(sender: &AccountDeviceSession, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(sender.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
 #[tokio::test]
 async fn session_reopens_encrypted_sqlite_group_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -246,7 +260,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
     let sent = alice
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: b"hello through session".to_vec(),
+            payload: app_payload_for(&alice, b"hello through session"),
         })
         .await
         .unwrap();
@@ -265,7 +279,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
             sender: alice.self_id(),
-            payload: b"hello through session".to_vec(),
+            payload: app_payload_for(&alice, b"hello through session"),
         }]
     );
 }
@@ -304,7 +318,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
     let sent = alice
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: b"hello after restart".to_vec(),
+            payload: app_payload_for(&alice, b"hello after restart"),
         })
         .await
         .unwrap();
@@ -323,7 +337,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
             sender: alice.self_id(),
-            payload: b"hello after restart".to_vec(),
+            payload: app_payload_for(&alice, b"hello after restart"),
         }]
     );
 }
@@ -446,7 +460,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: b"queued by session".to_vec(),
+            payload: app_payload_for(&carol, b"queued by session"),
         })
         .await
         .unwrap();

@@ -5,11 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AgentTextStreamKeyContextV1,
+};
 use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_TAG,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG,
+    STREAM_TAG,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::{GroupId, MessageId};
+use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
@@ -26,7 +30,7 @@ use transport_quic_broker::{
     subscribe_text_from_broker_with_updates,
 };
 use transport_quic_stream::{
-    QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
+    AgentTextStreamCrypto, QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
 };
 
 pub mod daemon;
@@ -888,6 +892,8 @@ enum StreamCommand {
         group: String,
         #[arg(long, value_name = "HEX", help = "Stream id to finish")]
         stream_id: String,
+        #[arg(long, value_name = "HEX", help = "Stream-start message id")]
+        start_event_id: String,
         #[arg(long, value_name = "HEX", help = "Final transcript hash")]
         transcript_hash: String,
         #[arg(long, help = "Number of streamed chunks")]
@@ -1183,85 +1189,6 @@ pub(crate) fn command_output_result(
     }
 }
 
-pub(crate) async fn run_stream_watch_local_with_observer<F>(cli: Cli, on_delta: F) -> CliOutput
-where
-    F: FnMut(AgentStreamDelta) + Send,
-{
-    let json_output = cli.json;
-    match execute_stream_watch_with_observer(cli, on_delta).await {
-        Ok(output) if json_output => CliOutput {
-            code: 0,
-            stdout: format!(
-                "{}\n",
-                serde_json::to_string(&json!({
-                    "ok": true,
-                    "result": output.json,
-                }))
-                .expect("JSON response serialization cannot fail")
-            ),
-            stderr: String::new(),
-        },
-        Ok(output) => CliOutput {
-            code: 0,
-            stdout: ensure_trailing_newline(output.plain),
-            stderr: String::new(),
-        },
-        Err(err) if json_output => json_dm_error(err),
-        Err(err) => CliOutput {
-            code: 1,
-            stdout: String::new(),
-            stderr: format!("error: {err}\n"),
-        },
-    }
-}
-
-async fn execute_stream_watch_with_observer<F>(
-    cli: Cli,
-    on_delta: F,
-) -> Result<CommandOutput, DmError>
-where
-    F: FnMut(AgentStreamDelta) + Send,
-{
-    let home = resolve_home(cli.home.clone());
-    let account_flag = cli.account.clone();
-    let command = cli.command.clone();
-    let Command::Stream {
-        command:
-            StreamCommand::Watch {
-                group,
-                stream_id,
-                server_cert_der_hex,
-                insecure_local,
-                background,
-            },
-    } = command
-    else {
-        return unsupported_command(
-            "stream watch",
-            "daemon stream observers only support stream watch",
-        );
-    };
-    let secret_store = resolve_secret_store(cli.secret_store)?;
-    let keychain_service = resolve_keychain_service(cli.keychain_service);
-    let account_home = open_account_home(&home, secret_store, &keychain_service)?;
-    let relay = resolve_relay(cli.relay)?;
-    let app = app_for(home, relay, account_home.clone());
-    stream_watch_command_app(
-        &account_home,
-        &app,
-        StreamCommand::Watch {
-            group,
-            stream_id,
-            server_cert_der_hex,
-            insecure_local,
-            background,
-        },
-        account_flag,
-        on_delta,
-    )
-    .await
-}
-
 async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, DmError)> {
     let json_output = cli.json;
     execute_inner(cli)
@@ -1275,12 +1202,19 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
     if let Command::Stream { command } = &command
-        && matches!(
-            command,
-            StreamCommand::Receive { .. } | StreamCommand::Send { .. }
-        )
+        && matches!(command, StreamCommand::Receive { .. })
     {
         return stream_command_local(command.clone()).await;
+    }
+    if let Command::Stream {
+        command:
+            stream_command @ StreamCommand::Send {
+                start_event_id: None,
+                ..
+            },
+    } = &command
+    {
+        return stream_command_local(stream_command.clone()).await;
     }
     let secret_store = resolve_secret_store(cli.secret_store)?;
     let keychain_service = resolve_keychain_service(cli.keychain_service);
@@ -3350,7 +3284,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
             let receiver = QuicTextStreamReceiver::bind(bind)?;
             let local_addr = receiver.local_addr()?;
             let server_cert_der_hex = hex::encode(receiver.server_cert_der());
-            let received = receiver.receive_once(start_event_id).await?;
+            let received = receiver.receive_once(start_event_id, None).await?;
             let stream_id = hex::encode(&received.stream_id);
             Ok(CommandOutput {
                 plain: format!(
@@ -3399,6 +3333,9 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
             let (start_event_id, anchored) = stream_start_event_id(start_event_id)?;
             if broker {
                 let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
+                if !anchored {
+                    return Err(DmError::MissingStreamStart);
+                }
                 let sent = publish_text_to_broker(PublishTextToBroker {
                     broker_addr: connect,
                     server_name: server_name.clone(),
@@ -3408,6 +3345,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                     text: text.clone(),
                     max_chunk_bytes: chunk_bytes,
                     chunk_delay: Duration::from_millis(chunk_delay_ms),
+                    crypto: None,
                 })
                 .await?;
                 return Ok(CommandOutput {
@@ -3439,6 +3377,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                 text: text.clone(),
                 max_chunk_bytes: chunk_bytes,
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
+                crypto: None,
             })
             .await?;
             Ok(CommandOutput {
@@ -3539,9 +3478,10 @@ pub(crate) async fn stream_command_app_with_runtime(
             insecure_local,
             background,
         } => {
-            stream_watch_command_app(
+            stream_watch_command_app_with_runtime(
                 account_home,
                 app,
+                runtime,
                 StreamCommand::Watch {
                     group,
                     stream_id,
@@ -3554,6 +3494,101 @@ pub(crate) async fn stream_command_app_with_runtime(
             )
             .await
         }
+        StreamCommand::Send {
+            broker,
+            connect,
+            server_name,
+            server_cert_der_hex,
+            insecure_local,
+            stream_id,
+            start_event_id,
+            chunk_bytes,
+            chunk_delay_ms,
+            text,
+        } => {
+            if text.is_empty() {
+                return Err(DmError::EmptyStreamText);
+            }
+            let text = text.join(" ");
+            let start_event_id_hex = start_event_id.ok_or(DmError::MissingStreamStart)?;
+            let expected_stream_id_hex =
+                stream_id.map(|value| normalize_hex(&value)).transpose()?;
+            let (stream_id, crypto) = stream_crypto_for_start_event(
+                account_home,
+                app,
+                runtime,
+                account_flag.as_deref(),
+                None,
+                expected_stream_id_hex.as_deref(),
+                &start_event_id_hex,
+            )
+            .await?;
+            let start_event_id = MessageId::new(hex::decode(normalize_hex(&start_event_id_hex)?)?);
+            if broker {
+                let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
+                let sent = publish_text_to_broker(PublishTextToBroker {
+                    broker_addr: connect,
+                    server_name: server_name.clone(),
+                    trust: trust.clone(),
+                    stream_id: stream_id.clone(),
+                    start_event_id,
+                    text: text.clone(),
+                    max_chunk_bytes: chunk_bytes,
+                    chunk_delay: Duration::from_millis(chunk_delay_ms),
+                    crypto: Some(crypto),
+                })
+                .await?;
+                return Ok(CommandOutput {
+                    plain: format!(
+                        "sent brokered stream {} chunks={}",
+                        hex::encode(&stream_id),
+                        sent.chunk_count
+                    ),
+                    json: json!({
+                        "brokered": true,
+                        "connect": connect.to_string(),
+                        "server_name": server_name,
+                        "trust": broker_trust_name(&trust),
+                        "stream_id": hex::encode(sent.stream_id),
+                        "anchored": true,
+                        "text_bytes": text.len(),
+                        "transcript_hash": hex::encode(sent.transcript_hash),
+                        "chunk_count": sent.chunk_count,
+                    }),
+                });
+            }
+            let trust = stream_trust(connect, server_cert_der_hex, insecure_local)?;
+            let sent = send_text_stream(SendTextStream {
+                server_addr: connect,
+                server_name: server_name.clone(),
+                trust: trust.clone(),
+                stream_id: stream_id.clone(),
+                start_event_id,
+                text: text.clone(),
+                max_chunk_bytes: chunk_bytes,
+                chunk_delay: Duration::from_millis(chunk_delay_ms),
+                crypto: Some(crypto),
+            })
+            .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "sent stream {} chunks={}",
+                    hex::encode(&stream_id),
+                    sent.chunk_count
+                ),
+                json: json!({
+                    "brokered": false,
+                    "connect": connect.to_string(),
+                    "server_name": server_name,
+                    "trust": stream_trust_name(&trust),
+                    "stream_id": hex::encode(sent.stream_id),
+                    "anchored": true,
+                    "text_bytes": text.len(),
+                    "transcript_hash": hex::encode(sent.transcript_hash),
+                    "chunk_count": sent.chunk_count,
+                }),
+            })
+        }
         StreamCommand::ComposeOpen { .. }
         | StreamCommand::ComposeAppend { .. }
         | StreamCommand::ComposeFinish { .. }
@@ -3564,6 +3599,7 @@ pub(crate) async fn stream_command_app_with_runtime(
         StreamCommand::Finish {
             group,
             stream_id,
+            start_event_id,
             transcript_hash,
             chunk_count,
             text,
@@ -3583,6 +3619,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     &group_id,
                     AgentTextStreamFinishRequest {
                         stream_id: stream_id.clone(),
+                        start_event_id,
                         final_text_or_reference: text.join(" "),
                         transcript_hash,
                         chunk_count,
@@ -3675,15 +3712,16 @@ pub(crate) async fn stream_command_app_with_runtime(
                 }),
             })
         }
-        StreamCommand::Receive { .. } | StreamCommand::Send { .. } => {
+        StreamCommand::Receive { .. } => {
             unreachable!("local QUIC stream commands return before app setup")
         }
     }
 }
 
-async fn stream_watch_command_app<F>(
+pub(crate) async fn stream_watch_command_app_with_runtime<F>(
     account_home: &AccountHome,
     app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
     command: StreamCommand,
     account_flag: Option<String>,
     mut on_delta: F,
@@ -3713,7 +3751,7 @@ where
             limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
         },
     )?;
-    let (start_message_id_hex, start_payload) =
+    let (start_message_id_hex, start_payload, _start_sender_hex) =
         latest_stream_start(messages, expected_stream_id_hex.as_deref())?;
     if start_message_id_hex.is_empty() {
         return Err(DmError::StreamStartNotConfirmed);
@@ -3731,9 +3769,19 @@ where
     let candidate = parse_quic_candidate(candidate)?;
     let candidate_addr = resolve_quic_candidate_addr(&candidate).await?;
     let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
-    let stream_id = hex::decode(&start_payload.stream_id_hex)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+    let (stream_id, crypto) = stream_crypto_for_start_event(
+        account_home,
+        app,
+        runtime,
+        account_flag.as_deref(),
+        Some(&group_id_hex),
+        Some(&stream_id_hex),
+        &start_message_id_hex,
+    )
+    .await?;
+    let crypto = Some(crypto);
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
     let delta_stream_id = stream_id_hex.clone();
@@ -3744,6 +3792,7 @@ where
             trust: trust.clone(),
             stream_id,
             start_event_id,
+            crypto,
         },
         |chunk| {
             on_delta(AgentStreamDelta {
@@ -3798,19 +3847,104 @@ fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, b
 fn latest_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
-) -> Result<(String, StreamStartView), DmError> {
+) -> Result<(String, StreamStartView, String), DmError> {
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
             let start = StreamStartView::from_event(message.kind, &message.tags)?;
             if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
-                Some((message.message_id_hex, start))
+                Some((message.message_id_hex, start, message.sender))
             } else {
                 None
             }
         })
         .ok_or(DmError::MissingStreamStart)
+}
+
+pub(crate) async fn stream_crypto_for_start_event(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    account_hint: Option<&str>,
+    group_id_hex: Option<&str>,
+    stream_id_hex: Option<&str>,
+    start_message_id_hex: &str,
+) -> Result<(Vec<u8>, AgentTextStreamCrypto), DmError> {
+    let start_message_id_hex = normalize_hex(start_message_id_hex)?;
+    let group_id_hex = group_id_hex.map(normalize_group_id_hex).transpose()?;
+    let stream_id_hex = stream_id_hex.map(normalize_hex).transpose()?;
+    let mut accounts = Vec::new();
+    if let Some(account) = account_hint.filter(|hint| !hint.trim().is_empty()) {
+        accounts.push(resolve_account(account_home, Some(account.to_owned()))?);
+    }
+    for account in account_home.accounts()? {
+        if account.local_signing
+            && !accounts
+                .iter()
+                .any(|existing| existing.account_id_hex == account.account_id_hex)
+        {
+            accounts.push(account);
+        }
+    }
+
+    for account in accounts {
+        if !account.local_signing {
+            continue;
+        }
+        let messages = app.messages_with_query(
+            &account.label,
+            AppMessageQuery {
+                group_id_hex: group_id_hex.clone(),
+                limit: None,
+            },
+        )?;
+        for message in messages.into_iter().rev() {
+            if message.message_id_hex != start_message_id_hex {
+                continue;
+            }
+            let Some(start) = StreamStartView::from_event(message.kind, &message.tags) else {
+                continue;
+            };
+            if stream_id_hex
+                .as_deref()
+                .is_some_and(|stream_id| stream_id != start.stream_id_hex)
+            {
+                continue;
+            }
+            let group_id = GroupId::new(hex::decode(&message.group_id_hex)?);
+            let stream_id = hex::decode(&start.stream_id_hex)?;
+            let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+            let group_state = match runtime.group_mls_state(&account.label, &group_id).await {
+                Ok(group_state) => group_state,
+                Err(_) => continue,
+            };
+            let component_secret = match runtime
+                .safe_export_secret(
+                    &account.label,
+                    &group_id,
+                    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+                )
+                .await
+            {
+                Ok(secret) => secret,
+                Err(_) => continue,
+            };
+            let crypto = AgentTextStreamCrypto::new(
+                component_secret,
+                AgentTextStreamKeyContextV1::new(
+                    group_id,
+                    stream_id.clone(),
+                    EpochId(group_state.epoch),
+                    MemberId::new(hex::decode(message.sender)?),
+                    start_event_id,
+                ),
+            );
+            return Ok((stream_id, crypto));
+        }
+    }
+
+    Err(DmError::MissingStreamStart)
 }
 
 struct ParsedQuicCandidate {
@@ -3933,6 +4067,7 @@ fn agent_text_stream_payload_value(
         return Some(json!({
             "kind": "final",
             "stream_id": tag_value(tags, STREAM_TAG).unwrap_or_default(),
+            "start_event_id": tag_value(tags, STREAM_START_TAG).unwrap_or_default(),
             "final_text_or_reference": content,
             "transcript_hash": tag_value(tags, STREAM_HASH_TAG).unwrap_or_default(),
             "chunk_count": tag_value(tags, STREAM_CHUNKS_TAG)
@@ -4297,8 +4432,11 @@ fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
                 "direction": message.direction,
                 "group_id": message.group_id_hex,
                 "from": message.sender,
+                "url": imeta.get("url").cloned().unwrap_or_default(),
                 "file_hash_hex": imeta.get("x").cloned().unwrap_or_default(),
-                "file_name": imeta.get("name").cloned().unwrap_or_default(),
+                "file_name": imeta.get("filename").cloned().unwrap_or_default(),
+                "nonce_hex": imeta.get("n").cloned().unwrap_or_default(),
+                "version": imeta.get("v").cloned().unwrap_or_default(),
                 "media_type": imeta.get("m").cloned().unwrap_or_default(),
                 "size_bytes": imeta
                     .get("size")

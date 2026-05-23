@@ -598,7 +598,8 @@ mod tests {
         let dto = NostrKeyPackagePublication {
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
             key_package: KeyPackage(vec![1, 2, 3, 4]),
-            key_package_id: "kp-ref-1".into(),
+            key_package_slot_id: "slot-1".into(),
+            key_package_ref: "bb".repeat(32),
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],

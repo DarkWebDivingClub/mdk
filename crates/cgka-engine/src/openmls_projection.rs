@@ -1343,16 +1343,23 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();
-                observations.push(OpenMlsReplayObservation::ApplicationProcessed {
-                    message_id,
-                    source_epoch,
-                    sender,
-                    payload: payload.clone(),
-                    decrypted_payload_ref: format!(
-                        "sha256:{}",
-                        hex::encode(message_digest(payload.as_slice()))
-                    ),
-                });
+                if crate::app_payload::app_payload_is_valid_for_sender(&payload, &sender) {
+                    observations.push(OpenMlsReplayObservation::ApplicationProcessed {
+                        message_id,
+                        source_epoch,
+                        sender,
+                        payload: payload.clone(),
+                        decrypted_payload_ref: format!(
+                            "sha256:{}",
+                            hex::encode(message_digest(payload.as_slice()))
+                        ),
+                    });
+                } else {
+                    observations.push(OpenMlsReplayObservation::Ignored {
+                        message_id,
+                        kind: projection.kind,
+                    });
+                }
             }
             ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
                 observations.push(OpenMlsReplayObservation::Ignored {
@@ -1461,12 +1468,13 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
                         ));
                     }
                     AppDataUpdateOperation::Remove => {
-                        crate::app_components::validate_app_component_remove(update.component_id())
-                            .map_err(|_| {
-                                ProcessMessageError::ValidationError(
-                                    ValidationError::WrongWireFormat,
-                                )
-                            })?;
+                        crate::app_components::validate_app_component_remove(
+                            mls_group,
+                            update.component_id(),
+                        )
+                        .map_err(|_| {
+                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                        })?;
                         updater.remove(&update.component_id());
                     }
                 }

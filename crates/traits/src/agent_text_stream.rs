@@ -31,11 +31,6 @@ pub const AGENT_TEXT_STREAM_ROLE_FANOUT: u8 = 0x04;
 pub const AGENT_TEXT_STREAM_ROLE_MASK: u8 =
     AGENT_TEXT_STREAM_ROLE_RECEIVE | AGENT_TEXT_STREAM_ROLE_SEND | AGENT_TEXT_STREAM_ROLE_FANOUT;
 
-pub const AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC: u8 = 0x01;
-pub const AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC: u8 = 0x02;
-pub const AGENT_TEXT_STREAM_ROUTE_MASK: u8 =
-    AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC | AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC;
-
 pub const AGENT_TEXT_STREAM_RECORD_TEXT_DELTA: u8 = 0x01;
 pub const AGENT_TEXT_STREAM_RECORD_TOOL_DELTA: u8 = 0x02;
 pub const AGENT_TEXT_STREAM_RECORD_STATUS: u8 = 0x03;
@@ -49,12 +44,15 @@ pub const AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN: u32 = 64 * 1024;
 pub const AGENT_TEXT_STREAM_MAX_REPLAY_TTL_SECS: u32 = 5 * 60;
 pub const AGENT_TEXT_STREAM_MAX_PADDING_BUCKET_BYTES: u16 = 4096;
 
+/// Encoded `0x8006` component state length in bytes: `required_member_roles`
+/// (u8), `allowed_member_roles` (u8), `max_plaintext_frame_len` (u32),
+/// `replay_ttl_secs` (u32), `padding_bucket_bytes` (u16).
+pub const AGENT_TEXT_STREAM_COMPONENT_STATE_LEN: usize = 12;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTextStreamQuicPolicyV1 {
     pub required_member_roles: u8,
     pub allowed_member_roles: u8,
-    pub required_route_modes: u8,
-    pub allowed_route_modes: u8,
     pub max_plaintext_frame_len: u32,
     pub replay_ttl_secs: u32,
     pub padding_bucket_bytes: u16,
@@ -65,8 +63,6 @@ impl AgentTextStreamQuicPolicyV1 {
         Self {
             required_member_roles: AGENT_TEXT_STREAM_ROLE_RECEIVE,
             allowed_member_roles: AGENT_TEXT_STREAM_ROLE_RECEIVE | AGENT_TEXT_STREAM_ROLE_SEND,
-            required_route_modes: AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC,
-            allowed_route_modes: AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC,
             max_plaintext_frame_len: 4096,
             replay_ttl_secs: 0,
             padding_bucket_bytes: 0,
@@ -75,11 +71,9 @@ impl AgentTextStreamQuicPolicyV1 {
 
     pub fn encode_component_state(&self) -> Result<Vec<u8>, AgentTextStreamPolicyError> {
         self.validate()?;
-        let mut out = Vec::with_capacity(14);
+        let mut out = Vec::with_capacity(AGENT_TEXT_STREAM_COMPONENT_STATE_LEN);
         out.push(self.required_member_roles);
         out.push(self.allowed_member_roles);
-        out.push(self.required_route_modes);
-        out.push(self.allowed_route_modes);
         out.extend_from_slice(&self.max_plaintext_frame_len.to_be_bytes());
         out.extend_from_slice(&self.replay_ttl_secs.to_be_bytes());
         out.extend_from_slice(&self.padding_bucket_bytes.to_be_bytes());
@@ -87,7 +81,7 @@ impl AgentTextStreamQuicPolicyV1 {
     }
 
     pub fn decode_component_state(bytes: &[u8]) -> Result<Self, AgentTextStreamPolicyError> {
-        if bytes.len() != 14 {
+        if bytes.len() != AGENT_TEXT_STREAM_COMPONENT_STATE_LEN {
             return Err(AgentTextStreamPolicyError::InvalidComponentStateLength(
                 bytes.len(),
             ));
@@ -95,20 +89,18 @@ impl AgentTextStreamQuicPolicyV1 {
         let policy = Self {
             required_member_roles: bytes[0],
             allowed_member_roles: bytes[1],
-            required_route_modes: bytes[2],
-            allowed_route_modes: bytes[3],
             max_plaintext_frame_len: u32::from_be_bytes(
-                bytes[4..8]
+                bytes[2..6]
                     .try_into()
                     .expect("slice length checked by component state length"),
             ),
             replay_ttl_secs: u32::from_be_bytes(
-                bytes[8..12]
+                bytes[6..10]
                     .try_into()
                     .expect("slice length checked by component state length"),
             ),
             padding_bucket_bytes: u16::from_be_bytes(
-                bytes[12..14]
+                bytes[10..12]
                     .try_into()
                     .expect("slice length checked by component state length"),
             ),
@@ -140,22 +132,6 @@ impl AgentTextStreamQuicPolicyV1 {
         }
         if self.required_member_roles & !self.allowed_member_roles != 0 {
             return Err(AgentTextStreamPolicyError::RequiredRolesNotAllowed);
-        }
-        if self.required_route_modes == 0 {
-            return Err(AgentTextStreamPolicyError::EmptyRequiredRoutes);
-        }
-        if self.required_route_modes & !AGENT_TEXT_STREAM_ROUTE_MASK != 0 {
-            return Err(AgentTextStreamPolicyError::UnknownRequiredRouteBits(
-                self.required_route_modes,
-            ));
-        }
-        if self.allowed_route_modes & !AGENT_TEXT_STREAM_ROUTE_MASK != 0 {
-            return Err(AgentTextStreamPolicyError::UnknownAllowedRouteBits(
-                self.allowed_route_modes,
-            ));
-        }
-        if self.required_route_modes & !self.allowed_route_modes != 0 {
-            return Err(AgentTextStreamPolicyError::RequiredRoutesNotAllowed);
         }
         if self.max_plaintext_frame_len == 0 {
             return Err(AgentTextStreamPolicyError::EmptyFrameLimit);
@@ -189,17 +165,9 @@ pub enum AgentTextStreamPolicyError {
     UnknownAllowedRoleBits(u8),
     #[error("required agent text stream roles must be a subset of allowed roles")]
     RequiredRolesNotAllowed,
-    #[error("required agent text stream route modes cannot be empty")]
-    EmptyRequiredRoutes,
-    #[error("required agent text stream route mask contains unknown bits: {0:#04x}")]
-    UnknownRequiredRouteBits(u8),
-    #[error("allowed agent text stream route mask contains unknown bits: {0:#04x}")]
-    UnknownAllowedRouteBits(u8),
-    #[error("required agent text stream routes must be a subset of allowed routes")]
-    RequiredRoutesNotAllowed,
     #[error("agent text stream plaintext frame limit cannot be zero")]
     EmptyFrameLimit,
-    #[error("agent text stream component state must be 14 bytes, got {0}")]
+    #[error("agent text stream component state must be 12 bytes, got {0}")]
     InvalidComponentStateLength(usize),
     #[error("agent text stream plaintext frame limit exceeds app profile max: {0}")]
     FrameLimitTooLarge(u32),
@@ -477,8 +445,6 @@ mod tests {
             vec![
                 AGENT_TEXT_STREAM_ROLE_RECEIVE,
                 AGENT_TEXT_STREAM_ROLE_RECEIVE | AGENT_TEXT_STREAM_ROLE_SEND,
-                AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC,
-                AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC,
                 0x00,
                 0x00,
                 0x10,
@@ -491,6 +457,7 @@ mod tests {
                 0x00,
             ]
         );
+        assert_eq!(bytes.len(), AGENT_TEXT_STREAM_COMPONENT_STATE_LEN);
         assert_eq!(
             AgentTextStreamQuicPolicyV1::decode_component_state(&bytes).unwrap(),
             AgentTextStreamQuicPolicyV1::user_to_agent_default()
@@ -526,14 +493,26 @@ mod tests {
             Err(AgentTextStreamPolicyError::PaddingBucketTooLarge(_))
         ));
 
-        let direct_required_but_not_allowed = AgentTextStreamQuicPolicyV1 {
-            required_route_modes: AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC,
-            allowed_route_modes: AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC,
+        let required_role_not_allowed = AgentTextStreamQuicPolicyV1 {
+            required_member_roles: AGENT_TEXT_STREAM_ROLE_SEND,
+            allowed_member_roles: AGENT_TEXT_STREAM_ROLE_RECEIVE,
             ..AgentTextStreamQuicPolicyV1::user_to_agent_default()
         };
         assert!(matches!(
-            direct_required_but_not_allowed.validate(),
-            Err(AgentTextStreamPolicyError::RequiredRoutesNotAllowed)
+            required_role_not_allowed.validate(),
+            Err(AgentTextStreamPolicyError::RequiredRolesNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length_component_state() {
+        assert!(matches!(
+            AgentTextStreamQuicPolicyV1::decode_component_state(&[0u8; 14]),
+            Err(AgentTextStreamPolicyError::InvalidComponentStateLength(14))
+        ));
+        assert!(matches!(
+            AgentTextStreamQuicPolicyV1::decode_component_state(&[0u8; 11]),
+            Err(AgentTextStreamPolicyError::InvalidComponentStateLength(11))
         ));
     }
 

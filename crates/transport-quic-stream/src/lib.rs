@@ -4,20 +4,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordError, AgentTextStreamRecordV1,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_VERSION,
+    AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
 };
+use cgka_traits::app_components::encode_quic_varint;
 use cgka_traits::{MessageId, agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rand::{RngCore, rngs::OsRng};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
+const AEAD_TAG_LEN: usize = 16;
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -45,6 +51,7 @@ impl QuicTextStreamReceiver {
     pub async fn receive_once(
         self,
         start_event_id: MessageId,
+        crypto: Option<AgentTextStreamCrypto>,
     ) -> Result<ReceivedTextStream, QuicTextStreamError> {
         let incoming = self
             .endpoint
@@ -60,6 +67,11 @@ impl QuicTextStreamReceiver {
         let mut transcript = None;
 
         while let Some(record) = read_record(&mut recv).await? {
+            let record = if let Some(crypto) = &crypto {
+                decrypt_record(crypto, &record)?
+            } else {
+                record
+            };
             if record.seq != expected_seq {
                 return Err(QuicTextStreamError::UnexpectedSequence {
                     expected: expected_seq,
@@ -126,6 +138,7 @@ pub struct SendTextStream {
     pub text: String,
     pub max_chunk_bytes: usize,
     pub chunk_delay: Duration,
+    pub crypto: Option<AgentTextStreamCrypto>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +172,21 @@ pub struct ReceivedTextChunk {
     pub text: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentTextStreamCrypto {
+    pub component_secret: Vec<u8>,
+    pub context: AgentTextStreamKeyContextV1,
+}
+
+impl AgentTextStreamCrypto {
+    pub fn new(component_secret: Vec<u8>, context: AgentTextStreamKeyContextV1) -> Self {
+        Self {
+            component_secret,
+            context,
+        }
+    }
+}
+
 pub async fn send_text_stream(
     config: SendTextStream,
 ) -> Result<SentTextStream, QuicTextStreamError> {
@@ -166,6 +194,14 @@ pub async fn send_text_stream(
         return Err(QuicTextStreamError::EmptyChunkSize);
     }
     if config.max_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
+        return Err(QuicTextStreamError::ChunkSizeTooLarge(
+            config.max_chunk_bytes,
+        ));
+    }
+    if config.crypto.is_some()
+        && config.max_chunk_bytes + AEAD_TAG_LEN
+            > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
+    {
         return Err(QuicTextStreamError::ChunkSizeTooLarge(
             config.max_chunk_bytes,
         ));
@@ -185,7 +221,12 @@ pub async fn send_text_stream(
     {
         let record =
             AgentTextStreamRecordV1::text_delta(config.stream_id.clone(), index as u64 + 1, chunk);
-        write_record(&mut send, &record).await?;
+        let wire_record = if let Some(crypto) = &config.crypto {
+            encrypt_record(crypto, &record)?
+        } else {
+            record.clone()
+        };
+        write_record(&mut send, &wire_record).await?;
         transcript.append(record.seq, record.record_type, &record.plaintext_frame);
         if !config.chunk_delay.is_zero() {
             sleep(config.chunk_delay).await;
@@ -232,6 +273,128 @@ pub fn split_text_deltas(text: &str, max_chunk_bytes: usize) -> Vec<Vec<u8>> {
         chunks.push(current.into_bytes());
     }
     chunks
+}
+
+pub fn encrypt_record(
+    crypto: &AgentTextStreamCrypto,
+    record: &AgentTextStreamRecordV1,
+) -> Result<AgentTextStreamRecordV1, QuicTextStreamError> {
+    validate_crypto_record_context(crypto, record)?;
+    if record.plaintext_frame.len() + AEAD_TAG_LEN
+        > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
+    {
+        return Err(QuicTextStreamError::EncryptedFrameTooLarge(
+            record.plaintext_frame.len(),
+        ));
+    }
+    let key = derive_record_key(crypto);
+    let nonce = derive_record_nonce(crypto, record.seq);
+    let aad = record_aad(crypto, record);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| QuicTextStreamError::Crypto("invalid record key".into()))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &record.plaintext_frame,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| QuicTextStreamError::Crypto("record encryption failed".into()))?;
+    Ok(AgentTextStreamRecordV1 {
+        plaintext_frame: ciphertext,
+        ..record.clone()
+    })
+}
+
+pub fn decrypt_record(
+    crypto: &AgentTextStreamCrypto,
+    record: &AgentTextStreamRecordV1,
+) -> Result<AgentTextStreamRecordV1, QuicTextStreamError> {
+    validate_crypto_record_context(crypto, record)?;
+    if record.plaintext_frame.len() < AEAD_TAG_LEN {
+        return Err(QuicTextStreamError::Crypto(
+            "encrypted record frame is shorter than the AEAD tag".into(),
+        ));
+    }
+    let key = derive_record_key(crypto);
+    let nonce = derive_record_nonce(crypto, record.seq);
+    let aad = record_aad(crypto, record);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| QuicTextStreamError::Crypto("invalid record key".into()))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &record.plaintext_frame,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| QuicTextStreamError::Crypto("record decryption failed".into()))?;
+    Ok(AgentTextStreamRecordV1 {
+        plaintext_frame: plaintext,
+        ..record.clone()
+    })
+}
+
+fn validate_crypto_record_context(
+    crypto: &AgentTextStreamCrypto,
+    record: &AgentTextStreamRecordV1,
+) -> Result<(), QuicTextStreamError> {
+    if crypto.component_secret.is_empty() {
+        return Err(QuicTextStreamError::Crypto(
+            "missing agent text stream component secret".into(),
+        ));
+    }
+    if crypto.context.stream_id != record.stream_id {
+        return Err(QuicTextStreamError::MixedStreamIds);
+    }
+    Ok(())
+}
+
+fn derive_record_key(crypto: &AgentTextStreamCrypto) -> [u8; 32] {
+    derive_bytes(crypto, b"record key")
+}
+
+fn derive_record_nonce(crypto: &AgentTextStreamCrypto, seq: u64) -> [u8; 12] {
+    let base = derive_bytes(crypto, b"record nonce");
+    let mut nonce = [0_u8; 12];
+    nonce.copy_from_slice(&base[..12]);
+    let seq = (seq as u128).to_be_bytes();
+    for (byte, seq_byte) in nonce.iter_mut().zip(seq[4..].iter()) {
+        *byte ^= *seq_byte;
+    }
+    nonce
+}
+
+fn derive_bytes(crypto: &AgentTextStreamCrypto, label: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot agent text stream quic aead v1");
+    encode_hash_part(&mut hasher, &crypto.component_secret);
+    encode_hash_part(&mut hasher, label);
+    encode_hash_part(&mut hasher, &crypto.context.encode());
+    hasher.finalize().into()
+}
+
+fn record_aad(crypto: &AgentTextStreamCrypto, record: &AgentTextStreamRecordV1) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(AGENT_TEXT_STREAM_RECORD_VERSION);
+    let group_hash = Sha256::digest(crypto.context.group_id.as_slice());
+    out.extend_from_slice(&group_hash);
+    encode_quic_varint(record.stream_id.len() as u64, &mut out);
+    out.extend_from_slice(&record.stream_id);
+    out.extend_from_slice(&crypto.context.mls_epoch.0.to_be_bytes());
+    encode_quic_varint(crypto.context.sender_id.as_slice().len() as u64, &mut out);
+    out.extend_from_slice(crypto.context.sender_id.as_slice());
+    out.extend_from_slice(&record.seq.to_be_bytes());
+    out.push(record.record_type);
+    out.push(record.flags);
+    out
+}
+
+fn encode_hash_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
@@ -427,10 +590,14 @@ pub enum QuicTextStreamError {
     EmptyChunkSize,
     #[error("agent text stream chunk size exceeds app profile max: {0}")]
     ChunkSizeTooLarge(usize),
+    #[error("agent text stream encrypted frame would exceed app profile max: plaintext {0}")]
+    EncryptedFrameTooLarge(usize),
     #[error("agent text stream mixed stream ids in one QUIC stream")]
     MixedStreamIds,
     #[error("agent text stream sequence mismatch: expected {expected}, got {actual}")]
     UnexpectedSequence { expected: u64, actual: u64 },
+    #[error("agent text stream crypto failed: {0}")]
+    Crypto(String),
 }
 
 #[cfg(test)]
@@ -469,6 +636,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn crypto_seals_record_body_and_round_trips() {
+        let stream_id = vec![0x42; 32];
+        let crypto = AgentTextStreamCrypto::new(
+            vec![0x07; 32],
+            AgentTextStreamKeyContextV1::new(
+                cgka_traits::GroupId::new(vec![0x01; 32]),
+                stream_id.clone(),
+                cgka_traits::EpochId(3),
+                cgka_traits::MemberId::new(vec![0x02; 32]),
+                MessageId::new(vec![0x24; 32]),
+            ),
+        );
+        let record = AgentTextStreamRecordV1::text_delta(stream_id, 1, b"hello".to_vec());
+        let sealed = encrypt_record(&crypto, &record).unwrap();
+        assert_ne!(sealed.plaintext_frame, b"hello");
+        assert!(
+            !sealed
+                .encode()
+                .unwrap()
+                .windows(b"hello".len())
+                .any(|window| window == b"hello")
+        );
+
+        let opened = decrypt_record(&crypto, &sealed).unwrap();
+        assert_eq!(opened, record);
+    }
+
     #[tokio::test]
     async fn insecure_local_rejects_remote_server_addr() {
         let err = send_text_stream(SendTextStream {
@@ -480,6 +675,7 @@ mod tests {
             text: "hello".to_owned(),
             max_chunk_bytes: 5,
             chunk_delay: Duration::ZERO,
+            crypto: None,
         })
         .await
         .unwrap_err();
@@ -497,7 +693,7 @@ mod tests {
         let server_cert = receiver.server_cert_der().to_vec();
         let stream_id = vec![0x42; 32];
         let start_event_id = MessageId::new(vec![0x24; 32]);
-        let receive = tokio::spawn(receiver.receive_once(start_event_id.clone()));
+        let receive = tokio::spawn(receiver.receive_once(start_event_id.clone(), None));
 
         let sent = send_text_stream(SendTextStream {
             server_addr,
@@ -508,6 +704,7 @@ mod tests {
             text: "hello over quic".to_owned(),
             max_chunk_bytes: 5,
             chunk_delay: Duration::ZERO,
+            crypto: None,
         })
         .await
         .unwrap();

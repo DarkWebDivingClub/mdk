@@ -178,7 +178,8 @@ async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
             matches!(
                 event,
                 GroupEvent::MessageReceived { payload, .. }
-                    if payload == b"epoch-one-delayed"
+                    if cgka_conformance_simulator::client::decode_harness_app_payload(payload)
+                        == b"epoch-one-delayed"
             )
         }),
         "expected delayed payload after retained-anchor peel, got {events:?}"
@@ -1629,7 +1630,9 @@ fn assert_canonical_application_event(
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            GroupEvent::MessageReceived { payload, .. } => {
+                Some(cgka_conformance_simulator::client::decode_harness_app_payload(payload))
+            }
             _ => None,
         })
         .collect();

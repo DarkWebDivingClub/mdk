@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{MemberId, MessageId, TransportAdapterError, TransportEndpoint};
+use nostr::base64::Engine as _;
+use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::{NostrPublishOutcome, NostrRelayClient};
 
 pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
 pub const KIND_MARMOT_KEY_PACKAGE_RELAY_LIST: u64 = 10_051;
-pub const KEY_PACKAGE_ENCODING_HEX: &str = "hex";
+pub const KEY_PACKAGE_ENCODING_BASE64: &str = "base64";
 
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";
+const MLS_PROTOCOL_VERSION_TAG: &str = "mls_protocol_version";
 const MLS_CIPHERSUITE_TAG: &str = "mls_ciphersuite";
 const MLS_EXTENSIONS_TAG: &str = "mls_extensions";
 const MLS_PROPOSALS_TAG: &str = "mls_proposals";
@@ -23,7 +26,8 @@ const RELAYS_TAG: &str = "relays";
 pub struct NostrKeyPackagePublication {
     pub account_id: MemberId,
     pub key_package: KeyPackage,
-    pub key_package_id: String,
+    pub key_package_slot_id: String,
+    pub key_package_ref: String,
     pub mls_ciphersuite: String,
     pub mls_extensions: Vec<String>,
     pub mls_proposals: Vec<String>,
@@ -39,9 +43,14 @@ impl NostrKeyPackagePublication {
                 "Marmot KeyPackage account id must be a 32-byte Nostr pubkey".into(),
             ));
         }
-        if self.key_package_id.is_empty() {
+        if self.key_package_slot_id.is_empty() {
             return Err(TransportAdapterError::Publish(
                 "Marmot KeyPackage d tag must not be empty".into(),
+            ));
+        }
+        if self.key_package_ref.is_empty() {
+            return Err(TransportAdapterError::Publish(
+                "Marmot KeyPackage i tag must not be empty".into(),
             ));
         }
         if self.mls_ciphersuite.is_empty() {
@@ -77,13 +86,14 @@ impl NostrKeyPackagePublication {
 
         let identity = hex::encode(self.account_id.as_slice());
         let tags = vec![
-            vec![D_TAG.into(), self.key_package_id.clone()],
-            vec![IDENTITY_TAG.into(), identity.clone()],
+            vec![D_TAG.into(), self.key_package_slot_id.clone()],
+            vec![MLS_PROTOCOL_VERSION_TAG.into(), "1.0".into()],
+            vec![IDENTITY_TAG.into(), self.key_package_ref.clone()],
             vec![MLS_CIPHERSUITE_TAG.into(), self.mls_ciphersuite.clone()],
             values_tag(MLS_EXTENSIONS_TAG, &self.mls_extensions),
             values_tag(MLS_PROPOSALS_TAG, &self.mls_proposals),
             values_tag(APP_COMPONENTS_TAG, &self.app_components),
-            vec![ENCODING_TAG.into(), KEY_PACKAGE_ENCODING_HEX.into()],
+            vec![ENCODING_TAG.into(), KEY_PACKAGE_ENCODING_BASE64.into()],
             values_tag(
                 RELAYS_TAG,
                 &self
@@ -98,7 +108,7 @@ impl NostrKeyPackagePublication {
             identity,
             KIND_MARMOT_KEY_PACKAGE,
             tags,
-            hex::encode(&self.key_package.0),
+            BASE64_STANDARD.encode(&self.key_package.0),
         ))
     }
 }
@@ -127,9 +137,15 @@ impl NostrKeyPackagePublisher {
         publication: &NostrKeyPackagePublication,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         let event = publication.to_event()?;
-        self.relay_client
+        let event_id = MessageId::new(hex::decode(&event.id).map_err(|err| {
+            TransportAdapterError::Publish(format!("invalid KeyPackage event id: {err}"))
+        })?);
+        let mut outcome = self
+            .relay_client
             .publish_event(&publication.publish_endpoints, &event, self.required_acks)
-            .await
+            .await?;
+        outcome.message_id.get_or_insert(event_id);
+        Ok(outcome)
     }
 }
 
@@ -191,19 +207,19 @@ mod tests {
     }
 
     #[test]
-    fn marmot_key_package_event_uses_kind_30443_and_mip00_tags() {
+    fn marmot_key_package_event_uses_kind_30443_and_marmot_tags() {
         let publication = sample_publication();
 
         let event = publication.to_event().unwrap();
 
         assert_eq!(event.kind, KIND_MARMOT_KEY_PACKAGE);
         assert_eq!(event.pubkey, "a1".repeat(32));
-        assert_eq!(event.content, "01020304");
-        let identity = "a1".repeat(32);
-        assert_eq!(tag(&event, "d"), Some("kp-ref-1"));
-        assert_eq!(tag(&event, "i"), Some(identity.as_str()));
+        assert_eq!(event.content, "AQIDBA==");
+        assert_eq!(tag(&event, "d"), Some("slot-1"));
+        assert_eq!(tag(&event, "mls_protocol_version"), Some("1.0"));
+        assert_eq!(tag(&event, "i"), Some("bb".repeat(32).as_str()));
         assert_eq!(tag(&event, "mls_ciphersuite"), Some("0x0001"));
-        assert_eq!(tag(&event, "encoding"), Some(KEY_PACKAGE_ENCODING_HEX));
+        assert_eq!(tag(&event, "encoding"), Some(KEY_PACKAGE_ENCODING_BASE64));
         assert_eq!(
             event
                 .tags
@@ -253,7 +269,8 @@ mod tests {
         NostrKeyPackagePublication {
             account_id: MemberId::new(vec![0xA1; 32]),
             key_package: KeyPackage(vec![1, 2, 3, 4]),
-            key_package_id: "kp-ref-1".into(),
+            key_package_slot_id: "slot-1".into(),
+            key_package_ref: "bb".repeat(32),
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],

@@ -6,6 +6,7 @@ use crate::bus::{ClientId, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
@@ -34,6 +35,7 @@ pub struct HarnessClient {
     /// Default group_id used to set transport_group_id on outbound + inbound
     /// envelopes. Set automatically after the first create/join.
     default_group: Option<GroupId>,
+    app_event_counter: u64,
 }
 
 pub struct ClientBuilder {
@@ -62,8 +64,7 @@ impl ClientBuilder {
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage = MemoryStorage::new();
-        let peeler = NostrMlsPeeler::new(self.signer.public_key().to_hex())
-            .with_welcome_signer(self.signer.clone());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
         let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
             .feature_registry(self.registry.clone())
@@ -81,6 +82,7 @@ impl ClientBuilder {
             registry: self.registry,
             pending_events: Vec::new(),
             default_group: None,
+            app_event_counter: 0,
         }
     }
 }
@@ -145,8 +147,7 @@ impl HarnessClient {
     }
 
     pub fn restart(&mut self) {
-        let peeler = NostrMlsPeeler::new(self.signer.public_key().to_hex())
-            .with_welcome_signer(self.signer.clone());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
         let mut engine = EngineBuilder::new(self.storage.clone())
             .identity(self.identity.clone())
             .feature_registry(self.registry.clone())
@@ -339,11 +340,12 @@ impl HarnessClient {
             .default_group
             .clone()
             .expect("must create or join a group first");
+        let payload = self.next_app_payload(payload.into());
         let res = self
             .engine
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
-                payload: payload.into(),
+                payload,
             })
             .await
             .expect("send app");
@@ -363,11 +365,12 @@ impl HarnessClient {
             .default_group
             .clone()
             .expect("must create or join a group first");
+        let payload = self.next_app_payload(payload.into());
         let res = self
             .engine
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
-                payload: payload.into(),
+                payload,
             })
             .await
             .expect("send app");
@@ -505,6 +508,15 @@ impl HarnessClient {
         self.default_group.clone().expect("group")
     }
 
+    fn next_app_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {
+        let seq = self.app_event_counter;
+        self.app_event_counter = self
+            .app_event_counter
+            .checked_add(1)
+            .expect("app event counter exhausted");
+        encode_harness_app_payload(&self.engine.self_id(), seq, payload)
+    }
+
     /// Return a clone of `msg` whose payload is the peeled MLS wire bytes.
     ///
     /// This keeps replay/projection tests honest about the transport boundary:
@@ -555,6 +567,43 @@ impl HarnessClient {
             self.pending_events.push(event);
         }
     }
+}
+
+pub fn encode_harness_app_payload(sender: &MemberId, sequence: u64, payload: Vec<u8>) -> Vec<u8> {
+    let (content, tags) = match String::from_utf8(payload) {
+        Ok(content) => (content, Vec::new()),
+        Err(err) => (
+            hex::encode(err.into_bytes()),
+            vec![vec![
+                "harness-payload-encoding".to_owned(),
+                "hex".to_owned(),
+            ]],
+        ),
+    };
+    MarmotAppEvent::new(
+        hex::encode(sender.as_slice()),
+        1_700_000_000 + sequence,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        tags,
+        content,
+    )
+    .encode()
+    .expect("harness app event encodes")
+}
+
+pub fn decode_harness_app_payload(payload: &[u8]) -> Vec<u8> {
+    let Ok(event) = MarmotAppEvent::decode(payload) else {
+        return payload.to_vec();
+    };
+    if event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice() == ["harness-payload-encoding", "hex"])
+        && let Ok(bytes) = hex::decode(&event.content)
+    {
+        return bytes;
+    }
+    event.content.into_bytes()
 }
 
 fn route(msg: TransportMessage, gid: &GroupId) -> TransportMessage {

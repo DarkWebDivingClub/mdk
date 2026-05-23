@@ -821,9 +821,11 @@ async fn handle_connection(
             .await;
             let output = start_stream_watch(
                 *cli,
+                defaults,
                 workers.runtime.runtime.as_ref(),
                 &workers.runtime.stream_watch,
-            );
+            )
+            .await;
             (false, output)
         }
         DaemonRequest::MessagesSubscribe { .. } => (
@@ -1701,8 +1703,9 @@ async fn write_stream_end(stream: &mut UnixStream) -> bool {
     .await
 }
 
-fn start_stream_watch(
+async fn start_stream_watch(
     cli: Cli,
+    defaults: &DaemonDefaults,
     runtime: Option<&marmot_app::MarmotAppRuntime>,
     workers: &StreamWatchWorkers,
 ) -> CliOutput {
@@ -1715,10 +1718,26 @@ fn start_stream_watch(
         );
     };
     let stream_manager = runtime.shared_services().agent_streams();
-    let (report, handle) = match spawn_stream_watch(cli, stream_manager) {
-        Ok(spawned) => spawned,
-        Err(message) => return daemon_error(json, "stream_watch_failed", message),
+    let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
+        Ok(secret_store) => secret_store,
+        Err(err) => return daemon_error(json, "stream_watch_failed", err.to_string()),
     };
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home =
+        match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
+            Ok(account_home) => account_home,
+            Err(err) => return daemon_error(json, "stream_watch_failed", err.to_string()),
+        };
+    let app = crate::app_for(
+        defaults.home.clone(),
+        defaults.relay.clone(),
+        account_home.clone(),
+    );
+    let (report, handle) =
+        match spawn_stream_watch(cli, account_home, app, runtime.clone(), stream_manager) {
+            Ok(spawned) => spawned,
+            Err(message) => return daemon_error(json, "stream_watch_failed", message),
+        };
     let watch_id = report.watch_id.clone();
     workers.replace(watch_id, handle);
 
@@ -1727,6 +1746,9 @@ fn start_stream_watch(
 
 fn spawn_stream_watch(
     mut cli: Cli,
+    account_home: marmot_account::AccountHome,
+    app: marmot_app::MarmotApp,
+    runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
 ) -> Result<(DaemonStreamWatchReport, JoinHandle<()>), String> {
     let report = stream_manager.start_watch(new_stream_watch_start(&cli)?);
@@ -1743,10 +1765,26 @@ fn spawn_stream_watch(
     let worker_watch_id = watch_id;
     let worker_stream_manager = stream_manager.clone();
     let handle = tokio::spawn(async move {
-        let output = crate::run_stream_watch_local_with_observer(cli, move |delta| {
-            worker_stream_manager.record_delta(delta.clone());
-        })
-        .await;
+        let json = cli.json;
+        let account_flag = cli.account.clone();
+        let command = match cli.command.clone() {
+            crate::Command::Stream { command } => command,
+            _ => return,
+        };
+        let output = crate::command_output_result(
+            json,
+            crate::stream_watch_command_app_with_runtime(
+                &account_home,
+                &app,
+                &runtime,
+                command,
+                account_flag,
+                move |delta| {
+                    worker_stream_manager.record_delta(delta.clone());
+                },
+            )
+            .await,
+        );
         finish_stream_watch(stream_manager, worker_watch_id, output);
     });
 
@@ -2017,6 +2055,46 @@ async fn open_stream_compose(
         Ok(bytes) => bytes,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
+    let crypto = {
+        let Some(runtime) = runtime_host.runtime.as_ref() else {
+            return daemon_error(
+                cli.json,
+                "stream_compose_failed",
+                "app runtime is not available for stream crypto".to_owned(),
+            );
+        };
+        let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
+            Ok(secret_store) => secret_store,
+            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
+        };
+        let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+        let account_home =
+            match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
+                Ok(account_home) => account_home,
+                Err(err) => {
+                    return daemon_error(cli.json, "stream_compose_failed", err.to_string());
+                }
+            };
+        let app = crate::app_for(
+            defaults.home.clone(),
+            defaults.relay.clone(),
+            account_home.clone(),
+        );
+        match crate::stream_crypto_for_start_event(
+            &account_home,
+            &app,
+            runtime,
+            account.as_deref(),
+            Some(&group_id),
+            Some(&stream_id),
+            &start_message_id,
+        )
+        .await
+        {
+            Ok((_, crypto)) => Some(crypto),
+            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
+        }
+    };
 
     let key = stream_compose_key(account.as_deref(), &stream_id);
     let (tx, rx) = mpsc::channel(32);
@@ -2041,6 +2119,7 @@ async fn open_stream_compose(
                 trust,
                 stream_id: stream_id_bytes,
                 start_event_id,
+                crypto,
             },
             chunk_bytes,
             rx,
@@ -2160,6 +2239,7 @@ async fn finish_stream_compose(
         command: crate::StreamCommand::Finish {
             group: report.group_id.clone(),
             stream_id: report.stream_id.clone(),
+            start_event_id: report.start_message_id.clone(),
             transcript_hash,
             chunk_count: report.chunk_count,
             text: vec![report.text.clone()],
@@ -2640,7 +2720,13 @@ fn is_hosted_runtime_command(cli: &Cli) -> bool {
         }
         crate::Command::Stream { command } => matches!(
             command,
-            crate::StreamCommand::Start { .. } | crate::StreamCommand::Finish { .. }
+            crate::StreamCommand::Start { .. }
+                | crate::StreamCommand::Finish { .. }
+                | crate::StreamCommand::Watch { .. }
+                | crate::StreamCommand::Send {
+                    start_event_id: Some(_),
+                    ..
+                }
         ),
         crate::Command::Keys { .. }
         | crate::Command::Follows { .. }
@@ -2811,6 +2897,7 @@ async fn reconcile_app_runtime(
             state.clone(),
             events.clone(),
             host.stream_watch.clone(),
+            runtime.clone(),
             runtime.shared_services().agent_streams(),
             receiver,
         ));
@@ -2832,6 +2919,7 @@ async fn reconcile_app_runtime(
                 state,
                 events,
                 host.stream_watch.clone(),
+                runtime.clone(),
                 runtime.shared_services().agent_streams(),
                 runtime.subscribe(),
             ));
@@ -2854,6 +2942,7 @@ fn spawn_app_runtime_bridge(
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     stream_workers: StreamWatchWorkers,
+    runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
     mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
 ) -> JoinHandle<()> {
@@ -2866,6 +2955,7 @@ fn spawn_app_runtime_bridge(
                         state.clone(),
                         events.clone(),
                         stream_workers.clone(),
+                        runtime.clone(),
                         stream_manager.clone(),
                         event,
                     )
@@ -2888,6 +2978,7 @@ async fn handle_app_runtime_event(
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     stream_workers: StreamWatchWorkers,
+    runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
     event: marmot_app::MarmotAppEvent,
 ) {
@@ -2942,6 +3033,7 @@ async fn handle_app_runtime_event(
                 &message.account_id_hex,
                 &summary,
                 stream_workers,
+                runtime,
                 stream_manager,
             )
             .await;
@@ -3010,8 +3102,24 @@ async fn auto_watch_agent_stream_starts(
     account_id: &str,
     summary: &marmot_app::SyncSummary,
     stream_workers: StreamWatchWorkers,
+    runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
 ) {
+    let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
+        Ok(secret_store) => secret_store,
+        Err(_) => return,
+    };
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home =
+        match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
+            Ok(account_home) => account_home,
+            Err(_) => return,
+        };
+    let app = crate::app_for(
+        defaults.home.clone(),
+        defaults.relay.clone(),
+        account_home.clone(),
+    );
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {
@@ -3047,7 +3155,13 @@ async fn auto_watch_agent_stream_starts(
                 },
             },
         };
-        if let Ok((report, handle)) = spawn_stream_watch(cli, stream_manager.clone()) {
+        if let Ok((report, handle)) = spawn_stream_watch(
+            cli,
+            account_home.clone(),
+            app.clone(),
+            runtime.clone(),
+            stream_manager.clone(),
+        ) {
             stream_workers.replace(report.watch_id, handle);
         }
     }
@@ -3825,6 +3939,7 @@ mod tests {
             trust: transport_quic_broker::BrokerServerTrust::InsecureLocal,
             stream_id,
             start_event_id,
+            crypto: None,
         }
     }
 

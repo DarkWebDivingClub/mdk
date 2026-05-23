@@ -27,7 +27,7 @@ use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls_rust_crypto::RustCrypto;
-use openmls_traits::types::Ciphersuite;
+pub use openmls_traits::types::Ciphersuite;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
@@ -133,6 +133,15 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 
     pub fn build(self) -> Result<Engine<S>, EngineError> {
+        // spec/foundation/mls-protocol.md:11-15 — Marmot has a single
+        // mandatory-to-implement ciphersuite. Reject any other ciphersuite at
+        // construction so no group can ever be created off-spec.
+        if self.ciphersuite != DEFAULT_CIPHERSUITE {
+            return Err(EngineError::UnsupportedCiphersuite {
+                got: u16::from(self.ciphersuite),
+                required: u16::from(DEFAULT_CIPHERSUITE),
+            });
+        }
         let identity_bytes = self
             .identity_bytes
             .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;
@@ -369,17 +378,30 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
             <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
         let (epoch, secret) = if let Some(staged) = mls_group.pending_commit() {
             let s = staged
-                .export_secret(crypto, crate::group_lifecycle::EXPORTER_LABEL, &[], 32)
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::EXPORTER_CONTEXT,
+                    32,
+                )
                 .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
             (staged.group_context().epoch().as_u64(), s)
         } else {
             let s = mls_group
-                .export_secret(crypto, crate::group_lifecycle::EXPORTER_LABEL, &[], 32)
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::EXPORTER_CONTEXT,
+                    32,
+                )
                 .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
             (mls_group.epoch().as_u64(), s)
         };
         let mut map = std::collections::HashMap::new();
-        map.insert(crate::group_lifecycle::EXPORTER_LABEL.to_string(), secret);
+        map.insert(
+            crate::group_lifecycle::EXPORTER_SNAPSHOT_KEY.to_string(),
+            secret,
+        );
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
             map,

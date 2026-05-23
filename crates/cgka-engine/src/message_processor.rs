@@ -432,10 +432,24 @@ impl<S: StorageProvider> Engine<S> {
                             reason: StaleReason::PeelFailed,
                         });
                     };
+                    let payload = bytes.into_bytes();
+                    if crate::app_payload::validate_app_payload_for_sender(&payload, &sender)
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "cgka_engine::message_processor",
+                            method = "ingest_group_message",
+                            "dropping application message with invalid Marmot app event",
+                        );
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::PeelFailed,
+                        });
+                    }
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
                         sender,
-                        payload: bytes.into_bytes(),
+                        payload,
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     Ok(IngestOutcome::Processed)
@@ -1247,15 +1261,15 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
-        // MIP-03 §149 admin-cannot-self-remove guard. If the leaver is an
-        // admin AND they're the only admin, refuse with a typed error so
-        // the caller can prompt for admin transfer.
+        // member-departure.md:23-26 — an admin must leave the admin set before
+        // using SelfRemove. This is stricter than merely preserving a non-empty
+        // admin set: it prevents an admin identity from departing while still
+        // present in the prior epoch's admin policy.
         let self_pubkey =
             crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let admins = crate::app_components::admins_of_group(&mls_group)?;
         let i_am_admin = admins.iter().any(|k| k == &self_pubkey);
-        let only_admin = i_am_admin && admins.len() == 1;
-        if only_admin {
+        if i_am_admin {
             return Err(EngineError::AdminCannotSelfRemove {
                 group_id: group_id.clone(),
             });
@@ -1322,6 +1336,8 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+
+        crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
 
         let out: MlsMessageOut = mls_group
             .create_message(&provider, &self.identity.signer, &payload)
@@ -1401,12 +1417,13 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
                         ));
                     }
                     AppDataUpdateOperation::Remove => {
-                        crate::app_components::validate_app_component_remove(update.component_id())
-                            .map_err(|_| {
-                                ProcessMessageError::ValidationError(
-                                    ValidationError::WrongWireFormat,
-                                )
-                            })?;
+                        crate::app_components::validate_app_component_remove(
+                            mls_group,
+                            update.component_id(),
+                        )
+                        .map_err(|_| {
+                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                        })?;
                         updater.remove(&update.component_id());
                     }
                 }

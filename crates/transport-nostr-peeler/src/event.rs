@@ -6,6 +6,7 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::types::{MemberId, MessageId};
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -131,24 +132,6 @@ impl NostrTransportEvent {
             sig: None,
         }
     }
-
-    pub(crate) fn new_local(
-        pubkey: String,
-        kind: u64,
-        tags: Vec<Vec<String>>,
-        content: String,
-    ) -> Self {
-        Self::new_unsigned(pubkey, kind, tags, content)
-    }
-}
-
-#[derive(Serialize)]
-struct EventCore<'a> {
-    pubkey: &'a str,
-    created_at: u64,
-    kind: u64,
-    tags: &'a [Vec<String>],
-    content: &'a str,
 }
 
 fn pre_signing_id(
@@ -158,14 +141,19 @@ fn pre_signing_id(
     tags: &[Vec<String>],
     content: &str,
 ) -> String {
-    let core = EventCore {
-        pubkey,
-        created_at,
-        kind,
-        tags,
-        content,
-    };
-    let bytes = serde_json::to_vec(&core).expect("serializing EventCore should not fail");
+    let preimage = Value::Array(vec![
+        Value::from(0u8),
+        Value::from(pubkey),
+        Value::from(created_at),
+        Value::from(kind),
+        Value::Array(
+            tags.iter()
+                .map(|tag| Value::Array(tag.iter().map(|v| Value::from(v.as_str())).collect()))
+                .collect(),
+        ),
+        Value::from(content),
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("serializing Nostr event id should not fail");
     hex::encode(Sha256::digest(bytes))
 }
 

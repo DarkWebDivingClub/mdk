@@ -9,6 +9,7 @@ use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent,
@@ -304,7 +305,7 @@ async fn engine_does_not_apply_stored_branch_before_stability_gate() {
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![bob.self_id()],
         })
         .await
         .unwrap();
@@ -364,7 +365,7 @@ async fn engine_ingest_buffers_commit_for_convergence_before_quiescence() {
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![bob.self_id()],
         })
         .await
         .unwrap();
@@ -505,7 +506,8 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
             matches!(
                 event,
                 GroupEvent::MessageReceived { group_id: event_group, payload, .. }
-                    if *event_group == group_id && payload == b"multi commit canonical payload"
+                    if *event_group == group_id
+                        && app_content(payload) == b"multi commit canonical payload"
             )
         }),
         "expected multi-commit canonical app payload event, got {events:?}"
@@ -1339,7 +1341,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
             matches!(
                 event,
                 GroupEvent::MessageReceived { group_id: event_group, payload, .. }
-                    if *event_group == group_id && payload == b"future epoch witness"
+                    if *event_group == group_id && app_content(payload) == b"future epoch witness"
             )
         }),
         "expected accepted app message event after canonical convergence, got {events:?}"
@@ -1453,7 +1455,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            GroupEvent::MessageReceived { payload, .. } => Some(app_content(payload)),
             _ => None,
         })
         .collect();
@@ -1550,7 +1552,8 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
             matches!(
                 event,
                 GroupEvent::MessageReceived { group_id: event_group, payload, .. }
-                    if *event_group == group_id && payload == b"restart canonical payload"
+                    if *event_group == group_id
+                        && app_content(payload) == b"restart canonical payload"
             )
         }),
         "expected rebuilt engine to emit canonical app payload, got {events:?}"
@@ -1671,7 +1674,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            GroupEvent::MessageReceived { payload, .. } => Some(app_content(payload)),
             _ => None,
         })
         .collect();
@@ -1700,7 +1703,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![bob.self_id()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1879,7 +1882,7 @@ async fn engine_queues_app_send_until_convergence_is_stable() {
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"queued until stable".to_vec(),
+            payload: app_payload_for(&carol, b"queued until stable"),
         })
         .await
         .unwrap();
@@ -2075,7 +2078,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"queued through trait lifecycle".to_vec(),
+            payload: app_payload_for(&carol, b"queued through trait lifecycle"),
         })
         .await
         .unwrap();
@@ -2200,7 +2203,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             group_id: group_id.clone(),
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
-                payload: b"after invite publish resolves".to_vec(),
+                payload: app_payload_for(&alice, b"after invite publish resolves"),
             },
             created_at_ms: 1,
         })
@@ -2299,7 +2302,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"queued across restart".to_vec(),
+            payload: app_payload_for(&carol, b"queued across restart"),
         })
         .await
         .unwrap();
@@ -2380,7 +2383,7 @@ async fn send_app(
     let result = engine
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload,
+            payload: app_payload_for(engine, payload),
         })
         .await
         .expect("send app");
@@ -2388,6 +2391,26 @@ async fn send_app(
         SendResult::ApplicationMessage { msg } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
+}
+
+fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+fn app_content(payload: &[u8]) -> Vec<u8> {
+    MarmotAppEvent::decode(payload)
+        .expect("test app event decodes")
+        .content
+        .into_bytes()
 }
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {

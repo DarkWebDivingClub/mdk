@@ -32,7 +32,7 @@ mod relay_list;
 mod sdk_client;
 
 pub use key_package::{
-    KEY_PACKAGE_ENCODING_HEX, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
+    KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
     NostrKeyPackagePublication, NostrKeyPackagePublisher,
 };
 pub use relay_list::{

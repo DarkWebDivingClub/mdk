@@ -1055,6 +1055,7 @@ async fn drive_intents(
     let bus_ids: Vec<_> = clients.iter().map(|c| c.bus_id).collect();
     let group_ids: Vec<_> = clients.iter().map(|c| c.group_id()).collect();
     let mut still_member = vec![true; n];
+    let mut app_event_seq = 0_u64;
 
     for intent in intents {
         match intent {
@@ -1071,9 +1072,16 @@ async fn drive_intents(
                     .engine
                     .send(cgka_traits::engine::SendIntent::AppMessage {
                         group_id: gid.clone(),
-                        payload: payload.clone(),
+                        payload: cgka_conformance_simulator::client::encode_harness_app_payload(
+                            &clients[idx].member_id(),
+                            app_event_seq,
+                            payload.clone(),
+                        ),
                     })
                     .await;
+                app_event_seq = app_event_seq
+                    .checked_add(1)
+                    .expect("app event sequence exhausted");
                 if let Ok(cgka_traits::engine::SendResult::ApplicationMessage { msg }) = res {
                     bus.send(bus_ids[idx], reroute(msg, &gid));
                 }
@@ -1260,9 +1268,7 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         let mut restarted = EngineBuilder::new(restarted_storage.clone())
             .identity(restarted_identity.clone())
             .feature_registry(registry())
-            .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::new(
-                hex::encode(restarted_identity),
-            )))
+            .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::new()))
             .build()
             .expect("restarted engine builds");
         let restarted_result = restarted

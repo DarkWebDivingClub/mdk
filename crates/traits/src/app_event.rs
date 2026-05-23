@@ -79,7 +79,12 @@ impl MarmotAppEvent {
         }
     }
 
-    /// Canonical-JSON bytes for the MLS application-message plaintext.
+    /// Serde struct-order JSON bytes for the MLS application-message plaintext.
+    ///
+    /// This is not NIP-01 canonical JSON: it serializes the struct fields in
+    /// declaration order rather than the canonical `[0,pubkey,...]` array form.
+    /// The `id` is the canonical NIP-01 id and is validated separately on
+    /// decode via [`Self::validate_id`].
     pub fn encode(&self) -> Result<Vec<u8>, MarmotAppEventError> {
         serde_json::to_vec(self).map_err(|err| MarmotAppEventError::Json(err.to_string()))
     }

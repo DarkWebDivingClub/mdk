@@ -31,6 +31,7 @@
 
 pub mod app_components;
 
+pub(crate) mod app_payload;
 pub mod auto_committer;
 pub mod canonicalization;
 pub mod capabilities;
@@ -54,8 +55,9 @@ pub mod update_group_data;
 pub mod upgrade;
 pub mod wire_format;
 
-pub use engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 pub use feature_registry::FeatureRegistry;
+pub use key_package::{KeyPackageMetadata, key_package_metadata};
 pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
     default_join_config, join_config,

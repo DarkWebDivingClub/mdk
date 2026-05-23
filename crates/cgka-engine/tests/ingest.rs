@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -189,6 +190,26 @@ fn build_client_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engi
         .unwrap()
 }
 
+fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+fn app_content(payload: &[u8]) -> Vec<u8> {
+    MarmotAppEvent::decode(payload)
+        .expect("test app event decodes")
+        .content
+        .into_bytes()
+}
+
 // ── Every StaleReason reachable ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -291,7 +312,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     let msg = match alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"retry after peel".to_vec(),
+            payload: app_payload_for(&alice, b"retry after peel"),
         })
         .await
         .unwrap()
@@ -318,7 +339,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     let events = bob.drain_events();
     assert!(
         events.iter().any(
-            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if payload == b"retry after peel")
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"retry after peel")
         ),
         "expected retried message to emit after peel succeeds, got {events:?}"
     );
@@ -353,7 +374,7 @@ async fn ingest_own_created_message_returns_own_echo() {
     let app_msg = match alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"hi".to_vec(),
+            payload: app_payload_for(&alice, b"hi"),
         })
         .await
         .unwrap()
@@ -497,7 +518,7 @@ async fn send_app_message_round_trips_to_another_client() {
     let send_res = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"hello bob".to_vec(),
+            payload: app_payload_for(&alice, b"hello bob"),
         })
         .await
         .unwrap();
@@ -523,7 +544,7 @@ async fn send_app_message_round_trips_to_another_client() {
         matches!(
             e,
             GroupEvent::MessageReceived { sender, payload, .. }
-                if sender == &alice.self_id() && payload == b"hello bob"
+                if sender == &alice.self_id() && app_content(payload) == b"hello bob"
         )
     });
     assert!(got_it, "expected MessageReceived; got {events:?}");
@@ -562,7 +583,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
     let bob_msg = match bob
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"arrived while alice was pending".to_vec(),
+            payload: app_payload_for(&bob, b"arrived while alice was pending"),
         })
         .await
         .unwrap()
@@ -605,7 +626,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
     alice.publish_failed(invite_pending).await.unwrap();
     let events = alice.drain_events();
     let replayed = events.iter().any(
-        |e| matches!(e, GroupEvent::MessageReceived { payload, .. } if payload == b"arrived while alice was pending"),
+        |e| matches!(e, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"arrived while alice was pending"),
     );
     assert!(
         replayed,

@@ -99,6 +99,34 @@ fn builder_rejects_missing_peeler() {
     assert!(matches!(res, Err(EngineError::Other(_))));
 }
 
+#[test]
+fn builder_rejects_non_mandatory_ciphersuite() {
+    // spec/foundation/mls-protocol.md:11-15 — only
+    // MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001) is permitted.
+    let res = EngineBuilder::new(MemoryStorage::new())
+        .identity(valid_identity(b"self-identity"))
+        .peeler(Box::new(StubPeeler))
+        .ciphersuite(cgka_engine::Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519)
+        .build();
+    assert!(matches!(
+        res,
+        Err(EngineError::UnsupportedCiphersuite {
+            got: 0x0003,
+            required: 0x0001,
+        })
+    ));
+}
+
+#[test]
+fn builder_accepts_mandatory_ciphersuite_explicitly() {
+    let res = EngineBuilder::new(MemoryStorage::new())
+        .identity(valid_identity(b"self-identity"))
+        .peeler(Box::new(StubPeeler))
+        .ciphersuite(cgka_engine::DEFAULT_CIPHERSUITE)
+        .build();
+    assert!(res.is_ok());
+}
+
 #[tokio::test]
 async fn empty_engine_methods_return_typed_results() {
     let mut engine = EngineBuilder::new(MemoryStorage::new())

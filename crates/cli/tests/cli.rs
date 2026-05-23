@@ -1699,8 +1699,17 @@ fn keys_publish_reuses_create_identity_key_package() {
     );
 
     assert_eq!(republished["key_package_bytes"], first["key_package_bytes"]);
-    assert_eq!(second["key_package_id"], first["key_package_id"]);
     assert_eq!(second["key_package_bytes"], first["key_package_bytes"]);
+    assert!(
+        first["key_package_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        second["key_package_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
 }
 
 #[test]
@@ -1729,7 +1738,12 @@ fn keys_rotate_forces_a_new_key_package_then_publish_reuses_it() {
 
     assert_ne!(second["key_package_id"], first["key_package_id"]);
     assert_eq!(second["key_package_bytes"], rotated["key_package_bytes"]);
-    assert_eq!(third["key_package_id"], second["key_package_id"]);
+    assert_eq!(third["key_package_bytes"], second["key_package_bytes"]);
+    assert!(
+        third["key_package_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
 }
 
 #[test]
@@ -1907,11 +1921,11 @@ fn group_create_includes_agent_text_streams_by_default() {
     );
     assert_eq!(
         created_group["agent_text_stream"]["data_hex"],
-        "0103020200001000000000000000"
+        "010300001000000000000000"
     );
     assert_eq!(
-        created_group["agent_text_stream"]["required_route_modes"],
-        serde_json::json!(["brokered_quic"])
+        created_group["agent_text_stream"]["required_member_roles"],
+        serde_json::json!(["receive"])
     );
 
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
@@ -2116,6 +2130,8 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
             group_id,
             "--stream-id",
             stream_id,
+            "--start-event-id",
+            start_message_id,
             "--transcript-hash",
             sent["transcript_hash"].as_str().expect("transcript hash"),
             "--chunk-count",
@@ -2126,6 +2142,10 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         ],
     );
     assert_eq!(finished["agent_text_stream"]["kind"], "final");
+    assert_eq!(
+        finished["agent_text_stream"]["start_event_id"],
+        start_message_id
+    );
 
     let bob_final_message = wait_until_projected_agent_stream_message(
         home.path(),

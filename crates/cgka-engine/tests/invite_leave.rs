@@ -5,6 +5,7 @@ use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -134,6 +135,19 @@ fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap()
+}
+
+fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
 }
 
 fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<MemoryStorage>, EngineError> {
@@ -570,7 +584,7 @@ async fn selfremove_full_flow_with_auto_commit() {
     let pending_send = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"wait for auto confirm".to_vec(),
+            payload: app_payload_for(&alice, b"wait for auto confirm"),
         })
         .await;
     assert!(

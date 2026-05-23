@@ -900,7 +900,7 @@ async fn group_context_returns_live_view() {
 
     let ctx = alice.group_context(&group_id).expect("group_context");
     assert_eq!(ctx.epoch().0, 1);
-    let secret = ctx.exporter_secret("marmot/engine/v1", 32);
+    let secret = ctx.exporter_secret("marmot/group-event", 32);
     assert!(secret.is_some(), "well-known label should resolve");
     assert!(
         ctx.exporter_secret("nonexistent-label", 32).is_none(),

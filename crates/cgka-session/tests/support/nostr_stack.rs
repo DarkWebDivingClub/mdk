@@ -153,7 +153,7 @@ impl NostrStackHarness {
                 self._dir.path().join(format!("{label}.sqlite")),
                 self.database_key.clone(),
                 keys.public_key().to_bytes().to_vec(),
-                Box::new(NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys)),
+                Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)),
             )
             .supported_app_components(supported_app_components()),
         )

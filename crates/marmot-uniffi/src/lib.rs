@@ -506,15 +506,18 @@ impl Marmot {
         insecure_local: bool,
     ) -> Result<Arc<AgentStreamSubscription>, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
-        let watch = self.runtime.watch_agent_text_stream(
-            &account_ref,
-            &group_id,
-            marmot_app::AgentStreamWatchOptions {
-                stream_id_hex,
-                server_cert_der,
-                insecure_local,
-            },
-        )?;
+        let watch = self
+            .runtime
+            .watch_agent_text_stream(
+                &account_ref,
+                &group_id,
+                marmot_app::AgentStreamWatchOptions {
+                    stream_id_hex,
+                    server_cert_der,
+                    insecure_local,
+                },
+            )
+            .await?;
         Ok(AgentStreamSubscription::new(watch))
     }
 

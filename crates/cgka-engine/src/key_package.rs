@@ -18,6 +18,39 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use tls_codec::{Deserialize as _, Serialize as _};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageMetadata {
+    pub key_package_ref_hex: String,
+    pub credential_identity_hex: String,
+}
+
+/// Parse and validate a transported KeyPackage enough for transport-directory
+/// publication/fetch checks.
+pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, EngineError> {
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+        .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
+    let kp_in = match msg.extract() {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        _ => {
+            return Err(EngineError::Serialize(
+                "MLS message did not carry a KeyPackage".into(),
+            ));
+        }
+    };
+    let crypto = RustCrypto::default();
+    let key_package = kp_in
+        .validate(&crypto, ProtocolVersion::Mls10)
+        .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+    let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    let key_package_ref = key_package
+        .hash_ref(&crypto)
+        .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
+    Ok(KeyPackageMetadata {
+        key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
+        credential_identity_hex: hex::encode(member_id.as_slice()),
+    })
+}
+
 /// Parse and validate a transported KeyPackage and report whether it carries
 /// the MLS last-resort extension.
 pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {

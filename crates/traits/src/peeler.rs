@@ -20,11 +20,13 @@ use async_trait::async_trait;
 /// ### Method invariants
 ///
 /// - `peel_group_message` MUST fail cleanly with `PeelerError::DecryptFailed`
-///   on wrong exporter secrets. If envelope metadata shows the message source
-///   epoch is older than the supplied context, prefer `PeelerError::StaleEpoch`.
-///   The engine maps both to
-///   `StaleReason::PeelFailed`, choosing retry or terminal storage from
-///   the available epoch evidence.
+///   on wrong exporter secrets. A transport that carries an authenticated
+///   message-source-epoch hint MAY instead return `PeelerError::StaleEpoch`
+///   when that hint is older than the supplied context; transports without
+///   such a hint (e.g. the Nostr binding, whose kind-445 content is opaque
+///   `base64(nonce || ciphertext)`) simply return `DecryptFailed`. The engine
+///   maps both to `StaleReason::PeelFailed`, choosing retry or terminal
+///   storage from the available epoch evidence.
 /// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
 ///   local identity — the engine maps that to `StaleReason::NotForThisClient`.
 /// - `wrap_group_message` MUST be deterministic given the same input

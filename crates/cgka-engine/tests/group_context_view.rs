@@ -19,7 +19,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
-const ENGINE_EXPORTER_LABEL: &str = "marmot/engine/v1";
+const ENGINE_EXPORTER_LABEL: &str = "marmot/group-event";
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
