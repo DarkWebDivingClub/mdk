@@ -1,9 +1,10 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_session::{AccountDeviceSession, SessionConfig};
-use cgka_traits::engine::{CreateGroupRequest, GroupEvent};
+use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -127,12 +128,20 @@ struct RecordingAdapterInner {
     activations: Mutex<Vec<TransportAccountActivation>>,
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
-    accepted_count: Mutex<Option<usize>>,
+    accepted_counts: Mutex<VecDeque<usize>>,
 }
 
 impl RecordingAdapter {
     fn accept_only_next(&self, accepted_count: usize) {
-        *self.inner.accepted_count.lock().unwrap() = Some(accepted_count);
+        self.accept_next(accepted_count);
+    }
+
+    fn accept_next(&self, accepted_count: usize) {
+        self.inner
+            .accepted_counts
+            .lock()
+            .unwrap()
+            .push_back(accepted_count);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -176,10 +185,10 @@ impl TransportAdapter for RecordingAdapter {
         self.inner.publishes.lock().unwrap().push(request.clone());
         let accepted_count = self
             .inner
-            .accepted_count
+            .accepted_counts
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .unwrap_or_else(|| request.target.endpoints().len());
         Ok(TransportPublishReport {
             message_id: request.message.id,
@@ -377,4 +386,88 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
     assert_eq!(effects.failures.len(), 1);
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 0);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot evolution partial publish key").unwrap();
+    let mut alice_session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut carol_session = session(dir.path().join("carol.sqlite"), &key, b"carol");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let carol_id = carol_session.self_id();
+
+    let created = alice_session
+        .create_group(CreateGroupRequest {
+            name: "runtime evolution".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice_session
+        .confirm_published(create_pending)
+        .await
+        .unwrap();
+
+    let adapter = RecordingAdapter::default();
+    adapter.accept_next(1);
+    adapter.accept_next(0);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                created.group_id.clone(),
+                created.group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                carol_id,
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice_session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let effects = runtime
+        .send(SendIntent::Invite {
+            group_id: created.group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(effects.pending.len(), 1);
+    assert!(matches!(
+        effects.pending[0],
+        PendingResolution::Confirmed { .. }
+    ));
+    assert_eq!(effects.failures.len(), 1);
+    assert_eq!(runtime.session().epoch(&created.group_id).unwrap().0, 2);
+    assert_eq!(
+        runtime.session().members(&created.group_id).unwrap().len(),
+        3
+    );
+
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2);
+    assert!(matches!(
+        publishes[0].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        publishes[1].message.envelope,
+        TransportEnvelope::Welcome { .. }
+    ));
 }

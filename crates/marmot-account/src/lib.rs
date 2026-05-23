@@ -942,10 +942,7 @@ where
                     welcomes,
                     pending,
                 } => {
-                    let mut messages = Vec::with_capacity(1 + welcomes.len());
-                    messages.push(msg);
-                    messages.extend(welcomes);
-                    self.publish_pending(messages, pending, &mut output, &mut queue)
+                    self.publish_group_evolution(msg, welcomes, pending, &mut output, &mut queue)
                         .await?;
                 }
                 PublishWork::AutoPublish { msg, pending } => {
@@ -976,6 +973,34 @@ where
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
+        } else {
+            let effects = self.session.publish_failed(pending).await?;
+            output
+                .pending
+                .push(PendingResolution::RolledBack { pending });
+            output.absorb_session_effects(effects, queue);
+        }
+        Ok(())
+    }
+
+    async fn publish_group_evolution(
+        &mut self,
+        commit: TransportMessage,
+        welcomes: Vec<TransportMessage>,
+        pending: PendingStateRef,
+        output: &mut AccountDeviceEffects,
+        queue: &mut VecDeque<PublishWork>,
+    ) -> AccountResult<()> {
+        if self.publish_one(commit, output).await? {
+            let effects = self.session.confirm_published(pending).await?;
+            output
+                .pending
+                .push(PendingResolution::Confirmed { pending });
+            output.absorb_session_effects(effects, queue);
+
+            for welcome in welcomes {
+                self.publish_one(welcome, output).await?;
+            }
         } else {
             let effects = self.session.publish_failed(pending).await?;
             output

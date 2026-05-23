@@ -97,9 +97,10 @@ pub enum SendResult {
     Proposal { msg: TransportMessage },
     /// Commit (+ optional welcomes) that EXISTING group members need to
     /// process. Used for invite / remove / update to an existing group.
-    /// Application must publish ALL outputs and then call
-    /// [`CgkaEngine::confirm_published`] with `pending` so the engine can
-    /// advance its epoch.
+    /// Application must publish `msg` and call
+    /// [`CgkaEngine::confirm_published`] with `pending` once the commit meets
+    /// the transport's required acknowledgements. Welcome delivery is
+    /// independent: a failed welcome must not roll back a live commit.
     GroupEvolution {
         msg: TransportMessage,
         welcomes: Vec<TransportMessage>,
