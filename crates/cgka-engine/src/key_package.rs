@@ -84,8 +84,13 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        kp_in
+        let key_package = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))
+            .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+        // foundation/key-packages.md: reject a KeyPackage whose credential
+        // identity is not a valid Marmot account identity. This single gate
+        // covers both the create-group and invite invitee paths.
+        crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+        Ok(key_package)
     }
 }

@@ -15,10 +15,23 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use storage_sqlite::SqlCipherKey;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
+    // public key (spec/foundation/identity.md). Derive one deterministically
+    // from the ergonomic label so a session built on this identity is accepted
+    // by the engine while staying stable across a test run.
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-session-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        let secret = hasher.finalize();
+        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+            return keys.public_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
 }
 
 fn hash_id(bytes: &[u8]) -> MessageId {

@@ -693,6 +693,7 @@ dependencies = [
  "cgka-traits",
  "hex",
  "insta",
+ "k256",
  "openmls",
  "openmls_basic_credential",
  "openmls_memory_storage",
@@ -2037,7 +2038,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
 dependencies = [
  "cfg-if",
+ "ecdsa",
  "elliptic-curve",
+ "sha2",
+ "signature",
 ]
 
 [[package]]

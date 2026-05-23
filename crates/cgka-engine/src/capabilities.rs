@@ -135,7 +135,15 @@ pub(crate) fn capabilities_of_key_package(kp: &openmls::prelude::KeyPackage) -> 
 /// Read a LeafNode's advertised capabilities for constructability checks and
 /// cache-on-ingest updates.
 pub(crate) fn capabilities_of_leaf(leaf: &openmls::prelude::LeafNode) -> GroupCapabilities {
-    let caps = leaf.capabilities();
+    let mut out = group_capabilities_from_caps(leaf.capabilities());
+    out.app_components = crate::app_components::app_components_of_leaf(leaf)
+        .unwrap_or_else(|_| AppComponentSet::default());
+    out
+}
+
+/// Convert OpenMLS [`Capabilities`] into Marmot [`GroupCapabilities`]
+/// (extensions + proposals only; app components are carried separately).
+fn group_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for ext in caps.extensions() {
         if !ext.is_grease() {
@@ -145,7 +153,21 @@ pub(crate) fn capabilities_of_leaf(leaf: &openmls::prelude::LeafNode) -> GroupCa
     for prop in caps.proposals() {
         out.proposals.insert(u16::from(*prop));
     }
-    out.app_components = crate::app_components::app_components_of_leaf(leaf)
-        .unwrap_or_else(|_| AppComponentSet::default());
+    out
+}
+
+/// The full set of capabilities this client supports at runtime: the MLS
+/// extensions/proposals it advertises (derived from the feature registry, same
+/// as [`leaf_capabilities`]) plus the app components it supports. Used by the
+/// join path to reject a Welcome whose group requires capabilities this client
+/// cannot apply (joining.md:65, convergence.md:19), independent of what the
+/// consumed KeyPackage's leaf happened to advertise.
+pub(crate) fn self_supported_capabilities(
+    registry: &FeatureRegistry,
+    ciphersuite: Ciphersuite,
+    supported_app_components: &AppComponentSet,
+) -> GroupCapabilities {
+    let mut out = group_capabilities_from_caps(&leaf_capabilities(registry, ciphersuite));
+    out.app_components = supported_app_components.clone();
     out
 }

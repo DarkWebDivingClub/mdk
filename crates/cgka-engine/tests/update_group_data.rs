@@ -41,10 +41,25 @@ use storage_memory::MemoryStorage;
 use tls_codec::Serialize as _;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
+    // public key (spec/foundation/identity.md). Derive one deterministically
+    // from the ergonomic label so admin/member tracking stays stable across a
+    // run while the engine accepts the identity.
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut material = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        material.copy_from_slice(&hasher.finalize());
+        if let Ok(sk) = SigningKey::from_bytes(&material) {
+            return sk.verifying_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
 }
 
 fn hash_id(bytes: &[u8]) -> MessageId {

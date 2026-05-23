@@ -1310,6 +1310,19 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         ))),
                     };
                 }
+                // foundation/identity.md: deferred commits replayed during
+                // convergence are an inbound credential ingress too. Reject a
+                // commit that would add a member with an invalid x-only
+                // secp256k1 credential identity before merging it.
+                for add in staged.add_proposals() {
+                    if let Err(err) = crate::identity::validated_member_id_of_leaf(
+                        add.add_proposal().key_package().leaf_node(),
+                    ) {
+                        return Err(OpenMlsProjectionError::Replay(format!(
+                            "invalid added credential identity: {err}"
+                        )));
+                    }
+                }
                 let resulting_epoch = mls_group.epoch().as_u64() + 1;
                 let mut consumed_proposal_refs = staged
                     .queued_proposals()

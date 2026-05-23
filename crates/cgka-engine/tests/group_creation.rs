@@ -24,19 +24,57 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
+use openmls::prelude::{
+    BasicCredential, Capabilities, CredentialWithKey, KeyPackage as MlsKeyPackage, MlsMessageOut,
+};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::types::Ciphersuite;
 use storage_memory::MemoryStorage;
+use tls_codec::Serialize as _;
+
+/// Build a wire KeyPackage carrying a `BasicCredential` whose identity is the
+/// raw `identity` bytes, bypassing the engine's identity validation. Used to
+/// simulate a malformed credential arriving from a non-conformant peer.
+fn key_package_with_raw_identity(identity: &[u8]) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential = BasicCredential::new(identity.to_vec());
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.public().into(),
+    };
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::default())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage(mls_msg.tls_serialize_detached().unwrap())
+}
 
 /// Mock peeler: wraps `EncryptedPayload` bytes verbatim into a
 /// `TransportMessage` with a hash-derived id. No real crypto. Peel paths
 /// unwrap the payload back out.
 fn pad32(name: &[u8]) -> Vec<u8> {
-    // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
-    // zero-padded to 32 so engine-layer admin tracking works without
-    // breaking ergonomic test names.
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
+    // public key (spec/foundation/identity.md). Derive one deterministically
+    // from the ergonomic label so admin/member tracking stays stable across a
+    // run while the engine accepts the identity.
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut material = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        material.copy_from_slice(&hasher.finalize());
+        if let Ok(sk) = SigningKey::from_bytes(&material) {
+            return sk.verifying_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
 }
 
 struct MockPeeler;
@@ -161,6 +199,56 @@ fn build_client_on_storage(
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
+}
+
+#[tokio::test]
+async fn create_group_rejects_invitee_keypackage_with_non_secp256k1_identity() {
+    // A peer with a non-conformant client sends a KeyPackage whose credential
+    // identity is 32 bytes but not a valid x-only secp256k1 point. The engine
+    // MUST reject it at parse time (foundation/key-packages.md).
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let mut bad_identity = vec![0u8; 32];
+    bad_identity[..5].copy_from_slice(b"david"); // 32 bytes, not a curve point
+    let bad_kp = key_package_with_raw_identity(&bad_identity);
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "bad-invitee".into(),
+            description: "".into(),
+            members: vec![bad_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject the malformed invitee");
+    assert!(
+        matches!(err, EngineError::InvalidCredentialIdentity(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_group_rejects_invitee_keypackage_with_short_identity() {
+    // Same gate, length branch: a 3-byte identity is rejected.
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let bad_kp = key_package_with_raw_identity(b"bob");
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "short-invitee".into(),
+            description: "".into(),
+            members: vec![bad_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject the short invitee identity");
+    assert!(
+        matches!(err, EngineError::InvalidCredentialIdentity(_)),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -444,6 +532,124 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
         ),
         other => panic!("expected EngineError::Other(already processed), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn join_welcome_rejected_when_client_no_longer_supports_required_capability() {
+    // joining.md:65 / convergence.md:19 — a client MUST reject a Welcome whose
+    // resulting group has active required capabilities it cannot apply.
+    //
+    // carol publishes a KeyPackage that advertises the SelfRemove proposal, so
+    // alice's invite (which requires it) passes. carol then downgrades: she
+    // rebuilds her engine on the same storage with an empty feature registry,
+    // so her runtime no longer supports SelfRemove. Joining the group must now
+    // be rejected.
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let carol_storage = MemoryStorage::new();
+    let mut capable_carol =
+        build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
+    let carol_kp = capable_carol.fresh_key_package().await.unwrap();
+
+    let (_gid, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "requires-self-remove".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![Feature("self-remove")],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match result {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    drop(capable_carol);
+
+    // Downgraded carol: same identity + storage (so she can decrypt the
+    // Welcome) but an empty registry (no SelfRemove support).
+    let mut downgraded_carol =
+        build_client_on_storage(b"carol", FeatureRegistry::new(), carol_storage);
+    let err = downgraded_carol
+        .join_welcome(welcome)
+        .await
+        .expect_err("join must be rejected for an unsupported required capability");
+    match err {
+        EngineError::MissingRequiredCapabilities { required, had } => {
+            // The group requires the SelfRemove proposal (0x000a = 10)...
+            assert!(
+                required.proposals.contains(&10),
+                "group should require SelfRemove; got {required:?}"
+            );
+            // ...which downgraded carol no longer advertises.
+            assert!(
+                !had.proposals.contains(&10),
+                "downgraded carol must not advertise SelfRemove; got {had:?}"
+            );
+        }
+        other => panic!("expected MissingRequiredCapabilities, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn join_welcome_rejected_when_client_lacks_required_app_component() {
+    // App-component variant of the join capability gate. carol publishes a KP
+    // advertising a custom app component; alice requires it; carol then rejoins
+    // with an engine that does not support that component.
+    const CUSTOM_COMPONENT: u16 = 0xF300;
+    let mut alice = build_client_with_components(b"alice", [CUSTOM_COMPONENT]);
+    let carol_storage = MemoryStorage::new();
+    let capable_carol = EngineBuilder::new(carol_storage.clone())
+        .identity(pad32(b"carol"))
+        .supported_app_components([CUSTOM_COMPONENT])
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build capable carol");
+    let mut capable_carol = capable_carol;
+    let carol_kp = capable_carol.fresh_key_package().await.unwrap();
+
+    let (_gid, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "requires-component".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: CUSTOM_COMPONENT,
+                data: vec![1, 2, 3],
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match result {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    drop(capable_carol);
+
+    // Downgraded carol supports no app components.
+    let mut downgraded_carol = EngineBuilder::new(carol_storage)
+        .identity(pad32(b"carol"))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build downgraded carol");
+    let err = downgraded_carol
+        .join_welcome(welcome)
+        .await
+        .expect_err("join must be rejected for an unsupported required app component");
+    assert!(
+        matches!(err, EngineError::MissingRequiredCapabilities { ref required, .. }
+            if required.app_components.contains(CUSTOM_COMPONENT)),
+        "expected MissingRequiredCapabilities naming the component; got {err:?}"
+    );
 }
 
 #[tokio::test]

@@ -451,19 +451,29 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    // foundation/identity.md: reject an inbound commit that
+                    // would add a member whose credential identity is not a
+                    // valid x-only secp256k1 public key, before it mutates
+                    // canonical state.
+                    let added: Vec<MemberId> = match staged
+                        .add_proposals()
+                        .map(|p| {
+                            crate::identity::validated_member_id_of_leaf(
+                                p.add_proposal().key_package().leaf_node(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(added) => added,
+                        Err(err) => {
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            return Err(err);
+                        }
+                    };
                     let recovery_snapshot =
                         self.fork_recovery
                             .create_snapshot(&self.storage, &group_id, before)?;
                     let before_members = group_lifecycle::marmot_members(&mls_group);
-                    let added: Vec<MemberId> = staged
-                        .add_proposals()
-                        .filter_map(|p| {
-                            let leaf = p.add_proposal().key_package().leaf_node();
-                            BasicCredential::try_from(leaf.credential().clone())
-                                .ok()
-                                .map(|bc| MemberId::new(bc.identity().to_vec()))
-                        })
-                        .collect();
                     self.retain_current_epoch_snapshot_for_group(&group_id)?;
                     // Extract capabilities from Add proposals before the
                     // staged commit is consumed by merge.

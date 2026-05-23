@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::canonicalization::{
-    CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
+    CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
     InvalidatedAppMessageReason, SyncState,
 };
 use crate::engine::Engine;
@@ -112,6 +112,19 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        // A group that has already entered `Unrecoverable` MUST stop applying
+        // group-state changes until a verified repair path
+        // (spec/protocol-core/group-state.md:50-51,65). Report the halt and
+        // leave canonical state untouched.
+        if self.epoch_manager.is_unrecoverable(group_id) {
+            return Ok(unrecoverable_result(
+                self.epoch_manager
+                    .epoch(group_id)
+                    .map(|e| e.0)
+                    .unwrap_or_default(),
+            ));
+        }
+
         let previous_group = self
             .storage
             .get_group(group_id)
@@ -150,6 +163,21 @@ impl<S: StorageProvider> Engine<S> {
             now_ms,
         )?;
         if result.sync_state != SyncState::Stable {
+            return Ok(result);
+        }
+
+        // retained-history.md:30-31 — a required retained state missing inside
+        // the rollback horizon MUST report `MissingRetainedAnchor`, leave
+        // canonical group state unchanged, and move the group to
+        // `Unrecoverable`. Halt before applying anything.
+        if result
+            .errors
+            .contains(&CanonicalizationError::MissingRetainedAnchor)
+        {
+            self.epoch_manager.mark_unrecoverable(group_id);
+            self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
+                group_id: group_id.clone(),
+            });
             return Ok(result);
         }
 
@@ -290,6 +318,26 @@ impl<S: StorageProvider> Engine<S> {
                     .insert(cgka_traits::types::MessageId::new(bytes));
             }
         }
+    }
+}
+
+/// Result returned for a group already in `Unrecoverable`: no canonical
+/// mutation, `MissingRetainedAnchor` reported, current tip preserved.
+fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
+    CanonicalizationResult {
+        previous_tip: current_tip,
+        selected_tip: None,
+        selected_branch_id: None,
+        sync_state: SyncState::Stable,
+        accepted_commits: Vec::new(),
+        accepted_proposals: Vec::new(),
+        accepted_app_messages: Vec::new(),
+        invalidated_app_messages: Vec::new(),
+        dropped_messages: Vec::new(),
+        already_seen: Vec::new(),
+        queued_outbound_intents: Vec::new(),
+        publishable_outbound_messages: Vec::new(),
+        errors: vec![CanonicalizationError::MissingRetainedAnchor],
     }
 }
 

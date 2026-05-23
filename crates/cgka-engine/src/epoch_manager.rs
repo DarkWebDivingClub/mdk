@@ -232,4 +232,25 @@ impl EpochManager {
         let new = prev.detect_fork(buffered);
         self.states.insert(group_id.clone(), new);
     }
+
+    /// Transition the named group into `Unrecoverable`. Always legal. Called
+    /// when convergence reports a `MissingRetainedAnchor` inside the rollback
+    /// horizon: canonical state is frozen and the engine stops applying or
+    /// ingesting group-state changes until a verified repair path
+    /// (`spec/protocol-core/group-state.md:54-66`).
+    pub(crate) fn mark_unrecoverable(&mut self, group_id: &GroupId) {
+        let prev = self
+            .states
+            .remove(group_id)
+            .unwrap_or_else(|| EpochState::stable(EpochId(0)));
+        self.states
+            .insert(group_id.clone(), prev.to_unrecoverable());
+    }
+
+    /// Whether the named group is currently `Unrecoverable`.
+    pub(crate) fn is_unrecoverable(&self, group_id: &GroupId) -> bool {
+        self.states
+            .get(group_id)
+            .is_some_and(|s| s.is_unrecoverable())
+    }
 }

@@ -220,6 +220,13 @@ pub enum GroupEvent {
         winner: CommitOrderingKey,
         invalidated: CommitOrderingKey,
     },
+    /// The group entered the `Unrecoverable` state: convergence reported a
+    /// `MissingRetainedAnchor` inside the rollback horizon, so the client
+    /// stopped applying group-state changes and now needs a verified repair
+    /// path. See `spec/protocol-core/group-state.md:54-66`.
+    GroupUnrecoverable {
+        group_id: GroupId,
+    },
 }
 
 /// Request shape for [`CgkaEngine::create_group`]. Carries the intended

@@ -757,6 +757,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::Peeler(_) => "peeler",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::UnknownPending => "unknown_pending",
     }
     .into()

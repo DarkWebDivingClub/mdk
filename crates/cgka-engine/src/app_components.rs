@@ -191,15 +191,66 @@ pub(crate) fn require_admin_for_staged_commit(
     require_admin(mls_group, group_id, sender)
 }
 
-pub(crate) fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
-    staged.add_proposals().next().is_some()
-        || staged.remove_proposals().next().is_some()
-        || staged.queued_proposals().any(|queued| {
-            matches!(
-                queued.proposal(),
-                Proposal::GroupContextExtensions(_) | Proposal::AppDataUpdate(_)
-            )
-        })
+/// Does this staged commit require the sender to be a group admin?
+///
+/// `spec/protocol-core/group-messaging.md:46-53` defines an *allowlist* of the
+/// only two commit shapes a non-admin may produce:
+///
+/// - **(a) self-update**: a Commit that updates only the sender's own LeafNode,
+///   i.e. an inline update path with no by-reference proposals; and
+/// - **(b) SelfRemove-only**: a Commit whose by-reference proposals are all
+///   `SelfRemove` (at least one), and nothing else.
+///
+/// The two shapes must not be combined with each other or with any other
+/// proposal type. Every other commit shape — including `PreSharedKey`,
+/// `ReInit`, `ExternalInit`, `GroupContextExtensions`, `AppDataUpdate`,
+/// `AppEphemeral`, `Custom`, by-reference `Add`/`Remove`/`Update`, illegal
+/// combinations, and the empty/no-op commit — requires admin.
+///
+/// This is the inverse of the allowlist: it returns `true` (admin required)
+/// unless the commit is exactly one of the two allowed non-admin shapes.
+///
+/// `pub` so engine integration tests can classify real OpenMLS staged commits
+/// directly; there is no production caller outside this crate.
+pub fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
+    !is_allowed_non_admin_commit(staged)
+}
+
+/// Returns `true` iff `staged` is exactly one of the two commit shapes a
+/// non-admin member is permitted to commit. Fail-closed: any unrecognized or
+/// combined shape returns `false`.
+///
+/// Both allowed shapes carry the committer's own update-path leaf node — MLS
+/// requires a fresh path on a Remove/SelfRemove commit, and a self-update *is*
+/// a path. So the update path is never a disqualifier; classification is driven
+/// entirely by the set of by-reference proposals.
+fn is_allowed_non_admin_commit(staged: &StagedCommit) -> bool {
+    let mut proposal_count = 0usize;
+    let mut self_remove_count = 0usize;
+    for queued in staged.queued_proposals() {
+        proposal_count += 1;
+        match queued.proposal() {
+            Proposal::SelfRemove => self_remove_count += 1,
+            // Any non-SelfRemove by-reference proposal (Add, Remove, Update,
+            // PreSharedKey, ReInit, ExternalInit, GroupContextExtensions,
+            // AppDataUpdate, AppEphemeral, Custom) disqualifies both allowed
+            // shapes.
+            _ => return false,
+        }
+    }
+
+    // Shape (a): self-update only — the committer's update path with no
+    // by-reference proposals (updates only the sender's own LeafNode).
+    let is_self_update_only = proposal_count == 0 && staged.update_path_leaf_node().is_some();
+
+    // Shape (b): SelfRemove-only — at least one SelfRemove proposal and every
+    // by-reference proposal is a SelfRemove. The committer's update path is
+    // expected and allowed; it re-keys the committer's own leaf for PCS.
+    let is_self_remove_only = self_remove_count > 0 && self_remove_count == proposal_count;
+
+    // The two shapes are mutually exclusive by proposal count; `^` also rejects
+    // the empty/no-op commit (neither shape).
+    is_self_update_only ^ is_self_remove_only
 }
 
 pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], EngineError> {

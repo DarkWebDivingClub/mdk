@@ -127,6 +127,27 @@ impl Recovering {
     }
 }
 
+// ── Unrecoverable inner ─────────────────────────────────────────────────────
+
+/// Data carried by [`EpochState::Unrecoverable`].
+///
+/// Per `spec/protocol-core/group-state.md:14-18,54-66` and
+/// `retained-history.md:30-31`, a client enters `Unrecoverable` when it cannot
+/// safely select a canonical branch from its retained material (e.g. a
+/// `MissingRetainedAnchor` inside the rollback horizon). The canonical state is
+/// left unchanged at `last_stable_epoch`, and the client MUST stop applying or
+/// ingesting group-state changes until a verified repair path restores it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrecoverable {
+    last_stable_epoch: EpochId,
+}
+
+impl Unrecoverable {
+    pub fn last_stable_epoch(&self) -> EpochId {
+        self.last_stable_epoch
+    }
+}
+
 // ── EpochState ──────────────────────────────────────────────────────────────
 
 /// Per-group commit lifecycle.
@@ -151,21 +172,40 @@ impl Recovering {
 ///                                ▲
 ///                                │
 ///                                ▼
-///                         ┌─────────────┐
-///                         │ Recovering  │   (unrecoverable fork fallback;
-///                         └─────────────┘    same-epoch races recover
-///                                            before entering this state)
+///                         ┌─────────────┐  to_unrecoverable
+///                         │ Recovering  │ ─────────────────┐
+///                         └─────────────┘                  │
+///                          (same-epoch races recover       ▼
+///                           before this state)      ┌───────────────┐
+///                                                   │ Unrecoverable │
+///                  to_unrecoverable (any state) ───►│               │
+///                                                   └───────┬───────┘
+///                                                           │ repair_to_stable
+///                                                           ▼
+///                                                       (Stable)
 /// ```
 ///
-/// Every transition below returns `Result<Self, InvalidTransition>`. Illegal
-/// transitions do NOT panic — they return a typed error the engine logs and
-/// upgrades to an `EngineError::Backend` in practice.
+/// `to_unrecoverable` is reachable from any state (a fail-safe halt on
+/// `MissingRetainedAnchor` inside the rollback horizon); `repair_to_stable` is
+/// the only legal exit from `Unrecoverable`.
+///
+/// Every fallible transition below returns `Result<Self, InvalidTransition>`.
+/// Illegal transitions do NOT panic — they return a typed error the engine logs
+/// and upgrades to an `EngineError::Backend` in practice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EpochState {
-    Stable { epoch: EpochId },
+    Stable {
+        epoch: EpochId,
+    },
     PendingPublish(PendingPublish),
     Merging(Merging),
     Recovering(Recovering),
+    /// The client cannot safely select a branch from its retained local
+    /// material (e.g. a `MissingRetainedAnchor` inside the rollback horizon).
+    /// Canonical state is frozen at the last stable epoch; the client MUST stop
+    /// applying and ingesting group-state changes until a verified repair path.
+    /// See `spec/protocol-core/group-state.md:17,54-66`.
+    Unrecoverable(Unrecoverable),
 }
 
 impl EpochState {
@@ -181,13 +221,23 @@ impl EpochState {
             EpochState::PendingPublish(p) => p.epoch(),
             EpochState::Merging(m) => m.epoch(),
             EpochState::Recovering(r) => r.last_stable_epoch(),
+            EpochState::Unrecoverable(u) => u.last_stable_epoch(),
         }
     }
 
     /// Whether the engine may ingest new inbound messages while in this state.
+    ///
     /// `PendingPublish` and `Merging` buffer; `Stable` and `Recovering` accept.
+    /// `Unrecoverable` rejects: the client MUST stop ingesting group-state
+    /// changes until a verified repair path (`group-state.md:50-51,65`).
     pub fn can_ingest(&self) -> bool {
         matches!(self, EpochState::Stable { .. } | EpochState::Recovering(_))
+    }
+
+    /// Whether this group is in the terminal `Unrecoverable` state and requires
+    /// a repair path before it may apply or ingest more group traffic.
+    pub fn is_unrecoverable(&self) -> bool {
+        matches!(self, EpochState::Unrecoverable(_))
     }
 
     /// Short name for logs / tests.
@@ -197,6 +247,7 @@ impl EpochState {
             EpochState::PendingPublish(_) => "PendingPublish",
             EpochState::Merging(_) => "Merging",
             EpochState::Recovering(_) => "Recovering",
+            EpochState::Unrecoverable(_) => "Unrecoverable",
         }
     }
 
@@ -275,6 +326,32 @@ impl EpochState {
             last_stable_epoch,
             buffered,
         })
+    }
+
+    /// `* → Unrecoverable`. Always legal. Called when convergence reports a
+    /// `MissingRetainedAnchor` inside the rollback horizon (or another case
+    /// where no candidate branch can be validated from retained material). The
+    /// current epoch becomes the frozen `last_stable_epoch`; canonical state is
+    /// left unchanged. See `spec/protocol-core/group-state.md:54-66` and
+    /// `retained-history.md:30-31`.
+    pub fn to_unrecoverable(self) -> Self {
+        let last_stable_epoch = self.epoch();
+        EpochState::Unrecoverable(Unrecoverable { last_stable_epoch })
+    }
+
+    /// `Unrecoverable → Stable`. The only legal exit from `Unrecoverable`: the
+    /// client repaired, restored, or replaced its local group copy through a
+    /// verified path (`group-state.md:44,65-68`). `epoch` is the verified
+    /// canonical epoch after repair.
+    pub fn repair_to_stable(self, epoch: EpochId) -> Result<Self, InvalidTransition> {
+        match self {
+            EpochState::Unrecoverable(_) => Ok(EpochState::Stable { epoch }),
+            other => Err(InvalidTransition {
+                from: other.name(),
+                to: "Stable",
+                reason: "repair_to_stable requires Unrecoverable",
+            }),
+        }
     }
 }
 
@@ -457,6 +534,40 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Stable"));
         assert!(msg.contains("Merging"));
+    }
+
+    #[test]
+    fn to_unrecoverable_freezes_last_stable_epoch_and_blocks_ingest() {
+        let s = EpochState::stable(EpochId(9)).to_unrecoverable();
+        assert_eq!(s.name(), "Unrecoverable");
+        assert!(s.is_unrecoverable());
+        assert_eq!(s.epoch(), EpochId(9));
+        // Unrecoverable MUST stop ingesting group-state changes.
+        assert!(!s.can_ingest());
+    }
+
+    #[test]
+    fn to_unrecoverable_is_legal_from_recovering() {
+        let s = EpochState::stable(EpochId(4))
+            .detect_fork(vec![])
+            .to_unrecoverable();
+        match &s {
+            EpochState::Unrecoverable(u) => assert_eq!(u.last_stable_epoch(), EpochId(4)),
+            other => panic!("expected Unrecoverable, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn repair_to_stable_only_from_unrecoverable() {
+        let unrecoverable = EpochState::stable(EpochId(2)).to_unrecoverable();
+        let repaired = unrecoverable.repair_to_stable(EpochId(5)).unwrap();
+        assert_eq!(repaired, EpochState::stable(EpochId(5)));
+        // Not legal from Stable.
+        assert!(
+            EpochState::stable(EpochId(0))
+                .repair_to_stable(EpochId(1))
+                .is_err()
+        );
     }
 
     #[test]

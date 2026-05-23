@@ -24,6 +24,15 @@ pub enum EngineError {
     #[error("member {member} is not in group {group_id}")]
     UnknownMember { group_id: GroupId, member: MemberId },
 
+    /// A credential identity is not a valid Marmot account identity. Per
+    /// `spec/foundation/identity.md`, a Marmot member-leaf credential identity
+    /// MUST be exactly 32 bytes encoding a valid x-only secp256k1 (BIP-340)
+    /// public key. Returned at every member/credential ingress (create,
+    /// invite, join/welcome, inbound processing) and at local identity
+    /// creation.
+    #[error("invalid credential identity: {0}")]
+    InvalidCredentialIdentity(String),
+
     /// MIP-03 §149 — an admin cannot SelfRemove if doing so would leave the
     /// group with zero admins. Demote (or transfer admin status) before
     /// leaving.

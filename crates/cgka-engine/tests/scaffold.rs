@@ -15,6 +15,25 @@ use cgka_traits::types::MemberId;
 use cgka_traits::{CgkaEngine, EngineError};
 use storage_memory::MemoryStorage;
 
+/// Deterministic, spec-valid x-only secp256k1 identity derived from a label.
+fn valid_identity(seed: &[u8]) -> Vec<u8> {
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut material = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-test-identity-v1");
+        hasher.update(seed);
+        hasher.update(counter.to_be_bytes());
+        material.copy_from_slice(&hasher.finalize());
+        if let Ok(sk) = SigningKey::from_bytes(&material) {
+            return sk.verifying_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
+}
+
 struct StubPeeler;
 
 #[async_trait]
@@ -50,14 +69,15 @@ impl TransportPeeler for StubPeeler {
 
 #[test]
 fn engine_can_be_built_and_boxed_as_trait_object() {
+    let identity = valid_identity(b"self-identity");
     let engine = EngineBuilder::new(MemoryStorage::new())
-        .identity(b"self-identity".to_vec())
+        .identity(identity.clone())
         .peeler(Box::new(StubPeeler))
         .build()
         .expect("build");
 
     // self_id is real from the start.
-    assert_eq!(engine.self_id().as_slice(), b"self-identity");
+    assert_eq!(engine.self_id().as_slice(), identity.as_slice());
 
     // Witness: this line stops compiling if async-trait lifetimes regress.
     let _boxed: Box<dyn CgkaEngine + Send + Sync> = Box::new(engine);
@@ -82,7 +102,7 @@ fn builder_rejects_missing_peeler() {
 #[tokio::test]
 async fn empty_engine_methods_return_typed_results() {
     let mut engine = EngineBuilder::new(MemoryStorage::new())
-        .identity(b"id".to_vec())
+        .identity(valid_identity(b"id"))
         .peeler(Box::new(StubPeeler))
         .build()
         .unwrap();

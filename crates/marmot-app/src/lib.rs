@@ -4334,7 +4334,8 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::MemberAdded { group_id, .. }
         | GroupEvent::MemberRemoved { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
-        | GroupEvent::ForkRecovered { group_id, .. } => group_id,
+        | GroupEvent::ForkRecovered { group_id, .. }
+        | GroupEvent::GroupUnrecoverable { group_id } => group_id,
     }
 }
 
@@ -6008,7 +6009,8 @@ fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         | GroupEvent::MemberAdded { group_id, .. }
         | GroupEvent::MemberRemoved { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
-        | GroupEvent::ForkRecovered { group_id, .. } => Some(group_id),
+        | GroupEvent::ForkRecovered { group_id, .. }
+        | GroupEvent::GroupUnrecoverable { group_id } => Some(group_id),
     }
 }
 

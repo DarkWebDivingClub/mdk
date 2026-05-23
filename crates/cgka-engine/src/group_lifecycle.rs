@@ -350,6 +350,35 @@ impl<S: StorageProvider> Engine<S> {
 
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
+        // 5b. Reject the Welcome if any member leaf carries an invalid Marmot
+        // credential identity (foundation/identity.md, joining.md:65). The
+        // Welcome embeds the full ratchet tree, so every current member's
+        // credential is checked here at join ingress.
+        validate_member_credentials(&mls_group)?;
+
+        // 5c. Reject the Welcome if the resulting group has active required
+        // capabilities (MLS extensions, proposal types, or Marmot app
+        // components) this client cannot apply. The create/invite paths run the
+        // symmetric `missing_from` check; joining.md:65 and convergence.md:19
+        // require it here too. `had` is this client's CURRENT runtime support
+        // (feature registry + supported app components), so a group requiring
+        // more than this client can process is rejected even if a stale or
+        // over-broad KeyPackage was consumed.
+        let group_required =
+            crate::capability_manager::required_capabilities_from_group(&mls_group);
+        let had = crate::capabilities::self_supported_capabilities(
+            &self.registry,
+            self.ciphersuite,
+            &self.supported_app_components,
+        );
+        let missing = group_required.missing_from(&had);
+        if !missing.is_empty() {
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(group_required),
+                had: Box::new(had),
+            });
+        }
+
         // 6. Persist Marmot group record from signed group-context data.
         let mut group_record = Group {
             id: group_id.clone(),
@@ -454,9 +483,7 @@ impl<S: StorageProvider> Engine<S> {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn member_id_of_key_package(kp: &openmls::prelude::KeyPackage) -> Result<MemberId, EngineError> {
-    let basic: BasicCredential = BasicCredential::try_from(kp.leaf_node().credential().clone())
-        .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
-    Ok(MemberId::new(basic.identity().to_vec()))
+    crate::identity::validated_member_id_of_leaf(kp.leaf_node())
 }
 
 /// Build the projected post-merge member list: existing MLS members + each
@@ -471,9 +498,7 @@ pub(crate) fn projected_members_with_pending(
 ) -> Result<Vec<Member>, EngineError> {
     let mut out = marmot_members(group);
     for kp in invitees {
-        let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
-            .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
-        let id = MemberId::new(bc.identity().to_vec());
+        let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
         if !out.iter().any(|m| m.id == id) {
             out.push(Member {
                 id,
@@ -482,6 +507,19 @@ pub(crate) fn projected_members_with_pending(
         }
     }
     Ok(out)
+}
+
+/// Validate the Marmot credential identity of every member leaf in `group`.
+///
+/// Used at join ingress (`do_join_welcome`) so a Welcome whose resulting group
+/// contains any member with an invalid x-only secp256k1 credential identity is
+/// rejected before the group is persisted. Returns the offending member's
+/// error on the first invalid credential.
+pub(crate) fn validate_member_credentials(group: &MlsGroup) -> Result<(), EngineError> {
+    for member in group.members() {
+        crate::identity::validated_member_id(&member.credential)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn marmot_members(group: &MlsGroup) -> Vec<Member> {

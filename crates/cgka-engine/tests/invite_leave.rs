@@ -18,13 +18,25 @@ use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
-    // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
-    // zero-padded to 32 so engine-layer admin tracking works without
-    // breaking ergonomic test names.
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
+    // public key (spec/foundation/identity.md). Derive one deterministically
+    // from the ergonomic label so admin/member tracking stays stable across a
+    // run while the engine accepts the identity.
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut material = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        material.copy_from_slice(&hasher.finalize());
+        if let Ok(sk) = SigningKey::from_bytes(&material) {
+            return sk.verifying_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
 }
 
 struct MockPeeler;
@@ -124,13 +136,12 @@ fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
         .unwrap()
 }
 
-fn build_raw_identity_client(id: &[u8]) -> Engine<MemoryStorage> {
+fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<MemoryStorage>, EngineError> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(id.to_vec())
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
-        .unwrap()
 }
 
 fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
@@ -448,40 +459,26 @@ async fn non_admin_cannot_invite_members() {
 }
 
 #[tokio::test]
-async fn remove_members_rejects_malformed_target_member_identity() {
-    let mut alice = build_client(b"alice");
-    let mut bob = build_raw_identity_client(b"bob");
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "malformed-target".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    match create {
-        SendResult::GroupCreated { pending, .. } => {
-            alice.confirm_published(pending).await.unwrap();
-        }
-        _ => unreachable!(),
-    };
-
-    let err = alice
-        .send(SendIntent::RemoveMembers {
-            group_id: group_id.clone(),
-            members: vec![bob.self_id()],
-        })
-        .await
+async fn engine_rejects_malformed_local_credential_identity_at_build() {
+    // foundation/identity.md: a Marmot credential identity MUST be a valid
+    // 32-byte x-only secp256k1 public key. A short, non-curve identity is
+    // rejected at identity creation, so a member with a malformed identity can
+    // never enter a group in the first place.
+    let err = try_build_raw_identity_client(b"bob")
         .err()
-        .unwrap();
-
+        .expect("building an engine with a 3-byte identity must fail");
+    let message = err.to_string();
     assert!(
-        matches!(err, EngineError::Backend(message) if message.contains("32-byte member identities"))
+        message.contains("invalid credential identity"),
+        "unexpected error: {message}"
+    );
+
+    // A 32-byte value that is not a valid curve point is also rejected.
+    let mut not_a_point = vec![0u8; 32];
+    not_a_point[..5].copy_from_slice(b"david");
+    assert!(
+        try_build_raw_identity_client(&not_a_point).is_err(),
+        "a 32-byte non-curve identity must be rejected"
     );
 }
 

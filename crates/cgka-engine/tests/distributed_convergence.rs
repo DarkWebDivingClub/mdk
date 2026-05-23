@@ -16,7 +16,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -29,10 +29,25 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
+    // public key (spec/foundation/identity.md). Derive one deterministically
+    // from the ergonomic label so admin/member tracking stays stable across a
+    // run while the engine accepts the identity.
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut material = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        material.copy_from_slice(&hasher.finalize());
+        if let Ok(sk) = SigningKey::from_bytes(&material) {
+            return sk.verifying_key().to_bytes().to_vec();
+        }
+        counter += 1;
+    }
 }
 
 struct MockPeeler;
@@ -875,6 +890,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         result.errors,
         vec![CanonicalizationError::MissingRetainedAnchor]
     );
+    // retained-history.md:30-31 — canonical state is left unchanged...
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
     assert!(
@@ -884,6 +900,44 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
             .iter()
             .any(|member| member.id == eve.self_id())
     );
+    // ...and the group moves to Unrecoverable, which the engine surfaces via a
+    // GroupUnrecoverable event.
+    assert!(
+        carol.drain_events().iter().any(|e| matches!(
+            e,
+            GroupEvent::GroupUnrecoverable { group_id: g } if g == &group_id
+        )),
+        "engine must emit GroupUnrecoverable on MissingRetainedAnchor"
+    );
+
+    // group-state.md:50-51,65 — while Unrecoverable, the client MUST stop
+    // applying group-state changes. A second convergence pass still reports
+    // MissingRetainedAnchor and applies nothing.
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 4_000_000)
+        .expect("convergence on an unrecoverable group is a no-op result");
+    assert_eq!(
+        second.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert!(second.selected_tip.is_none());
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+
+    // Inbound ingest is halted too: a fresh inbound group message is retained
+    // (buffered), not applied, until a verified repair path.
+    let outcome = carol
+        .ingest(bob_commit.clone())
+        .await
+        .expect("ingest does not error on an unrecoverable group");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Buffered { .. } | IngestOutcome::Stale { .. }
+        ),
+        "inbound must not be applied while Unrecoverable; got {outcome:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 }
 
 #[tokio::test]
