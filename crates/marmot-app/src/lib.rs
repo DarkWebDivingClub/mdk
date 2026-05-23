@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -5808,7 +5808,7 @@ impl AppTransportRouting {
     }
 
     fn add_group(&self, group: TransportGroupSubscription) {
-        let mut state = self.inner.write().expect("app routing lock poisoned");
+        let mut state = self.write();
         if state
             .group_routes
             .iter()
@@ -5820,47 +5820,44 @@ impl AppTransportRouting {
     }
 
     fn snapshot(&self) -> AppRoutingState {
-        self.inner
-            .read()
-            .expect("app routing lock poisoned")
-            .clone()
+        self.read().clone()
     }
 
     fn replace(&self, state: AppRoutingState) {
-        *self.inner.write().expect("app routing lock poisoned") = state;
+        *self.write() = state;
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, AppRoutingState> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 impl TransportRoutingPolicy for AppTransportRouting {
     fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
-        self.inner
-            .read()
-            .expect("app routing lock poisoned")
-            .local_inbox_endpoints
-            .clone()
+        self.read().local_inbox_endpoints.clone()
     }
 
     fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
-        self.inner
-            .read()
-            .expect("app routing lock poisoned")
-            .key_package_endpoints
-            .clone()
+        self.read().key_package_endpoints.clone()
     }
 
     fn group_subscriptions(&self) -> Vec<TransportGroupSubscription> {
-        self.inner
-            .read()
-            .expect("app routing lock poisoned")
-            .group_routes
-            .clone()
+        self.read().group_routes.clone()
     }
 
     fn publish_target(
         &self,
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
-        let state = self.inner.read().expect("app routing lock poisoned");
+        let state = self.read();
         match &message.envelope {
             TransportEnvelope::Welcome { recipient } => {
                 let endpoints = state
@@ -5890,10 +5887,7 @@ impl TransportRoutingPolicy for AppTransportRouting {
     }
 
     fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
-        self.inner
-            .read()
-            .expect("app routing lock poisoned")
-            .required_acks
+        self.read().required_acks
     }
 }
 
@@ -7323,6 +7317,31 @@ mod tests {
             backoff.next_delay_with_jitter(Duration::ZERO),
             Duration::from_secs(2)
         );
+    }
+
+    #[test]
+    fn app_transport_routing_recovers_from_poisoned_lock() {
+        let routing = AppTransportRouting::new(AppRoutingState {
+            local_inbox_endpoints: Vec::new(),
+            key_package_endpoints: Vec::new(),
+            inbox_routes: HashMap::new(),
+            group_routes: Vec::new(),
+            required_acks: 1,
+        });
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = routing.inner.write().unwrap();
+            panic!("poison app routing lock");
+        }));
+
+        routing.replace(AppRoutingState {
+            local_inbox_endpoints: Vec::new(),
+            key_package_endpoints: Vec::new(),
+            inbox_routes: HashMap::new(),
+            group_routes: Vec::new(),
+            required_acks: 2,
+        });
+
+        assert_eq!(routing.snapshot().required_acks, 2);
     }
 
     #[test]

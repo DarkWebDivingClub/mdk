@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -221,11 +221,7 @@ impl MarmotRelayPlane {
     ) -> MarmotRelayPlaneAccountAdapter {
         self.spawn_router();
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER);
-        self.inner
-            .transport
-            .account_deliveries
-            .write()
-            .expect("relay-plane account deliveries lock poisoned")
+        account_deliveries_write(&self.inner.transport.account_deliveries)
             .insert(account_id.clone(), delivery_tx);
         MarmotRelayPlaneAccountAdapter {
             account_id,
@@ -310,10 +306,7 @@ impl MarmotRelayPlane {
         let adapter = transport.adapter.clone();
         let handle = handle.spawn(async move {
             while let Ok(Some(delivery)) = adapter.receive().await {
-                let sender = transport
-                    .account_deliveries
-                    .read()
-                    .expect("relay-plane account deliveries lock poisoned")
+                let sender = account_deliveries_read(&transport.account_deliveries)
                     .get(&delivery.account_id)
                     .cloned();
                 if let Some(sender) = sender {
@@ -663,12 +656,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if account_id != &self.account_id {
             return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
         }
-        self.relay_plane
-            .inner
-            .transport
-            .account_deliveries
-            .write()
-            .expect("relay-plane account deliveries lock poisoned")
+        account_deliveries_write(&self.relay_plane.inner.transport.account_deliveries)
             .remove(account_id);
         self.relay_plane
             .inner
@@ -729,6 +717,22 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 }
 
+fn account_deliveries_read(
+    deliveries: &RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
+) -> RwLockReadGuard<'_, HashMap<MemberId, mpsc::Sender<TransportDelivery>>> {
+    deliveries
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn account_deliveries_write(
+    deliveries: &RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
+) -> RwLockWriteGuard<'_, HashMap<MemberId, mpsc::Sender<TransportDelivery>>> {
+    deliveries
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn publish_report_from_outcome(
     outcome: NostrPublishOutcome,
     request: TransportPublishRequest,
@@ -756,6 +760,20 @@ mod tests {
     use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE};
 
     use super::*;
+
+    #[test]
+    fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
+        let deliveries = RwLock::new(HashMap::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = deliveries.write().unwrap();
+            panic!("poison account deliveries lock");
+        }));
+
+        let (delivery_tx, _delivery_rx) = mpsc::channel(1);
+        account_deliveries_write(&deliveries).insert(MemberId::new(vec![0x01; 32]), delivery_tx);
+
+        assert_eq!(account_deliveries_read(&deliveries).len(), 1);
+    }
 
     #[derive(Default)]
     struct RecordingRelayClient {

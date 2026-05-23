@@ -26,9 +26,10 @@ impl SqliteOpenMlsStorage {
     fn lock(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, SqliteOpenMlsStorageError> {
-        self.connection
+        Ok(self
+            .connection
             .lock()
-            .map_err(|e| SqliteOpenMlsStorageError::Lock(e.to_string()))
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 }
 

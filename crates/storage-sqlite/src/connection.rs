@@ -146,9 +146,10 @@ impl SqliteStorage {
     }
 
     pub(crate) fn lock(&self) -> StorageResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-        self.connection
+        Ok(self
+            .connection
             .lock()
-            .map_err(|e| StorageError::Backend(format!("sqlite connection lock poisoned: {e}")))
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 }
 
@@ -267,6 +268,19 @@ mod tests {
 
         assert!(!rendered.contains("debug-visible secret"));
         assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn connection_lock_recovers_from_poisoned_guard() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.connection.lock().unwrap();
+            panic!("poison sqlite connection lock");
+        }));
+
+        let conn = store.lock().unwrap();
+
+        assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
     }
 
     #[test]
