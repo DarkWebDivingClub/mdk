@@ -52,6 +52,7 @@ use cgka_traits::{
     GroupId, MemberId, MessageId, SecretBytes, TransportAdapter, TransportAdapterError,
     TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
 };
+use hkdf::Hkdf;
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
@@ -98,6 +99,10 @@ use relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRe
 
 const ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
+const SESSION_DB_FILE: &str = "session.sqlite";
+const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
+const SQLCIPHER_SALT_LEN: usize = 32;
+const SQLCIPHER_KEY_LEN: usize = 32;
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
@@ -2732,10 +2737,36 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
+    #[error("SQLCipher key derivation failed: {0}")]
+    SqlcipherKeyDerivation(String),
     #[error("no matching reaction by this account to retract")]
     ReactionNotFound,
     #[error("transport event stream closed")]
     TransportClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlcipherDatabaseKind {
+    Session,
+    AccountProjection,
+    DirectoryCache,
+}
+
+impl SqlcipherDatabaseKind {
+    fn hkdf_info_label(self) -> &'static [u8] {
+        match self {
+            Self::Session => b"marmot-app/session-sqlcipher-key/v2",
+            Self::AccountProjection => b"marmot-app/account-projection-sqlcipher-key/v2",
+            Self::DirectoryCache => b"marmot-app/directory-cache-sqlcipher-key/v2",
+        }
+    }
+
+    fn legacy_hash_label(self) -> &'static [u8] {
+        match self {
+            Self::Session | Self::AccountProjection => b"marmot-app-sqlcipher-key-v1",
+            Self::DirectoryCache => b"marmot-app-directory-cache-sqlcipher-key-v1",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3447,10 +3478,13 @@ impl MarmotApp {
         let keys = self.account_home().load_signing_keys(label)?;
         let account_id = MemberId::new(keys.public_key().to_bytes());
         let peeler = NostrMlsPeeler::new().with_welcome_signer(keys.clone());
+        let session_path = self.account_dir(label).join(SESSION_DB_FILE);
+        let session_key =
+            self.sqlcipher_key(label, &keys, &session_path, SqlcipherDatabaseKind::Session)?;
         let session = AccountDeviceSession::open(
             SessionConfig::new(
-                self.account_dir(label).join("session.sqlite"),
-                self.sqlcipher_key(label, &keys)?,
+                session_path,
+                session_key,
                 account_id.as_slice().to_vec(),
                 Box::new(peeler),
             )
@@ -3768,17 +3802,46 @@ impl MarmotApp {
         }
     }
 
-    fn sqlcipher_key(&self, label: &str, keys: &nostr::Keys) -> Result<SqlCipherKey, AppError> {
-        Ok(SqlCipherKey::new(self.sqlcipher_key_material(label, keys))?)
+    fn sqlcipher_key(
+        &self,
+        label: &str,
+        keys: &nostr::Keys,
+        db_path: &Path,
+        kind: SqlcipherDatabaseKind,
+    ) -> Result<SqlCipherKey, AppError> {
+        let salt = self.sqlcipher_salt(label, keys, db_path, kind)?;
+        Ok(SqlCipherKey::new(derive_sqlcipher_key_material(
+            label, keys, &salt, kind,
+        )?)?)
     }
 
-    fn sqlcipher_key_material(&self, label: &str, keys: &nostr::Keys) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-app-sqlcipher-key-v1");
-        hasher.update(label.as_bytes());
-        hasher.update(keys.public_key().to_bytes());
-        hasher.update(keys.secret_key().to_secret_bytes());
-        hex::encode(hasher.finalize())
+    fn sqlcipher_salt(
+        &self,
+        label: &str,
+        keys: &nostr::Keys,
+        db_path: &Path,
+        kind: SqlcipherDatabaseKind,
+    ) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
+        let salt_path = sqlcipher_salt_path(db_path);
+        if salt_path.exists() {
+            return read_sqlcipher_salt(&salt_path);
+        }
+
+        let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        write_sqlcipher_salt(&salt_path, &salt)?;
+
+        if db_path.exists() {
+            let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
+            let new_key =
+                SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind)?)?;
+            if let Err(err) = rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key) {
+                let _ = fs::remove_file(&salt_path);
+                return Err(err);
+            }
+        }
+
+        Ok(salt)
     }
 
     fn account_inbox_endpoints(
@@ -3829,8 +3892,14 @@ impl MarmotApp {
 
     fn account_projection(&self, label: &str) -> Result<AccountProjectionDb, AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let key = self.sqlcipher_key(label, &keys)?;
-        AccountProjectionDb::open(self.account_projection_path(label), &key)
+        let path = self.account_projection_path(label);
+        let key = self.sqlcipher_key(
+            label,
+            &keys,
+            &path,
+            SqlcipherDatabaseKind::AccountProjection,
+        )?;
+        AccountProjectionDb::open(path, &key)
     }
 
     fn projection_status(&self, label: &str) -> AppProjectionStatus {
@@ -3949,8 +4018,14 @@ impl MarmotApp {
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
         let keys = self.account_home().load_signing_keys(&account.label)?;
-        let key = SqlCipherKey::new(self.directory_cache_key_material(&account.label, &keys))?;
-        DirectoryCache::open(self.directory_cache_path(&account.label), &key)
+        let path = self.directory_cache_path(&account.label);
+        let key = self.sqlcipher_key(
+            &account.label,
+            &keys,
+            &path,
+            SqlcipherDatabaseKind::DirectoryCache,
+        )?;
+        DirectoryCache::open(path, &key)
     }
 
     fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
@@ -3981,15 +4056,6 @@ impl MarmotApp {
         }
 
         Ok(caches)
-    }
-
-    fn directory_cache_key_material(&self, label: &str, keys: &nostr::Keys) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-app-directory-cache-sqlcipher-key-v1");
-        hasher.update(label.as_bytes());
-        hasher.update(keys.public_key().to_bytes());
-        hasher.update(keys.secret_key().to_secret_bytes());
-        hex::encode(hasher.finalize())
     }
 
     fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
@@ -6249,6 +6315,80 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
         .is_err()
 }
 
+fn sqlcipher_salt_path(db_path: &Path) -> PathBuf {
+    let Some(file_name) = db_path.file_name() else {
+        return db_path.with_extension("salt");
+    };
+    let mut salt_file_name = file_name.to_os_string();
+    salt_file_name.push(SQLCIPHER_SALT_SUFFIX);
+    db_path.with_file_name(salt_file_name)
+}
+
+fn read_sqlcipher_salt(path: &Path) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
+    let raw = fs::read_to_string(path)?;
+    let bytes = hex::decode(raw.trim())?;
+    bytes.try_into().map_err(|_| {
+        AppError::SqlcipherKeyDerivation(format!("invalid salt length in {}", path.display()))
+    })
+}
+
+fn write_sqlcipher_salt(path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, hex::encode(salt))?;
+    Ok(())
+}
+
+fn derive_sqlcipher_key_material(
+    label: &str,
+    keys: &nostr::Keys,
+    salt: &[u8; SQLCIPHER_SALT_LEN],
+    kind: SqlcipherDatabaseKind,
+) -> Result<String, AppError> {
+    let secret = keys.secret_key().to_secret_bytes();
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), &secret);
+    let mut info = Vec::new();
+    encode_hkdf_part(&mut info, b"marmot-app-sqlcipher-key");
+    encode_hkdf_part(&mut info, kind.hkdf_info_label());
+    encode_hkdf_part(&mut info, label.as_bytes());
+    encode_hkdf_part(&mut info, keys.public_key().to_bytes().as_slice());
+    let mut output = [0_u8; SQLCIPHER_KEY_LEN];
+    hkdf.expand(&info, &mut output)
+        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".into()))?;
+    Ok(hex::encode(output))
+}
+
+fn legacy_sqlcipher_key_material(
+    label: &str,
+    keys: &nostr::Keys,
+    kind: SqlcipherDatabaseKind,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.legacy_hash_label());
+    hasher.update(label.as_bytes());
+    hasher.update(keys.public_key().to_bytes());
+    hasher.update(keys.secret_key().to_secret_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn encode_hkdf_part(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn rekey_legacy_sqlcipher_database(
+    db_path: &Path,
+    legacy_key: &SqlCipherKey,
+    new_key: &SqlCipherKey,
+) -> Result<(), AppError> {
+    let conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "key", legacy_key.as_secret_str())?;
+    let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    conn.pragma_update(None, "rekey", new_key.as_secret_str())?;
+    Ok(())
+}
+
 fn remove_sqlite_file_set(path: &Path) -> Result<(), AppError> {
     for candidate in [
         path.to_path_buf(),
@@ -6887,6 +7027,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), USER_DIRECTORY_SEARCH_MAX_FRONTIER);
+    }
+
+    #[test]
+    fn sqlcipher_keys_use_stable_per_database_salts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let session_path = app.account_dir("alice").join(SESSION_DB_FILE);
+        let projection_path = app.account_projection_path("alice");
+
+        let session_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &session_path,
+                SqlcipherDatabaseKind::Session,
+            )
+            .unwrap();
+        let repeated_session_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &session_path,
+                SqlcipherDatabaseKind::Session,
+            )
+            .unwrap();
+        let projection_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session_key.as_secret_str(),
+            repeated_session_key.as_secret_str()
+        );
+        assert_ne!(session_key.as_secret_str(), projection_key.as_secret_str());
+        assert!(sqlcipher_salt_path(&session_path).exists());
+        assert!(sqlcipher_salt_path(&projection_path).exists());
+    }
+
+    #[test]
+    fn sqlcipher_key_migrates_legacy_database_to_salted_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+        let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
+            "alice",
+            &keys,
+            SqlcipherDatabaseKind::AccountProjection,
+        ))
+        .unwrap();
+        {
+            let conn = Connection::open(&projection_path).unwrap();
+            conn.pragma_update(None, "key", legacy_key.as_secret_str())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker (value) VALUES ('kept');",
+            )
+            .unwrap();
+        }
+
+        let salted_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+
+        assert!(sqlcipher_salt_path(&projection_path).exists());
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", salted_key.as_secret_str())
+            .unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", legacy_key.as_secret_str())
+            .unwrap();
+        assert!(
+            conn.query_row("SELECT value FROM marker", [], |row| row
+                .get::<_, String>(0))
+                .is_err()
+        );
     }
 
     #[test]

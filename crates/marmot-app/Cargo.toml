@@ -11,6 +11,7 @@ cgka-engine.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true
 hex.workspace = true
+hkdf.workspace = true
 marmot-account.workspace = true
 nostr.workspace = true
 nostr-sdk.workspace = true
