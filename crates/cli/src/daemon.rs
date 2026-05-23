@@ -3224,19 +3224,13 @@ fn record_runtime_activity_report(
 }
 
 fn apply_defaults(cli: &mut Cli, defaults: &DaemonDefaults) {
-    if cli.home.is_none() {
-        cli.home = Some(defaults.home.clone());
-    }
+    cli.home = Some(defaults.home.clone());
     cli.relay = defaults.relay.clone();
     cli.daemon_discovery_relays = defaults.discovery_relays.clone();
     cli.daemon_default_account_relays = defaults.default_account_relays.clone();
     apply_default_account_relays(cli, defaults);
-    if cli.secret_store.is_none() {
-        cli.secret_store = defaults.secret_store;
-    }
-    if cli.keychain_service.is_none() {
-        cli.keychain_service = defaults.keychain_service.clone();
-    }
+    cli.secret_store = defaults.secret_store;
+    cli.keychain_service = defaults.keychain_service.clone();
     cli.socket = None;
 }
 
@@ -3887,6 +3881,39 @@ mod tests {
 
         assert_eq!(cli.relay.as_deref(), Some("wss://daemon.example"));
         assert_eq!(cli.socket, None);
+    }
+
+    #[test]
+    fn apply_defaults_overwrites_client_storage_scope_with_daemon_defaults() {
+        let defaults = DaemonDefaults {
+            home: PathBuf::from("/tmp/dm-daemon-home"),
+            socket: PathBuf::from("/tmp/dm-daemon.sock"),
+            pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
+            log_path: PathBuf::from("/tmp/dm-daemon.log"),
+            relay: Some("wss://daemon.example".to_owned()),
+            discovery_relays: Vec::new(),
+            default_account_relays: Vec::new(),
+            secret_store: Some(crate::SecretStoreKind::File),
+            keychain_service: Some("daemon-keychain".to_owned()),
+        };
+        let mut cli = Cli {
+            home: Some(PathBuf::from("/tmp/client-selected-home")),
+            socket: Some(PathBuf::from("/tmp/forwarded.sock")),
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: Some(crate::SecretStoreKind::Keychain),
+            keychain_service: Some("client-keychain".to_owned()),
+            account: None,
+            json: true,
+            command: crate::Command::Sync,
+        };
+
+        apply_defaults(&mut cli, &defaults);
+
+        assert_eq!(cli.home.as_deref(), Some(defaults.home.as_path()));
+        assert_eq!(cli.secret_store, Some(crate::SecretStoreKind::File));
+        assert_eq!(cli.keychain_service.as_deref(), Some("daemon-keychain"));
     }
 
     #[test]
