@@ -15,11 +15,11 @@ use cgka_traits::agent_text_stream::{
     AgentTextStreamTranscriptV1,
 };
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, ReceivedTextChunk, ReceivedTextStream, SentTextStream, decrypt_record,
@@ -29,6 +29,13 @@ use transport_quic_stream::{
 pub const QUIC_BROKER_PROTOCOL_V1: &str = "marmot.quic_broker.v1";
 pub const DEFAULT_SUBSCRIBER_QUEUE_DEPTH: usize = 32;
 pub const DEFAULT_BROKER_BACKLOG_DEPTH: usize = 1024;
+pub const DEFAULT_BROKER_MAX_ROOMS: usize = 512;
+pub const DEFAULT_BROKER_MAX_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_BROKER_MAX_CONNECTIONS: usize = 256;
+pub const DEFAULT_BROKER_MAX_STREAMS_PER_CONNECTION: usize = 64;
+pub const DEFAULT_BROKER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_BROKER_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_BROKER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 const FRAME_LEN_BYTES: usize = 4;
 #[cfg(test)]
@@ -43,6 +50,13 @@ pub struct QuicBrokerConfig {
     pub bind_addr: SocketAddr,
     pub per_subscriber_queue: usize,
     pub max_backlog: usize,
+    pub max_rooms: usize,
+    pub max_backlog_bytes: usize,
+    pub max_connections: usize,
+    pub max_streams_per_connection: usize,
+    pub read_timeout: Duration,
+    pub max_idle_timeout: Duration,
+    pub keep_alive_interval: Duration,
     pub tls: QuicBrokerTlsConfig,
 }
 
@@ -63,6 +77,13 @@ impl Default for QuicBrokerConfig {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4450),
             per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
             max_backlog: DEFAULT_BROKER_BACKLOG_DEPTH,
+            max_rooms: DEFAULT_BROKER_MAX_ROOMS,
+            max_backlog_bytes: DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+            max_connections: DEFAULT_BROKER_MAX_CONNECTIONS,
+            max_streams_per_connection: DEFAULT_BROKER_MAX_STREAMS_PER_CONNECTION,
+            read_timeout: DEFAULT_BROKER_READ_TIMEOUT,
+            max_idle_timeout: DEFAULT_BROKER_MAX_IDLE_TIMEOUT,
+            keep_alive_interval: DEFAULT_BROKER_KEEP_ALIVE_INTERVAL,
             tls: QuicBrokerTlsConfig::GenerateSelfSigned {
                 subject_alt_names: vec!["localhost".to_owned()],
             },
@@ -74,6 +95,9 @@ pub struct QuicBrokerServer {
     endpoint: Endpoint,
     server_cert_der: Vec<u8>,
     state: Arc<BrokerState>,
+    connection_limiter: Arc<Semaphore>,
+    max_streams_per_connection: usize,
+    read_timeout: Duration,
 }
 
 impl QuicBrokerServer {
@@ -84,7 +108,29 @@ impl QuicBrokerServer {
         if config.max_backlog == 0 {
             return Err(QuicBrokerError::EmptyBacklog);
         }
-        let (server_config, server_cert_der) = configure_server(&config.tls)?;
+        if config.max_rooms == 0 {
+            return Err(QuicBrokerError::EmptyRoomLimit);
+        }
+        if config.max_backlog_bytes == 0 {
+            return Err(QuicBrokerError::EmptyBacklogByteLimit);
+        }
+        if config.max_connections == 0 {
+            return Err(QuicBrokerError::EmptyConnectionLimit);
+        }
+        if config.max_streams_per_connection == 0 {
+            return Err(QuicBrokerError::EmptyStreamLimit);
+        }
+        if config.read_timeout.is_zero() {
+            return Err(QuicBrokerError::EmptyReadTimeout);
+        }
+        if config.max_idle_timeout.is_zero() {
+            return Err(QuicBrokerError::EmptyIdleTimeout);
+        }
+        if config.keep_alive_interval.is_zero() {
+            return Err(QuicBrokerError::EmptyKeepAliveInterval);
+        }
+        let (mut server_config, server_cert_der) = configure_server(&config.tls)?;
+        server_config.transport_config(Arc::new(broker_transport_config(&config)?));
         let endpoint = Endpoint::server(server_config, config.bind_addr)?;
         Ok(Self {
             endpoint,
@@ -92,7 +138,12 @@ impl QuicBrokerServer {
             state: Arc::new(BrokerState::new(
                 config.per_subscriber_queue,
                 config.max_backlog,
+                config.max_rooms,
+                config.max_backlog_bytes,
             )),
+            connection_limiter: Arc::new(Semaphore::new(config.max_connections)),
+            max_streams_per_connection: config.max_streams_per_connection,
+            read_timeout: config.read_timeout,
         })
     }
 
@@ -124,12 +175,24 @@ impl QuicBrokerServer {
                     let Some(incoming) = incoming else {
                         return Ok(());
                     };
+                    let Ok(permit) = Arc::clone(&self.connection_limiter).try_acquire_owned() else {
+                        incoming.refuse();
+                        continue;
+                    };
                     let state = Arc::clone(&self.state);
+                    let max_streams_per_connection = self.max_streams_per_connection;
+                    let read_timeout = self.read_timeout;
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let Ok(connection) = incoming.await else {
                             return;
                         };
-                        let _ = handle_connection(state, connection).await;
+                        let _ = handle_connection(
+                            state,
+                            connection,
+                            max_streams_per_connection,
+                            read_timeout,
+                        ).await;
                     });
                 }
             }
@@ -398,7 +461,7 @@ where
     let mut transcript =
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
 
-    while let Some(record) = read_record_frame(&mut recv).await? {
+    while let Some(record) = read_record_frame(&mut recv, None).await? {
         let record = if let Some(crypto) = &config.crypto {
             decrypt_record(crypto, &record)?
         } else {
@@ -450,6 +513,8 @@ where
 struct BrokerState {
     per_subscriber_queue: usize,
     max_backlog: usize,
+    max_rooms: usize,
+    max_backlog_bytes: usize,
     inner: Mutex<BrokerStateInner>,
 }
 
@@ -457,12 +522,14 @@ struct BrokerState {
 struct BrokerStateInner {
     rooms: HashMap<BrokerStreamKey, BrokerRoom>,
     next_subscriber_id: u64,
+    total_backlog_bytes: usize,
 }
 
 #[derive(Debug)]
 struct BrokerRoom {
     subscribers: Vec<Subscriber>,
-    backlog: VecDeque<AgentTextStreamRecordV1>,
+    backlog: VecDeque<BacklogRecord>,
+    backlog_bytes: usize,
     subscriber_notify: Arc<Notify>,
     finished_at: Option<Instant>,
 }
@@ -472,10 +539,17 @@ impl Default for BrokerRoom {
         Self {
             subscribers: Vec::new(),
             backlog: VecDeque::new(),
+            backlog_bytes: 0,
             subscriber_notify: Arc::new(Notify::new()),
             finished_at: None,
         }
     }
+}
+
+#[derive(Debug)]
+struct BacklogRecord {
+    record: AgentTextStreamRecordV1,
+    bytes: usize,
 }
 
 #[derive(Debug)]
@@ -485,10 +559,17 @@ struct Subscriber {
 }
 
 impl BrokerState {
-    fn new(per_subscriber_queue: usize, max_backlog: usize) -> Self {
+    fn new(
+        per_subscriber_queue: usize,
+        max_backlog: usize,
+        max_rooms: usize,
+        max_backlog_bytes: usize,
+    ) -> Self {
         Self {
             per_subscriber_queue,
             max_backlog,
+            max_rooms,
+            max_backlog_bytes,
             inner: Mutex::new(BrokerStateInner::default()),
         }
     }
@@ -496,25 +577,37 @@ impl BrokerState {
     async fn subscribe(
         &self,
         key: BrokerStreamKey,
-    ) -> (
-        u64,
-        Vec<AgentTextStreamRecordV1>,
-        mpsc::Receiver<AgentTextStreamRecordV1>,
-    ) {
+    ) -> Result<
+        (
+            u64,
+            Vec<AgentTextStreamRecordV1>,
+            mpsc::Receiver<AgentTextStreamRecordV1>,
+        ),
+        QuicBrokerError,
+    > {
         let (tx, rx) = mpsc::channel(self.per_subscriber_queue);
         let mut inner = self.inner.lock().await;
         self.purge_expired_finished_rooms(&mut inner);
+        if !inner.rooms.contains_key(&key) && inner.rooms.len() >= self.max_rooms {
+            return Err(QuicBrokerError::RoomLimitExceeded {
+                limit: self.max_rooms,
+            });
+        }
         let id = inner.next_subscriber_id;
         inner.next_subscriber_id += 1;
         let room = inner.rooms.entry(key).or_default();
-        let backlog = room.backlog.iter().cloned().collect();
+        let backlog = room
+            .backlog
+            .iter()
+            .map(|entry| entry.record.clone())
+            .collect();
         if room.finished_at.is_some() {
-            return (id, backlog, rx);
+            return Ok((id, backlog, rx));
         }
         room.subscribers.push(Subscriber { id, tx });
         room.subscriber_notify.notify_waiters();
         room.subscriber_notify.notify_one();
-        (id, backlog, rx)
+        Ok((id, backlog, rx))
     }
 
     async fn unsubscribe(&self, key: &BrokerStreamKey, id: u64) {
@@ -528,11 +621,22 @@ impl BrokerState {
                 && room.finished_at.is_none();
         }
         if should_remove {
-            inner.rooms.remove(key);
+            remove_room(&mut inner, key);
         }
     }
 
-    async fn publish(&self, key: &BrokerStreamKey, record: AgentTextStreamRecordV1) -> usize {
+    async fn publish(
+        &self,
+        key: &BrokerStreamKey,
+        record: AgentTextStreamRecordV1,
+    ) -> Result<usize, QuicBrokerError> {
+        let record_bytes = record.encode()?.len();
+        if record_bytes > self.max_backlog_bytes {
+            return Err(QuicBrokerError::BacklogRecordTooLarge {
+                record_bytes,
+                limit: self.max_backlog_bytes,
+            });
+        }
         let mut inner = self.inner.lock().await;
         self.purge_expired_finished_rooms(&mut inner);
         if inner
@@ -540,13 +644,29 @@ impl BrokerState {
             .get(key)
             .is_some_and(|room| room.finished_at.is_some())
         {
-            inner.rooms.remove(key);
+            remove_room(&mut inner, key);
+        }
+        if !inner.rooms.contains_key(key) && inner.rooms.len() >= self.max_rooms {
+            return Err(QuicBrokerError::RoomLimitExceeded {
+                limit: self.max_rooms,
+            });
         }
         let mut delivered = 0;
+        let mut total_backlog_bytes = inner.total_backlog_bytes;
         let room = inner.rooms.entry(key.clone()).or_default();
-        room.backlog.push_back(record.clone());
-        while room.backlog.len() > self.max_backlog {
-            room.backlog.pop_front();
+        room.backlog.push_back(BacklogRecord {
+            record: record.clone(),
+            bytes: record_bytes,
+        });
+        room.backlog_bytes += record_bytes;
+        total_backlog_bytes += record_bytes;
+        while room.backlog.len() > self.max_backlog || total_backlog_bytes > self.max_backlog_bytes
+        {
+            let Some(dropped) = room.backlog.pop_front() else {
+                break;
+            };
+            room.backlog_bytes = room.backlog_bytes.saturating_sub(dropped.bytes);
+            total_backlog_bytes = total_backlog_bytes.saturating_sub(dropped.bytes);
         }
         room.subscribers.retain(|subscriber| {
             if subscriber.tx.try_send(record.clone()).is_ok() {
@@ -556,21 +676,32 @@ impl BrokerState {
                 false
             }
         });
-        delivered
+        let should_remove =
+            room.subscribers.is_empty() && room.backlog.is_empty() && room.finished_at.is_none();
+        inner.total_backlog_bytes = total_backlog_bytes;
+        if should_remove {
+            remove_room(&mut inner, key);
+        }
+        Ok(delivered)
     }
 
-    async fn wait_for_subscriber(&self, key: &BrokerStreamKey) {
-        let _ = timeout(PUBLISH_SUBSCRIBER_GRACE, async {
+    async fn wait_for_subscriber(&self, key: &BrokerStreamKey) -> Result<(), QuicBrokerError> {
+        let result = timeout(PUBLISH_SUBSCRIBER_GRACE, async {
             loop {
                 let notify = {
                     let mut inner = self.inner.lock().await;
                     self.purge_expired_finished_rooms(&mut inner);
+                    if !inner.rooms.contains_key(key) && inner.rooms.len() >= self.max_rooms {
+                        return Err(QuicBrokerError::RoomLimitExceeded {
+                            limit: self.max_rooms,
+                        });
+                    }
                     let room = inner.rooms.entry(key.clone()).or_default();
                     if room.finished_at.is_some() {
                         *room = BrokerRoom::default();
                     }
                     if !room.subscribers.is_empty() {
-                        return;
+                        return Ok(());
                     }
                     room.subscriber_notify.clone()
                 };
@@ -578,11 +709,28 @@ impl BrokerState {
             }
         })
         .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.drop_empty_unfinished_room(key).await;
+                Ok(())
+            }
+        }
     }
 
     async fn drop_room(&self, key: &BrokerStreamKey) {
         let mut inner = self.inner.lock().await;
-        inner.rooms.remove(key);
+        remove_room(&mut inner, key);
+    }
+
+    async fn drop_empty_unfinished_room(&self, key: &BrokerStreamKey) {
+        let mut inner = self.inner.lock().await;
+        let should_remove = inner.rooms.get(key).is_some_and(|room| {
+            room.subscribers.is_empty() && room.backlog.is_empty() && room.finished_at.is_none()
+        });
+        if should_remove {
+            remove_room(&mut inner, key);
+        }
     }
 
     async fn finish_room(self: &Arc<Self>, key: &BrokerStreamKey) {
@@ -611,7 +759,7 @@ impl BrokerState {
             }
         }
         if should_remove {
-            inner.rooms.remove(key);
+            remove_room(&mut inner, key);
         }
         should_retain
     }
@@ -625,20 +773,32 @@ impl BrokerState {
             .finished_at
             .is_some_and(|finished_at| finished_at.elapsed() >= FINISHED_ROOM_TTL)
         {
-            inner.rooms.remove(key);
+            remove_room(&mut inner, key);
         }
     }
 
     fn purge_expired_finished_rooms(&self, inner: &mut BrokerStateInner) {
+        let mut total_backlog_bytes = 0;
         inner.rooms.retain(|_, room| {
-            room.finished_at
-                .is_none_or(|finished_at| finished_at.elapsed() < FINISHED_ROOM_TTL)
+            let retain = room
+                .finished_at
+                .is_none_or(|finished_at| finished_at.elapsed() < FINISHED_ROOM_TTL);
+            if retain {
+                total_backlog_bytes += room.backlog_bytes;
+            }
+            retain
         });
+        inner.total_backlog_bytes = total_backlog_bytes;
     }
 
     #[cfg(test)]
     async fn room_count(&self) -> usize {
         self.inner.lock().await.rooms.len()
+    }
+
+    #[cfg(test)]
+    async fn backlog_bytes_for_test(&self) -> usize {
+        self.inner.lock().await.total_backlog_bytes
     }
 
     #[cfg(test)]
@@ -650,28 +810,48 @@ impl BrokerState {
     }
 }
 
+fn remove_room(inner: &mut BrokerStateInner, key: &BrokerStreamKey) {
+    if let Some(room) = inner.rooms.remove(key) {
+        inner.total_backlog_bytes = inner.total_backlog_bytes.saturating_sub(room.backlog_bytes);
+    }
+}
+
 async fn handle_connection(
     state: Arc<BrokerState>,
     connection: quinn::Connection,
+    max_streams_per_connection: usize,
+    read_timeout: Duration,
 ) -> Result<(), QuicBrokerError> {
+    let stream_limiter = Arc::new(Semaphore::new(max_streams_per_connection));
     loop {
         tokio::select! {
             uni = connection.accept_uni() => {
-                let Ok(recv) = uni else {
+                let Ok(mut recv) = uni else {
                     return Ok(());
+                };
+                let Ok(permit) = Arc::clone(&stream_limiter).try_acquire_owned() else {
+                    let _ = recv.stop(0_u32.into());
+                    continue;
                 };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _ = handle_publish_stream(state, recv).await;
+                    let _permit = permit;
+                    let _ = handle_publish_stream(state, recv, read_timeout).await;
                 });
             }
             bi = connection.accept_bi() => {
-                let Ok((send, recv)) = bi else {
+                let Ok((mut send, mut recv)) = bi else {
                     return Ok(());
+                };
+                let Ok(permit) = Arc::clone(&stream_limiter).try_acquire_owned() else {
+                    let _ = send.reset(0_u32.into());
+                    let _ = recv.stop(0_u32.into());
+                    continue;
                 };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _ = handle_subscribe_stream(state, send, recv).await;
+                    let _permit = permit;
+                    let _ = handle_subscribe_stream(state, send, recv, read_timeout).await;
                 });
             }
         }
@@ -681,20 +861,21 @@ async fn handle_connection(
 async fn handle_publish_stream(
     state: Arc<BrokerState>,
     mut recv: quinn::RecvStream,
+    read_timeout: Duration,
 ) -> Result<(), QuicBrokerError> {
-    let control = read_control_frame(&mut recv).await?;
+    let control = read_control_frame(&mut recv, read_timeout).await?;
     let QuicBrokerControlV1::Publish { .. } = control.control else {
         return Err(QuicBrokerError::SubscribeRequiresBidirectionalStream);
     };
     let key = control.key()?;
-    state.wait_for_subscriber(&key).await;
+    state.wait_for_subscriber(&key).await?;
 
-    while let Some(record) = read_record_frame(&mut recv).await? {
+    while let Some(record) = read_record_frame(&mut recv, Some(read_timeout)).await? {
         if record.stream_id != key.stream_id {
             state.drop_room(&key).await;
             return Err(QuicBrokerError::MixedStreamIds);
         }
-        state.publish(&key, record).await;
+        state.publish(&key, record).await?;
     }
     state.finish_room(&key).await;
     Ok(())
@@ -704,13 +885,14 @@ async fn handle_subscribe_stream(
     state: Arc<BrokerState>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    read_timeout: Duration,
 ) -> Result<(), QuicBrokerError> {
-    let control = read_control_frame(&mut recv).await?;
+    let control = read_control_frame(&mut recv, read_timeout).await?;
     let QuicBrokerControlV1::Subscribe { .. } = control.control else {
         return Err(QuicBrokerError::PublishRequiresUnidirectionalStream);
     };
     let key = control.key()?;
-    let (subscriber_id, backlog, mut rx) = state.subscribe(key.clone()).await;
+    let (subscriber_id, backlog, mut rx) = state.subscribe(key.clone()).await?;
     let result = async {
         for record in backlog {
             write_record_frame(&mut send, &record).await?;
@@ -736,8 +918,9 @@ async fn write_control_frame(
 
 async fn read_control_frame(
     recv: &mut quinn::RecvStream,
+    read_timeout: Duration,
 ) -> Result<QuicBrokerControlEnvelopeV1, QuicBrokerError> {
-    let bytes = read_bytes_frame(recv)
+    let bytes = read_bytes_frame(recv, Some(read_timeout))
         .await?
         .ok_or(QuicBrokerError::MissingControlFrame)?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -753,8 +936,9 @@ async fn write_record_frame(
 
 async fn read_record_frame(
     recv: &mut quinn::RecvStream,
+    read_timeout: Option<Duration>,
 ) -> Result<Option<AgentTextStreamRecordV1>, QuicBrokerError> {
-    let Some(bytes) = read_bytes_frame(recv).await? else {
+    let Some(bytes) = read_bytes_frame(recv, read_timeout).await? else {
         return Ok(None);
     };
     Ok(Some(AgentTextStreamRecordV1::decode(&bytes)?))
@@ -773,11 +957,18 @@ async fn write_bytes_frame(
 
 async fn read_bytes_frame(
     recv: &mut quinn::RecvStream,
+    read_timeout: Option<Duration>,
 ) -> Result<Option<Vec<u8>>, QuicBrokerError> {
     let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
     let mut read = 0;
     while read < FRAME_LEN_BYTES {
-        match recv.read(&mut len_bytes[read..]).await? {
+        let chunk = match read_timeout {
+            Some(read_timeout) => {
+                broker_read_deadline(read_timeout, recv.read(&mut len_bytes[read..])).await?
+            }
+            None => recv.read(&mut len_bytes[read..]).await?,
+        };
+        match chunk {
             Some(0) => return Err(QuicBrokerError::TruncatedFrameLength),
             Some(n) => read += n,
             None if read == 0 => return Ok(None),
@@ -788,8 +979,26 @@ async fn read_bytes_frame(
     let len = u32::from_be_bytes(len_bytes) as usize;
     validate_frame_len(len)?;
     let mut bytes = vec![0_u8; len];
-    recv.read_exact(&mut bytes).await?;
+    match read_timeout {
+        Some(read_timeout) => {
+            broker_read_deadline(read_timeout, recv.read_exact(&mut bytes)).await?;
+        }
+        None => recv.read_exact(&mut bytes).await?,
+    }
     Ok(Some(bytes))
+}
+
+async fn broker_read_deadline<T, E>(
+    read_timeout: Duration,
+    read: impl Future<Output = Result<T, E>>,
+) -> Result<T, QuicBrokerError>
+where
+    QuicBrokerError: From<E>,
+{
+    timeout(read_timeout, read)
+        .await
+        .map_err(|_| QuicBrokerError::ReadTimeout)?
+        .map_err(Into::into)
 }
 
 fn validate_frame_len(len: usize) -> Result<(), QuicBrokerError> {
@@ -819,6 +1028,17 @@ fn decode_start_event_id(value: &str) -> Result<Vec<u8>, QuicBrokerError> {
         return Err(QuicBrokerError::InvalidStartEventIdLength(bytes.len()));
     }
     Ok(bytes)
+}
+
+fn broker_transport_config(config: &QuicBrokerConfig) -> Result<TransportConfig, QuicBrokerError> {
+    let mut transport = TransportConfig::default();
+    let streams = VarInt::try_from(config.max_streams_per_connection as u64)?;
+    transport
+        .max_concurrent_bidi_streams(streams)
+        .max_concurrent_uni_streams(streams)
+        .max_idle_timeout(Some(config.max_idle_timeout.try_into()?))
+        .keep_alive_interval(Some(config.keep_alive_interval));
+    Ok(transport)
 }
 
 fn configure_server(tls: &QuicBrokerTlsConfig) -> Result<(ServerConfig, Vec<u8>), QuicBrokerError> {
@@ -981,6 +1201,8 @@ pub enum QuicBrokerError {
     Rustls(#[from] rustls::Error),
     #[error(transparent)]
     QuinnConfig(#[from] quinn::ConfigError),
+    #[error("broker QUIC transport value exceeds varint bounds")]
+    TransportValueTooLarge(#[from] quinn::VarIntBoundsExceeded),
     #[error(transparent)]
     Connect(#[from] quinn::ConnectError),
     #[error(transparent)]
@@ -1019,6 +1241,26 @@ pub enum QuicBrokerError {
     EmptySubscriberQueue,
     #[error("broker backlog depth cannot be zero")]
     EmptyBacklog,
+    #[error("broker room limit cannot be zero")]
+    EmptyRoomLimit,
+    #[error("broker backlog byte limit cannot be zero")]
+    EmptyBacklogByteLimit,
+    #[error("broker connection limit cannot be zero")]
+    EmptyConnectionLimit,
+    #[error("broker per-connection stream limit cannot be zero")]
+    EmptyStreamLimit,
+    #[error("broker read timeout cannot be zero")]
+    EmptyReadTimeout,
+    #[error("broker idle timeout cannot be zero")]
+    EmptyIdleTimeout,
+    #[error("broker keep-alive interval cannot be zero")]
+    EmptyKeepAliveInterval,
+    #[error("broker room limit exceeded: {limit}")]
+    RoomLimitExceeded { limit: usize },
+    #[error("broker backlog record is larger than the byte budget: {record_bytes} > {limit}")]
+    BacklogRecordTooLarge { record_bytes: usize, limit: usize },
+    #[error("broker frame read timed out")]
+    ReadTimeout,
     #[error("broker control frame is missing")]
     MissingControlFrame,
     #[error("wrong broker control protocol: {0}")]
@@ -1055,6 +1297,15 @@ pub enum QuicBrokerError {
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    fn test_state(max_backlog: usize) -> BrokerState {
+        BrokerState::new(
+            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            max_backlog,
+            DEFAULT_BROKER_MAX_ROOMS,
+            DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        )
+    }
 
     #[tokio::test]
     async fn broker_forwards_live_records_to_subscriber_with_same_transcript() {
@@ -1246,23 +1497,20 @@ mod tests {
 
     #[tokio::test]
     async fn broker_retains_finished_rooms_and_closes_live_subscribers() {
-        let state = Arc::new(BrokerState::new(
-            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
-            DEFAULT_BROKER_BACKLOG_DEPTH,
-        ));
+        let state = Arc::new(test_state(DEFAULT_BROKER_BACKLOG_DEPTH));
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
-        let (_subscriber_id, _backlog, mut rx) = state.subscribe(key.clone()).await;
+        let (_subscriber_id, _backlog, mut rx) = state.subscribe(key.clone()).await.unwrap();
         assert_eq!(state.room_count().await, 1);
 
-        state.publish(&key, record.clone()).await;
+        state.publish(&key, record.clone()).await.unwrap();
         state.finish_room(&key).await;
 
         assert_eq!(state.room_count().await, 1);
         assert_eq!(rx.recv().await.expect("queued live record").seq, record.seq);
         assert!(rx.recv().await.is_none());
 
-        let (_late_id, backlog, mut finished_rx) = state.subscribe(key).await;
+        let (_late_id, backlog, mut finished_rx) = state.subscribe(key).await.unwrap();
         assert_eq!(backlog.len(), 1);
         assert_eq!(backlog[0].seq, record.seq);
         assert!(finished_rx.recv().await.is_none());
@@ -1270,14 +1518,11 @@ mod tests {
 
     #[tokio::test]
     async fn broker_drops_finished_rooms_after_ttl() {
-        let state = Arc::new(BrokerState::new(
-            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
-            DEFAULT_BROKER_BACKLOG_DEPTH,
-        ));
+        let state = Arc::new(test_state(DEFAULT_BROKER_BACKLOG_DEPTH));
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
 
-        state.publish(&key, record).await;
+        state.publish(&key, record).await.unwrap();
         state.finish_room(&key).await;
 
         assert_eq!(state.room_count().await, 1);
@@ -1290,12 +1535,12 @@ mod tests {
 
     #[tokio::test]
     async fn broker_buffers_records_until_subscriber_arrives() {
-        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH, DEFAULT_BROKER_BACKLOG_DEPTH);
+        let state = test_state(DEFAULT_BROKER_BACKLOG_DEPTH);
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
 
-        assert_eq!(state.publish(&key, record.clone()).await, 0);
-        let (_subscriber_id, backlog, _rx) = state.subscribe(key).await;
+        assert_eq!(state.publish(&key, record.clone()).await.unwrap(), 0);
+        let (_subscriber_id, backlog, _rx) = state.subscribe(key).await.unwrap();
         let received = backlog.first().expect("subscriber should receive backlog");
 
         assert_eq!(received.seq, record.seq);
@@ -1304,7 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_backlog_drops_oldest_records_when_bound_reached() {
-        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH, 2);
+        let state = test_state(2);
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         for seq in 1..=3 {
             let record = AgentTextStreamRecordV1::text_delta(
@@ -1312,15 +1557,125 @@ mod tests {
                 seq,
                 format!("chunk-{seq}").into_bytes(),
             );
-            assert_eq!(state.publish(&key, record).await, 0);
+            assert_eq!(state.publish(&key, record).await.unwrap(), 0);
         }
 
-        let (_subscriber_id, backlog, mut rx) = state.subscribe(key).await;
+        let (_subscriber_id, backlog, mut rx) = state.subscribe(key).await.unwrap();
         let first = backlog.first().expect("subscriber should receive backlog");
         let second = backlog.get(1).expect("subscriber should receive backlog");
         assert_eq!(first.seq, 2);
         assert_eq!(second.seq, 3);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn broker_state_rejects_new_rooms_past_limit() {
+        let state = BrokerState::new(
+            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            DEFAULT_BROKER_BACKLOG_DEPTH,
+            1,
+            usize::MAX,
+        );
+        let first_key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+        let second_key = BrokerStreamKey::new(vec![0xbb; 32], MessageId::new(vec![0x22; 32]));
+
+        state
+            .publish(
+                &first_key,
+                AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"first".to_vec()),
+            )
+            .await
+            .unwrap();
+        let err = state
+            .publish(
+                &second_key,
+                AgentTextStreamRecordV1::text_delta(vec![0xbb; 32], 1, b"second".to_vec()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            QuicBrokerError::RoomLimitExceeded { limit: 1 }
+        ));
+        assert_eq!(state.room_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn broker_state_enforces_global_backlog_byte_budget() {
+        let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+        let sample = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
+        let state = BrokerState::new(
+            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            DEFAULT_BROKER_BACKLOG_DEPTH,
+            4,
+            sample.encode().unwrap().len() * 2,
+        );
+
+        for seq in 1..=3 {
+            state
+                .publish(
+                    &key,
+                    AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], seq, b"hello".to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (_subscriber_id, backlog, _rx) = state.subscribe(key).await.unwrap();
+        assert_eq!(
+            backlog.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(state.backlog_bytes_for_test().await <= sample.encode().unwrap().len() * 2);
+    }
+
+    #[tokio::test]
+    async fn broker_read_deadline_times_out_stalled_reads() {
+        let err = broker_read_deadline(Duration::from_millis(5), async {
+            sleep(Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, QuicBrokerError::ReadTimeout));
+    }
+
+    #[test]
+    fn broker_config_rejects_zero_resource_limits() {
+        assert!(matches!(
+            QuicBrokerServer::bind(QuicBrokerConfig {
+                bind_addr: LOCAL_SERVER_BIND,
+                max_rooms: 0,
+                ..QuicBrokerConfig::default()
+            }),
+            Err(QuicBrokerError::EmptyRoomLimit)
+        ));
+        assert!(matches!(
+            QuicBrokerServer::bind(QuicBrokerConfig {
+                bind_addr: LOCAL_SERVER_BIND,
+                max_connections: 0,
+                ..QuicBrokerConfig::default()
+            }),
+            Err(QuicBrokerError::EmptyConnectionLimit)
+        ));
+        assert!(matches!(
+            QuicBrokerServer::bind(QuicBrokerConfig {
+                bind_addr: LOCAL_SERVER_BIND,
+                max_streams_per_connection: 0,
+                ..QuicBrokerConfig::default()
+            }),
+            Err(QuicBrokerError::EmptyStreamLimit)
+        ));
+        assert!(matches!(
+            QuicBrokerServer::bind(QuicBrokerConfig {
+                bind_addr: LOCAL_SERVER_BIND,
+                read_timeout: Duration::ZERO,
+                ..QuicBrokerConfig::default()
+            }),
+            Err(QuicBrokerError::EmptyReadTimeout)
+        ));
     }
 
     #[test]
@@ -1383,6 +1738,7 @@ mod tests {
                 cert_path,
                 key_path,
             },
+            ..QuicBrokerConfig::default()
         })
         .unwrap();
 

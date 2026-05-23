@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         per_subscriber_queue: args.per_subscriber_queue,
         max_backlog: args.max_backlog,
         tls,
+        ..QuicBrokerConfig::default()
     })?;
     let local_addr = server.local_addr()?;
     let server_cert_sha256_fingerprint = server.server_cert_sha256_fingerprint();
