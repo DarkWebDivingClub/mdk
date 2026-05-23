@@ -4085,8 +4085,10 @@ name = "storage-memory"
 version = "0.1.0"
 dependencies = [
  "cgka-traits",
+ "openmls",
  "openmls_memory_storage",
  "openmls_traits",
+ "serde_json",
  "test-log",
  "thiserror 2.0.18",
  "tokio",

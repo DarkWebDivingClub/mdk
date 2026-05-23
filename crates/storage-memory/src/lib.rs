@@ -25,8 +25,27 @@ use cgka_traits::storage::{
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
 use openmls_memory_storage::MemoryStorage as OpenMlsMemStorage;
+use openmls_traits::storage::CURRENT_VERSION as OPENMLS_STORAGE_VERSION;
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+const OPENMLS_DIRECT_GROUP_LABELS: &[&[u8]] = &[
+    b"Tree",
+    b"GroupContext",
+    b"InterimTranscriptHash",
+    b"ConfirmationTag",
+    b"MlsGroupJoinConfig",
+    b"OwnLeafNodes",
+    b"GroupState",
+    b"ProposalQueueRefs",
+    b"OwnLeafNodeIndex",
+    b"EpochSecrets",
+    b"ResumptionPsk",
+    b"MessageSecrets",
+    b"EpochKeyPairs",
+];
+const OPENMLS_QUEUED_PROPOSAL_LABEL: &[u8] = b"QueuedProposal";
 
 #[derive(Default)]
 struct Inner {
@@ -83,6 +102,66 @@ fn read<T>(lock: &RwLock<T>) -> StorageResult<std::sync::RwLockReadGuard<'_, T>>
 fn write<T>(lock: &RwLock<T>) -> StorageResult<std::sync::RwLockWriteGuard<'_, T>> {
     lock.write()
         .map_err(|e| StorageError::Backend(format!("write lock poisoned: {e}")))
+}
+
+fn openmls_group_key(group_id: &GroupId) -> StorageResult<Vec<u8>> {
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    serde_json::to_vec(&mls_group_id).map_err(|e| StorageError::Serialization(e.to_string()))
+}
+
+#[cfg(test)]
+fn openmls_storage_key(label: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut out = label.to_vec();
+    out.extend_from_slice(key);
+    out.extend_from_slice(&OPENMLS_STORAGE_VERSION.to_be_bytes());
+    out
+}
+
+fn is_group_scoped_openmls_key(storage_key: &[u8], group_key: &[u8]) -> bool {
+    let version = OPENMLS_STORAGE_VERSION.to_be_bytes();
+    if !storage_key.ends_with(&version) {
+        return false;
+    }
+
+    for label in OPENMLS_DIRECT_GROUP_LABELS {
+        if storage_key.starts_with(label) {
+            let value_key = &storage_key[label.len()..storage_key.len() - version.len()];
+            return value_key.starts_with(group_key);
+        }
+    }
+
+    if storage_key.starts_with(OPENMLS_QUEUED_PROPOSAL_LABEL) {
+        let value_key =
+            &storage_key[OPENMLS_QUEUED_PROPOSAL_LABEL.len()..storage_key.len() - version.len()];
+        return queued_proposal_key_matches_group(value_key, group_key);
+    }
+
+    false
+}
+
+fn queued_proposal_key_matches_group(value_key: &[u8], group_key: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<JsonValue>(value_key) else {
+        return false;
+    };
+    let Ok(group) = serde_json::from_slice::<JsonValue>(group_key) else {
+        return false;
+    };
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .is_some_and(|candidate| candidate == &group)
+}
+
+fn group_scoped_openmls_values(
+    values: &HashMap<Vec<u8>, Vec<u8>>,
+    group_id: &GroupId,
+) -> StorageResult<HashMap<Vec<u8>, Vec<u8>>> {
+    let group_key = openmls_group_key(group_id)?;
+    Ok(values
+        .iter()
+        .filter(|(key, _)| is_group_scoped_openmls_key(key, &group_key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
 }
 
 // ── GroupStorage ────────────────────────────────────────────────────────────
@@ -238,6 +317,7 @@ impl MessageStorage for MemoryStorage {
             .read()
             .map_err(|e| StorageError::Backend(format!("openmls read lock poisoned: {e}")))?
             .clone();
+        let mls_values = group_scoped_openmls_values(&mls_values, group_id)?;
         inner.snapshots.insert(
             (group_id.clone(), name.to_string()),
             GroupSnapshot {
@@ -347,12 +427,14 @@ impl MessageStorage for MemoryStorage {
                 inner.convergence_policies.remove(group_id);
             }
         }
-        *self
+        let group_key = openmls_group_key(group_id)?;
+        let mut openmls_values = self
             .openmls
             .values
             .write()
-            .map_err(|e| StorageError::Backend(format!("openmls write lock poisoned: {e}")))? =
-            mls_values;
+            .map_err(|e| StorageError::Backend(format!("openmls write lock poisoned: {e}")))?;
+        openmls_values.retain(|key, _| !is_group_scoped_openmls_key(key, &group_key));
+        openmls_values.extend(mls_values);
         Ok(())
     }
 

@@ -294,18 +294,21 @@ fn snapshot_rollback_restores_openmls_memory_values() {
     let store = MemoryStorage::new();
     let g0 = sample_group(gid(1), 0, 1);
     store.put_group(&g0).unwrap();
+    let group_state_key = openmls_storage_key(b"GroupState", &openmls_group_key(&g0.id).unwrap());
+    let post_commit_key =
+        openmls_storage_key(b"MessageSecrets", &openmls_group_key(&g0.id).unwrap());
     store
         .mls_storage()
         .values
         .write()
         .unwrap()
-        .insert(b"group-state".to_vec(), b"epoch-0".to_vec());
+        .insert(group_state_key.clone(), b"epoch-0".to_vec());
     store.create_group_snapshot(&g0.id, "pre-commit").unwrap();
 
     {
         let mut values = store.mls_storage().values.write().unwrap();
-        values.insert(b"group-state".to_vec(), b"epoch-1".to_vec());
-        values.insert(b"new-secret".to_vec(), b"post-commit".to_vec());
+        values.insert(group_state_key.clone(), b"epoch-1".to_vec());
+        values.insert(post_commit_key.clone(), b"post-commit".to_vec());
     }
 
     store
@@ -313,8 +316,40 @@ fn snapshot_rollback_restores_openmls_memory_values() {
         .unwrap();
 
     let values = store.mls_storage().values.read().unwrap();
-    assert_eq!(values.get(b"group-state".as_slice()).unwrap(), b"epoch-0");
-    assert!(!values.contains_key(b"new-secret".as_slice()));
+    assert_eq!(values.get(&group_state_key).unwrap(), b"epoch-0");
+    assert!(!values.contains_key(&post_commit_key));
+}
+
+#[test]
+fn snapshot_rollback_preserves_other_group_openmls_memory_values() {
+    let store = MemoryStorage::new();
+    let g1 = sample_group(gid(1), 0, 1);
+    let g2 = sample_group(gid(2), 0, 1);
+    store.put_group(&g1).unwrap();
+    store.put_group(&g2).unwrap();
+    let g1_key = openmls_storage_key(b"GroupState", &openmls_group_key(&g1.id).unwrap());
+    let g2_key = openmls_storage_key(b"GroupState", &openmls_group_key(&g2.id).unwrap());
+
+    {
+        let mut values = store.mls_storage().values.write().unwrap();
+        values.insert(g1_key.clone(), b"g1-epoch-0".to_vec());
+        values.insert(g2_key.clone(), b"g2-epoch-0".to_vec());
+    }
+    store.create_group_snapshot(&g1.id, "pre-commit").unwrap();
+
+    {
+        let mut values = store.mls_storage().values.write().unwrap();
+        values.insert(g1_key.clone(), b"g1-epoch-1".to_vec());
+        values.insert(g2_key.clone(), b"g2-epoch-1".to_vec());
+    }
+
+    store
+        .rollback_group_to_snapshot(&g1.id, "pre-commit")
+        .unwrap();
+
+    let values = store.mls_storage().values.read().unwrap();
+    assert_eq!(values.get(&g1_key).unwrap(), b"g1-epoch-0");
+    assert_eq!(values.get(&g2_key).unwrap(), b"g2-epoch-1");
 }
 
 #[test]
