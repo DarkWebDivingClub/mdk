@@ -750,13 +750,13 @@ impl TuiApp {
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let account = self
             .selected_account_row()
-            .map(|account| shorten(&account_display_label(account), 18))
+            .map(|account| shorten(&terminal_safe_text(&account_display_label(account)), 18))
             .unwrap_or_else(|| "no account".to_owned());
         let chat = self
             .selected_chat_row()
-            .map(|chat| shorten(&chat.name, 24))
+            .map(|chat| shorten(&terminal_safe_text(&chat.name), 24))
             .unwrap_or_else(|| "no chat".to_owned());
-        let daemon = daemon_header_label(&self.daemon);
+        let daemon = terminal_safe_text(&daemon_header_label(&self.daemon));
         let line = Line::from(vec![
             Span::styled(
                 "dm",
@@ -799,7 +799,7 @@ impl TuiApp {
                     ListItem::new(Line::from(vec![
                         Span::raw(format!("{marker} ")),
                         Span::styled(
-                            shorten(&account_display_label(account), 22),
+                            shorten(&terminal_safe_text(&account_display_label(account)), 22),
                             row_label_style(index == self.selected_account, ACCOUNT_ACCENT),
                         ),
                         Span::raw(format!(" {signing}")),
@@ -892,7 +892,7 @@ impl TuiApp {
         };
         let lines = vec![Line::from(vec![
             Span::styled("> ", Style::default().fg(FOCUS_ACCENT)),
-            Span::raw(prompt),
+            Span::raw(terminal_safe_text(&prompt)),
         ])];
         frame.render_widget(
             Paragraph::new(lines)
@@ -3421,19 +3421,25 @@ fn stream_preview_line_pair(
 ) -> Option<[Line<'static>; 2]> {
     let body = match status {
         "completed" => return None,
-        "failed" => format!("stream failed: {}", error.unwrap_or("stream watch failed")),
+        "failed" => format!(
+            "stream failed: {}",
+            terminal_safe_text(error.unwrap_or("stream watch failed"))
+        ),
         _ => {
             if text.is_empty() {
                 return None;
             } else {
-                text.to_owned()
+                terminal_safe_text(text)
             }
         }
     };
     Some([
         Line::from(""),
         Line::from(vec![
-            Span::styled(author.to_owned(), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                terminal_safe_text(author),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(": "),
             Span::raw(body),
         ]),
@@ -3447,12 +3453,12 @@ fn message_lines(
     messages
         .iter()
         .flat_map(|message| {
-            let author = message_author_label(message, selected_account);
+            let author = terminal_safe_text(&message_author_label(message, selected_account));
             [
                 Line::from(vec![
                     Span::styled(author, Style::default().fg(Color::Yellow)),
                     Span::raw(": "),
-                    Span::raw(message.display_text.clone()),
+                    Span::raw(terminal_safe_text(&message.display_text)),
                 ]),
                 Line::from(""),
             ]
@@ -3473,7 +3479,7 @@ fn unique_member_refs(members: Vec<String>) -> Vec<String> {
 fn member_ref_summary(members: &[String]) -> String {
     members
         .iter()
-        .map(|member| shorten(member, 14))
+        .map(|member| shorten(&terminal_safe_text(member), 14))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -3514,8 +3520,9 @@ fn chat_row_line(chat: &ChatRow, selected: bool, unread_count: usize) -> Line<'s
 }
 
 fn chat_label(name: &str, unread_count: usize, max_len: usize) -> String {
+    let name = terminal_safe_text(name);
     if unread_count == 0 {
-        return shorten(name, max_len);
+        return shorten(&name, max_len);
     }
     shorten(&format!("{name} ({unread_count})"), max_len)
 }
@@ -3577,7 +3584,7 @@ fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDiagnostics> 
 
 fn status_panel_lines(status: &str, diagnostics: Option<&GroupDiagnostics>) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(status.to_owned()),
+        Line::from(terminal_safe_text(status)),
         Line::from(""),
         Line::from(""),
     ];
@@ -3588,8 +3595,8 @@ fn status_panel_lines(status: &str, diagnostics: Option<&GroupDiagnostics>) -> V
     if let Some(error) = &diagnostics.error {
         lines.push(Line::from(format!(
             "MLS group={} unavailable: {}",
-            shorten(&diagnostics.group_id, 18),
-            error
+            shorten(&terminal_safe_text(&diagnostics.group_id), 18),
+            terminal_safe_text(error)
         )));
         return lines;
     }
@@ -3603,7 +3610,7 @@ fn status_panel_lines(status: &str, diagnostics: Option<&GroupDiagnostics>) -> V
         .unwrap_or_else(|| "unknown".to_owned());
     lines.push(Line::from(format!(
         "MLS epoch={epoch} group={} members={member_count}",
-        shorten(&diagnostics.group_id, 18)
+        shorten(&terminal_safe_text(&diagnostics.group_id), 18)
     )));
     if diagnostics.components.is_empty() {
         lines.push(Line::from("components: none"));
@@ -3626,7 +3633,8 @@ fn group_component_diagnostics_line(component: &GroupComponentDiagnostics) -> Li
         .unwrap_or_else(|| "unknown".to_owned());
     Line::from(format!(
         "{} id={id} data={}",
-        component.component, component.data_hex
+        terminal_safe_text(&component.component),
+        terminal_safe_text(&component.data_hex)
     ))
 }
 
@@ -3680,6 +3688,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+fn terminal_safe_text(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
 }
 
 fn shorten(value: &str, max_len: usize) -> String {
@@ -4217,6 +4229,52 @@ mod tests {
         assert_eq!(rendered[1], "me: hello from the stream");
         assert!(rendered.iter().all(|line| !line.contains("marmot_payload")));
         assert!(rendered.iter().all(|line| !line.contains("stream start")));
+    }
+
+    #[test]
+    fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
+        let messages = vec![MessageRow {
+            message_id: "01".to_owned(),
+            direction: "received".to_owned(),
+            from: "alice".to_owned(),
+            from_display_name: Some("ali\u{1b}]0;pwn\u{7}ce".to_owned()),
+            plaintext: "hi\u{1b}[2J\nbob".to_owned(),
+            display_text: "hi\u{1b}[2J\nbob".to_owned(),
+            recorded_at: 1,
+            received_at: 1,
+        }];
+        let rendered = message_lines(&messages, None)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], "ali]0;pwnce: hi[2Jbob");
+
+        let previews = vec![LiveStreamPreview {
+            group_id: "group-a".to_owned(),
+            stream_id: "stream-a".to_owned(),
+            author: "stream\u{1b}[31m".to_owned(),
+            status: "running".to_owned(),
+            text: "part\u{9b}31mial\u{7}".to_owned(),
+            error: None,
+            optimistic: false,
+        }];
+        let preview_lines =
+            stream_preview_lines(&DaemonView::default(), &previews, Some("group-a"));
+        assert_eq!(line_text(&preview_lines[1]), "stream[31m: part31mial");
+
+        let chat = ChatRow {
+            group_id: "group-a".to_owned(),
+            name: "ops\u{1b}[5m".to_owned(),
+            archived: false,
+        };
+        assert_eq!(line_text(&chat_row_line(&chat, false, 0)), "  ops[5m");
+
+        let status = status_panel_lines(
+            "ready\u{1b}[2J",
+            Some(&GroupDiagnostics::unavailable("aa", "bad\u{1b}[31m")),
+        );
+        assert_eq!(line_text(&status[0]), "ready[2J");
+        assert_eq!(line_text(&status[3]), "MLS group=aa unavailable: bad[31m");
     }
 
     #[test]
