@@ -5,19 +5,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
-use cgka_traits::agent_text_stream::{
-    AgentTextStreamAppPayloadEnvelopeV1, AgentTextStreamAppPayloadError,
-    AgentTextStreamAppPayloadV1, AgentTextStreamRouteV1, AgentTextStreamStartPayloadV1,
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_TAG,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::{GroupId, MarmotAppMessagePayloadV1, MessageId};
+use cgka_traits::{GroupId, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime,
-    SyncSummary, UserDirectorySearch, UserProfileMetadata,
+    StreamStartView, SyncSummary, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -964,8 +963,6 @@ pub(crate) enum DmError {
     QuicStream(#[from] transport_quic_stream::QuicTextStreamError),
     #[error(transparent)]
     QuicBroker(#[from] transport_quic_broker::QuicBrokerError),
-    #[error(transparent)]
-    AgentTextStreamPayload(#[from] AgentTextStreamAppPayloadError),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
     #[error(transparent)]
@@ -3516,7 +3513,8 @@ pub(crate) async fn stream_command_app_with_runtime(
                     quic_candidates,
                 )
                 .await?;
-            let agent_text_stream = agent_text_stream_payload_value(&payload);
+            let agent_text_stream =
+                agent_text_stream_payload_value(payload.kind, &payload.tags, &payload.content);
             Ok(CommandOutput {
                 plain: format!(
                     "started stream {} published={}",
@@ -3592,7 +3590,8 @@ pub(crate) async fn stream_command_app_with_runtime(
                     },
                 )
                 .await?;
-            let agent_text_stream = agent_text_stream_payload_value(&payload);
+            let agent_text_stream =
+                agent_text_stream_payload_value(payload.kind, &payload.tags, &payload.content);
             Ok(CommandOutput {
                 plain: format!(
                     "finished stream {} published={}",
@@ -3629,32 +3628,28 @@ pub(crate) async fn stream_command_app_with_runtime(
                     limit: None,
                 },
             )?;
-            let final_message = messages.into_iter().rev().find_map(|message| {
-                let payload = agent_text_stream_payload(&message.plaintext)?;
-                match payload.payload {
-                    AgentTextStreamAppPayloadV1::Final(final_payload)
-                        if final_payload.stream_id == stream_id_hex =>
-                    {
-                        Some((message, final_payload))
-                    }
-                    _ => None,
-                }
+            let final_message = messages.into_iter().rev().find(|message| {
+                marmot_app::is_stream_final_event(message.kind, &message.tags)
+                    && tag_value(&message.tags, STREAM_TAG) == Some(stream_id_hex.as_str())
             });
             let (verified, final_message_json) = match final_message {
-                Some((message, final_payload)) => {
-                    let transcript_hash_matches =
-                        final_payload.transcript_hash == transcript_hash_hex;
+                Some(message) => {
+                    let final_transcript_hash =
+                        tag_value(&message.tags, STREAM_HASH_TAG).unwrap_or_default();
+                    let final_chunk_count = tag_value(&message.tags, STREAM_CHUNKS_TAG)
+                        .and_then(|count| count.parse::<u64>().ok())
+                        .unwrap_or_default();
+                    let transcript_hash_matches = final_transcript_hash == transcript_hash_hex;
                     let chunk_count_matches =
-                        chunk_count.is_none_or(|count| count == final_payload.chunk_count);
+                        chunk_count.is_none_or(|count| count == final_chunk_count);
                     (
                         transcript_hash_matches && chunk_count_matches,
                         json!({
                             "message_id": message.message_id_hex,
-                            "stream_id": final_payload.stream_id,
-                            "transcript_hash": final_payload.transcript_hash,
-                            "chunk_count": final_payload.chunk_count,
-                            "final_text_or_reference": final_payload.final_text_or_reference,
-                            "finished_at": final_payload.finished_at,
+                            "stream_id": stream_id_hex,
+                            "transcript_hash": final_transcript_hash,
+                            "chunk_count": final_chunk_count,
+                            "final_text_or_reference": message.plaintext,
                             "checks": {
                                 "transcript_hash": transcript_hash_matches,
                                 "chunk_count": chunk_count_matches,
@@ -3723,9 +3718,9 @@ where
     if start_message_id_hex.is_empty() {
         return Err(DmError::StreamStartNotConfirmed);
     }
-    if start_payload.route != AgentTextStreamRouteV1::BrokeredQuic {
+    if start_payload.route != "quic" {
         return Err(DmError::UnsupportedStreamRoute(
-            route_name(&start_payload.route).to_owned(),
+            stream_route_label(&start_payload.route).to_owned(),
         ));
     }
     let candidate = start_payload
@@ -3736,8 +3731,8 @@ where
     let candidate = parse_quic_candidate(candidate)?;
     let candidate_addr = resolve_quic_candidate_addr(&candidate).await?;
     let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
-    let stream_id = hex::decode(&start_payload.stream_id)?;
-    let stream_id_hex = start_payload.stream_id.clone();
+    let stream_id = hex::decode(&start_payload.stream_id_hex)?;
+    let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
@@ -3803,19 +3798,16 @@ fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, b
 fn latest_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
-) -> Result<(String, AgentTextStreamStartPayloadV1), DmError> {
+) -> Result<(String, StreamStartView), DmError> {
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
-            let payload = agent_text_stream_payload(&message.plaintext)?;
-            match payload.payload {
-                AgentTextStreamAppPayloadV1::Start(start)
-                    if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id) =>
-                {
-                    Some((message.message_id_hex, start))
-                }
-                _ => None,
+            let start = StreamStartView::from_event(message.kind, &message.tags)?;
+            if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
+                Some((message.message_id_hex, start))
+            } else {
+                None
             }
         })
         .ok_or(DmError::MissingStreamStart)
@@ -3920,40 +3912,42 @@ fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
-fn agent_text_stream_payload(plaintext: &str) -> Option<AgentTextStreamAppPayloadEnvelopeV1> {
-    AgentTextStreamAppPayloadEnvelopeV1::decode(plaintext.as_bytes())
-        .ok()
-        .flatten()
-}
-
-fn agent_text_stream_payload_json(plaintext: &str) -> Option<Value> {
-    agent_text_stream_payload(plaintext).map(|payload| agent_text_stream_payload_value(&payload))
-}
-
-fn agent_text_stream_payload_value(payload: &AgentTextStreamAppPayloadEnvelopeV1) -> Value {
-    match &payload.payload {
-        AgentTextStreamAppPayloadV1::Start(start) => json!({
+/// Render the `agent_text_stream` JSON view for a message's inner-event kind,
+/// tags, and content, or `None` if the message is neither a kind-1200 start nor
+/// a kind-9 stream-final. The shape stays stable for the TUI and daemon.
+fn agent_text_stream_payload_value(
+    kind: u64,
+    tags: &[Vec<String>],
+    content: &str,
+) -> Option<Value> {
+    if kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+        let start = StreamStartView::from_event(kind, tags)?;
+        return Some(json!({
             "kind": "start",
-            "stream_id": start.stream_id.clone(),
-            "created_at": start.created_at,
-            "route": route_name(&start.route),
-            "quic_candidates": start.quic_candidates.clone(),
-        }),
-        AgentTextStreamAppPayloadV1::Final(final_payload) => json!({
-            "kind": "final",
-            "stream_id": final_payload.stream_id.clone(),
-            "final_text_or_reference": final_payload.final_text_or_reference.clone(),
-            "transcript_hash": final_payload.transcript_hash.clone(),
-            "chunk_count": final_payload.chunk_count,
-            "finished_at": final_payload.finished_at,
-        }),
+            "stream_id": start.stream_id_hex,
+            "route": stream_route_label(&start.route),
+            "quic_candidates": start.quic_candidates,
+        }));
     }
+    if marmot_app::is_stream_final_event(kind, tags) {
+        return Some(json!({
+            "kind": "final",
+            "stream_id": tag_value(tags, STREAM_TAG).unwrap_or_default(),
+            "final_text_or_reference": content,
+            "transcript_hash": tag_value(tags, STREAM_HASH_TAG).unwrap_or_default(),
+            "chunk_count": tag_value(tags, STREAM_CHUNKS_TAG)
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or_default(),
+        }));
+    }
+    None
 }
 
-fn route_name(route: &AgentTextStreamRouteV1) -> &'static str {
+/// Map the inner-event `route` tag value to the historical JSON route label.
+fn stream_route_label(route: &str) -> &str {
     match route {
-        AgentTextStreamRouteV1::DirectQuic => "direct_quic",
-        AgentTextStreamRouteV1::BrokeredQuic => "brokered_quic",
+        "quic" => "brokered_quic",
+        other => other,
     }
 }
 
@@ -4067,12 +4061,15 @@ fn sync_json(
             hex::encode(group_id.as_slice())
         }).collect::<Vec<_>>(),
         "messages": summary.messages.into_iter().map(|message| {
-            let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
+            let agent_text_stream = agent_text_stream_payload_value(
+                message.kind,
+                &message.tags,
+                &message.plaintext,
+            );
             let from_display_name = message
                 .sender_display_name
                 .clone()
                 .or_else(|| display_name_for_sender(app, &message.sender));
-            let app_message = message.app_message;
             let mut value = json!({
                 "message_id": message.message_id_hex,
                 "direction": "received",
@@ -4080,12 +4077,11 @@ fn sync_json(
                 "from_display_name": from_display_name,
                 "group_id": hex::encode(message.group_id.as_slice()),
                 "plaintext": message.plaintext,
+                "kind": message.kind,
+                "tags": message.tags,
             });
             if let Some(agent_text_stream) = agent_text_stream {
                 value["agent_text_stream"] = agent_text_stream;
-            }
-            if let Some(app_message) = app_message {
-                value["app_message"] = json!(app_message);
             }
             value
         }).collect::<Vec<_>>(),
@@ -4260,8 +4256,8 @@ fn message_list_json_with_profiles(app: &MarmotApp, messages: Vec<AppMessageReco
 }
 
 fn message_record_json(message: AppMessageRecord, from_display_name: Option<String>) -> Value {
-    let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
-    let app_message = message.app_message;
+    let agent_text_stream =
+        agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
     let mut value = json!({
         "message_id": message.message_id_hex,
         "direction": message.direction,
@@ -4269,14 +4265,13 @@ fn message_record_json(message: AppMessageRecord, from_display_name: Option<Stri
         "from": message.sender,
         "from_display_name": from_display_name,
         "plaintext": message.plaintext,
+        "kind": message.kind,
+        "tags": message.tags,
         "recorded_at": message.recorded_at,
         "received_at": message.received_at,
     });
     if let Some(agent_text_stream) = agent_text_stream {
         value["agent_text_stream"] = agent_text_stream;
-    }
-    if let Some(app_message) = app_message {
-        value["app_message"] = json!(app_message);
     }
     value
 }
@@ -4294,23 +4289,42 @@ fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
 fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
     messages
         .into_iter()
-        .filter_map(|message| match message.app_message {
-            Some(MarmotAppMessagePayloadV1::Media { reference, caption }) => Some(json!({
+        .filter_map(|message| {
+            let imeta = imeta_fields(&message.tags)?;
+            let caption = (!message.plaintext.is_empty()).then(|| message.plaintext.clone());
+            Some(json!({
                 "message_id": message.message_id_hex,
                 "direction": message.direction,
                 "group_id": message.group_id_hex,
                 "from": message.sender,
-                "file_hash_hex": reference.file_hash_hex,
-                "file_name": reference.file_name,
-                "media_type": reference.media_type,
-                "size_bytes": reference.size_bytes,
+                "file_hash_hex": imeta.get("x").cloned().unwrap_or_default(),
+                "file_name": imeta.get("name").cloned().unwrap_or_default(),
+                "media_type": imeta.get("m").cloned().unwrap_or_default(),
+                "size_bytes": imeta
+                    .get("size")
+                    .and_then(|size| size.parse::<u64>().ok())
+                    .unwrap_or_default(),
                 "caption": caption,
                 "recorded_at": message.recorded_at,
                 "received_at": message.received_at,
-            })),
-            _ => None,
+            }))
         })
         .collect()
+}
+
+/// Parse a NIP-92 `imeta` tag (kind-9 media) into its `key value` fields.
+/// Returns `None` if the message has no `imeta` tag.
+fn imeta_fields(tags: &[Vec<String>]) -> Option<HashMap<String, String>> {
+    let imeta = tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))?;
+    let fields = imeta
+        .iter()
+        .skip(1)
+        .filter_map(|field| field.split_once(' '))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    Some(fields)
 }
 
 fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
@@ -4672,10 +4686,6 @@ fn dm_error_json(err: &DmError) -> Value {
         }),
         DmError::QuicBroker(err) => json!({
             "code": "quic_broker",
-            "message": err.to_string(),
-        }),
-        DmError::AgentTextStreamPayload(err) => json!({
-            "code": "agent_text_stream_payload",
             "message": err.to_string(),
         }),
         DmError::Hex(err) => json!({
@@ -5119,7 +5129,8 @@ mod tests {
                 group_id_hex: "group".to_owned(),
                 sender: "sender".to_owned(),
                 plaintext: id.to_owned(),
-                app_message: None,
+                kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
                 recorded_at: 100 + u64::try_from(index / 2).unwrap(),
                 received_at: 100 + u64::try_from(index / 2).unwrap(),
             })

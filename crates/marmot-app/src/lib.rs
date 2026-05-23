@@ -18,12 +18,11 @@ use cgka_engine::{
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
-    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AGENT_TEXT_STREAM_ROLE_FANOUT,
-    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
+    AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+    AGENT_TEXT_STREAM_ROLE_FANOUT, AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
     AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC, AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC,
-    AgentTextStreamAppPayloadEnvelopeV1, AgentTextStreamAppPayloadV1, AgentTextStreamQuicPolicyV1,
-    AgentTextStreamRouteV1, AgentTextStreamStartPayloadV1,
+    AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
@@ -37,9 +36,12 @@ pub use cgka_traits::app_components::{
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
     NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::app_payload::{
-    MarmotAppMessageEnvelopeV1, MarmotAppMessagePayloadV1, MarmotMediaReferenceV1,
-    MarmotReactionActionV1, display_text_for_app_message,
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG, STREAM_BROKER_TAG, STREAM_CHUNKS_TAG,
+    STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG,
+    STREAM_TYPE_TAG,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
@@ -99,6 +101,12 @@ const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
+/// Value of the `stream-type` tag on an agent text stream start event.
+const STREAM_TYPE_TEXT: &str = "text";
+/// Value of the `route` tag on a brokered QUIC agent text stream start event.
+const STREAM_ROUTE_QUIC: &str = "quic";
+/// `final-kind` tag value: the kind of the eventual stream-final chat message.
+const STREAM_FINAL_KIND_CHAT: &str = "9";
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
@@ -247,6 +255,22 @@ enum AccountWorkerCommand {
         payload: Vec<u8>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    SendAppEvent {
+        group_id: GroupId,
+        intent: AppMessageIntent,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    StartAgentTextStream {
+        group_id: GroupId,
+        stream_id: Vec<u8>,
+        quic_candidates: Vec<String>,
+        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
+    },
+    FinishAgentTextStream {
+        group_id: GroupId,
+        request: AgentTextStreamFinishRequest,
+        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
+    },
     RetryGroupConvergence {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -291,6 +315,88 @@ pub struct AgentTextStreamFinishRequest {
     pub transcript_hash: [u8; 32],
     pub chunk_count: u64,
     pub finished_at: u64,
+}
+
+/// A media attachment carried as a NIP-92 `imeta` tag on a kind-9 chat event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaReference {
+    pub file_hash_hex: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+}
+
+impl MediaReference {
+    fn validate(&self) -> Result<(), AppError> {
+        let hash = hex::decode(&self.file_hash_hex)
+            .map_err(|_| AppError::InvalidAppMessagePayload("media hash must be hex".into()))?;
+        if hash.len() != 32 {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media hash must be 32 bytes".into(),
+            ));
+        }
+        if self.file_name.trim().is_empty() {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media file name cannot be empty".into(),
+            ));
+        }
+        if self.media_type.trim().is_empty() {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media type cannot be empty".into(),
+            ));
+        }
+        if self.size_bytes == 0 {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media size must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// NIP-92 `imeta` tag fields for this attachment.
+    fn imeta_tag(&self) -> Vec<String> {
+        vec![
+            "imeta".to_owned(),
+            format!("m {}", self.media_type),
+            format!("x {}", self.file_hash_hex),
+            format!("size {}", self.size_bytes),
+            format!("name {}", self.file_name),
+        ]
+    }
+}
+
+/// A structured outgoing app message, resolved into a [`MarmotInnerEvent`] by
+/// the account worker (which owns the authoring account id and the clock).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppMessageIntent {
+    Chat {
+        content: String,
+    },
+    Reaction {
+        target_message_id: String,
+        emoji: String,
+    },
+    Unreact {
+        target_message_id: String,
+    },
+    Reply {
+        target_message_id: String,
+        text: String,
+    },
+    Delete {
+        target_message_id: String,
+    },
+    Media {
+        reference: MediaReference,
+        caption: Option<String>,
+    },
+    StreamStart {
+        stream_id: Vec<u8>,
+        quic_candidates: Vec<String>,
+    },
+    StreamFinal {
+        request: AgentTextStreamFinishRequest,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -412,8 +518,12 @@ pub struct ReceivedMessage {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub group_id: GroupId,
+    /// Displayed text for the inner app event (its `content`).
     pub plaintext: String,
-    pub app_message: Option<MarmotAppMessagePayloadV1>,
+    /// Nostr `kind` of the inner Marmot app event.
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    pub tags: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,37 +547,35 @@ pub struct RuntimeAccountError {
     pub message: String,
 }
 
+/// A kind-1200 agent-text-stream **start** observed in a group. The inner
+/// event's stream metadata lives on `message.tags`; clients use it to open the
+/// ephemeral QUIC preview. The eventual kind-9 stream-final flows as a normal
+/// [`RuntimeMessageUpdate::Message`] carrying `stream`/`stream-start` tags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeAgentStreamMessage {
     pub account_id_hex: String,
     pub account_label: String,
     pub message: ReceivedMessage,
-    pub payload: AgentTextStreamAppPayloadEnvelopeV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeMessageUpdate {
     Message(RuntimeMessageReceived),
     AgentStreamStarted(RuntimeAgentStreamMessage),
-    AgentStreamFinalized(RuntimeAgentStreamMessage),
 }
 
 impl RuntimeMessageUpdate {
     pub fn account_id_hex(&self) -> &str {
         match self {
             Self::Message(update) => &update.account_id_hex,
-            Self::AgentStreamStarted(update) | Self::AgentStreamFinalized(update) => {
-                &update.account_id_hex
-            }
+            Self::AgentStreamStarted(update) => &update.account_id_hex,
         }
     }
 
     pub fn message(&self) -> &ReceivedMessage {
         match self {
             Self::Message(update) => &update.message,
-            Self::AgentStreamStarted(update) | Self::AgentStreamFinalized(update) => {
-                &update.message
-            }
+            Self::AgentStreamStarted(update) => &update.message,
         }
     }
 }
@@ -566,7 +674,6 @@ pub enum MarmotAppEvent {
     },
     MessageReceived(RuntimeMessageReceived),
     AgentStreamStarted(RuntimeAgentStreamMessage),
-    AgentStreamFinalized(RuntimeAgentStreamMessage),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
 }
@@ -791,14 +898,14 @@ impl MarmotAppRuntime {
             // forwarding a zero-length MessageId.
             return Err(AppError::AgentStreamStartNotConfirmed);
         }
-        if start.route != AgentTextStreamRouteV1::BrokeredQuic {
+        if start.route != STREAM_ROUTE_QUIC {
             return Err(AppError::AgentStreamUnsupportedRoute);
         }
         let candidates = parse_quic_candidates(&start.quic_candidates)?;
         let server_cert_der = options.server_cert_der;
         let insecure_local = options.insecure_local;
-        let stream_id = hex::decode(&start.stream_id)?;
-        let stream_id_hex = start.stream_id.clone();
+        let stream_id = hex::decode(&start.stream_id_hex)?;
+        let stream_id_hex = start.stream_id_hex.clone();
         let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
@@ -963,17 +1070,16 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::reaction(
-            target_message_id,
-            emoji,
-            MarmotReactionActionV1::Add,
-        );
-        self.send_message(
-            account_ref,
-            group_id,
-            encode_validated_app_message(&envelope)?,
-        )
-        .await
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Reaction {
+                    target_message_id: target_message_id.to_owned(),
+                    emoji: emoji.to_owned(),
+                },
+            )
+            .await
     }
 
     pub async fn unreact_from_message(
@@ -982,17 +1088,15 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::reaction(
-            target_message_id,
-            "",
-            MarmotReactionActionV1::Remove,
-        );
-        self.send_message(
-            account_ref,
-            group_id,
-            encode_validated_app_message(&envelope)?,
-        )
-        .await
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Unreact {
+                    target_message_id: target_message_id.to_owned(),
+                },
+            )
+            .await
     }
 
     pub async fn reply_to_message(
@@ -1002,13 +1106,16 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         text: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::reply(target_message_id, text);
-        self.send_message(
-            account_ref,
-            group_id,
-            encode_validated_app_message(&envelope)?,
-        )
-        .await
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Reply {
+                    target_message_id: target_message_id.to_owned(),
+                    text: text.to_owned(),
+                },
+            )
+            .await
     }
 
     pub async fn delete_message(
@@ -1017,13 +1124,32 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::delete(target_message_id);
-        self.send_message(
-            account_ref,
-            group_id,
-            encode_validated_app_message(&envelope)?,
-        )
-        .await
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Delete {
+                    target_message_id: target_message_id.to_owned(),
+                },
+            )
+            .await
+    }
+
+    /// Send a media attachment as a kind-9 chat carrying a NIP-92 `imeta` tag.
+    pub async fn send_media_reference(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        reference: MediaReference,
+        caption: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Media { reference, caption },
+            )
+            .await
     }
 
     pub async fn retry_group_convergence(
@@ -1036,45 +1162,34 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Anchor a kind-1200 agent text stream start. The `created_at` argument is
+    /// retained for call-site stability; the worker stamps the inner event with
+    /// its own clock so the canonical id matches the authoring time. Returns the
+    /// built inner event (its tags carry the stream id, route, and brokers).
     pub async fn start_agent_text_stream(
         &self,
         account_ref: &str,
         group_id: &GroupId,
         stream_id: &[u8],
-        created_at: u64,
+        _created_at: u64,
         quic_candidates: Vec<String>,
-    ) -> Result<(AgentTextStreamAppPayloadEnvelopeV1, SendSummary), AppError> {
-        let payload =
-            AgentTextStreamAppPayloadEnvelopeV1::start(stream_id, created_at, quic_candidates);
-        let payload_bytes = payload
-            .encode()
-            .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))?;
-        let summary = self
-            .send_message(account_ref, group_id, payload_bytes)
-            .await?;
-        Ok((payload, summary))
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.accounts
+            .start_agent_text_stream(account_ref, group_id, stream_id.to_vec(), quic_candidates)
+            .await
     }
 
+    /// Send the kind-9 stream-final chat carrying `stream`/`stream-hash`/
+    /// `stream-chunks` tags. Returns the built inner event.
     pub async fn finish_agent_text_stream(
         &self,
         account_ref: &str,
         group_id: &GroupId,
         request: AgentTextStreamFinishRequest,
-    ) -> Result<(AgentTextStreamAppPayloadEnvelopeV1, SendSummary), AppError> {
-        let payload = AgentTextStreamAppPayloadEnvelopeV1::final_payload(
-            &request.stream_id,
-            request.final_text_or_reference,
-            request.transcript_hash,
-            request.chunk_count,
-            request.finished_at,
-        );
-        let payload_bytes = payload
-            .encode()
-            .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))?;
-        let summary = self
-            .send_message(account_ref, group_id, payload_bytes)
-            .await?;
-        Ok((payload, summary))
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.accounts
+            .finish_agent_text_stream(account_ref, group_id, request)
+            .await
     }
 
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
@@ -1562,6 +1677,65 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    async fn send_app_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SendAppEvent {
+                group_id: group_id.clone(),
+                intent,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    async fn start_agent_text_stream(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        stream_id: Vec<u8>,
+        quic_candidates: Vec<String>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StartAgentTextStream {
+                group_id: group_id.clone(),
+                stream_id,
+                quic_candidates,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    async fn finish_agent_text_stream(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: AgentTextStreamFinishRequest,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::FinishAgentTextStream {
+                group_id: group_id.clone(),
+                request,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn retry_group_convergence(
         &self,
         account_ref: &str,
@@ -1890,8 +2064,11 @@ pub struct AppMessageRecord {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_message: Option<MarmotAppMessagePayloadV1>,
+    /// Nostr `kind` of the inner Marmot app event (9 chat, 7 reaction, …).
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Vec<String>>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -2378,6 +2555,8 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
+    #[error("no matching reaction by this account to retract")]
+    ReactionNotFound,
     #[error("transport event stream closed")]
     TransportClosed,
 }
@@ -2400,7 +2579,8 @@ struct AppMessageProjection {
     group_id_hex: String,
     sender: String,
     plaintext: String,
-    app_message: Option<MarmotAppMessagePayloadV1>,
+    kind: u64,
+    tags: Vec<Vec<String>>,
     recorded_at: Option<u64>,
 }
 
@@ -3761,6 +3941,36 @@ async fn run_app_runtime_account_worker(
                         let result = client.send(&group_id, &payload).await;
                         let _ = respond.send(result);
                     }
+                    Some(AccountWorkerCommand::SendAppEvent {
+                        group_id,
+                        intent,
+                        respond,
+                    }) => {
+                        let result = client
+                            .send_app_event(&group_id, intent)
+                            .await
+                            .map(|(_event, summary)| summary);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::StartAgentTextStream {
+                        group_id,
+                        stream_id,
+                        quic_candidates,
+                        respond,
+                    }) => {
+                        let result = client
+                            .start_agent_text_stream(&group_id, &stream_id, quic_candidates)
+                            .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::FinishAgentTextStream {
+                        group_id,
+                        request,
+                        respond,
+                    }) => {
+                        let result = client.finish_agent_text_stream(&group_id, request).await;
+                        let _ = respond.send(result);
+                    }
                     Some(AccountWorkerCommand::RetryGroupConvergence { group_id, respond }) => {
                         let result = client.retry_group_convergence(&group_id).await;
                         let _ = respond.send(result);
@@ -3832,13 +4042,17 @@ fn publish_app_runtime_summary(
         });
     }
     for message in &summary.messages {
-        let _ = events.send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-            account_id_hex: account_id_hex.to_owned(),
-            account_label: account_label.to_owned(),
-            message: message.clone(),
-        }));
+        // A kind-1200 start is an open-preview signal, not a timeline message,
+        // so it is emitted only as `AgentStreamStarted`. Everything else
+        // (chat/reply/media/reaction/delete/stream-final) is a timeline message.
         if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
             let _ = events.send(event);
+        } else {
+            let _ = events.send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                account_id_hex: account_id_hex.to_owned(),
+                account_label: account_label.to_owned(),
+                message: message.clone(),
+            }));
         }
     }
     for event in &summary.events {
@@ -3863,28 +4077,23 @@ fn publish_app_runtime_group_state_updated(
     });
 }
 
+/// Emit a runtime `AgentStreamStarted` for a kind-1200 start event. Kind-9
+/// stream-final messages are normal timeline messages and do not fire here.
 fn agent_stream_runtime_event(
     account_id_hex: &str,
     account_label: &str,
     message: &ReceivedMessage,
 ) -> Option<MarmotAppEvent> {
-    let payload = AgentTextStreamAppPayloadEnvelopeV1::decode(message.plaintext.as_bytes())
-        .ok()
-        .flatten()?;
-    let stream_message = RuntimeAgentStreamMessage {
-        account_id_hex: account_id_hex.to_owned(),
-        account_label: account_label.to_owned(),
-        message: message.clone(),
-        payload,
-    };
-    match &stream_message.payload.payload {
-        AgentTextStreamAppPayloadV1::Start(_) => {
-            Some(MarmotAppEvent::AgentStreamStarted(stream_message))
-        }
-        AgentTextStreamAppPayloadV1::Final(_) => {
-            Some(MarmotAppEvent::AgentStreamFinalized(stream_message))
-        }
+    if message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+        return None;
     }
+    Some(MarmotAppEvent::AgentStreamStarted(
+        RuntimeAgentStreamMessage {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            message: message.clone(),
+        },
+    ))
 }
 
 struct ParsedQuicCandidate {
@@ -3897,26 +4106,52 @@ struct ResolvedQuicCandidate {
     server_name: String,
 }
 
-/// Find the most recent `Start` agent-text-stream payload in a group's message
-/// history, optionally constrained to a specific `stream_id`.
+/// A kind-1200 agent text stream start, projected from its inner-event tags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamStartView {
+    pub stream_id_hex: String,
+    pub route: String,
+    pub quic_candidates: Vec<String>,
+}
+
+impl StreamStartView {
+    /// Read the stream start view from a kind-1200 event's tags. Returns `None`
+    /// if the event is not a stream start or is missing the `stream` tag.
+    pub fn from_event(kind: u64, tags: &[Vec<String>]) -> Option<Self> {
+        if kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+            return None;
+        }
+        let stream_id_hex = tag_value(tags, STREAM_TAG)?.to_owned();
+        let route = tag_value(tags, STREAM_ROUTE_TAG)
+            .unwrap_or(STREAM_ROUTE_QUIC)
+            .to_owned();
+        let quic_candidates = tag_values(tags, STREAM_BROKER_TAG)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Some(Self {
+            stream_id_hex,
+            route,
+            quic_candidates,
+        })
+    }
+}
+
+/// Find the most recent kind-1200 stream start in a group's message history,
+/// optionally constrained to a specific `stream_id`.
 fn latest_agent_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
-) -> Result<(String, AgentTextStreamStartPayloadV1), AppError> {
+) -> Result<(String, StreamStartView), AppError> {
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
-            let payload = AgentTextStreamAppPayloadEnvelopeV1::decode(message.plaintext.as_bytes())
-                .ok()
-                .flatten()?;
-            match payload.payload {
-                AgentTextStreamAppPayloadV1::Start(start)
-                    if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id) =>
-                {
-                    Some((message.message_id_hex, start))
-                }
-                _ => None,
+            let start = StreamStartView::from_event(message.kind, &message.tags)?;
+            if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
+                Some((message.message_id_hex, start))
+            } else {
+                None
             }
         })
         .ok_or(AppError::AgentStreamMissingStart)
@@ -4054,22 +4289,12 @@ fn broker_trust_for_addr(
 
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {
     match event {
-        MarmotAppEvent::MessageReceived(message) => {
-            if AgentTextStreamAppPayloadEnvelopeV1::decode(message.message.plaintext.as_bytes())
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                None
-            } else {
-                Some(RuntimeMessageUpdate::Message(message))
-            }
-        }
+        // Every delivered timeline message (chat, reply, media, reaction,
+        // delete, stream-final) flows as a `Message`. The kind-1200 stream start
+        // arrives as its own `AgentStreamStarted` event below, never here.
+        MarmotAppEvent::MessageReceived(message) => Some(RuntimeMessageUpdate::Message(message)),
         MarmotAppEvent::AgentStreamStarted(message) => {
             Some(RuntimeMessageUpdate::AgentStreamStarted(message))
-        }
-        MarmotAppEvent::AgentStreamFinalized(message) => {
-            Some(RuntimeMessageUpdate::AgentStreamFinalized(message))
         }
         MarmotAppEvent::GroupJoined { .. }
         | MarmotAppEvent::GroupStateUpdated { .. }
@@ -4096,7 +4321,6 @@ fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)>
         )),
         MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
-        | MarmotAppEvent::AgentStreamFinalized(_)
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -4387,27 +4611,54 @@ impl AppClient {
         group_id: &GroupId,
         payload: &[u8],
     ) -> Result<SendSummary, AppError> {
+        // The transport-facing `send` carries plain UTF-8 chat text; structured
+        // payloads use `send_app_event` with a typed intent.
+        let content = String::from_utf8(payload.to_vec()).map_err(|_| {
+            AppError::InvalidAppMessagePayload("chat message must be valid UTF-8".into())
+        })?;
+        let (_event, summary) = self
+            .send_app_event(group_id, AppMessageIntent::Chat { content })
+            .await?;
+        Ok(summary)
+    }
+
+    /// Build, encrypt, send, and project the inner Marmot app event for `intent`.
+    /// Returns the built event so callers (agent-stream start/finish) can surface
+    /// its tags. The authoring account id and clock are resolved here so the
+    /// inner `pubkey` always equals the MLS-authenticated sender.
+    async fn send_app_event(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         self.ensure_group(group_id)?;
-        let plaintext = String::from_utf8_lossy(payload).to_string();
-        let app_message = MarmotAppMessageEnvelopeV1::decode(payload)
-            .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))?;
-        if let Some(envelope) = &app_message {
-            envelope
-                .validate()
-                .map_err(AppError::InvalidAppMessagePayload)?;
-        }
-        let app_message = app_message.map(|envelope| envelope.payload);
-        let plaintext = app_message
-            .as_ref()
-            .map(display_text_for_app_message)
-            .unwrap_or(plaintext);
+        let sender = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        // NIP-25 has no native un-react: a kind-7 reaction is retracted with a
+        // kind-5 delete of that reaction event. Resolve the user's own reaction
+        // event id from the projection before building the tombstone.
+        let intent = match intent {
+            AppMessageIntent::Unreact { target_message_id } => {
+                let reaction_id =
+                    self.own_reaction_event_id(group_id, &sender, &target_message_id)?;
+                AppMessageIntent::Delete {
+                    target_message_id: reaction_id,
+                }
+            }
+            other => other,
+        };
+        let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
+        let payload = encode_inner_event(&event)?;
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
-                payload: payload.to_vec(),
+                payload,
             })
             .await?;
         fail_if_publish_failed(&effects.failures)?;
@@ -4418,11 +4669,6 @@ impl AppClient {
             .iter()
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect::<Vec<_>>();
-        let sender = self
-            .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
         let projection = self.app.account_projection(&self.state.label)?;
         for message_id_hex in &message_ids {
             projection.record_message(&AppMessageProjection {
@@ -4430,16 +4676,50 @@ impl AppClient {
                 direction: "sent".to_owned(),
                 group_id_hex: group_id_hex.clone(),
                 sender: sender.clone(),
-                plaintext: plaintext.clone(),
-                app_message: app_message.clone(),
+                plaintext: event.content.clone(),
+                kind: event.kind,
+                tags: event.tags.clone(),
                 recorded_at: None,
             })?;
         }
         self.app.save_state(&self.state)?;
-        Ok(SendSummary {
-            published: effects.reports.len(),
-            message_ids,
-        })
+        Ok((
+            event,
+            SendSummary {
+                published: effects.reports.len(),
+                message_ids,
+            },
+        ))
+    }
+
+    /// Most recent kind-7 reaction this account authored that targets
+    /// `target_message_id`, identified by its own message id. Used to build the
+    /// kind-5 retraction for an un-react.
+    fn own_reaction_event_id(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        target_message_id: &str,
+    ) -> Result<String, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let messages =
+            self.app
+                .account_projection(&self.state.label)?
+                .messages(AppMessageQuery {
+                    group_id_hex: Some(group_id_hex),
+                    limit: None,
+                })?;
+        messages
+            .into_iter()
+            .rev()
+            .find(|message| {
+                message.kind == MARMOT_APP_EVENT_KIND_REACTION
+                    && message.sender == sender
+                    && tag_value(&message.tags, EVENT_REF_TAG) == Some(target_message_id)
+                    && !message.message_id_hex.is_empty()
+            })
+            .map(|message| message.message_id_hex)
+            .ok_or(AppError::ReactionNotFound)
     }
 
     pub async fn react_to_message(
@@ -4448,13 +4728,16 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::reaction(
-            target_message_id,
-            emoji,
-            MarmotReactionActionV1::Add,
-        );
-        let payload = encode_validated_app_message(&envelope)?;
-        self.send(group_id, &payload).await
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Reaction {
+                    target_message_id: target_message_id.to_owned(),
+                    emoji: emoji.to_owned(),
+                },
+            )
+            .await?;
+        Ok(summary)
     }
 
     pub async fn unreact_from_message(
@@ -4462,13 +4745,15 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::reaction(
-            target_message_id,
-            "",
-            MarmotReactionActionV1::Remove,
-        );
-        let payload = encode_validated_app_message(&envelope)?;
-        self.send(group_id, &payload).await
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Unreact {
+                    target_message_id: target_message_id.to_owned(),
+                },
+            )
+            .await?;
+        Ok(summary)
     }
 
     pub async fn delete_message(
@@ -4476,20 +4761,70 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::delete(target_message_id);
-        let payload = encode_validated_app_message(&envelope)?;
-        self.send(group_id, &payload).await
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Delete {
+                    target_message_id: target_message_id.to_owned(),
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn reply_to_message(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+        text: &str,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Reply {
+                    target_message_id: target_message_id.to_owned(),
+                    text: text.to_owned(),
+                },
+            )
+            .await?;
+        Ok(summary)
     }
 
     pub async fn send_media_reference(
         &mut self,
         group_id: &GroupId,
-        reference: MarmotMediaReferenceV1,
+        reference: MediaReference,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        let envelope = MarmotAppMessageEnvelopeV1::media(reference, caption);
-        let payload = encode_validated_app_message(&envelope)?;
-        self.send(group_id, &payload).await
+        let (_event, summary) = self
+            .send_app_event(group_id, AppMessageIntent::Media { reference, caption })
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn start_agent_text_stream(
+        &mut self,
+        group_id: &GroupId,
+        stream_id: &[u8],
+        quic_candidates: Vec<String>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.send_app_event(
+            group_id,
+            AppMessageIntent::StreamStart {
+                stream_id: stream_id.to_vec(),
+                quic_candidates,
+            },
+        )
+        .await
+    }
+
+    pub async fn finish_agent_text_stream(
+        &mut self,
+        group_id: &GroupId,
+        request: AgentTextStreamFinishRequest,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.send_app_event(group_id, AppMessageIntent::StreamFinal { request })
+            .await
     }
 
     pub async fn retry_group_convergence(
@@ -4703,7 +5038,8 @@ impl AppClient {
                         group_id_hex: hex::encode(message.group_id.as_slice()),
                         sender: message.sender.clone(),
                         plaintext: message.plaintext.clone(),
-                        app_message: message.app_message.clone(),
+                        kind: message.kind,
+                        tags: message.tags.clone(),
                         recorded_at: Some(source_recorded_at),
                     })?;
             }
@@ -5546,6 +5882,47 @@ struct EventGroupProjection<'a> {
     agent_text_stream: AppAgentTextStreamComponent,
 }
 
+/// Strictly decode the inner Marmot app event from MLS plaintext and bind it to
+/// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
+/// canonical id does not match or the inner `pubkey` is not the authenticated
+/// sender — both are integrity failures that must not reach the timeline.
+fn decode_received_event(
+    payload: &[u8],
+    sender_hex: &str,
+    sender_display_name: Option<String>,
+    group_id: &GroupId,
+    source_message_id_hex: &str,
+) -> Option<ReceivedMessage> {
+    let event = match MarmotInnerEvent::decode(payload) {
+        Ok(event) => event,
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot_app::ingest",
+                method = "decode_received_event",
+                "rejecting MLS application message: inner app event failed strict decode",
+            );
+            return None;
+        }
+    };
+    if event.validate_sender(sender_hex).is_err() {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: inner author is not the authenticated sender",
+        );
+        return None;
+    }
+    Some(ReceivedMessage {
+        message_id_hex: source_message_id_hex.to_owned(),
+        sender: sender_hex.to_owned(),
+        sender_display_name,
+        group_id: group_id.clone(),
+        plaintext: event.content,
+        kind: event.kind,
+        tags: event.tags,
+    })
+}
+
 fn observe_event(
     state: &mut AccountState,
     display_names: &HashMap<String, String>,
@@ -5587,23 +5964,19 @@ fn observe_event(
             }
             let sender_hex = hex::encode(sender.as_slice());
             let sender_display_name = display_names.get(&sender_hex).cloned();
-            let plaintext = String::from_utf8_lossy(payload).to_string();
-            let app_message = MarmotAppMessageEnvelopeV1::decode(payload)
-                .ok()
-                .flatten()
-                .filter(|envelope| envelope.validate().is_ok())
-                .map(|envelope| envelope.payload);
-            let plaintext = app_message
-                .as_ref()
-                .map(display_text_for_app_message)
-                .unwrap_or(plaintext);
-            let message = ReceivedMessage {
-                message_id_hex: source_message_id_hex.to_owned(),
-                sender: sender_hex,
+            // The MLS layer authenticated `sender`; the inner Nostr-shaped event
+            // must (1) carry a valid canonical id and (2) name `sender` as its
+            // author. Reject anything that fails either check rather than
+            // rendering an unauthenticated or tampered payload.
+            let Some(message) = decode_received_event(
+                payload,
+                &sender_hex,
                 sender_display_name,
-                group_id: group_id.clone(),
-                plaintext,
-                app_message,
+                group_id,
+                source_message_id_hex,
+            ) else {
+                summary.events.push(event.clone());
+                return None;
             };
             summary.messages.push(message.clone());
             summary.events.push(event.clone());
@@ -5695,15 +6068,197 @@ fn send_summary_from_effects(effects: &marmot_account::AccountDeviceEffects) -> 
     }
 }
 
-fn encode_validated_app_message(
-    envelope: &MarmotAppMessageEnvelopeV1,
-) -> Result<Vec<u8>, AppError> {
-    envelope
-        .validate()
-        .map_err(AppError::InvalidAppMessagePayload)?;
-    envelope
+/// Build the inner Marmot app event for `intent`, authored by `sender_pubkey_hex`
+/// at `created_at`. `Unreact` must be resolved to a `Delete` of the reaction
+/// event id before this is called (see [`AccountWorker`]'s unreact handling).
+fn build_inner_event(
+    intent: &AppMessageIntent,
+    sender_pubkey_hex: &str,
+    created_at: u64,
+) -> Result<MarmotInnerEvent, AppError> {
+    let event = |kind, tags, content| {
+        MarmotInnerEvent::new(
+            sender_pubkey_hex.to_owned(),
+            created_at,
+            kind,
+            tags,
+            content,
+        )
+    };
+    match intent {
+        AppMessageIntent::Chat { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            Vec::new(),
+            content.clone(),
+        )),
+        AppMessageIntent::Reaction {
+            target_message_id,
+            emoji,
+        } => {
+            validate_message_ref(target_message_id)?;
+            if emoji.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "reaction add requires a non-empty emoji".into(),
+                ));
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REACTION,
+                vec![event_ref_tag(target_message_id)],
+                emoji.clone(),
+            ))
+        }
+        AppMessageIntent::Reply {
+            target_message_id,
+            text,
+        } => {
+            validate_message_ref(target_message_id)?;
+            if text.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "reply requires non-empty text".into(),
+                ));
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                vec![
+                    event_ref_tag(target_message_id),
+                    vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
+                ],
+                text.clone(),
+            ))
+        }
+        AppMessageIntent::Unreact { .. } | AppMessageIntent::Delete { .. } => {
+            // `Unreact` is mapped to a `Delete` of the reaction event id by the
+            // worker before reaching here; both encode as a kind-5 tombstone.
+            let target_message_id = match intent {
+                AppMessageIntent::Delete { target_message_id }
+                | AppMessageIntent::Unreact { target_message_id } => target_message_id,
+                _ => unreachable!(),
+            };
+            validate_message_ref(target_message_id)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_DELETE,
+                vec![event_ref_tag(target_message_id)],
+                String::new(),
+            ))
+        }
+        AppMessageIntent::Media { reference, caption } => {
+            reference.validate()?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                vec![reference.imeta_tag()],
+                caption.clone().unwrap_or_default(),
+            ))
+        }
+        AppMessageIntent::StreamStart {
+            stream_id,
+            quic_candidates,
+        } => {
+            let stream_id_hex = hex::encode(stream_id);
+            if stream_id.is_empty() || stream_id.len() > AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream id length is out of range".into(),
+                ));
+            }
+            let brokers: Vec<&String> = quic_candidates
+                .iter()
+                .filter(|candidate| !candidate.trim().is_empty())
+                .collect();
+            if brokers.is_empty() {
+                return Err(AppError::AgentStreamMissingCandidate);
+            }
+            let mut tags = vec![
+                vec![STREAM_TAG.to_owned(), stream_id_hex],
+                vec![STREAM_TYPE_TAG.to_owned(), STREAM_TYPE_TEXT.to_owned()],
+                vec![
+                    STREAM_FINAL_KIND_TAG.to_owned(),
+                    STREAM_FINAL_KIND_CHAT.to_owned(),
+                ],
+                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
+            ];
+            tags.extend(
+                brokers
+                    .into_iter()
+                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
+            );
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                tags,
+                String::new(),
+            ))
+        }
+        AppMessageIntent::StreamFinal { request } => {
+            if request.stream_id.is_empty()
+                || request.stream_id.len() > AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN
+            {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream id length is out of range".into(),
+                ));
+            }
+            let tags = vec![
+                vec![STREAM_TAG.to_owned(), hex::encode(&request.stream_id)],
+                vec![
+                    STREAM_HASH_TAG.to_owned(),
+                    hex::encode(request.transcript_hash),
+                ],
+                vec![
+                    STREAM_CHUNKS_TAG.to_owned(),
+                    request.chunk_count.to_string(),
+                ],
+            ];
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                tags,
+                request.final_text_or_reference.clone(),
+            ))
+        }
+    }
+}
+
+fn event_ref_tag(target_message_id: &str) -> Vec<String> {
+    vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]
+}
+
+fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
+    if target_message_id.trim().is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(
+            "target message id cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Encode a built inner event into MLS application-message plaintext bytes.
+fn encode_inner_event(event: &MarmotInnerEvent) -> Result<Vec<u8>, AppError> {
+    event
         .encode()
         .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
+}
+
+/// True when an inner event is a kind-9 chat that finalizes an agent text
+/// stream (it carries a `stream` tag plus a `stream-start` or `stream-hash`
+/// tag). Such events flow as normal timeline messages, not start signals.
+pub fn is_stream_final_event(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT
+        && tag_value(tags, STREAM_TAG).is_some()
+        && (tag_value(tags, STREAM_START_TAG).is_some()
+            || tag_value(tags, STREAM_HASH_TAG).is_some())
+}
+
+/// First value of the named tag (`tag[0] == name` → `tag[1]`).
+pub fn tag_value<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .and_then(|tag| tag.get(1))
+        .map(String::as_str)
+}
+
+/// All values of the named tag across every matching tag entry.
+pub fn tag_values<'a>(tags: &'a [Vec<String>], name: &str) -> Vec<&'a str> {
+    tags.iter()
+        .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .filter_map(|tag| tag.get(1))
+        .map(String::as_str)
+        .collect()
 }
 
 fn validate_group_profile(name: &str, description: &str) -> Result<(), AppError> {
@@ -5902,5 +6457,230 @@ mod tests {
             state.seen_events.last().map(String::as_str),
             Some(expected_last.as_str())
         );
+    }
+
+    const SENDER_HEX: &str = "aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55";
+
+    fn build(intent: AppMessageIntent) -> MarmotInnerEvent {
+        build_inner_event(&intent, SENDER_HEX, 1_700_000_000).unwrap()
+    }
+
+    #[test]
+    fn chat_intent_builds_kind_nine_with_no_tags() {
+        let event = build(AppMessageIntent::Chat {
+            content: "hello".to_owned(),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.content, "hello");
+        assert!(event.tags.is_empty());
+        assert_eq!(event.pubkey, SENDER_HEX);
+    }
+
+    #[test]
+    fn reaction_intent_builds_kind_seven_with_e_tag() {
+        let event = build(AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: "🔥".to_owned(),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
+        assert_eq!(event.content, "🔥");
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("abc123"));
+    }
+
+    #[test]
+    fn reaction_intent_rejects_empty_emoji() {
+        let result = build_inner_event(
+            &AppMessageIntent::Reaction {
+                target_message_id: "abc123".to_owned(),
+                emoji: "  ".to_owned(),
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
+    }
+
+    #[test]
+    fn delete_intent_builds_empty_kind_five_with_e_tag() {
+        let event = build(AppMessageIntent::Delete {
+            target_message_id: "abc123".to_owned(),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_DELETE);
+        assert_eq!(event.content, "");
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("abc123"));
+    }
+
+    #[test]
+    fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
+        let event = build(AppMessageIntent::Reply {
+            target_message_id: "parent".to_owned(),
+            text: "sure".to_owned(),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.content, "sure");
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
+        assert_eq!(tag_value(&event.tags, QUOTE_REF_TAG), Some("parent"));
+    }
+
+    #[test]
+    fn media_intent_builds_kind_nine_with_imeta_tag() {
+        let event = build(AppMessageIntent::Media {
+            reference: MediaReference {
+                file_hash_hex: hex::encode([0x11_u8; 32]),
+                file_name: "a.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                size_bytes: 7,
+            },
+            caption: Some("cap".to_owned()),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.content, "cap");
+        let imeta = event
+            .tags
+            .iter()
+            .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
+            .unwrap();
+        assert!(imeta.iter().any(|field| field == "m image/png"));
+        assert!(imeta.iter().any(|field| field == "size 7"));
+        assert!(imeta.iter().any(|field| field == "name a.png"));
+    }
+
+    #[test]
+    fn stream_start_intent_builds_kind_1200_with_broker_tags() {
+        let event = build(AppMessageIntent::StreamStart {
+            stream_id: vec![0xab; 32],
+            quic_candidates: vec![
+                "quic://broker.example:4450".to_owned(),
+                "quic://[::1]:4450".to_owned(),
+            ],
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
+        assert_eq!(event.content, "");
+        let start = StreamStartView::from_event(event.kind, &event.tags).unwrap();
+        assert_eq!(start.stream_id_hex, hex::encode([0xab; 32]));
+        assert_eq!(start.route, STREAM_ROUTE_QUIC);
+        assert_eq!(
+            start.quic_candidates,
+            vec![
+                "quic://broker.example:4450".to_owned(),
+                "quic://[::1]:4450".to_owned(),
+            ]
+        );
+        assert_eq!(tag_value(&event.tags, STREAM_TYPE_TAG), Some("text"));
+        assert_eq!(tag_value(&event.tags, STREAM_FINAL_KIND_TAG), Some("9"));
+    }
+
+    #[test]
+    fn stream_start_intent_requires_a_broker() {
+        let result = build_inner_event(
+            &AppMessageIntent::StreamStart {
+                stream_id: vec![0xab; 32],
+                quic_candidates: vec!["   ".to_owned()],
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(matches!(result, Err(AppError::AgentStreamMissingCandidate)));
+    }
+
+    #[test]
+    fn stream_final_intent_builds_kind_nine_stream_final() {
+        let event = build(AppMessageIntent::StreamFinal {
+            request: AgentTextStreamFinishRequest {
+                stream_id: vec![0xcd; 32],
+                final_text_or_reference: "done".to_owned(),
+                transcript_hash: [0xee; 32],
+                chunk_count: 3,
+                finished_at: 9,
+            },
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.content, "done");
+        assert!(is_stream_final_event(event.kind, &event.tags));
+        assert_eq!(
+            tag_value(&event.tags, STREAM_TAG),
+            Some(hex::encode([0xcd; 32]).as_str())
+        );
+        assert_eq!(
+            tag_value(&event.tags, STREAM_HASH_TAG),
+            Some(hex::encode([0xee; 32]).as_str())
+        );
+        assert_eq!(tag_value(&event.tags, STREAM_CHUNKS_TAG), Some("3"));
+    }
+
+    #[test]
+    fn received_event_decodes_when_id_and_sender_match() {
+        let event = build(AppMessageIntent::Chat {
+            content: "hi".to_owned(),
+        });
+        let bytes = event.encode().unwrap();
+        let group_id = GroupId::new(vec![0x01]);
+        let message = decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1")
+            .expect("valid event is accepted");
+        assert_eq!(message.plaintext, "hi");
+        assert_eq!(message.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(message.sender, SENDER_HEX);
+    }
+
+    #[test]
+    fn received_event_with_tampered_id_is_rejected() {
+        let mut event = build(AppMessageIntent::Chat {
+            content: "hi".to_owned(),
+        });
+        // Mutate the content without recomputing the id: the canonical id no
+        // longer matches, so the strict decoder must reject it.
+        event.content = "tampered".to_owned();
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let group_id = GroupId::new(vec![0x01]);
+        assert!(decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1").is_none());
+    }
+
+    #[test]
+    fn received_event_with_wrong_sender_is_rejected() {
+        let event = build(AppMessageIntent::Chat {
+            content: "hi".to_owned(),
+        });
+        let bytes = event.encode().unwrap();
+        let group_id = GroupId::new(vec![0x01]);
+        let other_sender = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
+        // The inner pubkey is SENDER_HEX, but MLS authenticated `other_sender`.
+        assert!(decode_received_event(&bytes, other_sender, None, &group_id, "msg1").is_none());
+    }
+
+    #[test]
+    fn inner_event_id_matches_nostr_sdk_event_id() {
+        use nostr::{EventId, Keys, Kind, Tag, Tags, Timestamp};
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let created_at = 1_700_000_123_u64;
+        let kind = MARMOT_APP_EVENT_KIND_CHAT;
+        let tags = vec![
+            vec![EVENT_REF_TAG.to_owned(), "parent-id".to_owned()],
+            vec![QUOTE_REF_TAG.to_owned(), "parent-id".to_owned()],
+        ];
+        let content = "hello from marmot 🦫";
+
+        // Our canonical id over the unsigned-event preimage.
+        let ours =
+            cgka_traits::canonical_event_id(&pubkey.to_hex(), created_at, kind, &tags, content);
+
+        // The nostr SDK's NIP-01 id for the same {pubkey, created_at, kind,
+        // tags, content}. If these diverge, external Nostr clients would reject
+        // our inner event id.
+        let sdk_tags = Tags::from_list(
+            tags.iter()
+                .map(|tag| Tag::parse(tag.clone()).unwrap())
+                .collect(),
+        );
+        let theirs = EventId::new(
+            &pubkey,
+            &Timestamp::from(created_at),
+            &Kind::from(kind as u16),
+            &sdk_tags,
+            content,
+        );
+
+        assert_eq!(ours, theirs.to_hex());
     }
 }

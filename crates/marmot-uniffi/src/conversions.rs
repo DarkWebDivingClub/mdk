@@ -6,7 +6,7 @@
 //! (Rust → FFI). When the iOS side needs to round-trip data back into
 //! marmot-app we'll add the reverse direction explicitly.
 
-use cgka_traits::{GroupId, MarmotAppMessagePayloadV1, MarmotReactionActionV1};
+use cgka_traits::GroupId;
 use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
@@ -91,66 +91,18 @@ impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
     }
 }
 
-/// Structured chat payloads (reactions, replies, deletes, …) carried inside a
-/// message. Flattened from `MarmotAppMessagePayloadV1` for host bindings.
-#[derive(Clone, Debug, uniffi::Enum)]
-pub enum AppMessagePayloadFfi {
-    Reaction {
-        target_message_id: String,
-        emoji: String,
-        removed: bool,
-    },
-    Delete {
-        target_message_id: String,
-    },
-    Retry {
-        target_message_id: String,
-    },
-    Media {
-        file_name: String,
-        media_type: String,
-        size_bytes: u64,
-        caption: Option<String>,
-    },
-    Reply {
-        target_message_id: String,
-        text: String,
-    },
+/// One Nostr tag from an inner Marmot app event, e.g. `["e", "<id>"]` or an
+/// `["imeta", …]` media descriptor. Host apps branch on the inner event `kind`
+/// plus these tags instead of a fixed payload enum.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MessageTagFfi {
+    pub values: Vec<String>,
 }
 
-impl From<MarmotAppMessagePayloadV1> for AppMessagePayloadFfi {
-    fn from(value: MarmotAppMessagePayloadV1) -> Self {
-        match value {
-            MarmotAppMessagePayloadV1::Reaction {
-                target_message_id,
-                emoji,
-                action,
-            } => Self::Reaction {
-                target_message_id,
-                emoji,
-                removed: matches!(action, MarmotReactionActionV1::Remove),
-            },
-            MarmotAppMessagePayloadV1::Delete { target_message_id } => {
-                Self::Delete { target_message_id }
-            }
-            MarmotAppMessagePayloadV1::Retry {
-                target_message_id, ..
-            } => Self::Retry { target_message_id },
-            MarmotAppMessagePayloadV1::Media { reference, caption } => Self::Media {
-                file_name: reference.file_name,
-                media_type: reference.media_type,
-                size_bytes: reference.size_bytes,
-                caption,
-            },
-            MarmotAppMessagePayloadV1::Reply {
-                target_message_id,
-                text,
-            } => Self::Reply {
-                target_message_id,
-                text,
-            },
-        }
-    }
+fn message_tags_ffi(tags: Vec<Vec<String>>) -> Vec<MessageTagFfi> {
+    tags.into_iter()
+        .map(|values| MessageTagFfi { values })
+        .collect()
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -160,7 +112,10 @@ pub struct AppMessageRecordFfi {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
-    pub app_message: Option<AppMessagePayloadFfi>,
+    /// Nostr `kind` of the inner Marmot app event (9 chat, 7 reaction, …).
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    pub tags: Vec<MessageTagFfi>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -173,7 +128,8 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             group_id_hex: value.group_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
-            app_message: value.app_message.map(Into::into),
+            kind: value.kind,
+            tags: message_tags_ffi(value.tags),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -299,7 +255,10 @@ pub struct ReceivedMessageFfi {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub plaintext: String,
-    pub app_message: Option<AppMessagePayloadFfi>,
+    /// Nostr `kind` of the inner Marmot app event.
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    pub tags: Vec<MessageTagFfi>,
 }
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
@@ -310,7 +269,8 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             sender: value.sender.clone(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
-            app_message: value.app_message.clone().map(Into::into),
+            kind: value.kind,
+            tags: message_tags_ffi(value.tags.clone()),
         }
     }
 }
@@ -337,9 +297,14 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
+    /// A timeline message: chat, reply, media, reaction, delete, or the kind-9
+    /// stream-final. Host apps branch on `received.message.kind` and `tags`; a
+    /// kind-9 carrying a `stream` tag is the stream-final that replaces the
+    /// ephemeral preview.
     Message { received: RuntimeMessageReceivedFfi },
+    /// A kind-1200 agent text stream start — the signal to open the QUIC
+    /// preview. Its stream id, route, and brokers live on `message.tags`.
     AgentStreamStarted { received: RuntimeMessageReceivedFfi },
-    AgentStreamFinalized { received: RuntimeMessageReceivedFfi },
 }
 
 impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
@@ -347,13 +312,6 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
         match value {
             RuntimeMessageUpdate::Message(m) => Self::Message { received: m.into() },
             RuntimeMessageUpdate::AgentStreamStarted(m) => Self::AgentStreamStarted {
-                received: RuntimeMessageReceivedFfi {
-                    account_id_hex: m.account_id_hex,
-                    account_label: m.account_label,
-                    message: ReceivedMessageFfi::from(&m.message),
-                },
-            },
-            RuntimeMessageUpdate::AgentStreamFinalized(m) => Self::AgentStreamFinalized {
                 received: RuntimeMessageReceivedFfi {
                     account_id_hex: m.account_id_hex,
                     account_label: m.account_label,
@@ -428,12 +386,10 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_label: e.account_label,
                 message: e.message,
             },
-            MarmotAppEvent::AgentStreamStarted(m) | MarmotAppEvent::AgentStreamFinalized(m) => {
-                Self::AgentStreamActivity {
-                    account_id_hex: m.account_id_hex,
-                    account_label: m.account_label,
-                }
-            }
+            MarmotAppEvent::AgentStreamStarted(m) => Self::AgentStreamActivity {
+                account_id_hex: m.account_id_hex,
+                account_label: m.account_label,
+            },
         }
     }
 }

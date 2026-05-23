@@ -4,8 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params, types::Type};
 
-use cgka_traits::MarmotAppMessagePayloadV1;
-
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
     AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupNostrRoutingComponent,
@@ -75,7 +73,8 @@ impl AccountProjectionDb {
                 group_id_hex TEXT NOT NULL,
                 sender TEXT NOT NULL,
                 plaintext TEXT NOT NULL,
-                app_message_json TEXT,
+                kind INTEGER NOT NULL DEFAULT 9,
+                tags_json TEXT,
                 recorded_at INTEGER,
                 received_at INTEGER NOT NULL
             );
@@ -125,7 +124,8 @@ impl AccountProjectionDb {
             "TEXT NOT NULL DEFAULT 'received'",
         )?;
         ensure_column(&conn, "messages", "recorded_at", "INTEGER")?;
-        ensure_column(&conn, "messages", "app_message_json", "TEXT")?;
+        ensure_column(&conn, "messages", "kind", "INTEGER NOT NULL DEFAULT 9")?;
+        ensure_column(&conn, "messages", "tags_json", "TEXT")?;
         ensure_column(
             &conn,
             "account_state",
@@ -420,16 +420,17 @@ impl AccountProjectionDb {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (
                 message_id_hex, direction, group_id_hex, sender, plaintext,
-                app_message_json, received_at, recorded_at
+                kind, tags_json, received_at, recorded_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &message.message_id_hex,
                 &message.direction,
                 &message.group_id_hex,
                 &message.sender,
                 &message.plaintext,
-                serialize_app_message(&message.app_message)?,
+                message.kind as i64,
+                serialize_tags(&message.tags)?,
                 now,
                 recorded_at,
             ],
@@ -444,11 +445,11 @@ impl AccountProjectionDb {
         let sql = match (&query.group_id_hex, query.limit) {
             (Some(_), Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        app_message_json,
+                        kind, tags_json,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
-                           app_message_json,
+                           kind, tags_json,
                            recorded_at, received_at FROM messages
                     WHERE group_id_hex = ?1
                     ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
@@ -457,18 +458,18 @@ impl AccountProjectionDb {
             }
             (Some(_), None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        app_message_json,
+                        kind, tags_json,
                         COALESCE(recorded_at, received_at), received_at FROM messages
                  WHERE group_id_hex = ?1
                  ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
             (None, Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        app_message_json,
+                        kind, tags_json,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
-                           app_message_json,
+                           kind, tags_json,
                            recorded_at, received_at FROM messages
                     ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
                     LIMIT ?1
@@ -476,22 +477,23 @@ impl AccountProjectionDb {
             }
             (None, None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        app_message_json,
+                        kind, tags_json,
                         COALESCE(recorded_at, received_at), received_at FROM messages
                  ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
         };
         let mut statement = self.conn.prepare(sql)?;
         let map_row = |row: &rusqlite::Row<'_>| {
-            let recorded_at = row.get::<_, i64>(6)?;
-            let received_at = row.get::<_, i64>(7)?;
+            let recorded_at = row.get::<_, i64>(7)?;
+            let received_at = row.get::<_, i64>(8)?;
             Ok(AppMessageRecord {
                 message_id_hex: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 direction: row.get(1)?,
                 group_id_hex: row.get(2)?,
                 sender: row.get(3)?,
                 plaintext: row.get(4)?,
-                app_message: deserialize_app_message_row(row.get::<_, Option<String>>(5)?, 5)?,
+                kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+                tags: deserialize_tags_row(row.get::<_, Option<String>>(6)?, 6)?,
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
             })
@@ -543,25 +545,25 @@ fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
         .collect()
 }
 
-fn serialize_app_message(
-    payload: &Option<MarmotAppMessagePayloadV1>,
-) -> Result<Option<String>, AppError> {
-    payload
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
+fn serialize_tags(tags: &[Vec<String>]) -> Result<Option<String>, AppError> {
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(tags)
+        .map(Some)
         .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
 }
 
-fn deserialize_app_message_row(
-    payload: Option<String>,
+fn deserialize_tags_row(
+    tags: Option<String>,
     column: usize,
-) -> Result<Option<MarmotAppMessagePayloadV1>, rusqlite::Error> {
-    payload
-        .filter(|payload| !payload.is_empty())
-        .map(|payload| serde_json::from_str(&payload))
-        .transpose()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
+) -> Result<Vec<Vec<String>>, rusqlite::Error> {
+    match tags.filter(|tags| !tags.is_empty()) {
+        Some(tags) => serde_json::from_str(&tags).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err))
+        }),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn ensure_column(

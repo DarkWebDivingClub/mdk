@@ -22,6 +22,9 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamTranscriptV1,
 };
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+};
 
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
 
@@ -1249,14 +1252,6 @@ fn runtime_message_update_stream_response(
             ),
             "AgentStreamStarted",
         ),
-        marmot_app::RuntimeMessageUpdate::AgentStreamFinalized(message) => message_stream_response(
-            runtime_message_json(
-                &message.message,
-                &message.account_id_hex,
-                &message.account_label,
-            ),
-            "AgentStreamFinalized",
-        ),
     }
 }
 
@@ -1574,25 +1569,36 @@ fn message_stream_response(message: serde_json::Value, trigger: &str) -> DaemonS
 }
 
 fn message_stream_type(message: &serde_json::Value) -> &'static str {
-    if let Some(kind) = message
-        .get("app_message")
-        .and_then(|payload| payload.get("kind"))
-        .and_then(serde_json::Value::as_str)
-    {
-        return match kind {
-            "reaction" => "reaction",
-            "delete" => "message_delete",
-            "media" => "media",
-            _ => "message",
-        };
-    }
-    match message
+    // Agent text stream classification is derived from the inner-event tags and
+    // exposed under `agent_text_stream`; prefer it so stream-final chats surface
+    // as `agent_stream_final` rather than a bare `message`.
+    if let Some(stream_kind) = message
         .get("agent_text_stream")
         .and_then(|stream| stream.get("kind"))
         .and_then(serde_json::Value::as_str)
     {
-        Some("start") => "agent_stream_start",
-        Some("final") => "agent_stream_final",
+        return match stream_kind {
+            "start" => "agent_stream_start",
+            "final" => "agent_stream_final",
+            _ => "message",
+        };
+    }
+    let kind = message.get("kind").and_then(serde_json::Value::as_u64);
+    let has_imeta = message
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array()
+                    .and_then(|values| values.first())
+                    .and_then(serde_json::Value::as_str)
+                    == Some("imeta")
+            })
+        });
+    match kind {
+        Some(MARMOT_APP_EVENT_KIND_REACTION) => "reaction",
+        Some(MARMOT_APP_EVENT_KIND_DELETE) => "message_delete",
+        Some(MARMOT_APP_EVENT_KIND_CHAT) if has_imeta => "media",
         _ => "message",
     }
 }
@@ -2899,26 +2905,24 @@ async fn handle_app_runtime_event(
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
         marmot_app::MarmotAppEvent::MessageReceived(message) => {
-            let is_agent_stream =
-                crate::agent_text_stream_payload(&message.message.plaintext).is_some();
-            if !is_agent_stream {
-                events.publish_message(message_stream_response(
-                    runtime_message_json(
-                        &message.message,
-                        &message.account_id_hex,
-                        &message.account_label,
-                    ),
-                    "MessageReceived",
-                ));
-                let summary = marmot_app::SyncSummary {
-                    messages: vec![message.message],
-                    ..marmot_app::SyncSummary::default()
-                };
-                record_runtime_activity_report(
-                    &state,
-                    runtime_activity_report_from_summary(started_at, 1, &summary),
-                );
-            }
+            // Every delivered timeline message (including a kind-9 stream-final)
+            // surfaces here; kind-1200 starts arrive as `AgentStreamStarted`.
+            events.publish_message(message_stream_response(
+                runtime_message_json(
+                    &message.message,
+                    &message.account_id_hex,
+                    &message.account_label,
+                ),
+                "MessageReceived",
+            ));
+            let summary = marmot_app::SyncSummary {
+                messages: vec![message.message],
+                ..marmot_app::SyncSummary::default()
+            };
+            record_runtime_activity_report(
+                &state,
+                runtime_activity_report_from_summary(started_at, 1, &summary),
+            );
         }
         marmot_app::MarmotAppEvent::AgentStreamStarted(message) => {
             events.publish_message(message_stream_response(
@@ -2941,24 +2945,6 @@ async fn handle_app_runtime_event(
                 stream_manager,
             )
             .await;
-            record_runtime_activity_report(
-                &state,
-                runtime_activity_report_from_summary(started_at, 1, &summary),
-            );
-        }
-        marmot_app::MarmotAppEvent::AgentStreamFinalized(message) => {
-            events.publish_message(message_stream_response(
-                runtime_message_json(
-                    &message.message,
-                    &message.account_id_hex,
-                    &message.account_label,
-                ),
-                "AgentStreamFinalized",
-            ));
-            let summary = marmot_app::SyncSummary {
-                messages: vec![message.message],
-                ..marmot_app::SyncSummary::default()
-            };
             record_runtime_activity_report(
                 &state,
                 runtime_activity_report_from_summary(started_at, 1, &summary),
@@ -3006,14 +2992,15 @@ fn runtime_message_json(
         "from_display_name": from_display_name,
         "group_id": hex::encode(message.group_id.as_slice()),
         "plaintext": message.plaintext,
+        "kind": message.kind,
+        "tags": message.tags,
         "recorded_at": now,
         "received_at": now,
     });
-    if let Some(agent_text_stream) = crate::agent_text_stream_payload_json(&message.plaintext) {
+    if let Some(agent_text_stream) =
+        crate::agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext)
+    {
         value["agent_text_stream"] = agent_text_stream;
-    }
-    if let Some(app_message) = &message.app_message {
-        value["app_message"] = serde_json::json!(app_message);
     }
     value
 }
@@ -3026,20 +3013,16 @@ async fn auto_watch_agent_stream_starts(
     stream_manager: marmot_app::AgentStreamWatchManager,
 ) {
     for message in &summary.messages {
-        let Some(payload) = crate::agent_text_stream_payload(&message.plaintext) else {
-            continue;
-        };
-        let cgka_traits::agent_text_stream::AgentTextStreamAppPayloadV1::Start(start) =
-            payload.payload
+        let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {
             continue;
         };
-        if start.route != cgka_traits::agent_text_stream::AgentTextStreamRouteV1::BrokeredQuic {
+        if start.route != "quic" {
             continue;
         }
         let group_id = hex::encode(message.group_id.as_slice());
         let insecure_local = crate::first_quic_candidate_is_loopback(&start.quic_candidates);
-        let stream_id = start.stream_id;
+        let stream_id = start.stream_id_hex;
         if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
             continue;
         }
@@ -4070,7 +4053,8 @@ mod tests {
             sender_display_name: Some("Alice Example".to_owned()),
             group_id: GroupId::new(vec![0xab; 32]),
             plaintext: "hello".to_owned(),
-            app_message: None,
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
         };
 
         let value = runtime_message_json(
@@ -4128,7 +4112,8 @@ mod tests {
             sender_display_name: Some("Bob Example".to_owned()),
             group_id: GroupId::new(vec![0xcd; 32]),
             plaintext: "hello back".to_owned(),
-            app_message: None,
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
         };
 
         let value = runtime_message_json(

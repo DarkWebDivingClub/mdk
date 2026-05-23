@@ -866,6 +866,65 @@ fn sync_until_message(
     );
 }
 
+/// Poll `sync`/`message list` until a projected message of `kind` referencing
+/// `target` via an `e` tag arrives (used for reactions/deletes whose content is
+/// empty or just an emoji, so plaintext matching doesn't apply).
+fn sync_until_message_with_kind(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    kind: u64,
+    target: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        if first_message_with_kind_and_target(&sync, kind, target).is_some() {
+            return sync;
+        }
+        let messages = run_json_with_relay(home, relay, &["--account", account, "message", "list"]);
+        if first_message_with_kind_and_target(&messages, kind, target).is_some() {
+            return messages;
+        }
+        last = messages;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not receive a kind-{kind} message; {}",
+        json_value_summary("last_sync", &last)
+    );
+}
+
+fn first_message_with_kind(value: &Value, kind: u64) -> Option<&Value> {
+    value["messages"]
+        .as_array()?
+        .iter()
+        .find(|message| message["kind"].as_u64() == Some(kind))
+}
+
+fn first_message_with_kind_and_target<'a>(
+    value: &'a Value,
+    kind: u64,
+    target: &str,
+) -> Option<&'a Value> {
+    value["messages"].as_array()?.iter().find(|message| {
+        message["kind"].as_u64() == Some(kind) && message_e_tag(message) == Some(target)
+    })
+}
+
+/// First `e` tag value on a projected message's `tags` array.
+fn message_e_tag(message: &Value) -> Option<&str> {
+    message["tags"].as_array()?.iter().find_map(|tag| {
+        let tag = tag.as_array()?;
+        if tag.first()?.as_str()? == "e" {
+            tag.get(1)?.as_str()
+        } else {
+            None
+        }
+    })
+}
+
 fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, member: &str) -> Value {
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
@@ -2548,7 +2607,9 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
         {
             preview = Some(line.clone());
         }
-        if line["result"]["trigger"] == "AgentStreamFinalized"
+        // The kind-9 stream-final now arrives as a normal timeline message; it
+        // is still classified as `agent_stream_final` via its stream tags.
+        if line["result"]["trigger"] == "MessageReceived"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
         {
@@ -2746,7 +2807,9 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
         {
             preview = Some(line.clone());
         }
-        if line["result"]["trigger"] == "AgentStreamFinalized"
+        // The kind-9 stream-final now arrives as a normal timeline message; it
+        // is still classified as `agent_stream_final` via its stream tags.
+        if line["result"]["trigger"] == "MessageReceived"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
         {
@@ -2923,17 +2986,18 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             "+",
         ],
     );
-    let reaction_text = format!("reacted + to {target_message_id}");
-    let reaction_sync = sync_until_message(home.path(), test_relay_url(), &alice, &reaction_text);
-    assert_eq!(
-        reaction_sync["messages"][0]["app_message"]["kind"],
-        "reaction"
-    );
-    assert_eq!(
-        reaction_sync["messages"][0]["app_message"]["target_message_id"],
-        target_message_id
-    );
-    assert_eq!(reaction_sync["messages"][0]["app_message"]["action"], "add");
+    // A reaction is now an inner kind-7 Nostr event: content is the emoji and an
+    // `e` tag references the reacted-to message.
+    let reaction_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &alice, 7, target_message_id);
+    let reaction = first_message_with_kind(&reaction_sync, 7).expect("reaction message");
+    let reaction_message_id = reaction["message_id"]
+        .as_str()
+        .expect("reaction message id")
+        .to_owned();
+    assert_eq!(reaction["plaintext"], "+");
+    assert_eq!(message_e_tag(reaction), Some(target_message_id));
+    assert_eq!(reaction["agent_text_stream"], Value::Null);
 
     run_json(
         home.path(),
@@ -2946,12 +3010,18 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             target_message_id,
         ],
     );
-    let unreact_text = format!("removed reaction from {target_message_id}");
-    let unreact_sync = sync_until_message(home.path(), test_relay_url(), &alice, &unreact_text);
-    assert_eq!(
-        unreact_sync["messages"][0]["app_message"]["action"],
-        "remove"
+    // Un-react is a NIP-25-style kind-5 delete of the reaction event id, so its
+    // `e` tag points at the kind-7 reaction, not the original message.
+    let unreact_sync = sync_until_message_with_kind(
+        home.path(),
+        test_relay_url(),
+        &alice,
+        5,
+        &reaction_message_id,
     );
+    let unreact = first_message_with_kind_and_target(&unreact_sync, 5, &reaction_message_id)
+        .expect("unreact delete message");
+    assert_eq!(message_e_tag(unreact), Some(reaction_message_id.as_str()));
 
     run_json(
         home.path(),
@@ -2964,9 +3034,13 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             target_message_id,
         ],
     );
-    let delete_text = format!("deleted {target_message_id}");
-    let delete_sync = sync_until_message(home.path(), test_relay_url(), &alice, &delete_text);
-    assert_eq!(delete_sync["messages"][0]["app_message"]["kind"], "delete");
+    // A delete is a kind-5 tombstone with empty content and an `e` tag.
+    let delete_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &alice, 5, target_message_id);
+    let delete = first_message_with_kind_and_target(&delete_sync, 5, target_message_id)
+        .expect("delete message");
+    assert_eq!(delete["plaintext"], "");
+    assert_eq!(message_e_tag(delete), Some(target_message_id));
 
     let retry = run_json(
         home.path(),

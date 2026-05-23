@@ -1,10 +1,13 @@
 use cgka_traits::TransportEndpoint;
-use cgka_traits::{MarmotAppMessagePayloadV1, MarmotMediaReferenceV1, MarmotReactionActionV1};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+    STREAM_TAG,
+};
 use marmot_account::AccountHome;
 use marmot_app::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
-    AppMessageQuery, MarmotApp, MarmotAppEvent, MarmotAppRuntime, RuntimeMessageUpdate,
-    UserDirectorySearch, UserProfileMetadata,
+    AppMessageQuery, MarmotApp, MarmotAppEvent, MarmotAppRuntime, MediaReference,
+    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr_relay_builder::MockRelay;
 use tokio::time::{Duration, timeout};
@@ -345,8 +348,9 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
             MarmotAppEvent::AgentStreamStarted(stream)
                 if stream.account_id_hex == bob_id
                     && stream.message.group_id == group_id
-                    && stream.payload.kind() == "start"
-                    && stream.payload.stream_id() == hex::encode(stream_id)
+                    && stream.message.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+                    && tag_value(&stream.message.tags, STREAM_TAG)
+                        == Some(hex::encode(stream_id).as_str())
         )
     })
     .await;
@@ -702,17 +706,13 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .unwrap();
     let reaction = alice.sync().await.unwrap();
     assert_eq!(reaction.messages.len(), 1);
+    // A reaction is a kind-7 event whose content is the emoji and whose `e` tag
+    // references the reacted-to message.
+    assert_eq!(reaction.messages[0].plaintext, "+");
+    assert_eq!(reaction.messages[0].kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(
-        reaction.messages[0].plaintext,
-        format!("reacted + to {target_message_id}")
-    );
-    assert_eq!(
-        reaction.messages[0].app_message,
-        Some(MarmotAppMessagePayloadV1::Reaction {
-            target_message_id: target_message_id.clone(),
-            emoji: "+".to_owned(),
-            action: MarmotReactionActionV1::Add,
-        })
+        tag_value(&reaction.messages[0].tags, "e"),
+        Some(target_message_id.as_str())
     );
 
     let empty_reaction = bob
@@ -725,18 +725,17 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .await
         .unwrap();
     let deletion = alice.sync().await.unwrap();
+    // A delete is a kind-5 tombstone with empty content and an `e` tag.
+    assert_eq!(deletion.messages[0].plaintext, "");
+    assert_eq!(deletion.messages[0].kind, MARMOT_APP_EVENT_KIND_DELETE);
     assert_eq!(
-        deletion.messages[0].plaintext,
-        format!("deleted {target_message_id}")
-    );
-    assert_eq!(
-        deletion.messages[0].app_message,
-        Some(MarmotAppMessagePayloadV1::Delete { target_message_id })
+        tag_value(&deletion.messages[0].tags, "e"),
+        Some(target_message_id.as_str())
     );
 
     bob.send_media_reference(
         &group_id,
-        MarmotMediaReferenceV1 {
+        MediaReference {
             file_hash_hex: hex::encode([0x42_u8; 32]),
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
@@ -747,19 +746,21 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     .await
     .unwrap();
     let media = alice.sync().await.unwrap();
-    assert_eq!(
-        media.messages[0].plaintext,
-        "media diagram.png: launch diagram"
-    );
-    assert!(matches!(
-        media.messages[0].app_message,
-        Some(MarmotAppMessagePayloadV1::Media { .. })
-    ));
+    // Media is a kind-9 chat: content is the caption, attachment is an `imeta`.
+    assert_eq!(media.messages[0].plaintext, "launch diagram");
+    assert_eq!(media.messages[0].kind, MARMOT_APP_EVENT_KIND_CHAT);
+    let imeta = media.messages[0]
+        .tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .expect("media carries an imeta tag");
+    assert!(imeta.iter().any(|field| field == "m image/png"));
+    assert!(imeta.iter().any(|field| field == "name diagram.png"));
 
     let bad_media = bob
         .send_media_reference(
             &group_id,
-            MarmotMediaReferenceV1 {
+            MediaReference {
                 file_hash_hex: "not-hex".to_owned(),
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
