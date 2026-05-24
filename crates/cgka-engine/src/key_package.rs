@@ -27,7 +27,7 @@ pub struct KeyPackageMetadata {
 /// Parse and validate a transported KeyPackage enough for transport-directory
 /// publication/fetch checks.
 pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, EngineError> {
-    let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
         .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
     let kp_in = match msg.extract() {
         MlsMessageBodyIn::KeyPackage(key_package) => key_package,
@@ -58,7 +58,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
 /// Parse and validate a transported KeyPackage and report whether it carries
 /// the MLS last-resort extension.
 pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {
-    let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
         .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
     let kp_in = match msg.extract() {
         MlsMessageBodyIn::KeyPackage(key_package) => key_package,
@@ -107,14 +107,14 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = mls_msg
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        Ok(KeyPackage(bytes))
+        Ok(KeyPackage::new(bytes))
     }
 
     /// Parse a transported KeyPackage back into an OpenMLS
     /// [`MlsKeyPackage`], running the MLS 1.0 validation pass. Used by
     /// `create_group` and `invite`.
     pub(crate) fn parse_key_package(&self, kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
-        let msg = MlsMessageIn::tls_deserialize_exact(kp.0.as_slice())
+        let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
             .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
 
         let kp_in = match msg.extract() {

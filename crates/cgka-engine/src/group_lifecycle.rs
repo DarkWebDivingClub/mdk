@@ -18,9 +18,10 @@ use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 use crate::wire_format::join_config;
+use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
-use cgka_traits::engine::{CreateGroupRequest, SendResult};
+use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
@@ -208,20 +209,26 @@ impl<S: StorageProvider> Engine<S> {
         // welcomes, only the recipient pubkey matters at wrap time, so the
         // pre-merge group context is sufficient.
         let ctx = build_group_context_snapshot(&mls_group, &provider)?;
+        let welcome_relays = welcome_relays_for_group(&mls_group)?;
 
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         if let Some(welcome_bytes) = &welcome_bytes {
-            for kp in &parsed_kps {
-                let recipient = member_id_of_key_package(kp)?;
+            for (source_kp, parsed_kp) in req.members.iter().zip(parsed_kps.iter()) {
+                let recipient = member_id_of_key_package(parsed_kp)?;
                 let payload = EncryptedPayload {
                     ciphertext: welcome_bytes.clone(),
                     aad: vec![],
                 };
-                let wrapped = self
-                    .peeler
-                    .wrap_welcome(&payload, &recipient)
-                    .await
-                    .map_err(EngineError::Peeler)?;
+                let wrapped = if let Some(metadata) =
+                    welcome_metadata_for_key_package(source_kp, welcome_relays.as_deref())?
+                {
+                    self.peeler
+                        .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
+                        .await
+                } else {
+                    self.peeler.wrap_welcome(&payload, &recipient).await
+                }
+                .map_err(EngineError::Peeler)?;
                 self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
                 welcomes.push(wrapped);
             }
@@ -505,6 +512,36 @@ impl<S: StorageProvider> Engine<S> {
 
 fn member_id_of_key_package(kp: &openmls::prelude::KeyPackage) -> Result<MemberId, EngineError> {
     crate::identity::validated_member_id_of_leaf(kp.leaf_node())
+}
+
+pub(crate) fn welcome_relays_for_group(
+    group: &MlsGroup,
+) -> Result<Option<Vec<TransportEndpoint>>, EngineError> {
+    Ok(
+        crate::app_components::nostr_routing_of_group(group)?.map(|routing| {
+            routing
+                .relays
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect::<Vec<_>>()
+        }),
+    )
+}
+
+pub(crate) fn welcome_metadata_for_key_package(
+    key_package: &KeyPackage,
+    relays: Option<&[TransportEndpoint]>,
+) -> Result<Option<WelcomeMetadata>, EngineError> {
+    let Some(relays) = relays else {
+        return Ok(None);
+    };
+    let Some(source) = &key_package.source else {
+        return Ok(None);
+    };
+    Ok(Some(WelcomeMetadata {
+        key_package_event_id: source.event_id.clone(),
+        relays: relays.to_vec(),
+    }))
 }
 
 /// Build the projected post-merge member list: existing MLS members + each

@@ -79,10 +79,9 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE,
-    KIND_MARMOT_KEY_PACKAGE_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
-    NostrAccountRelayListPublication, NostrKeyPackagePublication, NostrKeyPackagePublisher,
-    NostrRelayClient, NostrSdkRelayClient,
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
+    KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind, NostrAccountRelayListPublication,
+    NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 use transport_quic_broker::{
@@ -2279,7 +2278,7 @@ impl AccountManager {
         self.app.status(&account.label)?;
         let mut client = self.app.client(&account.label).await?;
         let key_package = client.publish_key_package().await?;
-        Ok(key_package.0.len())
+        Ok(key_package.bytes().len())
     }
 
     fn create_nostr_account(&self, identity: Option<String>) -> Result<AccountSummary, AppError> {
@@ -3830,7 +3829,10 @@ impl MarmotApp {
             return Err(AppError::MissingKeyPackage(label.to_owned()));
         }
         let record: KeyPackageRecord = read_json(path)?;
-        Ok(KeyPackage(hex::decode(record.key_package_hex)?))
+        key_package_from_hex_with_optional_source(
+            &record.key_package_hex,
+            &record.key_package_event_id,
+        )
     }
 
     async fn publish_cached_key_package(
@@ -4220,7 +4222,7 @@ impl MarmotApp {
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
             key_package_event_id: fetched.key_package_event_id.clone(),
-            key_package_hex: hex::encode(&fetched.key_package.0),
+            key_package_hex: hex::encode(fetched.key_package.bytes()),
             created_at: fetched.created_at,
             source_relays: fetched.source_relays.clone(),
         });
@@ -4696,7 +4698,7 @@ async fn run_app_runtime_account_worker(
                     Some(AccountWorkerCommand::PublishKeyPackage { respond }) => {
                         let result = async {
                             let key_package = client.publish_key_package().await?;
-                            Ok(key_package.0.len())
+                            Ok(key_package.bytes().len())
                         }
                         .await;
                         let _ = respond.send(result);
@@ -4704,7 +4706,7 @@ async fn run_app_runtime_account_worker(
                     Some(AccountWorkerCommand::RotateKeyPackage { respond }) => {
                         let result = async {
                             let key_package = client.rotate_key_package().await?;
-                            Ok(key_package.0.len())
+                            Ok(key_package.bytes().len())
                         }
                         .await;
                         let _ = respond.send(result);
@@ -6250,7 +6252,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             ],
             mls_proposals: vec!["0x000a".into()],
             app_components: self.app_components.clone(),
-            advertised_relays: publication.endpoints.clone(),
             publish_endpoints: publication.endpoints.clone(),
         };
         let outcome = NostrKeyPackagePublisher::new(relay_client)
@@ -6271,7 +6272,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 account_id_hex: hex::encode(publication.account_id.as_slice()),
                 key_package_id,
                 key_package_event_id,
-                key_package_hex: hex::encode(publication.key_package.0),
+                key_package_hex: hex::encode(publication.key_package.bytes()),
             },
         )
         .map_err(|e| KeyPackagePublishError(e.to_string()))
@@ -6413,7 +6414,10 @@ fn validated_cached_key_package(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
 ) -> Result<KeyPackage, AppError> {
-    let decoded = KeyPackage(hex::decode(&key_package.key_package_hex)?);
+    let decoded = key_package_from_hex_with_optional_source(
+        &key_package.key_package_hex,
+        &key_package.key_package_event_id,
+    )?;
     let metadata = key_package_metadata(&decoded)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
     if metadata.credential_identity_hex != account_id_hex {
@@ -6422,6 +6426,31 @@ fn validated_cached_key_package(
         ));
     }
     Ok(decoded)
+}
+
+fn key_package_from_hex_with_optional_source(
+    key_package_hex: &str,
+    event_id_hex: &str,
+) -> Result<KeyPackage, AppError> {
+    let bytes = hex::decode(key_package_hex)?;
+    if event_id_hex.is_empty() {
+        return Ok(KeyPackage::new(bytes));
+    }
+    Ok(KeyPackage::with_source_event_id(
+        bytes,
+        key_package_event_id_from_hex(event_id_hex)?,
+    ))
+}
+
+fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppError> {
+    let bytes = hex::decode(event_id_hex)?;
+    if bytes.len() != 32 {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "KeyPackage event id must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(MessageId::new(bytes))
 }
 
 fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
@@ -6490,15 +6519,6 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
     )?;
     require_multi_value_key_package_tag(&event, "mls_proposals")?;
     require_multi_value_key_package_tag(&event, "app_components")?;
-    require_multi_value_key_package_tag(&event, "relays")?;
-    let encoding = event
-        .tag_value("encoding")
-        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing encoding tag".into()))?;
-    if encoding != KEY_PACKAGE_ENCODING_BASE64 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "unsupported encoding: {encoding}"
-        )));
-    }
     let key_package_bytes = BASE64_STANDARD
         .decode(event.content.as_bytes())
         .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
@@ -6507,7 +6527,10 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
             "empty key package content".into(),
         ));
     }
-    let key_package = KeyPackage(key_package_bytes);
+    let key_package = KeyPackage::with_source_event_id(
+        key_package_bytes,
+        key_package_event_id_from_hex(&event.id)?,
+    );
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
     if metadata.credential_identity_hex != event.pubkey {

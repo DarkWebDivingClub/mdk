@@ -33,10 +33,8 @@ storage. Keep those in adapters or the app layer above this crate.
   is no source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
   snapshots / deferred-peel retry rather than a transport-carried epoch.
 - Welcomes are wrapped and peeled through NIP-59 when callers inject the local signer/decrypter. This crate must not
-  decide where that signer comes from. The kind `444` rumor carries base64 content plus `["encoding","base64"]`.
-- FOLLOW-UP: the kind `444` welcome rumor still lacks the spec-required `["e", <keypackage event id>]` and
-  `["relays", ...]` tags. Those values are not available at the `TransportPeeler::wrap_welcome` boundary and need a
-  trait-signature change to plumb through.
+  decide where that signer comes from. The kind `444` rumor carries base64 content plus the required
+  `["e", <keypackage event id>]` and `["relays", ...]` tags supplied through `wrap_welcome_with_metadata`.
 - Outbound kind `445` events are signed at wrap time, so their event id is final (no pre-signing-id replacement).
 
 ## Verification

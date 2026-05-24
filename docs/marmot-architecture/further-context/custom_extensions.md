@@ -547,7 +547,7 @@ kind-30443 addressable Nostr events for KeyPackage distribution. MUST advertise 
 - Credential type: standard BasicCredential — **inherit, correct.** Q1 (interop at this layer matters for MLS baseline)?
   Yes. Q2 (validation)? Heavy. Verdict: inherit.
 - KeyPackage event format: Marmot-specific (kind 30443, `d` tag, `i` tag, `mls_ciphersuite` tag, `mls_extensions` tag,
-  `mls_proposals` tag, `encoding` tag, `relays` tag). **Correct custom** — this is Nostr-layer event format, not
+  `mls_proposals` tag, `app_components` tag). **Correct custom** — this is Nostr-layer event format, not
   MLS-layer; no standard exists.
 - `last_resort` extension: standard, inherited. **Correct.**
 - `KeyPackageRef` calculation: standard RFC 9420. **Correct to inherit.**

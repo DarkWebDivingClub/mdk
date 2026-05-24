@@ -45,5 +45,3 @@ pub const NOSTR_GROUP_CONTENT_MIN_LEN: usize = 12 + 16;
 
 pub(crate) const GROUP_TAG: &str = "h";
 pub(crate) const RECIPIENT_TAG: &str = "p";
-pub(crate) const ENCODING_TAG: &str = "encoding";
-pub(crate) const ENCODING_BASE64: &str = "base64";

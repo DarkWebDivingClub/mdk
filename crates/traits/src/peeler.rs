@@ -7,6 +7,7 @@
 //! The peeler takes a [`GroupContextSnapshot`] (value type) rather than
 //! `&dyn GroupContext` so async peeler calls do not borrow live engine state.
 
+use crate::engine::WelcomeMetadata;
 use crate::error::PeelerError;
 use crate::group_context::GroupContextSnapshot;
 use crate::ingest::PeeledMessage;
@@ -56,4 +57,13 @@ pub trait TransportPeeler: Send + Sync {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError>;
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        _metadata: &WelcomeMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.wrap_welcome(payload, recipient).await
+    }
 }

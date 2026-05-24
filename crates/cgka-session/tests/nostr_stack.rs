@@ -4,9 +4,11 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
+use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::{EpochId, TransportAdapterError, TransportEndpoint, TransportPublishReport};
+use cgka_traits::{
+    EpochId, MessageId, TransportAdapterError, TransportEndpoint, TransportPublishReport,
+};
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 
 #[tokio::test]
@@ -291,7 +293,8 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
     .await;
     stack.sync_group(&bob, &created.group_id).await;
 
-    let carol_key_package = carol.session.fresh_key_package().await.unwrap();
+    let carol_key_package =
+        key_package_with_event_id(carol.session.fresh_key_package().await.unwrap(), 0xC0);
     let invite = alice
         .session
         .send(SendIntent::Invite {
@@ -367,7 +370,8 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
 }
 
 async fn create_group_for_bob(alice: &mut StackClient, bob: &mut StackClient) -> CreatedGroup {
-    let bob_key_package = bob.session.fresh_key_package().await.unwrap();
+    let bob_key_package =
+        key_package_with_event_id(bob.session.fresh_key_package().await.unwrap(), 0xB0);
     let created = alice
         .session
         .create_group(CreateGroupRequest {
@@ -383,6 +387,13 @@ async fn create_group_for_bob(alice: &mut StackClient, bob: &mut StackClient) ->
         .await
         .unwrap();
     CreatedGroup::from_effects(created)
+}
+
+fn key_package_with_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage {
+    KeyPackage::with_source_event_id(
+        key_package.bytes().to_vec(),
+        MessageId::new(vec![marker; 32]),
+    )
 }
 
 async fn publish_app_event(

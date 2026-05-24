@@ -25,19 +25,76 @@ use crate::group::Member;
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
+use crate::transport_adapter::TransportEndpoint;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 // ── Value types on the trait surface ────────────────────────────────────────
 
-/// Opaque KeyPackage bytes. The engine validates and parses internally; the
-/// application layer just shuttles these between KeyPackage-publish events
-/// and [`SendIntent::Invite`].
+/// Transport provenance for an externally published KeyPackage.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct KeyPackage(pub Vec<u8>);
+pub struct KeyPackageSource {
+    /// Nostr event id of the KeyPackage event consumed by the inviter.
+    pub event_id: MessageId,
+}
+
+/// Metadata a transport wrapper needs when producing a Welcome envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WelcomeMetadata {
+    pub key_package_event_id: MessageId,
+    pub relays: Vec<TransportEndpoint>,
+}
+
+/// Opaque KeyPackage bytes plus optional transport provenance.
+///
+/// The engine validates and parses the MLS bytes internally. Nostr-routed
+/// groups also need the KeyPackage event id when wrapping the Welcome rumor's
+/// required `e` tag, so app code that fetched a KeyPackage from a relay keeps
+/// that event id attached here until the invite/create path consumes it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyPackage {
+    pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<KeyPackageSource>,
+}
+
+impl KeyPackage {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            source: None,
+        }
+    }
+
+    pub fn with_source_event_id(bytes: Vec<u8>, event_id: MessageId) -> Self {
+        Self {
+            bytes,
+            source: Some(KeyPackageSource { event_id }),
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl PartialEq for KeyPackage {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for KeyPackage {}
+
+impl Hash for KeyPackage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
 
 /// Application's intent when calling [`CgkaEngine::send`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

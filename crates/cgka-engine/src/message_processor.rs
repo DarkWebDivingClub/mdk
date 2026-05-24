@@ -1030,23 +1030,29 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
-        for kp in &parsed_kps {
+        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(&mls_group)?;
+        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
             let recipient = {
-                let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
+                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
                     .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
                 MemberId::new(bc.identity().to_vec())
             };
-            let wrapped = self
-                .peeler
-                .wrap_welcome(
-                    &EncryptedPayload {
-                        ciphertext: welcome_bytes.clone(),
-                        aad: vec![],
-                    },
-                    &recipient,
-                )
-                .await
-                .map_err(EngineError::Peeler)?;
+            let payload = EncryptedPayload {
+                ciphertext: welcome_bytes.clone(),
+                aad: vec![],
+            };
+            let wrapped = if let Some(metadata) =
+                crate::group_lifecycle::welcome_metadata_for_key_package(
+                    source_kp,
+                    welcome_relays.as_deref(),
+                )? {
+                self.peeler
+                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
+                    .await
+            } else {
+                self.peeler.wrap_welcome(&payload, &recipient).await
+            }
+            .map_err(EngineError::Peeler)?;
             self.record_sent_message(&wrapped, &group_id, pre_commit_epoch)?;
             welcomes.push(wrapped);
         }

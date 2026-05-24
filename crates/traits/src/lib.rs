@@ -60,7 +60,7 @@ pub use capabilities::{
 };
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage,
-    SendIntent, SendResult,
+    KeyPackageSource, SendIntent, SendResult, WelcomeMetadata,
 };
 pub use engine_state::{
     EpochState, InvalidTransition, Merging, PendingPublish, PendingStateRef, PendingWelcomeState,

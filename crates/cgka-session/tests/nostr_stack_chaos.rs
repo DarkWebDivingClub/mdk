@@ -6,9 +6,9 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
+use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::{EpochId, GroupId, MemberId, TransportEndpoint, TransportMessage};
+use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
 use serde::Serialize;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use transport_nostr_peeler::NostrTransportEvent;
@@ -683,7 +683,10 @@ async fn create_group_for_bob(
     bob: &mut StackClient,
     seed: u64,
 ) -> CreatedGroup {
-    let bob_key_package = bob.session.fresh_key_package().await.unwrap();
+    let bob_key_package = key_package_with_event_id(
+        bob.session.fresh_key_package().await.unwrap(),
+        (seed & 0xff) as u8,
+    );
     let created = alice
         .session
         .create_group(CreateGroupRequest {
@@ -766,7 +769,8 @@ async fn invite_carol(
     carol: &mut StackClient,
     group_id: &GroupId,
 ) -> InvitePublish {
-    let carol_key_package = carol.session.fresh_key_package().await.unwrap();
+    let carol_key_package =
+        key_package_with_event_id(carol.session.fresh_key_package().await.unwrap(), 0xC0);
     let invite = alice
         .session
         .send(SendIntent::Invite {
@@ -787,6 +791,13 @@ async fn invite_carol(
         },
         other => panic!("expected group evolution publish work, got {other:?}"),
     }
+}
+
+fn key_package_with_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage {
+    KeyPackage::with_source_event_id(
+        key_package.bytes().to_vec(),
+        MessageId::new(vec![marker; 32]),
+    )
 }
 
 fn message_payloads(ingest: &IngestEffects) -> Vec<String> {

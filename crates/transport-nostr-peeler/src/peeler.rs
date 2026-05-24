@@ -1,11 +1,12 @@
 use crate::error::to_peeler_error;
 use crate::event::{decode_hex, decode_hex_exact};
 use crate::{
-    DEFAULT_EXPORTER_LABEL, ENCODING_BASE64, ENCODING_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE,
-    KIND_MARMOT_WELCOME_RUMOR, KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN,
-    NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
+    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_WELCOME_RUMOR,
+    KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN, NOSTR_GROUP_KEY_LEN, NostrTransportEvent,
+    RECIPIENT_TAG,
 };
 use async_trait::async_trait;
+use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -22,6 +23,8 @@ use std::sync::Arc;
 
 const NONCE_LEN: usize = 12;
 const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
+const KEY_PACKAGE_EVENT_TAG: &str = "e";
+const WELCOME_RELAYS_TAG: &str = "relays";
 
 /// Empty AAD for the outer kind-445 ChaCha20-Poly1305 sealing
 /// (`spec/transports/nostr.md`: `aad = ""`).
@@ -174,20 +177,18 @@ impl TransportPeeler for NostrMlsPeeler {
             )));
         }
 
-        // spec/transports/nostr.md:78,140 — reject a rumor whose `encoding` tag
-        // is missing or names any encoding other than `base64`.
-        match rumor_tag_value(&unwrapped.rumor, ENCODING_TAG) {
-            Some(encoding) if encoding == ENCODING_BASE64 => {}
-            Some(other) => {
-                return Err(PeelerError::Malformed(format!(
-                    "welcome rumor encoding tag is {other:?}, expected {ENCODING_BASE64:?}"
-                )));
-            }
-            None => {
-                return Err(PeelerError::Malformed(
-                    "welcome rumor is missing required encoding tag".into(),
-                ));
-            }
+        // spec/transports/nostr.md — the kind-444 welcome rumor links to the
+        // KeyPackage event consumed for this welcome and carries the group
+        // relay list the new member should use next.
+        let key_package_event_id = rumor_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)
+            .ok_or_else(|| PeelerError::Malformed("welcome rumor is missing e tag".into()))?;
+        decode_hex_exact("welcome e tag", key_package_event_id, 32).map_err(to_peeler_error)?;
+        let relays = rumor_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)
+            .ok_or_else(|| PeelerError::Malformed("welcome rumor is missing relays tag".into()))?;
+        if relays.is_empty() || relays.iter().any(|relay| relay.is_empty()) {
+            return Err(PeelerError::Malformed(
+                "welcome rumor relays tag must contain at least one non-empty relay".into(),
+            ));
         }
 
         let welcome_bytes = BASE64_STANDARD
@@ -272,6 +273,18 @@ impl TransportPeeler for NostrMlsPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let _ = (payload, recipient);
+        Err(PeelerError::MissingContext {
+            label: "welcome_metadata".into(),
+        })
+    }
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        metadata: &WelcomeMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
         if !payload.aad.is_empty() {
             return Err(PeelerError::WrapFailed(
                 "Nostr welcome wrap does not currently encode payload AAD".into(),
@@ -288,24 +301,25 @@ impl TransportPeeler for NostrMlsPeeler {
             .await
             .map_err(|e| PeelerError::WrapFailed(format!("signer public key: {e}")))?;
         let recipient_pubkey = Self::recipient_pubkey(recipient)?;
-        // spec/transports/nostr.md:66-78 — the kind-444 welcome rumor MUST carry
-        // base64 content plus an `["encoding","base64"]` tag.
-        //
-        // FLAG (follow-up): the rumor MUST also include `["e", <keypackage
-        // event id>]` and `["relays", ...]`. Those values are not available at
-        // the `TransportPeeler::wrap_welcome` boundary today — the Nostr
-        // KeyPackage event id (kind 30443) and group relay list are owned above
-        // this crate. Plumbing them requires extending the peeler trait
-        // signature (engine + session + all callers). Encoding/base64 is done
-        // locally here; `e`/`relays` are intentionally NOT faked.
+        if metadata.relays.is_empty() {
+            return Err(PeelerError::WrapFailed(
+                "Nostr welcome relays tag must not be empty".into(),
+            ));
+        }
         let rumor: UnsignedEvent = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
             BASE64_STANDARD.encode(&payload.ciphertext),
         )
-        .tags([Tag::custom(
-            nostr::TagKind::custom(ENCODING_TAG),
-            [ENCODING_BASE64],
-        )])
+        .tags([
+            Tag::custom(
+                nostr::TagKind::custom(KEY_PACKAGE_EVENT_TAG),
+                [hex::encode(metadata.key_package_event_id.as_slice())],
+            ),
+            Tag::custom(
+                nostr::TagKind::custom(WELCOME_RELAYS_TAG),
+                metadata.relays.iter().map(|relay| relay.as_str()),
+            ),
+        ])
         .build(sender_pubkey);
         let gift_wrap = EventBuilder::gift_wrap(signer, &recipient_pubkey, rumor, [])
             .await
@@ -316,12 +330,24 @@ impl TransportPeeler for NostrMlsPeeler {
 }
 
 /// First value of a tag on an unwrapped NIP-59 rumor (`tag[0] == name` →
-/// `tag[1]`). Used to read the kind-444 `encoding` tag.
+/// `tag[1]`).
 fn rumor_tag_value<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
     rumor.tags.iter().find_map(|tag| {
         let slice = tag.as_slice();
         match (slice.first(), slice.get(1)) {
             (Some(tag_name), Some(value)) if tag_name == name => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+fn rumor_tag_values<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<Vec<&'a str>> {
+    rumor.tags.iter().find_map(|tag| {
+        let slice = tag.as_slice();
+        match slice.first() {
+            Some(tag_name) if tag_name == name => {
+                Some(slice.iter().skip(1).map(String::as_str).collect())
+            }
             _ => None,
         }
     })
@@ -395,9 +421,10 @@ fn map_nip59_error(err: nostr::nips::nip59::Error) -> PeelerError {
 mod tests {
     use super::*;
     use crate::{DEFAULT_EXPORTER_LABEL, KIND_MARMOT_GROUP_MESSAGE};
+    use cgka_traits::TransportEndpoint;
     use cgka_traits::group_context::GroupContextSnapshot;
     use cgka_traits::ingest::PeeledContent;
-    use cgka_traits::types::EpochId;
+    use cgka_traits::types::{EpochId, MessageId};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -632,12 +659,13 @@ mod tests {
         let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
 
         let wrapped = sender_peeler
-            .wrap_welcome(
+            .wrap_welcome_with_metadata(
                 &EncryptedPayload {
                     ciphertext: b"mls welcome bytes".to_vec(),
                     aad: vec![],
                 },
                 &recipient,
+                &sample_welcome_metadata(),
             )
             .await
             .expect("wrap succeeds");
@@ -683,12 +711,13 @@ mod tests {
         let sender_peeler = NostrMlsPeeler::new().with_welcome_signer(sender);
         let wrong_peeler = NostrMlsPeeler::new().with_welcome_signer(wrong_receiver);
         let wrapped = sender_peeler
-            .wrap_welcome(
+            .wrap_welcome_with_metadata(
                 &EncryptedPayload {
                     ciphertext: b"mls welcome bytes".to_vec(),
                     aad: vec![],
                 },
                 &recipient,
+                &sample_welcome_metadata(),
             )
             .await
             .expect("wrap succeeds");
@@ -708,12 +737,13 @@ mod tests {
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
         let peeler = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
         let mut wrapped = peeler
-            .wrap_welcome(
+            .wrap_welcome_with_metadata(
                 &EncryptedPayload {
                     ciphertext: b"mls welcome bytes".to_vec(),
                     aad: vec![],
                 },
                 &recipient,
+                &sample_welcome_metadata(),
             )
             .await
             .expect("wrap succeeds");
@@ -777,18 +807,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn welcome_wrap_emits_base64_encoding_tag() {
+    async fn welcome_wrap_emits_required_key_package_and_relays_tags() {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let metadata = sample_welcome_metadata();
         let wrapped = NostrMlsPeeler::new()
             .with_welcome_signer(sender.clone())
-            .wrap_welcome(
+            .wrap_welcome_with_metadata(
                 &EncryptedPayload {
                     ciphertext: b"mls welcome bytes".to_vec(),
                     aad: vec![],
                 },
                 &recipient,
+                &metadata,
             )
             .await
             .expect("wrap succeeds");
@@ -800,9 +832,14 @@ mod tests {
             .await
             .expect("unwrap");
         assert_eq!(
-            rumor_tag_value(&unwrapped.rumor, ENCODING_TAG),
-            Some(ENCODING_BASE64)
+            rumor_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG),
+            Some(hex::encode(metadata.key_package_event_id.as_slice()).as_str())
         );
+        assert_eq!(
+            rumor_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG),
+            Some(vec!["wss://group-a.example", "wss://group-b.example"])
+        );
+        assert_eq!(rumor_tag_value(&unwrapped.rumor, "encoding"), None);
         // Content is base64 of the welcome bytes.
         assert_eq!(
             BASE64_STANDARD
@@ -813,42 +850,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn welcome_peel_rejects_missing_or_non_base64_encoding_tag() {
+    async fn welcome_peel_rejects_missing_key_package_or_relays_tags() {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
 
-        // Rumor with no encoding tag at all.
-        let missing = welcome_rumor_gift_wrap(&sender, &receiver, None).await;
+        let missing_key_package = welcome_rumor_gift_wrap(&sender, &receiver, false, true).await;
         assert!(matches!(
-            receiver_peeler.peel_welcome(&missing).await,
+            receiver_peeler.peel_welcome(&missing_key_package).await,
             Err(PeelerError::Malformed(_))
         ));
 
-        // Rumor whose encoding tag names a non-base64 encoding.
-        let hex_encoding = welcome_rumor_gift_wrap(&sender, &receiver, Some("hex")).await;
+        let missing_relays = welcome_rumor_gift_wrap(&sender, &receiver, true, false).await;
         assert!(matches!(
-            receiver_peeler.peel_welcome(&hex_encoding).await,
+            receiver_peeler.peel_welcome(&missing_relays).await,
             Err(PeelerError::Malformed(_))
         ));
     }
 
-    /// Build a kind-444 welcome rumor gift wrap with an optional `encoding` tag
-    /// value, used to exercise receiver-side encoding validation.
+    /// Build a kind-444 welcome rumor gift wrap with optional required tags,
+    /// used to exercise receiver-side metadata validation.
     async fn welcome_rumor_gift_wrap(
         sender: &nostr::Keys,
         receiver: &nostr::Keys,
-        encoding: Option<&str>,
+        include_key_package: bool,
+        include_relays: bool,
     ) -> TransportMessage {
         let mut builder = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
             BASE64_STANDARD.encode(b"mls welcome bytes"),
         );
-        if let Some(encoding) = encoding {
-            builder = builder.tags([Tag::custom(
-                nostr::TagKind::custom(ENCODING_TAG),
-                [encoding],
-            )]);
+        let mut tags = Vec::new();
+        if include_key_package {
+            tags.push(Tag::custom(
+                nostr::TagKind::custom(KEY_PACKAGE_EVENT_TAG),
+                [hex::encode(
+                    sample_welcome_metadata().key_package_event_id.as_slice(),
+                )],
+            ));
+        }
+        if include_relays {
+            tags.push(Tag::custom(
+                nostr::TagKind::custom(WELCOME_RELAYS_TAG),
+                ["wss://group-a.example"],
+            ));
+        }
+        if !tags.is_empty() {
+            builder = builder.tags(tags);
         }
         let rumor = builder.build(sender.public_key());
         let gift_wrap = EventBuilder::gift_wrap(sender, &receiver.public_key(), rumor, [])
@@ -858,6 +906,16 @@ mod tests {
             .unwrap()
             .to_transport_message()
             .unwrap()
+    }
+
+    fn sample_welcome_metadata() -> WelcomeMetadata {
+        WelcomeMetadata {
+            key_package_event_id: MessageId::new(vec![0x44; 32]),
+            relays: vec![
+                TransportEndpoint("wss://group-a.example".into()),
+                TransportEndpoint("wss://group-b.example".into()),
+            ],
+        }
     }
 
     fn sender_keys() -> nostr::Keys {

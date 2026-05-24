@@ -597,14 +597,13 @@ mod tests {
         let sdk = NostrSdkRelayClient::new(client);
         let dto = NostrKeyPackagePublication {
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
-            key_package: KeyPackage(vec![1, 2, 3, 4]),
+            key_package: KeyPackage::new(vec![1, 2, 3, 4]),
             key_package_slot_id: "slot-1".into(),
             key_package_ref: "bb".repeat(32),
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
             app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
-            advertised_relays: vec![TransportEndpoint("wss://kp.example".into())],
             publish_endpoints: vec![TransportEndpoint("wss://kp.example".into())],
         }
         .to_event()

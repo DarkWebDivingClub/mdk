@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackage(vec![0xEF; 4])], }"
+expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackage::new(vec![0xEF; 4])], }"
 ---
 {
   "Invite": {
@@ -11,12 +11,14 @@ expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackag
       170
     ],
     "key_packages": [
-      [
-        239,
-        239,
-        239,
-        239
-      ]
+      {
+        "bytes": [
+          239,
+          239,
+          239,
+          239
+        ]
+      }
     ]
   }
 }

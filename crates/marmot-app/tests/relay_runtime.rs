@@ -25,9 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
-use transport_nostr_adapter::{
-    KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient,
-};
+use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -263,13 +261,8 @@ async fn publish_key_package_at(
             ],
             vec!["mls_proposals".to_owned(), "0x000a".to_owned()],
             vec!["app_components".to_owned(), "0x8006".to_owned()],
-            vec![
-                "encoding".to_owned(),
-                KEY_PACKAGE_ENCODING_BASE64.to_owned(),
-            ],
-            vec!["relays".to_owned(), relay_url.to_owned()],
         ],
-        BASE64_STANDARD.encode(&key_package.0),
+        BASE64_STANDARD.encode(key_package.bytes()),
         created_at,
     )
     .await;
@@ -393,7 +386,7 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         .await
         .unwrap();
     assert_eq!(
-        fetched.key_package.0.len(),
+        fetched.key_package.bytes().len(),
         created.key_package_bytes.unwrap()
     );
 
@@ -435,12 +428,13 @@ async fn app_runtime_reuses_initial_key_package_when_republishing() {
         .await
         .unwrap();
 
-    assert_eq!(republished_bytes, first.key_package.0.len());
-    assert_eq!(second.key_package, first.key_package);
+    assert_eq!(republished_bytes, first.key_package.bytes().len());
+    assert_eq!(second.key_package.bytes(), first.key_package.bytes());
     assert!(!first.key_package_id.is_empty());
     assert!(!second.key_package_id.is_empty());
     assert!(!first.key_package_event_id.is_empty());
     assert!(!second.key_package_event_id.is_empty());
+    assert_ne!(second.key_package_event_id, first.key_package_event_id);
 
     runtime.shutdown().await;
 }
@@ -544,11 +538,15 @@ async fn app_runtime_can_rotate_key_package_on_request() {
         .await
         .unwrap();
 
-    assert_eq!(rotated_bytes, rotated.key_package.0.len());
+    assert_eq!(rotated_bytes, rotated.key_package.bytes().len());
     assert_ne!(rotated.key_package_id, first.key_package_id);
-    assert_eq!(republished.key_package, rotated.key_package);
+    assert_eq!(republished.key_package.bytes(), rotated.key_package.bytes());
     assert!(!rotated.key_package_id.is_empty());
     assert!(!republished.key_package_id.is_empty());
+    assert_ne!(
+        republished.key_package_event_id,
+        rotated.key_package_event_id
+    );
 
     runtime.shutdown().await;
 }
@@ -583,7 +581,7 @@ async fn app_runtime_rotate_repairs_missing_key_package_relay_list() {
 
     assert!(repaired.complete);
     assert_eq!(repaired.key_package.relays, vec![url]);
-    assert_eq!(fetched.key_package.0.len(), rotated_bytes);
+    assert_eq!(fetched.key_package.bytes().len(), rotated_bytes);
 
     runtime.shutdown().await;
 }

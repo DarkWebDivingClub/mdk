@@ -2030,7 +2030,7 @@ pub(crate) async fn key_package_command_with_runtime(
             Ok(CommandOutput {
                 plain: format!(
                     "fetched key package for {account_id} bytes={} relays={}",
-                    fetched.key_package.0.len(),
+                    fetched.key_package.bytes().len(),
                     fetched.source_relays.join(",")
                 ),
                 json: key_package_fetch_json(fetched),
@@ -4817,7 +4817,7 @@ fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
     json!({
         "account_id": fetched.account_id_hex,
         "key_package_id": fetched.key_package_id,
-        "key_package_bytes": fetched.key_package.0.len(),
+        "key_package_bytes": fetched.key_package.bytes().len(),
         "created_at": fetched.created_at,
         "source_relays": fetched.source_relays,
         "relay_lists": relay_lists_json(fetched.relay_lists),

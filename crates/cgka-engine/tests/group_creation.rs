@@ -57,7 +57,7 @@ fn key_package_with_raw_identity(identity: &[u8]) -> cgka_traits::engine::KeyPac
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
-    cgka_traits::engine::KeyPackage(mls_msg.tls_serialize_detached().unwrap())
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
 }
 
 fn key_package_with_mismatched_account_identity_proof(
@@ -96,7 +96,7 @@ fn key_package_with_mismatched_account_identity_proof(
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
-    cgka_traits::engine::KeyPackage(mls_msg.tls_serialize_detached().unwrap())
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
 }
 
 /// Mock peeler: wraps `EncryptedPayload` bytes verbatim into a
@@ -538,7 +538,10 @@ async fn create_group_rejects_invitee_keypackage_with_mismatched_account_identit
 async fn fresh_key_package_roundtrips_bytes() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
-    assert!(!kp.0.is_empty(), "key package bytes should be non-empty");
+    assert!(
+        !kp.bytes().is_empty(),
+        "key package bytes should be non-empty"
+    );
 }
 
 #[tokio::test]

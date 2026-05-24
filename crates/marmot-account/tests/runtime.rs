@@ -325,7 +325,7 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
 
     let key_package = runtime.publish_fresh_key_package().await.unwrap();
 
-    assert!(!key_package.0.is_empty());
+    assert!(!key_package.bytes().is_empty());
     let publications = publisher.publications();
     assert_eq!(publications.len(), 1);
     assert_eq!(publications[0].account_id, runtime.session().self_id());

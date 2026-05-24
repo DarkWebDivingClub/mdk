@@ -10,7 +10,6 @@ use crate::{NostrPublishOutcome, NostrRelayClient};
 
 pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
 pub const KIND_MARMOT_KEY_PACKAGE_RELAY_LIST: u64 = 10_051;
-pub const KEY_PACKAGE_ENCODING_BASE64: &str = "base64";
 
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";
@@ -19,8 +18,6 @@ const MLS_CIPHERSUITE_TAG: &str = "mls_ciphersuite";
 const MLS_EXTENSIONS_TAG: &str = "mls_extensions";
 const MLS_PROPOSALS_TAG: &str = "mls_proposals";
 const APP_COMPONENTS_TAG: &str = "app_components";
-const ENCODING_TAG: &str = "encoding";
-const RELAYS_TAG: &str = "relays";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrKeyPackagePublication {
@@ -32,7 +29,6 @@ pub struct NostrKeyPackagePublication {
     pub mls_extensions: Vec<String>,
     pub mls_proposals: Vec<String>,
     pub app_components: Vec<String>,
-    pub advertised_relays: Vec<TransportEndpoint>,
     pub publish_endpoints: Vec<TransportEndpoint>,
 }
 
@@ -73,11 +69,6 @@ impl NostrKeyPackagePublication {
                 "Marmot KeyPackage app_components tag must not be empty".into(),
             ));
         }
-        if self.advertised_relays.is_empty() {
-            return Err(TransportAdapterError::Publish(
-                "Marmot KeyPackage relays tag must not be empty".into(),
-            ));
-        }
         if self.publish_endpoints.is_empty() {
             return Err(TransportAdapterError::Publish(
                 "Marmot KeyPackage publish endpoints must not be empty".into(),
@@ -93,22 +84,13 @@ impl NostrKeyPackagePublication {
             values_tag(MLS_EXTENSIONS_TAG, &self.mls_extensions),
             values_tag(MLS_PROPOSALS_TAG, &self.mls_proposals),
             values_tag(APP_COMPONENTS_TAG, &self.app_components),
-            vec![ENCODING_TAG.into(), KEY_PACKAGE_ENCODING_BASE64.into()],
-            values_tag(
-                RELAYS_TAG,
-                &self
-                    .advertised_relays
-                    .iter()
-                    .map(|endpoint| endpoint.0.clone())
-                    .collect::<Vec<_>>(),
-            ),
         ];
 
         Ok(NostrTransportEvent::new_unsigned(
             identity,
             KIND_MARMOT_KEY_PACKAGE,
             tags,
-            BASE64_STANDARD.encode(&self.key_package.0),
+            BASE64_STANDARD.encode(self.key_package.bytes()),
         ))
     }
 }
@@ -219,7 +201,8 @@ mod tests {
         assert_eq!(tag(&event, "mls_protocol_version"), Some("1.0"));
         assert_eq!(tag(&event, "i"), Some("bb".repeat(32).as_str()));
         assert_eq!(tag(&event, "mls_ciphersuite"), Some("0x0001"));
-        assert_eq!(tag(&event, "encoding"), Some(KEY_PACKAGE_ENCODING_BASE64));
+        assert_eq!(tag(&event, "encoding"), None);
+        assert_eq!(tag(&event, "relays"), None);
         assert_eq!(
             event
                 .tags
@@ -233,18 +216,6 @@ mod tests {
                 "0x8001".to_string(),
                 "0x8003".to_string(),
                 "0x8004".to_string()
-            ]
-        );
-        assert_eq!(
-            event
-                .tags
-                .iter()
-                .find(|candidate| candidate.first().is_some_and(|name| name == "relays"))
-                .unwrap(),
-            &vec![
-                "relays".to_string(),
-                "wss://kp-a.example".to_string(),
-                "wss://kp-b.example".to_string()
             ]
         );
     }
@@ -268,17 +239,13 @@ mod tests {
     fn sample_publication() -> NostrKeyPackagePublication {
         NostrKeyPackagePublication {
             account_id: MemberId::new(vec![0xA1; 32]),
-            key_package: KeyPackage(vec![1, 2, 3, 4]),
+            key_package: KeyPackage::new(vec![1, 2, 3, 4]),
             key_package_slot_id: "slot-1".into(),
             key_package_ref: "bb".repeat(32),
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
             app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
-            advertised_relays: vec![
-                TransportEndpoint("wss://kp-a.example".into()),
-                TransportEndpoint("wss://kp-b.example".into()),
-            ],
             publish_endpoints: vec![
                 TransportEndpoint("wss://kp-a.example".into()),
                 TransportEndpoint("wss://kp-b.example".into()),

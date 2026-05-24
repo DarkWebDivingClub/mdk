@@ -347,7 +347,7 @@ fn snapshot_send_intents() {
         "intent_invite",
         SendIntent::Invite {
             group_id: gid(),
-            key_packages: vec![KeyPackage(vec![0xEF; 4])],
+            key_packages: vec![KeyPackage::new(vec![0xEF; 4])],
         }
     );
     insta::assert_json_snapshot!(
@@ -532,7 +532,7 @@ fn snapshot_create_group_request() {
             CreateGroupRequest {
                 name: "demo".into(),
                 description: "".into(),
-                members: vec![KeyPackage(vec![0xEF; 4])],
+                members: vec![KeyPackage::new(vec![0xEF; 4])],
                 required_features: vec![Feature("self-remove")],
                 app_components: vec![],
                 initial_admins: vec![],
