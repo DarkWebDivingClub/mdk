@@ -1,18 +1,28 @@
 use std::path::Path;
 
+use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
+use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
     STREAM_TAG,
 };
+use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
-    AppMessageQuery, MarmotApp, MarmotAppEvent, MarmotAppRuntime, MediaReference,
+    AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaReference,
     RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
+use nostr::base64::Engine as _;
+use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::MockRelay;
+use nostr_sdk::prelude::Client as NostrSdkClient;
 use tokio::time::{Duration, timeout};
+use transport_nostr_adapter::{
+    KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient,
+};
+use transport_nostr_peeler::NostrTransportEvent;
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -28,6 +38,127 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
 
 fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
+}
+
+async fn publish_nostr_event_at(
+    home: &AccountHome,
+    label: &str,
+    relay_url: &str,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: String,
+    created_at: u64,
+) {
+    let keys = home.load_signing_keys(label).unwrap();
+    let mut event =
+        NostrTransportEvent::new_unsigned(keys.public_key().to_hex(), kind, tags, content);
+    event.created_at = created_at;
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys).build());
+    relay_client
+        .publish_event(&[endpoint(relay_url)], &event, 1)
+        .await
+        .unwrap();
+}
+
+async fn publish_account_relay_lists_at(
+    home: &AccountHome,
+    label: &str,
+    relay_url: &str,
+    declared_relay_url: &str,
+    created_at: u64,
+) {
+    for (kind, tag_name) in [(10002, "r"), (10050, "relay"), (10051, "relay")] {
+        publish_nostr_event_at(
+            home,
+            label,
+            relay_url,
+            kind,
+            vec![vec![tag_name.to_owned(), declared_relay_url.to_owned()]],
+            String::new(),
+            created_at,
+        )
+        .await;
+    }
+}
+
+async fn publish_key_package_at(
+    home: &AccountHome,
+    label: &str,
+    relay_url: &str,
+    key_package: &KeyPackage,
+    slot_id: &str,
+    created_at: u64,
+) {
+    let account_id = home.account(label).unwrap().account_id_hex;
+    let metadata = key_package_metadata(key_package).unwrap();
+    publish_nostr_event_at(
+        home,
+        label,
+        relay_url,
+        KIND_MARMOT_KEY_PACKAGE,
+        vec![
+            vec!["d".to_owned(), slot_id.to_owned()],
+            vec!["mls_protocol_version".to_owned(), "1.0".to_owned()],
+            vec!["i".to_owned(), metadata.key_package_ref_hex],
+            vec!["mls_ciphersuite".to_owned(), "0x0001".to_owned()],
+            vec![
+                "mls_extensions".to_owned(),
+                "0xf2ee".to_owned(),
+                format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+            ],
+            vec!["mls_proposals".to_owned(), "0x000a".to_owned()],
+            vec!["app_components".to_owned(), "0x8006".to_owned()],
+            vec![
+                "encoding".to_owned(),
+                KEY_PACKAGE_ENCODING_BASE64.to_owned(),
+            ],
+            vec!["relays".to_owned(), relay_url.to_owned()],
+        ],
+        BASE64_STANDARD.encode(&key_package.0),
+        created_at,
+    )
+    .await;
+    assert_eq!(metadata.credential_identity_hex, account_id);
+}
+
+async fn publish_follow_list_at(
+    home: &AccountHome,
+    label: &str,
+    relay_url: &str,
+    follows: &[String],
+    created_at: u64,
+) {
+    let tags = follows
+        .iter()
+        .map(|follow| vec!["p".to_owned(), follow.clone()])
+        .collect::<Vec<_>>();
+    publish_nostr_event_at(home, label, relay_url, 3, tags, String::new(), created_at).await;
+}
+
+async fn publish_profile_at(
+    home: &AccountHome,
+    label: &str,
+    relay_url: &str,
+    name: &str,
+    created_at: u64,
+) {
+    publish_nostr_event_at(
+        home,
+        label,
+        relay_url,
+        0,
+        Vec::new(),
+        serde_json::json!({ "name": name }).to_string(),
+        created_at,
+    )
+    .await;
+}
+
+fn test_unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn assert_two_word_pseudonym(value: &str) {
@@ -155,6 +286,59 @@ async fn app_runtime_reuses_initial_key_package_when_republishing() {
     assert!(!second.key_package_id.is_empty());
     assert!(!first.key_package_event_id.is_empty());
     assert!(!second.key_package_event_id.is_empty());
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn key_package_fetch_rejects_future_event_and_keeps_cached_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let cached = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    let future_created_at = test_unix_now_seconds() + 600;
+    publish_key_package_at(
+        &home,
+        &created.account.label,
+        &url,
+        &cached.key_package,
+        "future-pin",
+        future_created_at,
+    )
+    .await;
+
+    let fetched = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fetched.key_package, cached.key_package);
+    assert_eq!(fetched.key_package_id, cached.key_package_id);
+    assert_eq!(fetched.key_package_event_id, cached.key_package_event_id);
+    assert!(
+        fetched.created_at < future_created_at,
+        "future-dated KeyPackage should not replace cached package"
+    );
 
     runtime.shutdown().await;
 }
@@ -992,6 +1176,85 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
 }
 
 #[tokio::test]
+async fn relay_list_fetch_rejects_future_events_and_keeps_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (seed_a, seed_a_url) = mock_relay().await;
+    let (seed_b, seed_b_url) = mock_relay().await;
+    let _relays = (seed_a, seed_b);
+    let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
+
+    let cached = app
+        .publish_account_relay_lists(
+            "alice",
+            AccountRelayListBootstrap::new(
+                vec![endpoint(&seed_a_url)],
+                vec![endpoint(&seed_a_url)],
+            ),
+        )
+        .await
+        .unwrap();
+    publish_account_relay_lists_at(
+        &home,
+        "alice",
+        &seed_b_url,
+        "wss://future.example",
+        test_unix_now_seconds() + 600,
+    )
+    .await;
+
+    let account_id = home.account("alice").unwrap().account_id_hex;
+    let fetched = app
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
+        .await
+        .unwrap();
+
+    assert_eq!(fetched, cached);
+    let directory_entry = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("cached directory entry");
+    assert_eq!(directory_entry.relay_lists, cached);
+}
+
+#[tokio::test]
+async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (_seed, seed_url) = mock_relay().await;
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![seed_url.clone()],
+        MarmotAppConfig {
+            directory_max_future_skew: Duration::from_secs(900),
+        },
+    );
+
+    publish_account_relay_lists_at(
+        &home,
+        "alice",
+        &seed_url,
+        "wss://within-skew.example",
+        test_unix_now_seconds() + 600,
+    )
+    .await;
+
+    let account_id = home.account("alice").unwrap().account_id_hex;
+    let fetched = app
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
+        .await
+        .unwrap();
+
+    assert!(fetched.complete);
+    assert_eq!(
+        fetched.default_relays,
+        vec!["wss://within-skew.example".to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn directory_cache_is_durable_app_state_not_json_user_files() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -1140,6 +1403,73 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
         .unwrap();
     assert_eq!(carol_results[0].account_id_hex, carol_id);
     assert_eq!(carol_results[0].radius, 2);
+}
+
+#[tokio::test]
+async fn user_directory_refresh_rejects_future_follow_and_profile_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let carol_id = home.account("carol").unwrap().account_id_hex;
+    let (seed_a, seed_a_url) = mock_relay().await;
+    let (seed_b, seed_b_url) = mock_relay().await;
+    let _relays = (seed_a, seed_b);
+    let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
+    let bootstrap =
+        AccountRelayListBootstrap::new(vec![endpoint(&seed_a_url)], vec![endpoint(&seed_a_url)]);
+
+    app.publish_user_profile(
+        "bob",
+        UserProfileMetadata {
+            name: Some("Bob Builder".into()),
+            ..UserProfileMetadata::default()
+        },
+        bootstrap.clone(),
+    )
+    .await
+    .unwrap();
+    app.publish_account_follow_list("alice", &[&bob_id], bootstrap)
+        .await
+        .unwrap();
+    app.refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_a_url)])
+        .await
+        .unwrap();
+
+    let future_created_at = test_unix_now_seconds() + 600;
+    publish_follow_list_at(
+        &home,
+        "alice",
+        &seed_b_url,
+        std::slice::from_ref(&carol_id),
+        future_created_at,
+    )
+    .await;
+    publish_profile_at(&home, "bob", &seed_b_url, "Future Bob", future_created_at).await;
+
+    let refresh = app
+        .refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_b_url)])
+        .await
+        .unwrap();
+    assert_eq!(refresh.follow_count, 1);
+    assert_eq!(refresh.profile_count, 0);
+
+    let alice_record = app
+        .directory_entry_for_account_id(&alice_id)
+        .unwrap()
+        .expect("alice directory record");
+    assert_eq!(alice_record.follows, vec![bob_id.clone()]);
+    let bob_record = app
+        .directory_entry_for_account_id(&bob_id)
+        .unwrap()
+        .expect("bob directory record");
+    assert_eq!(
+        bob_record.profile.as_ref().unwrap().name.as_deref(),
+        Some("Bob Builder")
+    );
 }
 
 #[tokio::test]

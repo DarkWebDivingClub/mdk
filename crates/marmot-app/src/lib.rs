@@ -119,6 +119,9 @@ const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
 const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
+const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
+    ".marmot-directory-future-created-at-cleanup-v1";
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -153,6 +156,7 @@ pub struct MarmotApp {
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
+    config: MarmotAppConfig,
 }
 
 #[derive(Clone)]
@@ -168,6 +172,26 @@ pub struct AccountManager {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarmotAppConfig {
+    pub directory_max_future_skew: Duration,
+}
+
+impl Default for MarmotAppConfig {
+    fn default() -> Self {
+        Self {
+            directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
+        }
+    }
+}
+
+impl MarmotAppConfig {
+    pub fn with_directory_max_future_skew(mut self, skew: Duration) -> Self {
+        self.directory_max_future_skew = skew;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -2886,13 +2910,30 @@ impl MarmotApp {
         Self::with_relays(root, vec![relay_url.into()])
     }
 
+    pub fn with_relay_and_config(
+        root: impl AsRef<Path>,
+        relay_url: impl Into<String>,
+        config: MarmotAppConfig,
+    ) -> Self {
+        Self::with_relays_and_config(root, vec![relay_url.into()], config)
+    }
+
     pub fn with_relays(root: impl AsRef<Path>, relay_urls: Vec<String>) -> Self {
+        Self::with_relays_and_config(root, relay_urls, MarmotAppConfig::default())
+    }
+
+    pub fn with_relays_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        config: MarmotAppConfig,
+    ) -> Self {
         let root = root.as_ref().to_path_buf();
         Self {
             account_home: AccountHome::open(&root),
             root,
             relay_urls,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            config,
         }
     }
 
@@ -2901,11 +2942,26 @@ impl MarmotApp {
         relay_urls: Vec<String>,
         account_home: AccountHome,
     ) -> Self {
+        Self::with_relays_and_account_home_and_config(
+            root,
+            relay_urls,
+            account_home,
+            MarmotAppConfig::default(),
+        )
+    }
+
+    pub fn with_relays_and_account_home_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        config: MarmotAppConfig,
+    ) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
             relay_urls,
             account_home,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            config,
         }
     }
 
@@ -3113,6 +3169,7 @@ impl MarmotApp {
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
         let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        let freshness = self.directory_freshness();
         let records = self
             .relay_plane
             .fetch_directory_events(
@@ -3121,7 +3178,17 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
-        let mut status = relay_list_status_from_records(&account_id_hex, records);
+        let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
+        let mut status = selection.value;
+        if selection.rejected_future {
+            let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+            if relay_lists_have_any_relays(&cached) {
+                if !relay_lists_have_any_relays(&status) {
+                    return Ok(cached);
+                }
+                fill_missing_relay_lists_from_cached(&mut status, &cached);
+            }
+        }
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
                 .iter()
@@ -3167,7 +3234,16 @@ impl MarmotApp {
         let records = self
             .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
             .await?;
-        let mut fetched = latest_key_package_from_records(account_id_hex, records)?;
+        let cached_entry = self.directory_entry_for_account_id(account_id_hex)?;
+        let mut fetched = fresh_or_cached_key_package(
+            account_id_hex,
+            latest_fresh_key_package_from_records(
+                account_id_hex,
+                records,
+                self.directory_freshness(),
+            )?,
+            cached_entry,
+        )?;
         fetched.relay_lists = relay_lists;
         self.remember_directory_key_package(&fetched)?;
         Ok(fetched)
@@ -3446,17 +3522,26 @@ impl MarmotApp {
                 source_relays,
             )
             .await?;
-        Ok(
-            latest_follow_list_from_records(account_id_hex, records).unwrap_or_else(|| {
-                FetchedFollowList {
-                    follows: Vec::new(),
-                    source_relays: source_relays
-                        .iter()
-                        .map(|endpoint| endpoint.0.clone())
-                        .collect(),
-                }
-            }),
-        )
+        let selection =
+            latest_follow_list_from_records(account_id_hex, records, self.directory_freshness());
+        if let Some(follow_list) = selection.value {
+            return Ok(follow_list);
+        }
+        if selection.rejected_future
+            && let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
+        {
+            return Ok(FetchedFollowList {
+                follows: entry.follows,
+                source_relays: entry.follow_source_relays,
+            });
+        }
+        Ok(FetchedFollowList {
+            follows: Vec::new(),
+            source_relays: source_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+        })
     }
 
     async fn refresh_directory_profiles(
@@ -3470,7 +3555,8 @@ impl MarmotApp {
         let records = self
             .fetch_events_for_account_ids(account_ids, KIND_NOSTR_METADATA, source_relays)
             .await?;
-        let profiles = latest_profiles_from_records(records);
+        let profiles =
+            latest_fresh_profiles_from_records(records, self.directory_freshness()).value;
         for account_id in account_ids {
             self.remember_directory_user(account_id)?;
         }
@@ -3513,6 +3599,10 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch user directory events: {e}")))
+    }
+
+    fn directory_freshness(&self) -> DirectoryFreshness {
+        DirectoryFreshness::from_now(self.config.directory_max_future_skew)
     }
 
     fn directory_source_relays(
@@ -3674,7 +3764,7 @@ impl MarmotApp {
             .to_hex();
         if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
             if let Some(key_package) = entry.key_package {
-                return Ok(KeyPackage(hex::decode(key_package.key_package_hex)?));
+                return validated_cached_key_package(&account_id, &key_package);
             }
             if !entry.relay_lists.key_package.relays.is_empty() {
                 let source_relays = entry
@@ -3688,7 +3778,15 @@ impl MarmotApp {
                 let records = self
                     .fetch_key_package_events_for_account_id(&account_id, &source_relays)
                     .await?;
-                let mut fetched = latest_key_package_from_records(&account_id, records)?;
+                let mut fetched = fresh_or_cached_key_package(
+                    &account_id,
+                    latest_fresh_key_package_from_records(
+                        &account_id,
+                        records,
+                        self.directory_freshness(),
+                    )?,
+                    Some(entry.clone()),
+                )?;
                 fetched.relay_lists = entry.relay_lists;
                 self.remember_directory_key_package(&fetched)?;
                 return Ok(fetched.key_package);
@@ -4076,6 +4174,7 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
+        self.clean_future_dated_directory_caches_for_all_accounts_once()?;
         let keys = self.account_home().load_signing_keys(&account.label)?;
         let path = self.directory_cache_path(&account.label);
         let key = self.sqlcipher_key(
@@ -4094,6 +4193,7 @@ impl MarmotApp {
             .into_iter()
             .filter(|account| account.local_signing)
             .collect::<Vec<_>>();
+        self.clean_future_dated_directory_caches_once(&accounts)?;
         let legacy_path = self.legacy_directory_cache_path();
         let legacy_entries = DirectoryCache::open_legacy_plaintext(legacy_path.clone())?
             .map(|cache| cache.entries())
@@ -4115,6 +4215,33 @@ impl MarmotApp {
         }
 
         Ok(caches)
+    }
+
+    fn clean_future_dated_directory_caches_once(
+        &self,
+        accounts: &[AccountSummary],
+    ) -> Result<(), AppError> {
+        let marker_path = self.root.join(DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER);
+        if marker_path.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.root)?;
+        remove_sqlite_file_set(&self.legacy_directory_cache_path())?;
+        for account in accounts {
+            remove_sqlite_file_set(&self.directory_cache_path(&account.label))?;
+        }
+        fs::write(marker_path, b"done\n")?;
+        Ok(())
+    }
+
+    fn clean_future_dated_directory_caches_for_all_accounts_once(&self) -> Result<(), AppError> {
+        let accounts = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.local_signing)
+            .collect::<Vec<_>>();
+        self.clean_future_dated_directory_caches_once(&accounts)
     }
 
     fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
@@ -5987,7 +6114,7 @@ fn relay_list_status_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
 ) -> AccountRelayListStatus {
-    records.sort_by_key(|record| record.event.created_at);
+    sort_directory_records(&mut records);
     let mut status = AccountRelayListStatus::empty();
     for record in records {
         if record.event.pubkey != account_id_hex {
@@ -6016,6 +6143,33 @@ fn relay_list_status_from_records(
     status
 }
 
+fn fresh_relay_list_status_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> DirectorySelection<AccountRelayListStatus> {
+    let mut rejected_future = false;
+    records.retain(|record| {
+        if record.event.pubkey != account_id_hex
+            || !matches!(
+                record.event.kind,
+                KIND_NIP65_RELAY_LIST
+                    | KIND_MARMOT_INBOX_RELAY_LIST
+                    | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
+            )
+        {
+            return true;
+        }
+        let accepted = freshness.accepts(record);
+        rejected_future |= !accepted;
+        accepted
+    });
+    DirectorySelection {
+        value: relay_list_status_from_records(account_id_hex, records),
+        rejected_future,
+    }
+}
+
 fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
     [
         KIND_NIP65_RELAY_LIST,
@@ -6031,12 +6185,7 @@ fn latest_key_package_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
 ) -> Result<FetchedKeyPackage, AppError> {
-    records.sort_by(|a, b| {
-        a.event
-            .created_at
-            .cmp(&b.event.created_at)
-            .then_with(|| a.event.id.cmp(&b.event.id))
-    });
+    sort_directory_records(&mut records);
     let mut latest = None;
     for record in records {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
@@ -6045,6 +6194,110 @@ fn latest_key_package_from_records(
         latest = Some(key_package_from_record(record)?);
     }
     latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
+}
+
+fn latest_fresh_key_package_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+    let mut rejected_future = false;
+    records.retain(|record| {
+        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
+            return true;
+        }
+        let accepted = freshness.accepts(record);
+        rejected_future |= !accepted;
+        accepted
+    });
+    match latest_key_package_from_records(account_id_hex, records) {
+        Ok(value) => Ok(DirectorySelection {
+            value: Some(value),
+            rejected_future,
+        }),
+        Err(AppError::MissingKeyPackage(_)) => Ok(DirectorySelection {
+            value: None,
+            rejected_future,
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+fn cached_key_package_from_entry(
+    entry: UserDirectoryRecord,
+) -> Result<Option<FetchedKeyPackage>, AppError> {
+    let Some(key_package) = entry.key_package else {
+        return Ok(None);
+    };
+    let decoded = validated_cached_key_package(&entry.account_id_hex, &key_package)?;
+    Ok(Some(FetchedKeyPackage {
+        account_id_hex: entry.account_id_hex,
+        key_package: decoded,
+        key_package_id: key_package.key_package_id,
+        key_package_event_id: key_package.key_package_event_id,
+        created_at: key_package.created_at,
+        source_relays: key_package.source_relays,
+        relay_lists: entry.relay_lists,
+    }))
+}
+
+fn validated_cached_key_package(
+    account_id_hex: &str,
+    key_package: &DirectoryKeyPackage,
+) -> Result<KeyPackage, AppError> {
+    let decoded = KeyPackage(hex::decode(&key_package.key_package_hex)?);
+    let metadata = key_package_metadata(&decoded)
+        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    if metadata.credential_identity_hex != account_id_hex {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "cached KeyPackage credential identity does not match directory account".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
+    !status.nip65.relays.is_empty()
+        || !status.inbox.relays.is_empty()
+        || !status.key_package.relays.is_empty()
+}
+
+fn fill_missing_relay_lists_from_cached(
+    status: &mut AccountRelayListStatus,
+    cached: &AccountRelayListStatus,
+) {
+    if status.nip65.relays.is_empty() {
+        status.nip65.relays = cached.nip65.relays.clone();
+    }
+    if status.inbox.relays.is_empty() {
+        status.inbox.relays = cached.inbox.relays.clone();
+    }
+    if status.key_package.relays.is_empty() {
+        status.key_package.relays = cached.key_package.relays.clone();
+    }
+    if status.bootstrap_relays.is_empty() {
+        status.bootstrap_relays = cached.bootstrap_relays.clone();
+    }
+    status.refresh();
+}
+
+fn fresh_or_cached_key_package(
+    account_id_hex: &str,
+    selection: DirectorySelection<Option<FetchedKeyPackage>>,
+    cached_entry: Option<UserDirectoryRecord>,
+) -> Result<FetchedKeyPackage, AppError> {
+    if let Some(fetched) = selection.value {
+        return Ok(fetched);
+    }
+    if selection.rejected_future
+        && let Some(cached) = cached_entry
+            .map(cached_key_package_from_entry)
+            .transpose()?
+            .flatten()
+    {
+        return Ok(cached);
+    }
+    Err(AppError::MissingKeyPackage(account_id_hex.to_owned()))
 }
 
 fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage, AppError> {
@@ -6257,23 +6510,64 @@ fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
-fn latest_follow_list_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> Option<FetchedFollowList> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryFreshness {
+    max_created_at: u64,
+}
+
+impl DirectoryFreshness {
+    fn from_now(max_future_skew: Duration) -> Self {
+        Self {
+            max_created_at: unix_now_seconds().saturating_add(max_future_skew.as_secs()),
+        }
+    }
+
+    fn accepts(self, record: &RelayEventRecord) -> bool {
+        record.event.created_at <= self.max_created_at
+    }
+}
+
+#[derive(Debug)]
+struct DirectorySelection<T> {
+    value: T,
+    rejected_future: bool,
+}
+
+fn sort_directory_records(records: &mut [RelayEventRecord]) {
     records.sort_by(|a, b| {
         a.event
             .created_at
             .cmp(&b.event.created_at)
             .then_with(|| a.event.id.cmp(&b.event.id))
     });
-    records.into_iter().rev().find_map(|record| {
+}
+
+fn latest_follow_list_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> DirectorySelection<Option<FetchedFollowList>> {
+    let mut rejected_future = false;
+    records.retain(|record| {
+        if record.event.kind != KIND_NOSTR_CONTACT_LIST || record.event.pubkey != account_id_hex {
+            return true;
+        }
+        let accepted = freshness.accepts(record);
+        rejected_future |= !accepted;
+        accepted
+    });
+    sort_directory_records(&mut records);
+    let value = records.into_iter().rev().find_map(|record| {
         if record.event.kind == KIND_NOSTR_CONTACT_LIST && record.event.pubkey == account_id_hex {
             Some(follow_list_from_record(record))
         } else {
             None
         }
-    })
+    });
+    DirectorySelection {
+        value,
+        rejected_future,
+    }
 }
 
 fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
@@ -6296,12 +6590,7 @@ fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
 fn latest_profiles_from_records(
     mut records: Vec<RelayEventRecord>,
 ) -> HashMap<String, UserProfileMetadata> {
-    records.sort_by(|a, b| {
-        a.event
-            .created_at
-            .cmp(&b.event.created_at)
-            .then_with(|| a.event.id.cmp(&b.event.id))
-    });
+    sort_directory_records(&mut records);
     let mut profiles = HashMap::new();
     for record in records {
         if record.event.kind == KIND_NOSTR_METADATA
@@ -6311,6 +6600,25 @@ fn latest_profiles_from_records(
         }
     }
     profiles
+}
+
+fn latest_fresh_profiles_from_records(
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> DirectorySelection<HashMap<String, UserProfileMetadata>> {
+    let mut rejected_future = false;
+    records.retain(|record| {
+        if record.event.kind != KIND_NOSTR_METADATA {
+            return true;
+        }
+        let accepted = freshness.accepts(record);
+        rejected_future |= !accepted;
+        accepted
+    });
+    DirectorySelection {
+        value: latest_profiles_from_records(records),
+        rejected_future,
+    }
 }
 
 fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileMetadata)> {
