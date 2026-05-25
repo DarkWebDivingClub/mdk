@@ -1,7 +1,7 @@
 //! Invite and MIP-03 SelfRemove round trips.
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::SyncState;
+use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
@@ -167,7 +167,7 @@ fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &Group
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
 
 // ── Invite ──────────────────────────────────────────────────────────────────

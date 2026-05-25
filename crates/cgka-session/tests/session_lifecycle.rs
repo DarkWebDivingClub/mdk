@@ -493,7 +493,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
     assert!(queued.publish.is_empty());
 
     carol.set_convergence_policy(CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     });
     let advanced = carol.advance_convergence(&created.group_id).await.unwrap();

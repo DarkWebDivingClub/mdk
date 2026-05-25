@@ -77,24 +77,26 @@ Late commits are handled by their source epoch:
 This rule is the local storage boundary for the forward-secrecy tradeoff. A client cannot be forced to replay commits
 older than the group policy says it will retain.
 
-## Sync Lifecycle
+## Convergence Status
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Stable
-    Stable --> Syncing: reconnect / relay dump starts
-    Syncing --> Canonicalizing: relay input quiesces
-    Canonicalizing --> Stable: selected branch applied
+    [*] --> Settled
+    Settled --> Syncing: reconnect / relay dump starts
+    Syncing --> Resolving: relay input quiesces
+    Resolving --> Settled: selected branch applied
+    Resolving --> Blocked: repair or retained material required
     Syncing --> Syncing: queue outbound intents
 ```
 
-During `Syncing`, outbound app messages and group changes are queued as local intents. App-message intents are encrypted
-after sync against the selected canonical state. Commit intents are regenerated after sync because any pending MLS state
+During `Syncing`, `Resolving`, or `Blocked`, outbound app messages and group changes are queued as local intents.
+App-message intents are encrypted after convergence settles against the selected canonical state. Commit intents are
+regenerated after convergence settles because any pending MLS state
 created before sync may have been based on a stale epoch.
 
 The application drives this lifecycle through `advance_convergence(group_id)`. That call runs the convergence pass
-against the engine's monotonic clock and, when the group is stable, returns regenerated `SendResult`s for queued local
-work. A regenerated group evolution pauses draining until its publish lifecycle is resolved; timer ticks in that
+against the engine's monotonic clock and, when convergence is settled, returns regenerated `SendResult`s for queued
+local work. A regenerated group evolution pauses draining until its publish lifecycle is resolved; timer ticks in that
 pending-publish window return no work.
 
 ## Branch Selection
@@ -255,7 +257,7 @@ Initial lemmas:
 2. **Rewind bound:** no selected branch forks earlier than `max_rewind_commits`.
 3. **Bounded witness override:** app witnesses cannot override more than `max_witness_override_depth` commits.
 4. **Spam resistance:** multiple app witnesses from the same sender in one epoch count once.
-5. **Outbound gate:** outbound intents queue while convergence is syncing and release only after the stability gate
+5. **Outbound gate:** outbound intents queue while convergence is syncing and release only after the settlement gate
    opens.
 6. **Three-branch convergence:** clients that enumerate the same three candidate branches in different orders select the
    same winner.

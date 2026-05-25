@@ -29,8 +29,8 @@ use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
 
 use crate::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
-    CanonicalizationState, DroppedMessage, DroppedMessageReason, MaterializedCandidate,
-    MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind, SyncState,
+    CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
+    MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
     canonicalize_with_materialized_candidates,
 };
 use crate::convergence::BranchCandidate;
@@ -582,16 +582,16 @@ fn missing_retained_anchor_result(
     now_ms: u64,
 ) -> CanonicalizationResult {
     let elapsed = now_ms.saturating_sub(state.last_convergence_relevant_input_ms);
-    let sync_state = if elapsed >= policy.stable_quiescence_ms {
-        SyncState::Stable
+    let convergence_status = if elapsed >= policy.settlement_quiescence_ms {
+        ConvergenceStatus::Blocked
     } else {
-        SyncState::Syncing
+        ConvergenceStatus::Syncing
     };
     CanonicalizationResult {
         previous_tip: state.current_tip_epoch,
         selected_tip: None,
         selected_branch_id: None,
-        sync_state,
+        convergence_status,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),

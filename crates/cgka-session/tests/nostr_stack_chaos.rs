@@ -58,7 +58,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         .await
         .unwrap();
     bob.session.set_convergence_policy(CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     });
 
@@ -175,7 +175,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     publish_confirm_and_deliver_welcome(&stack, &mut alice, &mut bob, created).await;
     stack.sync_group(&bob, &group_id).await;
     bob.session.set_convergence_policy(CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     });
 

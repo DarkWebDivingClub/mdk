@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
-    CanonicalizationError, CanonicalizationPolicy, DroppedMessageReason,
-    InvalidatedAppMessageReason, MessageKind, SyncState,
+    CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DroppedMessageReason,
+    InvalidatedAppMessageReason, MessageKind,
 };
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -247,7 +247,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(
         carol_storage
@@ -341,7 +341,7 @@ async fn engine_does_not_apply_stored_branch_before_stability_gate() {
         .converge_stored_openmls_messages(&group_id, 1_500)
         .expect("stored OpenMLS messages canonicalize while syncing");
 
-    assert_eq!(result.sync_state, SyncState::Syncing);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Syncing);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_eq!(
         carol_storage
@@ -407,7 +407,7 @@ async fn engine_ingest_buffers_commit_for_convergence_before_quiescence() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("stored commit applies after quiescence");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &commit, MessageState::Processed);
 }
@@ -485,7 +485,7 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("stored parent and child commits converge as one path");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
     assert_eq!(
         result.accepted_commits,
@@ -577,7 +577,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("missing parent is a pending graph input, not a hard error");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(result.accepted_commits.is_empty());
     assert!(result.dropped_messages.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
@@ -669,7 +669,7 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .converge_stored_openmls_messages(&group_id, 3_000_000)
         .expect("late same-epoch commit replays from retained anchor");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
         carol_storage.get_message(&bob_commit.id).unwrap().state,
         MessageState::Created,
@@ -791,7 +791,7 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .converge_stored_openmls_messages(&group_id, 3_000_000)
         .expect("rebuilt engine replays late same-epoch commit from retained anchor");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
         carol_storage.get_message(&bob_commit.id).unwrap().state,
         MessageState::Created,
@@ -896,6 +896,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         result.errors,
         vec![CanonicalizationError::MissingRetainedAnchor]
     );
+    assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
     // retained-history.md:30-31 — canonical state is left unchanged...
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
@@ -926,6 +927,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         second.errors,
         vec![CanonicalizationError::MissingRetainedAnchor]
     );
+    assert_eq!(second.convergence_status, ConvergenceStatus::Blocked);
     assert!(second.selected_tip.is_none());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
@@ -1332,7 +1334,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .converge_stored_openmls_messages(&group_id, 2_000)
         .expect("future app witness applies after selected commit");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_app_messages,
         vec![hex::encode(app_msg.id.as_slice())]
@@ -1435,7 +1437,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_app_messages,
         vec![hex::encode(app_messages[selected_index].id.as_slice())]
@@ -1548,7 +1550,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
         .converge_stored_openmls_messages(&group_id, 2_000)
         .expect("rebuilt engine converges stored OpenMLS messages");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
     let events = restarted.drain_events();
@@ -1766,7 +1768,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("proposal-consuming commit converges");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_proposals,
         vec![hex::encode(proposal.id.as_slice())]
@@ -1835,13 +1837,13 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
         .converge_stored_openmls_messages(&group_id, 2_000)
         .expect("duplicate should not pin syncing");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &commit, MessageState::Processed);
 }
 
 #[tokio::test]
-async fn engine_queues_app_send_until_convergence_is_stable() {
+async fn engine_queues_app_send_until_convergence_is_settled() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -1944,7 +1946,7 @@ async fn engine_queues_app_send_until_convergence_is_stable() {
 }
 
 #[tokio::test]
-async fn engine_queues_group_evolution_until_convergence_is_stable() {
+async fn engine_queues_group_evolution_until_convergence_is_settled() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -2091,7 +2093,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
     assert!(matches!(queued, SendResult::Queued { .. }));
 
     let policy = CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     };
     carol.set_convergence_policy(policy);

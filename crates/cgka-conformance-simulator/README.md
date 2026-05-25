@@ -187,9 +187,9 @@ as a regression fixture or the smallest readable example of a semantic edge.
 
 `generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic variants of
 `convergence-e2e-group-events/v1`. Each variant keeps the logical branch race stable but mutates queued delivery with
-duplicate, delay/release, and reorder steps before observer clients tick. Under the real Nostr peeler the stable
+duplicate, delay/release, and reorder steps before observer clients tick. Under the real Nostr peeler the settled
 expectation is that observers agree on one canonical branch, which may be Bob's single-commit branch at epoch 2 or
-Alice's deeper branch at epoch 3 depending on which messages are available before the stability gate. In both cases the
+Alice's deeper branch at epoch 3 depending on which messages are available before the settlement gate. In both cases the
 trace includes exactly the selected branch application payload.
 
 `generate_convergence_chaos_family(seed, cases)` produces deterministic adversarial convergence cases with built-in

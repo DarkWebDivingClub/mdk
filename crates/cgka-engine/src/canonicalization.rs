@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct CanonicalizationPolicy {
     pub convergence: ConvergencePolicy,
     pub app_message_past_epoch_limit: u64,
-    pub stable_quiescence_ms: u64,
+    pub settlement_quiescence_ms: u64,
 }
 
 impl Default for CanonicalizationPolicy {
@@ -21,7 +21,7 @@ impl Default for CanonicalizationPolicy {
         Self {
             convergence: ConvergencePolicy::default(),
             app_message_past_epoch_limit: 5,
-            stable_quiescence_ms: 1_000,
+            settlement_quiescence_ms: 1_000,
         }
     }
 }
@@ -35,10 +35,11 @@ pub struct CanonicalizationState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SyncState {
+pub enum ConvergenceStatus {
     Syncing,
-    Canonicalizing,
-    Stable,
+    Resolving,
+    Settled,
+    Blocked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +117,7 @@ pub struct CanonicalizationResult {
     pub previous_tip: u64,
     pub selected_tip: Option<u64>,
     pub selected_branch_id: Option<String>,
-    pub sync_state: SyncState,
+    pub convergence_status: ConvergenceStatus,
     pub accepted_commits: Vec<String>,
     pub accepted_proposals: Vec<String>,
     pub accepted_app_messages: Vec<String>,
@@ -228,9 +229,9 @@ fn canonicalize_internal(
         selected_tip,
         selected_branch_id: selected_branch_id.clone(),
         // Provisional; recomputed after dispositions are known so we can
-        // distinguish Stable (fixed point) from Canonicalizing (window
+        // distinguish Settled (fixed point) from Resolving (window
         // closed, more work pending).
-        sync_state: SyncState::Syncing,
+        convergence_status: ConvergenceStatus::Syncing,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
@@ -316,19 +317,20 @@ fn canonicalize_internal(
         &materialized_graph.materialized_commit_ids_by_branch,
     );
 
-    // Compute the sync state now that dispositions are known. Spec
+    // Compute the convergence status now that dispositions are known. Spec
     // (cgka-engine-canonicalization-contract.md §Lifecycle):
     //
     // - Syncing: convergence-relevant input window has not yet quiesced.
-    // - Canonicalizing: window quiesced, but the canonicalize pass left
-    //   work pending (commits with no materialized parent, blocking
-    //   errors like MissingRetainedAnchor / CandidateStateUnavailable).
-    // - Stable: window quiesced AND every input message received a
-    //   disposition AND no blocking error remains. This is the
-    //   fixed-point case.
-    result.sync_state = sync_state_for_result(&input, &input.pending_messages, &result);
+    // - Resolving: window quiesced, but the canonicalize pass left
+    //   work pending (for example, a commit with no materialized parent).
+    // - Blocked: window quiesced and convergence cannot advance without
+    //   a repair path or missing retained material.
+    // - Settled: window quiesced AND every input message received a
+    //   disposition AND no blocking error remains.
+    result.convergence_status =
+        convergence_status_for_result(&input, &input.pending_messages, &result);
 
-    if result.sync_state == SyncState::Stable {
+    if result.convergence_status == ConvergenceStatus::Settled {
         result.publishable_outbound_messages = input.outbound_intents;
     } else {
         result.queued_outbound_intents = input.outbound_intents;
@@ -717,16 +719,16 @@ fn drop_losing_materialized_candidate_commits(
     }
 }
 
-fn sync_state_for_result(
+fn convergence_status_for_result(
     input: &CanonicalizationInput,
     input_messages: &[PeeledMessage],
     result: &CanonicalizationResult,
-) -> SyncState {
+) -> ConvergenceStatus {
     let elapsed = input
         .now_ms
         .saturating_sub(input.state.last_convergence_relevant_input_ms);
-    if elapsed < input.policy.stable_quiescence_ms {
-        return SyncState::Syncing;
+    if elapsed < input.policy.settlement_quiescence_ms {
+        return ConvergenceStatus::Syncing;
     }
 
     let resolved: BTreeSet<&str> = result
@@ -750,11 +752,11 @@ fn sync_state_for_result(
         .chain(result.already_seen.iter().map(|s| s.message_id.as_str()))
         .collect();
 
-    // Canonicalizing fires when a pending input message did not receive
+    // Resolving fires when a pending input message did not receive
     // a disposition this pass — the typical case is a child commit
     // whose parent has not yet been materialized into a candidate
     // branch. `CandidateStateUnavailable` alone is *not* enough to flag
-    // Canonicalizing: it is reported any time no eligible branch was
+    // Resolving: it is reported any time no eligible branch was
     // selected, including the legitimate fixed-point case "no candidate
     // commits in the input batch at all."
     let unresolved_input = input_messages
@@ -762,10 +764,19 @@ fn sync_state_for_result(
         .any(|message| !resolved.contains(message.message_id.as_str()));
 
     if unresolved_input {
-        SyncState::Canonicalizing
+        ConvergenceStatus::Resolving
+    } else if has_blocking_convergence_error(result) {
+        ConvergenceStatus::Blocked
     } else {
-        SyncState::Stable
+        ConvergenceStatus::Settled
     }
+}
+
+fn has_blocking_convergence_error(result: &CanonicalizationResult) -> bool {
+    result
+        .errors
+        .iter()
+        .any(|error| matches!(error, CanonicalizationError::MissingRetainedAnchor))
 }
 
 fn app_message_expired(

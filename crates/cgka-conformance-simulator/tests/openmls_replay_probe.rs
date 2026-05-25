@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
-    CanonicalizationState, DroppedMessage, DroppedMessageReason, InvalidatedAppMessage,
-    InvalidatedAppMessageReason, MessageKind, SyncState, canonicalize_with_materialized_candidates,
+    CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
+    InvalidatedAppMessage, InvalidatedAppMessageReason, MessageKind,
+    canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::ConvergencePolicy;
 use cgka_conformance_simulator::openmls_projection::{
@@ -53,7 +54,7 @@ fn one_rewind_policy() -> CanonicalizationPolicy {
             max_witness_override_depth: 1,
         },
         app_message_past_epoch_limit: 5,
-        stable_quiescence_ms: 1_000,
+        settlement_quiescence_ms: 1_000,
     }
 }
 
@@ -262,7 +263,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
                     max_witness_override_depth: 1,
                 },
                 app_message_past_epoch_limit: 5,
-                stable_quiescence_ms: 1_000,
+                settlement_quiescence_ms: 1_000,
             },
             now_ms: 2_000,
         },
@@ -361,7 +362,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
                     max_witness_override_depth: 1,
                 },
                 app_message_past_epoch_limit: 5,
-                stable_quiescence_ms: 1_000,
+                settlement_quiescence_ms: 1_000,
             },
             now_ms: 2_000,
         },
@@ -476,7 +477,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
                     max_witness_override_depth: 1,
                 },
                 app_message_past_epoch_limit: 5,
-                stable_quiescence_ms: 1_000,
+                settlement_quiescence_ms: 1_000,
             },
             now_ms: 2_000,
         },
@@ -585,7 +586,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
                 max_witness_override_depth: 1,
             },
             app_message_past_epoch_limit: 5,
-            stable_quiescence_ms: 1_000,
+            settlement_quiescence_ms: 1_000,
         },
         2_000,
     )
@@ -691,7 +692,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
                 max_witness_override_depth: 1,
             },
             app_message_past_epoch_limit: 5,
-            stable_quiescence_ms: 1_000,
+            settlement_quiescence_ms: 1_000,
         },
         2_000,
     )
@@ -800,7 +801,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
                 max_witness_override_depth: 1,
             },
             app_message_past_epoch_limit: 5,
-            stable_quiescence_ms: 1_000,
+            settlement_quiescence_ms: 1_000,
         },
         2_000,
     )
@@ -1048,6 +1049,11 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         late_result.errors,
         vec![CanonicalizationError::MissingRetainedAnchor]
     );
+    assert_eq!(
+        late_result.convergence_status,
+        ConvergenceStatus::Blocked,
+        "missing retained anchor after quiescence blocks convergence instead of settling"
+    );
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
     assert_message_state(carol.storage(), &late_commit, MessageState::Created);
 }
@@ -1240,7 +1246,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         previous_tip: 1,
         selected_tip: Some(3),
         selected_branch_id: Some("bad-selected-path".into()),
-        sync_state: SyncState::Stable,
+        convergence_status: ConvergenceStatus::Settled,
         accepted_commits: commit_messages
             .iter()
             .map(|message| hex::encode(message.id.as_slice()))
@@ -1298,7 +1304,7 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
         previous_tip: 1,
         selected_tip: Some(2),
         selected_branch_id: Some("accepted-branch".into()),
-        sync_state: SyncState::Stable,
+        convergence_status: ConvergenceStatus::Settled,
         accepted_commits: vec![hex::encode(accepted_commit_id.as_slice())],
         accepted_proposals: vec![],
         accepted_app_messages: vec![hex::encode(accepted_app_id.as_slice())],

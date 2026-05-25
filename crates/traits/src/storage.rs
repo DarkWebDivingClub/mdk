@@ -77,7 +77,7 @@ pub trait MessageStorage {
 // ── OutboundIntentStorage ──────────────────────────────────────────────────
 
 /// Durable queue for local outbound work that cannot be safely published
-/// until convergence reaches `Stable`.
+/// until convergence reaches `Settled`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedOutboundIntent {
     pub id: MessageId,

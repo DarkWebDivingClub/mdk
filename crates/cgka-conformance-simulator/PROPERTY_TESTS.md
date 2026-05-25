@@ -49,12 +49,12 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
   occurrence is reported as already seen.
 - Why: replay should be idempotent and should not produce app-visible events twice.
 
-### `prop_quiescence_gate_controls_stability`
+### `prop_quiescence_gate_controls_settlement`
 
-- Generates: a selected commit, an outbound app intent, a generated stability window, and an early timestamp inside that
+- Generates: a selected commit, an outbound app intent, a generated settlement window, and an early timestamp inside that
   window.
-- Checks: before the window closes, sync state stays `Syncing` and outbound work stays queued. At the window boundary,
-  the same input becomes `Stable` and releases outbound work.
+- Checks: before the window closes, convergence status stays `Syncing` and outbound work stays queued. At the window boundary,
+  the same input becomes `Settled` and releases outbound work.
 - Why: the engine should wait for branch races to settle before publishing queued local work.
 
 ### `prop_capability_negotiation_matches_matrix`

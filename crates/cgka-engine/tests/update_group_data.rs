@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use cgka_engine::DEFAULT_CIPHERSUITE;
-use cgka_engine::canonicalization::{DroppedMessageReason, SyncState};
+use cgka_engine::canonicalization::{ConvergenceStatus, DroppedMessageReason};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
@@ -194,7 +194,7 @@ fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &Group
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
 
 fn malicious_app_component_commit(
@@ -521,7 +521,7 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
         .converge_stored_openmls_messages(&gid, 1_000_000)
         .expect("convergence should reject unauthorized commit without failing");
 
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(
         result.accepted_commits.is_empty(),
         "non-admin commit must not be selected"

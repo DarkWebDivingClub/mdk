@@ -1,7 +1,7 @@
 //! Capability negotiation, cache population, and upgrade discovery.
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::SyncState;
+use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
@@ -1084,7 +1084,7 @@ async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
     let result = bob
         .converge_stored_openmls_messages(&gid, 1_000_000)
         .unwrap();
-    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
     // Bob's Marmot record now reflects the upgraded RequiredCapabilities.
     // Pre-fix: `required_capabilities` was stale; reactions still missing.

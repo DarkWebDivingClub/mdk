@@ -22,7 +22,7 @@ event ids, or OpenMLS serialization. It models only the convergence boundary:
 - duplicate app witnesses from the same sender in the same epoch do not inflate witness score.
 - stale rewind status is derived from retained anchor, branch fork epoch, rewind distance, configured limit, and the
   distance ordering fact.
-- outbound intents are queued while convergence is syncing and released after the stability gate opens.
+- outbound intents are queued while convergence is syncing and released after the settlement gate opens.
 - three-branch candidate sets converge even when clients enumerate branches in different orders.
 - reordered, duplicated, and delayed delivery after peeling does not change canonical selection, duplicate the logical
   pending input, or duplicate app output/disposition emission.

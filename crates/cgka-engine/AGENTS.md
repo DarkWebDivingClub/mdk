@@ -154,11 +154,11 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     group id into an 8-byte digest instead of hex-encoding the full id.
   - **Test:** `tests/snapshot_privacy.rs`
 
-- **Item:** **S2** `Canonicalizing` sync state emission
-  - **What changed:** `canonicalization::sync_state_for_result` now emits `Canonicalizing` when the input window has
+- **Item:** **S2** `Resolving` convergence status emission
+  - **What changed:** `canonicalization::convergence_status_for_result` now emits `Resolving` when the input window has
     closed but a pending message did not receive a disposition this pass (e.g. a child commit waiting for its parent).
-    `Stable` strictly requires fixed-point.
-  - **Test:** `quiescence_with_orphan_commit_in_input_is_canonicalizing` in
+    `Settled` strictly requires fixed-point.
+  - **Test:** `quiescence_with_orphan_commit_in_input_is_resolving` in
     `crates/cgka-conformance-simulator/tests/canonicalization_contract.rs`
 
 - **Item:** **S3** Unattributable application messages

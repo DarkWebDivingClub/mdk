@@ -247,14 +247,14 @@ rule Init_Duplicate_Witness_Dedupe:
   Scenario 7:
 
   A client wants to send while convergence is still syncing. The outbound intent
-  is queued, then released only after the stability gate opens.
+  is queued, then released only after the settlement gate opens.
 */
 rule Init_Outbound_While_Syncing:
   [ Fr(~run) ]
 --[
-    Scenario(~run, 'outbound_queued_until_stable'),
+    Scenario(~run, 'outbound_queued_until_settled'),
     OutboundWanted(~run, 'alice', 'app_msg'),
-    SyncState(~run, 'alice', 'syncing')
+    ConvergenceStatus(~run, 'alice', 'syncing')
   ]->
   [
     OutboundIntent(~run, 'alice', 'app_msg'),
@@ -264,14 +264,15 @@ rule Init_Outbound_While_Syncing:
 /*
   Scenario 8:
 
-  A client that is already stable can publish the outbound intent directly.
+  A client whose convergence status is settled and whose lifecycle state is
+  Stable can publish the outbound intent directly.
 */
-rule Init_Outbound_While_Stable:
+rule Init_Outbound_While_Settled:
   [ Fr(~run) ]
 --[
-    Scenario(~run, 'outbound_published_when_stable'),
+    Scenario(~run, 'outbound_published_when_settled'),
     OutboundWanted(~run, 'alice', 'app_msg'),
-    SyncState(~run, 'alice', 'stable')
+    ConvergenceStatus(~run, 'alice', 'settled')
   ]->
   [
     OutboundIntent(~run, 'alice', 'app_msg'),
@@ -932,16 +933,16 @@ rule Queue_Outbound_While_Syncing:
   ]->
   [
     QueuedState(run, client, intent),
-    StableReady(run, client)
+    SettledReady(run, client)
   ]
 
-rule Release_Queued_Outbound_When_Stable:
+rule Release_Queued_Outbound_When_Settled:
   [
     QueuedState(run, client, intent),
-    StableReady(run, client)
+    SettledReady(run, client)
   ]
 --[
-    ConvergenceStable(run, client),
+    ConvergenceSettled(run, client),
     ReleasedQueuedOutbound(run, client, intent)
   ]->
   []
@@ -1604,30 +1605,30 @@ lemma queued_outbound_requires_syncing:
     ==> (
       Ex #j #k.
           OutboundWanted(run, client, intent) @ #j
-        & SyncState(run, client, 'syncing') @ #k
+        & ConvergenceStatus(run, client, 'syncing') @ #k
     )"
 
 lemma released_queued_outbound_requires_prior_queue:
   "All run client intent #i.
       ReleasedQueuedOutbound(run, client, intent) @ #i
     ==> (
-      ConvergenceStable(run, client) @ #i
+      ConvergenceSettled(run, client) @ #i
       & (Ex #j. QueuedOutbound(run, client, intent) @ #j & #j < #i)
     )"
 
 lemma syncing_outbound_is_never_published_directly:
   "All run client intent #i #j.
-      SyncState(run, client, 'syncing') @ #i
+      ConvergenceStatus(run, client, 'syncing') @ #i
     & PublishedOutbound(run, client, intent) @ #j
     ==> F"
 
-lemma stable_publish_requires_stable_state:
+lemma settled_publish_requires_lifecycle_stable_state:
   "All run client intent #i.
       PublishedOutbound(run, client, intent) @ #i
     ==> (
       Ex #j #k.
           OutboundWanted(run, client, intent) @ #j
-        & SyncState(run, client, 'stable') @ #k
+        & ConvergenceStatus(run, client, 'settled') @ #k
     )"
 
 lemma three_branch_selection_requires_dominance:
@@ -1698,14 +1699,14 @@ lemma duplicate_witness_dedupe_executable:
 lemma outbound_queue_release_executable:
   exists-trace
   "Ex run #i #j #k.
-      Scenario(run, 'outbound_queued_until_stable') @ #i
+      Scenario(run, 'outbound_queued_until_settled') @ #i
     & QueuedOutbound(run, 'alice', 'app_msg') @ #j
     & ReleasedQueuedOutbound(run, 'alice', 'app_msg') @ #k"
 
-lemma outbound_stable_publish_executable:
+lemma outbound_settled_publish_executable:
   exists-trace
   "Ex run #i #j.
-      Scenario(run, 'outbound_published_when_stable') @ #i
+      Scenario(run, 'outbound_published_when_settled') @ #i
     & PublishedOutbound(run, 'alice', 'app_msg') @ #j"
 
 lemma three_branch_permutation_executable:

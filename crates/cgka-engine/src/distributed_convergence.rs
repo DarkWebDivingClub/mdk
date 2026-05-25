@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
-    InvalidatedAppMessageReason, SyncState,
+    ConvergenceStatus, InvalidatedAppMessageReason,
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
@@ -162,7 +162,10 @@ impl<S: StorageProvider> Engine<S> {
             policy,
             now_ms,
         )?;
-        if result.sync_state != SyncState::Stable {
+        if matches!(
+            result.convergence_status,
+            ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
+        ) {
             return Ok(result);
         }
 
@@ -178,6 +181,9 @@ impl<S: StorageProvider> Engine<S> {
             self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
                 group_id: group_id.clone(),
             });
+            return Ok(result);
+        }
+        if result.convergence_status == ConvergenceStatus::Blocked {
             return Ok(result);
         }
 
@@ -328,7 +334,7 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         previous_tip: current_tip,
         selected_tip: None,
         selected_branch_id: None,
-        sync_state: SyncState::Stable,
+        convergence_status: ConvergenceStatus::Blocked,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),

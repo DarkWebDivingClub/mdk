@@ -3868,7 +3868,7 @@ impl MarmotApp {
             .feature_registry(app_feature_registry())
             .supported_app_components(self.supported_app_component_ids())
             .convergence_policy(CanonicalizationPolicy {
-                stable_quiescence_ms: 0,
+                settlement_quiescence_ms: 0,
                 ..CanonicalizationPolicy::default()
             }),
         )?;

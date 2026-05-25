@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
-    DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
-    MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
-    SyncState, canonicalize, canonicalize_with_materialized_candidates,
+    ConvergenceStatus, DroppedMessage, DroppedMessageReason, InvalidatedAppMessage,
+    InvalidatedAppMessageReason, MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage,
+    PeeledMessageKind, canonicalize, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{BranchCandidate, ConvergencePolicy};
 
@@ -31,7 +31,7 @@ fn policy() -> CanonicalizationPolicy {
             max_witness_override_depth: 1,
         },
         app_message_past_epoch_limit: 5,
-        stable_quiescence_ms: 1_000,
+        settlement_quiescence_ms: 1_000,
     }
 }
 
@@ -492,7 +492,7 @@ fn outbound_intents_are_queued_while_syncing() {
 
     let result = canonicalize(input);
 
-    assert_eq!(result.sync_state, SyncState::Syncing);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Syncing);
     assert_eq!(
         result.queued_outbound_intents,
         vec![OutboundIntent::SendAppMessage {
@@ -503,7 +503,7 @@ fn outbound_intents_are_queued_while_syncing() {
 }
 
 #[test]
-fn quiescence_with_no_input_is_stable() {
+fn quiescence_with_no_input_is_settled() {
     let mut input = input(vec![], vec![branch("live", 1, 3, 0x00)]);
     input.state.last_convergence_relevant_input_ms = 0;
     input.now_ms = 5_000; // window definitely closed
@@ -511,19 +511,19 @@ fn quiescence_with_no_input_is_stable() {
     let result = canonicalize(input);
 
     assert_eq!(
-        result.sync_state,
-        SyncState::Stable,
-        "quiesced + nothing pending = Stable"
+        result.convergence_status,
+        ConvergenceStatus::Settled,
+        "quiesced + nothing pending = Settled"
     );
 }
 
 #[test]
-fn quiescence_with_orphan_commit_in_input_is_canonicalizing() {
+fn quiescence_with_orphan_commit_in_input_is_resolving() {
     // Construct a commit whose parent branch isn't materialized AND
     // doesn't fork from a tracked candidate. The canonicalizer cannot
     // give it a disposition this pass — the spec calls this state
-    // "Canonicalizing" (window closed but pass left work pending),
-    // distinct from Stable (fixed point reached).
+    // "Resolving" (window closed but pass left work pending),
+    // distinct from Settled (fixed point reached).
     let orphan = commit_edge(
         "orphan-1",
         "orphan-branch",
@@ -539,9 +539,9 @@ fn quiescence_with_orphan_commit_in_input_is_canonicalizing() {
     let result = canonicalize(inp);
 
     assert_eq!(
-        result.sync_state,
-        SyncState::Canonicalizing,
-        "orphan commit with no parent leaves work pending → Canonicalizing"
+        result.convergence_status,
+        ConvergenceStatus::Resolving,
+        "orphan commit with no parent leaves work pending -> Resolving"
     );
     // The orphan didn't get a disposition.
     assert!(result.accepted_commits.is_empty());

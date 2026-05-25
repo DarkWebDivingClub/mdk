@@ -47,41 +47,45 @@ same anchor
 
 The canonical branch is selected by protocol evidence. Local arrival order is only an implementation detail.
 
-Lifecycle outputs also depend on local monotonic time. `sync_state` is a derived result, not an input claim.
-`sync_state` and `publishable_outbound_messages` are deterministic when engines also have the same
-`last_convergence_relevant_input_time`, `stable_quiescence_ms`, and current monotonic clock reading.
+Lifecycle outputs also depend on local monotonic time. `convergence_status` is a derived result, not an input claim.
+`convergence_status` and `publishable_outbound_messages` are deterministic when engines also have the same
+`last_convergence_relevant_input_time`, `settlement_quiescence_ms`, and current monotonic clock reading.
 
-## Lifecycle
+## Convergence Status
 
-The engine tracks a sync state:
+The engine derives a convergence status that is separate from the group lifecycle state:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Stable
-    Stable --> Syncing: reconnect or explicit sync starts
-    Syncing --> Canonicalizing: input has quiesced
-    Canonicalizing --> Stable: canonicalize reaches a fixed point
-    Canonicalizing --> Syncing: convergence-relevant input arrives
-    Stable --> Syncing: convergence-relevant input arrives
+    [*] --> Settled
+    Settled --> Syncing: reconnect or explicit sync starts
+    Syncing --> Resolving: input has quiesced
+    Resolving --> Settled: canonicalize reaches a fixed point
+    Resolving --> Blocked: repair or retained material required
+    Resolving --> Syncing: convergence-relevant input arrives
+    Settled --> Syncing: convergence-relevant input arrives
+    Blocked --> Syncing: repair or retained material appears
 ```
 
-States:
+Statuses:
 
 - `Syncing`: the engine is collecting peeled messages. Outbound app messages and group changes MUST be queued as
-  intents. Emitted while the convergence- relevant input window has not yet closed (i.e., the configured quiescence
+  intents. Emitted while the convergence-relevant input window has not yet closed (i.e., the configured quiescence
   duration has not elapsed since the last input).
-- `Canonicalizing`: the engine is building candidate states, scoring branches, applying the selected branch, and
+- `Resolving`: the engine is building candidate states, scoring branches, applying the selected branch, and
   assigning message dispositions. In an executable model where canonicalization is synchronous, this state is emitted at
   the completion of a pass when the input window has closed but the pass left work pending — typically a child commit
   whose parent is not yet materialized into a candidate branch. Outbound work remains queued.
-- `Stable`: the engine has seen no convergence-relevant input for at least the configured quiescence duration and the
+- `Settled`: the engine has seen no convergence-relevant input for at least the configured quiescence duration and the
   last canonicalization pass reached a fixed point. Every pending input message received a disposition (accepted,
-  dropped, invalidated, or already-seen) and no work remains. Outbound intents become publishable only in this state.
+  dropped, invalidated, or already-seen) and no work remains. Outbound intents become publishable only in this status.
+- `Blocked`: the input window has quiesced, but convergence cannot safely continue without a repair path or missing
+  retained material. Outbound work remains queued.
 
 Convergence-relevant input includes commits, proposals, and app messages that can affect branch witness scores. Pure
 duplicate messages do not reset the quiescence timer.
 
-`stable_quiescence_ms` MUST be tunable. Groups SHOULD publish a recommended value. Clients MAY choose a longer local
+`settlement_quiescence_ms` MUST be tunable. Groups SHOULD publish a recommended value. Clients MAY choose a longer local
 value, but MUST NOT choose a value below a group-required minimum. A value that is too high can pin clients in
 `Syncing`; a value that is too low can cause avoidable forks. Conformance tests SHOULD model both failure modes.
 
@@ -176,7 +180,7 @@ OutboundIntent =
 | PublishProposal(proposal)
 ```
 
-The engine MUST queue outbound intents while it is not `Stable`.
+The engine MUST queue outbound intents while convergence is not `Settled`.
 
 ## Policy
 
@@ -186,7 +190,7 @@ The convergence policy is a group policy. Unsupported policy is a capability mis
 ConvergencePolicy {
   max_rewind_commits: 5,
   app_message_past_epoch_limit: FromMlsConfiguration,
-  stable_quiescence_ms,
+  settlement_quiescence_ms,
   witness_quorum,
   max_witness_override_depth,
 }
@@ -208,7 +212,7 @@ oldest_retained_anchor = T - max_rewind_commits
 ```
 
 Engines MUST retain snapshots for the current tip and every epoch at or after that anchor. Engines MUST prune older
-retained anchors as soon as a successful canonicalization pass reaches `Stable` and advances the current tip.
+retained anchors as soon as a successful canonicalization pass reaches `Settled` and advances the current tip.
 
 `app_message_past_epoch_limit` MUST follow the MLS configuration used by the engine for decrypting past-epoch
 application messages. App messages outside that limit are discarded or reported as expired. The engine MUST NOT invent a
@@ -330,13 +334,13 @@ through `GroupEvent::AppMessageInvalidated`; it MUST NOT emit an invalidated mes
 
 ## Outbound Intents
 
-Outbound work is gated by sync state.
+Outbound work is gated by convergence status.
 
 Rules:
 
-- While `Syncing` or `Canonicalizing`, outbound intents MUST be queued.
-- App-message intents are encrypted only after the engine is `Stable`.
-- Commit intents MUST be regenerated after the engine becomes `Stable`.
+- While `Syncing`, `Resolving`, or `Blocked`, outbound intents MUST be queued.
+- App-message intents are encrypted only after convergence is `Settled`.
+- Commit intents MUST be regenerated after convergence becomes `Settled`.
 - Proposal intents MAY be retained while syncing, but MUST be revalidated before publish.
 - If an outbound intent targets an epoch older than the selected state, the engine MUST return an error and leave
   publishing to the application.
@@ -359,7 +363,7 @@ SendResult::Queued {
 advance_convergence(group_id) -> Vec<SendResult>
 ```
 
-When the group reaches `Stable`, the engine regenerates publishable messages from the selected canonical state and
+When convergence reaches `Settled`, the engine regenerates publishable messages from the selected canonical state and
 removes each queued intent after regeneration succeeds. If regeneration creates a commit, the engine returns that one
 `SendResult::GroupEvolution` and pauses further draining until the application reports `confirm_published` or
 `publish_failed`. Calling `advance_convergence` during that pending-publish window returns no publishable work.
@@ -373,7 +377,7 @@ CanonicalizationResult {
   previous_tip,
   selected_tip,
   selected_branch_id,
-  sync_state,
+  convergence_status,
   accepted_commits,
   accepted_proposals,
   accepted_app_messages,
@@ -488,9 +492,9 @@ The conformance suite should cover:
 - commit older than the retained anchor dropped as `BeyondAnchor` and persisted as invalidated,
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app-message intent queued during `Syncing`,
-- outbound commit intent regenerated after `Stable`,
-- `stable_quiescence_ms` too low producing extra forks in simulation,
-- `stable_quiescence_ms` too high pinning outbound work in simulation,
+- outbound commit intent regenerated after `Settled`,
+- `settlement_quiescence_ms` too low producing extra forks in simulation,
+- `settlement_quiescence_ms` too high pinning outbound work in simulation,
 - restart from persisted storage reproduces the same result.
 
 ## Relationship To Other Docs

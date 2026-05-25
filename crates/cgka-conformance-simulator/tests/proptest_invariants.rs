@@ -22,7 +22,7 @@
 //! - **(g) Canonicalization idempotence**: replaying a batch whose message
 //!   ids are already seen produces only already-seen dispositions.
 //! - **(h) Quiescence gate**: convergence-relevant input remains Syncing
-//!   before the stability window and becomes Stable after the window closes.
+//!   before the settlement window and becomes Settled after the window closes.
 //! - **(i) Capability negotiation**: generated capability matrices either
 //!   reject missing required support or report Available / Upgradeable /
 //!   Unavailable consistently.
@@ -37,8 +37,8 @@ use std::sync::Arc;
 use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
-    DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate, MessageKind,
-    OutboundIntent, PeeledMessage, PeeledMessageKind, SyncState,
+    ConvergenceStatus, DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate,
+    MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
     canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{
@@ -480,7 +480,7 @@ fn canonical_policy() -> CanonicalizationPolicy {
             max_witness_override_depth: 0,
         },
         app_message_past_epoch_limit: 5,
-        stable_quiescence_ms: 1_000,
+        settlement_quiescence_ms: 1_000,
     }
 }
 
@@ -826,7 +826,7 @@ proptest! {
     }
 }
 
-// ── Property (h) — quiescence/stability gate ──────────────────────────────
+// ── Property (h) — quiescence/settlement gate ─────────────────────────────
 
 fn commit_message(
     id: &str,
@@ -852,7 +852,7 @@ fn commit_message(
 }
 
 fn canonicalization_quiescence_gate_holds(
-    stable_quiescence_ms: u64,
+    settlement_quiescence_ms: u64,
     early_elapsed_ms: u64,
     payload_tag: u8,
 ) {
@@ -864,7 +864,7 @@ fn canonicalization_quiescence_gate_holds(
         consumed_proposal_ids: vec![],
     };
     let policy = CanonicalizationPolicy {
-        stable_quiescence_ms,
+        settlement_quiescence_ms,
         ..canonical_policy()
     };
     let input_at = |now_ms| CanonicalizationInput {
@@ -888,8 +888,8 @@ fn canonicalization_quiescence_gate_holds(
         vec![candidate.clone()],
     );
     prop_assert(
-        early.sync_state,
-        SyncState::Syncing,
+        early.convergence_status,
+        ConvergenceStatus::Syncing,
         "window must stay syncing before quiescence",
     );
     prop_assert(
@@ -903,27 +903,27 @@ fn canonicalization_quiescence_gate_holds(
         "outbound work should remain queued before quiescence",
     );
 
-    let stable = canonicalize_with_materialized_candidates(
-        input_at(last_input_ms + stable_quiescence_ms),
+    let settled = canonicalize_with_materialized_candidates(
+        input_at(last_input_ms + settlement_quiescence_ms),
         vec![candidate],
     );
     prop_assert(
-        stable.sync_state,
-        SyncState::Stable,
-        "window should become stable once quiescence elapses",
+        settled.convergence_status,
+        ConvergenceStatus::Settled,
+        "window should become settled once quiescence elapses",
     );
     prop_assert(
-        stable.queued_outbound_intents,
+        settled.queued_outbound_intents,
         vec![],
-        "stable convergence should not keep outbound work queued",
+        "settled convergence should not keep outbound work queued",
     );
     prop_assert(
-        stable.publishable_outbound_messages.len(),
+        settled.publishable_outbound_messages.len(),
         1,
-        "stable convergence should release outbound work",
+        "settled convergence should release outbound work",
     );
     prop_assert(
-        stable.accepted_commits,
+        settled.accepted_commits,
         vec!["selected-commit".into()],
         "selected commit should be accepted after quiescence",
     );
@@ -935,18 +935,18 @@ proptest! {
         .. ProptestConfig::default()
     })]
 
-    /// Property (h) — convergence input is gated by the stability window:
+    /// Property (h) — convergence input is gated by the settlement window:
     /// before the window closes, output stays queued; once it closes, the
-    /// same fixed point becomes Stable and releases outbound work.
+    /// same fixed point becomes Settled and releases outbound work.
     #[test]
-    fn prop_quiescence_gate_controls_stability(
-        (stable_quiescence_ms, early_elapsed_ms, payload_tag) in
+    fn prop_quiescence_gate_controls_settlement(
+        (settlement_quiescence_ms, early_elapsed_ms, payload_tag) in
             (1u64..=5_000).prop_flat_map(|stable| {
                 (Just(stable), 0..stable, any::<u8>())
             }),
     ) {
         canonicalization_quiescence_gate_holds(
-            stable_quiescence_ms,
+            settlement_quiescence_ms,
             early_elapsed_ms,
             payload_tag,
         );

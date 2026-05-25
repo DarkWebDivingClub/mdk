@@ -181,7 +181,7 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
     .await;
     stack.sync_group(&bob, &created.group_id).await;
     bob.session.set_convergence_policy(CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     });
 
@@ -338,7 +338,7 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
         .expect("commit delivery should reach bob");
     assert!(matches!(bob_commit.outcome, IngestOutcome::Buffered { .. }));
     bob.session.set_convergence_policy(CanonicalizationPolicy {
-        stable_quiescence_ms: 0,
+        settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     });
     bob.session

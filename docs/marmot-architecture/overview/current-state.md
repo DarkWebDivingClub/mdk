@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-18
+updated: 2026-05-25
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -12,8 +12,9 @@ status: overview
 > dedup at the API surface, atomic `EpochState` transitions, replay error classification, more honest convergence ingest
 > outcomes, capability-cache self-id assertion, fail-closed auto-committer admin guard, registry-overwrite warning), and
 > added a `SnapshotRollbackGuard` so the snapshot dance is panic-safe. Snapshot names no longer carry plaintext group
-> ids. The canonicalization contract now distinguishes `Canonicalizing` from `Stable`. The former auto-commit exception
-> to publish-before-apply is closed: auto-publish work now carries a pending ref and confirms or rolls back like
+> ids. The canonicalization contract now distinguishes `Resolving`, `Settled`, and `Blocked` convergence statuses from
+> lifecycle `Stable`. The old auto-commit exception to publish-before-apply is closed: auto-publish work now carries a
+> pending ref and confirms or rolls back like
 > explicit group evolution.
 
 # Current State — Implementations & Spec

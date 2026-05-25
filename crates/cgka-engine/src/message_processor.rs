@@ -731,7 +731,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         if !self
-            .advance_convergence_inputs_until_stable(group_id, now_ms)
+            .advance_convergence_inputs_until_settled(group_id, now_ms)
             .await?
         {
             return Ok(Vec::new());
@@ -741,7 +741,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut drained = Vec::new();
         for record in queued {
             if !self
-                .advance_convergence_inputs_until_stable(group_id, now_ms)
+                .advance_convergence_inputs_until_settled(group_id, now_ms)
                 .await?
             {
                 break;
@@ -772,7 +772,7 @@ impl<S: StorageProvider> Engine<S> {
         let result = self
             .converge_stored_openmls_messages(group_id, now_ms)
             .map_err(|e| EngineError::Backend(format!("converge before send: {e}")))?;
-        if result.sync_state != crate::canonicalization::SyncState::Stable {
+        if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled {
             return Ok(true);
         }
 
@@ -785,7 +785,7 @@ impl<S: StorageProvider> Engine<S> {
     /// opaque transport bytes do not participate in canonicalization until a
     /// selected branch gives the peeler the epoch context needed to unwrap
     /// them.
-    pub async fn advance_convergence_inputs_until_stable(
+    pub async fn advance_convergence_inputs_until_settled(
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
@@ -795,7 +795,8 @@ impl<S: StorageProvider> Engine<S> {
                 let result = self
                     .converge_stored_openmls_messages(group_id, now_ms)
                     .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
-                if result.sync_state != crate::canonicalization::SyncState::Stable {
+                if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled
+                {
                     return Ok(false);
                 }
                 if self.has_unresolved_convergence_inputs(group_id)? {
@@ -1532,7 +1533,8 @@ fn convergence_ingest_outcome(
         .chain(&result.accepted_proposals)
         .chain(&result.accepted_app_messages)
         .any(|accepted| accepted == &message_id);
-    if accepted && result.sync_state == crate::canonicalization::SyncState::Stable {
+    if accepted && result.convergence_status == crate::canonicalization::ConvergenceStatus::Settled
+    {
         return IngestOutcome::Processed;
     }
 

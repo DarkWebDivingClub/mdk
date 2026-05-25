@@ -82,14 +82,15 @@ Each group has an `EpochState`:
 Only the engine may construct non-`Stable` states. Applications observe state through typed outcomes, not direct state
 mutation.
 
-The engine also derives a convergence sync state:
+The engine also derives a convergence status:
 
 - `Syncing`: collecting convergence-relevant messages.
-- `Canonicalizing`: replaying candidates and assigning dispositions.
-- `Stable`: no convergence-relevant input has arrived for at least the configured quiescence window, and the selected
+- `Resolving`: replaying candidates and assigning dispositions.
+- `Settled`: no convergence-relevant input has arrived for at least the configured quiescence window, and the selected
   branch has been applied.
+- `Blocked`: convergence cannot safely continue without a repair path or missing retained material.
 
-`sync_state` is a derived result. It is not an input claim made by the caller.
+`convergence_status` is a derived result. It is not an input claim made by the caller.
 
 ## Inbound Processing
 
@@ -129,7 +130,7 @@ terminal `PeelFailed`, not `PeelDeferred`. This is the expected path for an invi
 receives the invite commit that created that welcome: the invitee never had the pre-welcome epoch secret. Future-epoch
 group messages, or group messages without a usable source-epoch hint, MAY remain `PeelDeferred`.
 
-When convergence reaches a stable selected branch, the engine MUST retry `PeelDeferred` raw group messages for that
+When convergence reaches a settled selected branch, the engine MUST retry `PeelDeferred` raw group messages for that
 group. A retry that peels into OpenMLS wire bytes promotes the stored payload from `RawTransport` to `OpenMlsWire`; it
 is then either processed immediately if it belongs to the current selected epoch or buffered as convergence input if it
 targets a later candidate epoch. Raw `PeelDeferred` messages MUST NOT by themselves block outbound work; only peeled
@@ -449,7 +450,7 @@ A conforming engine MUST pass scenario tests for:
 - commit older than retained anchor dropped as `BeyondAnchor`,
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app and commit intents queued while syncing,
-- queued commit regenerated after stable convergence,
+- queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.
 
