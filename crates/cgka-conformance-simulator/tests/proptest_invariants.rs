@@ -57,7 +57,7 @@ use cgka_traits::CgkaEngine;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel, TransportKind,
 };
-use cgka_traits::engine::{CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{SendIntent, SendResult};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::storage::{GroupStorage, MessageStorage};
 use proptest::prelude::*;
@@ -995,19 +995,15 @@ fn capability_negotiation_matches_matrix(case: CapabilityNegotiationCase) {
             || case.require_feature_at_create;
         let all_members_support = case.invitee_supports.iter().all(|supports| *supports);
         let create = alice
-            .engine
-            .create_group(CreateGroupRequest {
-                name: "capability property".into(),
-                description: "".into(),
-                members: key_packages,
-                required_features: case
-                    .require_feature_at_create
+            .try_create_group_with_admins(
+                "capability property",
+                key_packages,
+                case.require_feature_at_create
                     .then_some(PROP_FEATURE)
                     .into_iter()
                     .collect(),
-                app_components: vec![],
-                initial_admins: vec![],
-            })
+                vec![],
+            )
             .await;
 
         if feature_is_required && !all_members_support {
@@ -1021,12 +1017,8 @@ fn capability_negotiation_matches_matrix(case: CapabilityNegotiationCase) {
             return;
         }
 
-        let (group_id, result) =
+        let (group_id, pending) =
             create.unwrap_or_else(|err| panic!("group should create for {case:?}: {err:?}"));
-        let pending = match result {
-            cgka_traits::engine::SendResult::GroupCreated { pending, .. } => pending,
-            other => panic!("expected GroupCreated for {case:?}, got {other:?}"),
-        };
         alice.confirm(pending).await;
 
         let status = alice
@@ -1067,23 +1059,14 @@ proptest! {
 
 // ── Property (b) — convergence under send/leave schedules ─────────────────
 
-/// Re-route a `TransportMessage` so its `transport_group_id` matches the
-/// given `gid`. Mirrors the private `route` helper inside the harness's
-/// `client.rs` — needed here because we drive the engine + bus directly.
+/// Keep a `TransportMessage` on the transport route chosen by the engine.
+/// Nostr-routed harness groups use a transport group id that is distinct from
+/// the MLS group id, so tests that drive the engine directly must preserve it.
 fn reroute(
     msg: cgka_traits::transport::TransportMessage,
-    gid: &cgka_traits::types::GroupId,
+    _gid: &cgka_traits::types::GroupId,
 ) -> cgka_traits::transport::TransportMessage {
-    use cgka_traits::transport::TransportEnvelope;
-    match msg.envelope {
-        TransportEnvelope::Welcome { .. } => msg,
-        TransportEnvelope::GroupMessage { .. } => cgka_traits::transport::TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: gid.as_slice().to_vec(),
-            },
-            ..msg
-        },
-    }
+    msg
 }
 
 async fn drive_intents(

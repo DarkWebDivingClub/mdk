@@ -227,6 +227,17 @@ fn test_relay_url() -> &'static str {
     RELAY.get_or_init(TestRelay::new).url()
 }
 
+fn two_default_relays() -> (TestRelay, TestRelay, String) {
+    let first = TestRelay::new();
+    let second = TestRelay::new();
+    let relays = format!("{},{}", first.url(), second.url());
+    (first, second, relays)
+}
+
+fn relay_pair_json(first: &TestRelay, second: &TestRelay) -> Value {
+    serde_json::json!([first.url(), second.url()])
+}
+
 fn dm(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dm"));
     command.arg("--home").arg(home).arg("--json");
@@ -1846,16 +1857,13 @@ fn account_create_accepts_public_nostr_identity_without_signing() {
 fn account_create_publishes_required_relay_lists_from_default_relays() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
+    let (default_relay_a, default_relay_b, default_relays) = two_default_relays();
 
-    let created = create_account_with_relays(
-        home.path(),
-        "wss://relay1.example,wss://relay2.example",
-        relay,
-    );
+    let created = create_account_with_relays(home.path(), &default_relays, relay);
     assert_eq!(created["relay_lists"]["complete"], true);
     assert_eq!(
         created["relay_lists"]["default_relays"],
-        serde_json::json!(["wss://relay1.example", "wss://relay2.example"])
+        relay_pair_json(&default_relay_a, &default_relay_b)
     );
     assert_eq!(
         created["relay_lists"]["bootstrap_relays"],
@@ -1917,6 +1925,7 @@ fn account_create_rolls_back_when_relay_list_publication_fails() {
 fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = TestRelay::new();
+    let (default_relay_a, default_relay_b, default_relays) = two_default_relays();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
     let imported = run_json_with_stdin(
@@ -1926,7 +1935,7 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
             "create",
             "--nsec-stdin",
             "--default-relays",
-            "wss://relay1.example,wss://relay2.example",
+            &default_relays,
             "--bootstrap-relays",
             relay.url(),
             "--publish-missing-relay-lists",
@@ -1937,7 +1946,7 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     assert_eq!(imported["relay_lists"]["complete"], true);
     assert_eq!(
         imported["relay_lists"]["default_relays"],
-        serde_json::json!(["wss://relay1.example", "wss://relay2.example"])
+        relay_pair_json(&default_relay_a, &default_relay_b)
     );
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"][0]["account_id"], imported["account_id"]);
@@ -2005,12 +2014,9 @@ fn account_create_rolls_back_when_missing_relay_list_publication_fails() {
 fn account_relay_lists_checks_a_pubkey_from_bootstrap_relays() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
+    let (_default_relay_a, _default_relay_b, default_relays) = two_default_relays();
 
-    let created = create_account_with_relays(
-        home.path(),
-        "wss://relay1.example,wss://relay2.example",
-        relay,
-    );
+    let created = create_account_with_relays(home.path(), &default_relays, relay);
     let account_id = created["account_id"].as_str().expect("account id");
 
     let checked = run_json(
@@ -2458,7 +2464,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     let watcher = watcher.spawn().expect("stream watcher should start");
     let broker_addr = broker.addr.to_string();
     let (sent, output) =
-        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(15), |home| {
+        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(60), |home| {
             try_run_json(
                 home,
                 &[

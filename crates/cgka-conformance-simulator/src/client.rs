@@ -8,7 +8,10 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    default_group_components, encode_nostr_routing_v1,
+};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
@@ -19,7 +22,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,8 +38,8 @@ pub struct HarnessClient {
     signer: nostr::Keys,
     registry: FeatureRegistry,
     pending_events: Vec<GroupEvent>,
-    /// Default group_id used to set transport_group_id on outbound + inbound
-    /// envelopes. Set automatically after the first create/join.
+    /// Default MLS group id used by single-group scenarios. Set
+    /// automatically after the first create/join.
     default_group: Option<GroupId>,
     app_event_counter: u64,
 }
@@ -74,6 +77,7 @@ impl ClientBuilder {
                 keys: self.signer.clone(),
             }))
             .feature_registry(self.registry.clone())
+            .supported_app_components(harness_supported_app_components())
             .peeler(Box::new(peeler))
             .build()
             .expect("engine builds");
@@ -108,6 +112,42 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
             .checked_add(1)
             .expect("deterministic Nostr key search exhausted");
     }
+}
+
+fn harness_supported_app_components() -> Vec<u16> {
+    let mut components = default_group_components();
+    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    components.into_iter().collect()
+}
+
+fn harness_nostr_routing_component(creator_identity: &[u8], name: &str) -> AppComponentData {
+    let routing = NostrRoutingV1::new(
+        deterministic_nostr_group_id(creator_identity, name),
+        vec!["wss://group.example".to_owned()],
+    )
+    .expect("harness Nostr routing is valid");
+    AppComponentData {
+        component_id: NOSTR_ROUTING_COMPONENT_ID,
+        data: encode_nostr_routing_v1(&routing).expect("harness Nostr routing encodes"),
+    }
+}
+
+fn deterministic_nostr_group_id(creator_identity: &[u8], name: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-cgka-conformance-nostr-group-id-v1");
+    hasher.update(creator_identity);
+    hasher.update(name.as_bytes());
+    hasher.finalize().into()
+}
+
+fn key_package_with_harness_source(key_package: KeyPackage) -> KeyPackage {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-cgka-conformance-key-package-event-id-v1");
+    hasher.update(key_package.bytes());
+    KeyPackage::with_source_event_id(
+        key_package.bytes().to_vec(),
+        MessageId::new(hasher.finalize().to_vec()),
+    )
 }
 
 #[derive(Clone)]
@@ -178,6 +218,7 @@ impl HarnessClient {
                 keys: self.signer.clone(),
             }))
             .feature_registry(self.registry.clone())
+            .supported_app_components(harness_supported_app_components())
             .peeler(Box::new(peeler))
             .build()
             .expect("engine rebuilds");
@@ -193,7 +234,8 @@ impl HarnessClient {
     }
 
     pub async fn fresh_key_package(&mut self) -> KeyPackage {
-        self.engine.fresh_key_package().await.expect("kp")
+        let key_package = self.engine.fresh_key_package().await.expect("kp");
+        key_package_with_harness_source(key_package)
     }
 
     /// Create a new group with the given members + features.
@@ -217,6 +259,18 @@ impl HarnessClient {
         required_features: Vec<cgka_traits::capabilities::Feature>,
         initial_admins: Vec<MemberId>,
     ) -> (GroupId, PendingStateRef) {
+        self.try_create_group_with_admins(name, invitees, required_features, initial_admins)
+            .await
+            .expect("create_group")
+    }
+
+    pub async fn try_create_group_with_admins(
+        &mut self,
+        name: &str,
+        invitees: Vec<KeyPackage>,
+        required_features: Vec<cgka_traits::capabilities::Feature>,
+        initial_admins: Vec<MemberId>,
+    ) -> Result<(GroupId, PendingStateRef), EngineError> {
         let res = self
             .engine
             .create_group(CreateGroupRequest {
@@ -224,20 +278,23 @@ impl HarnessClient {
                 description: "".into(),
                 members: invitees,
                 required_features,
-                app_components: vec![],
+                app_components: vec![harness_nostr_routing_component(&self.identity, name)],
                 initial_admins,
             })
-            .await
-            .expect("create_group");
+            .await?;
         let (gid, pending, welcomes) = match res {
             (gid, SendResult::GroupCreated { pending, welcomes }) => (gid, pending, welcomes),
-            (_, other) => panic!("expected GroupCreated, got {other:?}"),
+            (_, other) => {
+                return Err(EngineError::Other(format!(
+                    "expected GroupCreated, got {other:?}"
+                )));
+            }
         };
         for w in welcomes {
             self.bus.send(self.bus_id, w);
         }
         self.default_group = Some(gid.clone());
-        (gid, pending)
+        Ok((gid, pending))
     }
 
     /// Confirm a pending publish. Required after every commit-producing
@@ -554,9 +611,10 @@ impl HarnessClient {
         msg: &TransportMessage,
     ) -> Result<TransportMessage, String> {
         let group_id = match &msg.envelope {
-            TransportEnvelope::GroupMessage { transport_group_id } => {
-                GroupId::new(transport_group_id.clone())
-            }
+            TransportEnvelope::GroupMessage { .. } => self
+                .default_group
+                .clone()
+                .ok_or_else(|| "must create or join a group first".to_owned())?,
             TransportEnvelope::Welcome { .. } => {
                 return Err("welcomes do not carry MLS group-message bytes".into());
             }
@@ -633,16 +691,8 @@ pub fn decode_harness_app_payload(payload: &[u8]) -> Vec<u8> {
     event.content.into_bytes()
 }
 
-fn route(msg: TransportMessage, gid: &GroupId) -> TransportMessage {
-    match msg.envelope {
-        TransportEnvelope::Welcome { .. } => msg,
-        TransportEnvelope::GroupMessage { .. } => TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: gid.as_slice().to_vec(),
-            },
-            ..msg
-        },
-    }
+fn route(msg: TransportMessage, _gid: &GroupId) -> TransportMessage {
+    msg
 }
 
 fn encode_admin_policy(admins: Vec<MemberId>) -> Result<Vec<u8>, EngineError> {
