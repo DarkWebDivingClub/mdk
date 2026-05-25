@@ -23,3 +23,6 @@ tracing.workspace = true
 transport-nostr-peeler.workspace = true
 
 [dev-dependencies]
+nostr-relay-builder.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite = "0.26"

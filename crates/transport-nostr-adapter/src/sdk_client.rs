@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use nostr_sdk::prelude::{
     Timestamp as NostrTimestamp,
 };
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -23,7 +23,10 @@ use crate::{
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
-const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(5);
+// nostr-sdk 0.44 waits up to 10s for each relay's OK response. Keep this
+// wrapper above that so SDK endpoint-level success/failure results surface
+// instead of a Darkmatter-level timeout masking them.
+const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(12);
 /// Publishing to relays is best-effort over a flaky network: retry the send a
 /// few times (with a short backoff) before giving up, so a single slow relay
 /// doesn't fail the whole publish.
@@ -210,6 +213,78 @@ impl NostrSdkRelayClient {
             .await
             .map_err(|e| TransportAdapterError::Publish(format!("sign event: {e}")))
     }
+
+    async fn publish_to_relay(
+        client: Client,
+        endpoint: RelayUrl,
+        event: Event,
+    ) -> Result<TransportEndpointReceipt, TransportEndpointFailure> {
+        let transport_endpoint = TransportEndpoint(endpoint.to_string());
+        if let Err(e) = client.add_relay(endpoint.clone()).await {
+            return Err(TransportEndpointFailure {
+                endpoint: transport_endpoint,
+                reason: format!("add relay: {e}"),
+            });
+        }
+        match timeout(
+            SDK_RELAY_CONNECT_WAIT,
+            client.connect_relay(endpoint.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(TransportEndpointFailure {
+                    endpoint: transport_endpoint,
+                    reason: format!("connect relay: {e}"),
+                });
+            }
+            Err(_) => {
+                return Err(TransportEndpointFailure {
+                    endpoint: transport_endpoint,
+                    reason: "connect relay timed out".to_owned(),
+                });
+            }
+        }
+
+        let mut last_error = "send event failed".to_owned();
+        for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
+            match timeout(
+                SDK_RELAY_PUBLISH_WAIT,
+                client.send_event_to([endpoint.clone()], &event),
+            )
+            .await
+            {
+                Ok(Ok(output)) if output.success.contains(&endpoint) => {
+                    return Ok(TransportEndpointReceipt {
+                        endpoint: transport_endpoint,
+                        accepted_at: None,
+                    });
+                }
+                Ok(Ok(output)) => {
+                    last_error = output
+                        .failed
+                        .get(&endpoint)
+                        .cloned()
+                        .unwrap_or_else(|| "relay did not acknowledge event".to_owned());
+                }
+                Ok(Err(e)) => {
+                    last_error = format!("send event: {e}");
+                }
+                Err(_) => {
+                    last_error = "send event timed out".to_owned();
+                }
+            }
+            if attempt < SDK_RELAY_PUBLISH_ATTEMPTS {
+                tokio::time::sleep(SDK_RELAY_PUBLISH_RETRY_BACKOFF).await;
+            }
+        }
+
+        Err(TransportEndpointFailure {
+            endpoint: transport_endpoint,
+            reason: last_error,
+        })
+    }
 }
 
 #[async_trait]
@@ -305,9 +380,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         endpoints: &[TransportEndpoint],
         event: &NostrTransportEvent,
-        _required_acks: usize,
+        required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         let parsed_endpoints = parse_endpoints(endpoints, "publish")?;
+        let mut seen_endpoints = HashSet::new();
+        let parsed_endpoints = parsed_endpoints
+            .into_iter()
+            .filter(|endpoint| seen_endpoints.insert(endpoint.clone()))
+            .collect::<Vec<_>>();
         let event = self.event_for_publish(event).await?;
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
@@ -315,69 +395,63 @@ impl NostrRelayClient for NostrSdkRelayClient {
             endpoint_count = parsed_endpoints.len(),
             "publishing SDK relay event"
         );
-        for endpoint in &parsed_endpoints {
-            self.client
-                .add_relay(endpoint.clone())
-                .await
-                .map_err(|e| TransportAdapterError::Publish(format!("add relay: {e}")))?;
-            timeout(
-                SDK_RELAY_CONNECT_WAIT,
-                self.client.connect_relay(endpoint.clone()),
-            )
-            .await
-            .map_err(|_| TransportAdapterError::Publish("connect relay timed out".to_owned()))?
-            .map_err(|e| TransportAdapterError::Publish(format!("connect relay: {e}")))?;
+        let ack_goal = (required_acks > 0).then_some(required_acks);
+        let message_id = cgka_traits::MessageId::new(event.id.to_bytes().to_vec());
+        let mut accepted = Vec::new();
+        let mut failed = Vec::new();
+        let mut publishes = JoinSet::new();
+        for endpoint in parsed_endpoints {
+            publishes.spawn(Self::publish_to_relay(
+                self.client.clone(),
+                endpoint,
+                event.clone(),
+            ));
         }
-        let mut last_error: Option<TransportAdapterError> = None;
-        let mut send_output = None;
-        for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
-            match timeout(
-                SDK_RELAY_PUBLISH_WAIT,
-                self.client.send_event_to(parsed_endpoints.clone(), &event),
-            )
-            .await
-            {
-                Ok(Ok(output)) => {
-                    send_output = Some(output);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    last_error = Some(TransportAdapterError::Publish(format!("send event: {e}")));
-                }
-                Err(_) => {
-                    last_error = Some(TransportAdapterError::Publish(
-                        "send event timed out".to_owned(),
-                    ));
-                }
-            }
-            if attempt < SDK_RELAY_PUBLISH_ATTEMPTS {
-                tokio::time::sleep(SDK_RELAY_PUBLISH_RETRY_BACKOFF).await;
-            }
-        }
-        let output = send_output.ok_or_else(|| {
-            last_error
-                .unwrap_or_else(|| TransportAdapterError::Publish("send event failed".to_owned()))
-        })?;
 
-        Ok(NostrPublishOutcome {
-            message_id: Some(cgka_traits::MessageId::new(event.id.to_bytes().to_vec())),
-            accepted: output
-                .success
-                .into_iter()
-                .map(|endpoint| TransportEndpointReceipt {
-                    endpoint: TransportEndpoint(endpoint.to_string()),
-                    accepted_at: None,
-                })
-                .collect(),
-            failed: output
-                .failed
-                .into_iter()
-                .map(|(endpoint, reason)| TransportEndpointFailure {
-                    endpoint: TransportEndpoint(endpoint.to_string()),
-                    reason,
-                })
-                .collect(),
-        })
+        while let Some(result) = publishes.join_next().await {
+            match result {
+                Ok(Ok(receipt)) => {
+                    accepted.push(receipt);
+                    if ack_goal.is_some_and(|goal| accepted.len() >= goal) {
+                        publishes.abort_all();
+                        return Ok(NostrPublishOutcome {
+                            message_id: Some(message_id),
+                            accepted,
+                            failed,
+                        });
+                    }
+                }
+                Ok(Err(failure)) => failed.push(failure),
+                Err(e) => {
+                    return Err(TransportAdapterError::Publish(format!(
+                        "publish task failed: {e}"
+                    )));
+                }
+            }
+        }
+
+        if required_acks == 0 || accepted.len() >= required_acks {
+            return Ok(NostrPublishOutcome {
+                message_id: Some(message_id),
+                accepted,
+                failed,
+            });
+        }
+
+        let reason = if accepted.is_empty() && !failed.is_empty() {
+            failed
+                .iter()
+                .map(|failure| failure.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            format!(
+                "insufficient publish acknowledgements: accepted {} of required {}",
+                accepted.len(),
+                required_acks
+            )
+        };
+        Err(TransportAdapterError::Publish(reason))
     }
 }
 
@@ -453,7 +527,10 @@ mod tests {
     use crate::NostrKeyPackagePublication;
     use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use nostr_relay_builder::MockRelay;
     use nostr_sdk::prelude::Keys;
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
     #[test]
@@ -618,6 +695,66 @@ mod tests {
     }
 
     #[test]
+    fn publish_timeout_exceeds_sdk_ok_wait() {
+        assert!(SDK_RELAY_PUBLISH_WAIT > Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn publish_event_does_not_wait_for_silent_relays_once_required_acks_are_met() {
+        let relay = MockRelay::run().await.unwrap();
+        let reachable = TransportEndpoint(relay.url().await.to_string());
+        let silent = TransportEndpoint(silent_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = NostrTransportEvent {
+            id: "11".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_010,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "cc".repeat(32)]],
+            content: "outer encrypted body".into(),
+            sig: None,
+        };
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            sdk.publish_event(&[silent, reachable.clone()], &dto, 1),
+        )
+        .await
+        .expect("publish should return as soon as the required ack arrives")
+        .expect("one good relay should satisfy the publish");
+
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, reachable);
+    }
+
+    #[tokio::test]
+    async fn publish_event_counts_duplicate_endpoint_once_for_required_acks() {
+        let relay = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = NostrTransportEvent {
+            id: "11".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_010,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "cc".repeat(32)]],
+            content: "outer encrypted body".into(),
+            sig: None,
+        };
+
+        let err = sdk
+            .publish_event(&[endpoint.clone(), endpoint], &dto, 2)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("accepted 1 of required 2"));
+    }
+
+    #[test]
     fn invalid_endpoint_is_rejected_during_planning() {
         let err = NostrSdkRelayClient::plan_subscription(&NostrSubscription::Group {
             account_id: MemberId::new(vec![0xA1; 32]),
@@ -629,5 +766,20 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("invalid endpoint"));
+    }
+
+    async fn silent_relay_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if tokio_tungstenite::accept_async(stream).await.is_ok() {
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
     }
 }
