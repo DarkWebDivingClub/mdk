@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -435,11 +435,14 @@ async fn app_runtime_reuses_initial_key_package_when_republishing() {
 
     assert_eq!(republished_bytes, first.key_package.bytes().len());
     assert_eq!(second.key_package.bytes(), first.key_package.bytes());
+    assert_eq!(second.key_package_id, first.key_package_id);
+    assert_eq!(second.key_package_ref_hex, first.key_package_ref_hex);
     assert!(!first.key_package_id.is_empty());
     assert!(!second.key_package_id.is_empty());
+    assert!(!first.key_package_ref_hex.is_empty());
+    assert!(!second.key_package_ref_hex.is_empty());
     assert!(!first.key_package_event_id.is_empty());
     assert!(!second.key_package_event_id.is_empty());
-    assert_ne!(second.key_package_event_id, first.key_package_event_id);
 
     runtime.shutdown().await;
 }
@@ -544,14 +547,15 @@ async fn app_runtime_can_rotate_key_package_on_request() {
         .unwrap();
 
     assert_eq!(rotated_bytes, rotated.key_package.bytes().len());
-    assert_ne!(rotated.key_package_id, first.key_package_id);
+    assert_eq!(rotated.key_package_id, first.key_package_id);
+    assert_ne!(rotated.key_package_ref_hex, first.key_package_ref_hex);
     assert_eq!(republished.key_package.bytes(), rotated.key_package.bytes());
+    assert_eq!(republished.key_package_id, rotated.key_package_id);
+    assert_eq!(republished.key_package_ref_hex, rotated.key_package_ref_hex);
     assert!(!rotated.key_package_id.is_empty());
     assert!(!republished.key_package_id.is_empty());
-    assert_ne!(
-        republished.key_package_event_id,
-        rotated.key_package_event_id
-    );
+    assert!(!rotated.key_package_ref_hex.is_empty());
+    assert!(!republished.key_package_ref_hex.is_empty());
 
     runtime.shutdown().await;
 }
@@ -721,6 +725,121 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
 }
 
 #[tokio::test]
+async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "pending invite",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(pending.pending_confirmation);
+    assert!(!pending.archived);
+    assert!(pending.via_welcome_message_id_hex.is_some());
+
+    let accepted = runtime
+        .accept_group_invite(&bob.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert!(!accepted.pending_confirmation);
+    assert!(!accepted.archived);
+
+    let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(!reloaded.pending_confirmation);
+    assert!(!reloaded.archived);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "declined invite",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(pending.pending_confirmation);
+
+    let declined = runtime
+        .decline_group_invite(&bob.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(declined.summary.published, 1);
+    assert!(!declined.group.pending_confirmation);
+    assert!(declined.group.archived);
+
+    let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(!reloaded.pending_confirmation);
+    assert!(reloaded.archived);
+    assert!(
+        !app.visible_groups(&bob_label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -764,6 +883,115 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     .await;
 
     assert!(matches!(received, MarmotAppEvent::MessageReceived(_)));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_starts_directory_subscriptions_for_known_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    runtime.start().await.unwrap();
+
+    let health = runtime.shared_services().relay_plane().relay_health().await;
+    assert_eq!(health.directory_active_subscriptions, 1);
+    assert_eq!(health.directory_completed_subscription_syncs, 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_sync_worker_ingests_profile_metadata_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    runtime.start().await.unwrap();
+    publish_profile_at(
+        &AccountHome::open(dir.path()),
+        &setup.account.label,
+        &url,
+        "sync-alice",
+        test_unix_now_seconds(),
+    )
+    .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let name = app
+                .directory_entry_for_account_id(&setup.account.account_id_hex)
+                .unwrap()
+                .and_then(|entry| entry.profile)
+                .and_then(|profile| profile.name);
+            if name.as_deref() == Some("sync-alice") {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("directory profile ingested");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_sync_worker_admits_follow_list_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let followed = format!("{:064x}", 77);
+
+    runtime.start().await.unwrap();
+    publish_follow_list_at(
+        &AccountHome::open(dir.path()),
+        &setup.account.label,
+        &url,
+        std::slice::from_ref(&followed),
+        test_unix_now_seconds(),
+    )
+    .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if app
+                .directory_entry_for_account_id(&followed)
+                .unwrap()
+                .is_some()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("followed user admitted");
     runtime.shutdown().await;
 }
 

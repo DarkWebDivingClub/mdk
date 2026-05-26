@@ -2084,6 +2084,8 @@ fn keys_publish_reuses_create_identity_key_package() {
 
     assert_eq!(republished["key_package_bytes"], first["key_package_bytes"]);
     assert_eq!(second["key_package_bytes"], first["key_package_bytes"]);
+    assert_eq!(second["key_package_id"], first["key_package_id"]);
+    assert_eq!(second["key_package_ref"], first["key_package_ref"]);
     assert!(
         first["key_package_id"]
             .as_str()
@@ -2120,9 +2122,12 @@ fn keys_rotate_forces_a_new_key_package_then_publish_reuses_it() {
         &["keys", "fetch", account_id, "--bootstrap-relays", relay],
     );
 
-    assert_ne!(second["key_package_id"], first["key_package_id"]);
+    assert_eq!(second["key_package_id"], first["key_package_id"]);
+    assert_ne!(second["key_package_ref"], first["key_package_ref"]);
     assert_eq!(second["key_package_bytes"], rotated["key_package_bytes"]);
     assert_eq!(third["key_package_bytes"], second["key_package_bytes"]);
+    assert_eq!(third["key_package_id"], second["key_package_id"]);
+    assert_eq!(third["key_package_ref"], second["key_package_ref"]);
     assert!(
         third["key_package_id"]
             .as_str()

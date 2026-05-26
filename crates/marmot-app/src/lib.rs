@@ -90,7 +90,7 @@ use url::Url;
 
 mod agent_streams;
 mod config;
-mod directory_cache;
+mod directory;
 mod error;
 mod ids;
 mod messages;
@@ -107,7 +107,7 @@ pub use ids::{account_id_hex_from_ref, npub_for_account_id};
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
 
-use directory_cache::DirectoryCache;
+use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, DirectorySyncRunSummary};
 use ids::{
     admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id, normalize_account_ids,
     normalize_group_id_hex_app, npub_for_account_id_lossy, parse_account_id_hex,
@@ -170,6 +170,7 @@ pub struct MarmotApp {
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
     config: MarmotAppConfig,
+    directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
 }
 
 #[derive(Clone)]
@@ -177,6 +178,7 @@ pub struct MarmotAppRuntime {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     accounts: AccountManager,
+    directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
 }
 
 #[derive(Clone)]
@@ -230,6 +232,11 @@ impl ManagedAccountWorker {
         let _ = self.shutdown.send(());
         self.handle.abort();
     }
+
+    fn shutdown(self) -> JoinHandle<()> {
+        let _ = self.shutdown.send(());
+        self.handle
+    }
 }
 
 struct AccountWorkerRuntime {
@@ -282,6 +289,14 @@ enum AccountWorkerCommand {
     LeaveGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    AcceptGroupInvite {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
+    },
+    DeclineGroupInvite {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<GroupInviteDeclineResult, AppError>>,
     },
     PromoteAdmin {
         group_id: GroupId,
@@ -767,6 +782,7 @@ impl MarmotAppRuntime {
             events,
             shared,
             accounts,
+            directory_sync: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1051,7 +1067,31 @@ impl MarmotAppRuntime {
     }
 
     pub async fn start(&self) -> Result<(), AppError> {
+        self.sync_user_directory_subscriptions().await?;
         self.reconcile_accounts().await
+    }
+
+    pub(crate) async fn sync_user_directory_subscriptions(
+        &self,
+    ) -> Result<DirectorySyncRunSummary, AppError> {
+        let directory_sync = self.ensure_directory_sync_worker().await;
+        directory_sync.request_rebuild_and_wait().await
+    }
+
+    async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
+        let mut directory_sync = self.directory_sync.lock().await;
+        if let Some(handle) = directory_sync.as_ref() {
+            return handle.clone();
+        }
+        let handle = DirectorySyncHandle::spawn(
+            self.accounts.app.clone(),
+            self.shared.relay_plane().clone(),
+        );
+        self.accounts
+            .app
+            .set_directory_sync_handle(Some(handle.clone()));
+        *directory_sync = Some(handle.clone());
+        handle
     }
 
     pub async fn reconcile_accounts(&self) -> Result<(), AppError> {
@@ -1143,6 +1183,26 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.accounts.leave_group(account_ref, group_id).await
+    }
+
+    pub async fn accept_group_invite(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupRecord, AppError> {
+        self.accounts
+            .accept_group_invite(account_ref, group_id)
+            .await
+    }
+
+    pub async fn decline_group_invite(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<GroupInviteDeclineResult, AppError> {
+        self.accounts
+            .decline_group_invite(account_ref, group_id)
+            .await
     }
 
     pub async fn update_group_profile(
@@ -1512,6 +1572,10 @@ impl MarmotAppRuntime {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(directory_sync) = self.directory_sync.lock().await.take() {
+            directory_sync.shutdown().await;
+        }
+        self.accounts.app.set_directory_sync_handle(None);
         self.accounts.shutdown().await;
         self.shared.relay_plane.shutdown().await;
     }
@@ -1838,6 +1902,42 @@ impl AccountManager {
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
         Ok(summary)
+    }
+
+    pub async fn accept_group_invite(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupRecord, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcceptGroupInvite {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn decline_group_invite(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<GroupInviteDeclineResult, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeclineGroupInvite {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let result = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        Ok(result)
     }
 
     pub async fn update_message_retention(
@@ -2336,9 +2436,24 @@ impl AccountManager {
     }
 
     pub async fn shutdown(&self) {
-        let mut workers = self.workers.lock().await;
-        for (_, worker) in workers.drain() {
-            worker.stop();
+        let handles = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .drain()
+                .map(|(_, worker)| worker.shutdown())
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, handle).await {
+                Ok(Ok(())) | Ok(Err(_)) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "shutdown",
+                        "managed account worker shutdown timed out",
+                    );
+                }
+            }
         }
     }
 }
@@ -2421,10 +2536,17 @@ pub struct SendSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInviteDeclineResult {
+    pub group: AppGroupRecord,
+    pub summary: SendSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchedKeyPackage {
     pub account_id_hex: String,
     pub key_package: KeyPackage,
     pub key_package_id: String,
+    pub key_package_ref_hex: String,
     pub key_package_event_id: String,
     pub created_at: u64,
     pub source_relays: Vec<String>,
@@ -2517,6 +2639,8 @@ impl UserDirectorySearch {
 pub struct DirectoryKeyPackage {
     pub key_package_id: String,
     #[serde(default)]
+    pub key_package_ref_hex: String,
+    #[serde(default)]
     pub key_package_event_id: String,
     pub key_package_hex: String,
     pub created_at: u64,
@@ -2537,6 +2661,12 @@ pub struct AppGroupRecord {
     pub agent_text_stream: AppAgentTextStreamComponent,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub pending_confirmation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcomer_account_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_welcome_message_id_hex: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2647,6 +2777,9 @@ impl AppGroupRecord {
             message_retention,
             agent_text_stream: AppAgentTextStreamComponent::disabled(),
             archived: false,
+            pending_confirmation: false,
+            welcomer_account_id_hex: None,
+            via_welcome_message_id_hex: None,
         }
     }
 
@@ -2690,6 +2823,28 @@ impl AppGroupRecord {
         if let Some(group) = group {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
+        }
+    }
+
+    fn apply_confirmation_state(&mut self, state: GroupConfirmationProjection) {
+        match state {
+            GroupConfirmationProjection::Preserve => {}
+            GroupConfirmationProjection::Accepted => {
+                self.pending_confirmation = false;
+                self.archived = false;
+            }
+            GroupConfirmationProjection::Pending {
+                via_welcome_message_id_hex,
+                welcomer_account_id_hex,
+            } => {
+                if !self.pending_confirmation && self.via_welcome_message_id_hex.is_some() {
+                    return;
+                }
+                self.pending_confirmation = true;
+                self.archived = false;
+                self.via_welcome_message_id_hex = Some(via_welcome_message_id_hex);
+                self.welcomer_account_id_hex = welcomer_account_id_hex;
+            }
         }
     }
 }
@@ -2946,7 +3101,11 @@ struct KeyPackageRecord {
     #[serde(default)]
     key_package_id: String,
     #[serde(default)]
+    key_package_ref_hex: String,
+    #[serde(default)]
     key_package_event_id: String,
+    #[serde(default)]
+    published_at: u64,
     key_package_hex: String,
 }
 
@@ -3001,6 +3160,7 @@ impl MarmotApp {
             relay_urls,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             config,
+            directory_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -3029,6 +3189,7 @@ impl MarmotApp {
             account_home,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             config,
+            directory_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -3851,10 +4012,7 @@ impl MarmotApp {
     }
 
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
-        let path = self
-            .key_package_cache_dir()
-            .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.json"));
+        let path = self.key_package_record_path(label);
         if !path.exists() {
             return Err(AppError::MissingKeyPackage(label.to_owned()));
         }
@@ -3863,6 +4021,22 @@ impl MarmotApp {
             &record.key_package_hex,
             &record.key_package_event_id,
         )
+    }
+
+    fn key_package_record_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.json"))
+    }
+
+    fn reusable_key_package_slot_id(&self, label: &str, account_id_hex: &str) -> Option<String> {
+        let record: KeyPackageRecord = read_json(self.key_package_record_path(label)).ok()?;
+        if record.account_id_hex != account_id_hex || record.key_package_id.is_empty() {
+            return None;
+        }
+        let bytes = hex::decode(&record.key_package_hex).ok()?;
+        let metadata = key_package_metadata(&KeyPackage::new(bytes)).ok()?;
+        (metadata.credential_identity_hex == account_id_hex).then_some(record.key_package_id)
     }
 
     async fn publish_cached_key_package(
@@ -3971,6 +4145,26 @@ impl MarmotApp {
         Ok(entries_by_id.into_values().collect())
     }
 
+    fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, AppError> {
+        let mut account_ids = self
+            .directory_entries()?
+            .into_iter()
+            .map(|entry| entry.account_id_hex)
+            .collect::<Vec<_>>();
+        account_ids.extend(
+            self.account_home()
+                .accounts()?
+                .into_iter()
+                .filter(|account| account.local_signing)
+                .map(|account| account.account_id_hex),
+        );
+        Ok(DirectorySyncPlan::from_known_users(
+            self.relay_endpoints(),
+            account_ids,
+            None,
+        ))
+    }
+
     fn directory_search_records(
         &self,
         searcher_account_id_hex: &str,
@@ -3994,7 +4188,8 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) = Self::directory_entry_from_caches(&caches, &account_id)? else {
+                let Some(record) = Self::directory_search_record_from_caches(&caches, &account_id)?
+                else {
                     continue;
                 };
                 if radius < radius_end {
@@ -4022,6 +4217,18 @@ impl MarmotApp {
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         for cache in caches {
             if let Some(entry) = cache.entry(account_id_hex)? {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    fn directory_search_record_from_caches(
+        caches: &[DirectoryCache],
+        account_id_hex: &str,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        for cache in caches {
+            if let Some(entry) = cache.search_record(account_id_hex)? {
                 return Ok(Some(entry));
             }
         }
@@ -4251,6 +4458,7 @@ impl MarmotApp {
         entry.relay_lists = fetched.relay_lists.clone();
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
+            key_package_ref_hex: fetched.key_package_ref_hex.clone(),
             key_package_event_id: fetched.key_package_event_id.clone(),
             key_package_hex: hex::encode(fetched.key_package.bytes()),
             created_at: fetched.created_at,
@@ -4260,11 +4468,23 @@ impl MarmotApp {
     }
 
     fn remember_directory_user(&self, account_id_hex: &str) -> Result<(), AppError> {
+        self.remember_directory_user_with_reason(account_id_hex, "directory")
+    }
+
+    fn remember_directory_user_with_reason(
+        &self,
+        account_id_hex: &str,
+        reason: &str,
+    ) -> Result<(), AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let entry = self
             .directory_entry_for_account_id(&account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(&account_id_hex));
-        self.save_directory_entry(&entry)
+        self.save_directory_entry_with_reason(&entry, reason)
+    }
+
+    fn remember_directory_message_sender(&self, message: &ReceivedMessage) -> Result<(), AppError> {
+        self.remember_directory_user_with_reason(&message.sender, "message")
     }
 
     fn remember_directory_follow_list(
@@ -4296,12 +4516,113 @@ impl MarmotApp {
         self.save_directory_entry(&entry)
     }
 
-    fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
-        let entry = self.hydrate_directory_record(entry.clone())?;
-        for cache in self.directory_caches()? {
-            cache.put(&entry)?;
+    fn remember_directory_profile_if_newer(
+        &self,
+        account_id_hex: &str,
+        profile: &UserProfileMetadata,
+    ) -> Result<(), AppError> {
+        if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
+            && entry
+                .profile
+                .as_ref()
+                .is_some_and(|cached| cached.created_at > profile.created_at)
+        {
+            return Ok(());
+        }
+        self.remember_directory_profile(account_id_hex, profile)
+    }
+
+    fn remember_directory_relay_list_event(
+        &self,
+        account_id_hex: &str,
+        record: &RelayEventRecord,
+    ) -> Result<(), AppError> {
+        let relays = relays_from_relay_list_event(&record.event);
+        if relays.is_empty() {
+            return Ok(());
+        }
+        let mut entry = self
+            .directory_entry_for_account_id(account_id_hex)?
+            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
+        match record.event.kind {
+            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.relays = relays,
+            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.relays = relays,
+            KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => entry.relay_lists.key_package.relays = relays,
+            _ => return Ok(()),
+        }
+        push_unique_strings(
+            &mut entry.relay_lists.bootstrap_relays,
+            source_relays_from_record(record),
+        );
+        entry.relay_lists.refresh();
+        self.save_directory_entry(&entry)
+    }
+
+    fn ingest_directory_relay_event(&self, record: RelayEventRecord) -> Result<(), AppError> {
+        if !self.directory_freshness().accepts(&record) {
+            return Ok(());
+        }
+        let account_id_hex = parse_account_id_hex(&record.event.pubkey)?;
+        match record.event.kind {
+            KIND_NOSTR_METADATA => {
+                if let Some((profile_account_id, profile)) = profile_from_record(record) {
+                    self.remember_directory_profile_if_newer(&profile_account_id, &profile)?;
+                }
+            }
+            KIND_NOSTR_CONTACT_LIST => {
+                let follow_list = follow_list_from_record(record);
+                self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+            }
+            KIND_NIP65_RELAY_LIST
+            | KIND_MARMOT_INBOX_RELAY_LIST
+            | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => {
+                self.remember_directory_relay_list_event(&account_id_hex, &record)?;
+            }
+            KIND_MARMOT_KEY_PACKAGE => {
+                let mut fetched = key_package_from_record(record)?;
+                fetched.relay_lists = self
+                    .account_relay_list_status_for_account_id(&account_id_hex)
+                    .unwrap_or_else(|_| AccountRelayListStatus::empty());
+                self.remember_directory_key_package(&fetched)?;
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
+        self.save_directory_entry_with_reason(entry, "directory")
+    }
+
+    fn save_directory_entry_with_reason(
+        &self,
+        entry: &UserDirectoryRecord,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let entry = self.hydrate_directory_record(entry.clone())?;
+        for cache in self.directory_caches()? {
+            cache.put_with_reason(&entry, reason)?;
+        }
+        self.request_directory_sync_rebuild();
+        Ok(())
+    }
+
+    fn set_directory_sync_handle(&self, handle: Option<DirectorySyncHandle>) {
+        *self
+            .directory_sync
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handle;
+    }
+
+    fn request_directory_sync_rebuild(&self) {
+        let handle = self
+            .directory_sync
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handle) = handle {
+            handle.request_rebuild();
+        }
     }
 
     fn directory_cache_path(&self, label: &str) -> PathBuf {
@@ -4635,6 +4956,30 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::LeaveGroup { group_id, respond }) => {
                         let result = client.leave_group(&group_id).await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::AcceptGroupInvite { group_id, respond }) => {
+                        let result = client.accept_group_invite(&group_id);
+                        if result.is_ok() {
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::DeclineGroupInvite { group_id, respond }) => {
+                        let result = client.decline_group_invite(&group_id).await;
+                        if result.is_ok() {
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::PromoteAdmin {
@@ -5381,6 +5726,19 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    pub fn accept_group_invite(&mut self, group_id: &GroupId) -> Result<AppGroupRecord, AppError> {
+        self.set_group_invite_confirmation(group_id, false, false)
+    }
+
+    pub async fn decline_group_invite(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<GroupInviteDeclineResult, AppError> {
+        let summary = self.leave_group(group_id).await?;
+        let group = self.set_group_invite_confirmation(group_id, false, true)?;
+        Ok(GroupInviteDeclineResult { group, summary })
+    }
+
     pub async fn promote_admin(
         &mut self,
         group_id: &GroupId,
@@ -5760,18 +6118,19 @@ impl AppClient {
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect::<Vec<_>>();
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let admin_policy = self.admin_policy_for_group(group_id);
-        let message_retention = self.message_retention_for_group(group_id);
-        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
+        let projection = EventGroupProjection {
+            nostr_routing,
+            group_metadata: group_metadata.as_ref(),
+            admin_policy: self.admin_policy_for_group(group_id),
+            message_retention: self.message_retention_for_group(group_id),
+            agent_text_stream: self.agent_text_stream_for_group(group_id),
+        };
         add_group(
             &mut self.state,
             group_id,
-            nostr_routing,
-            group_metadata.as_ref(),
-            admin_policy,
-            message_retention,
-            agent_text_stream,
+            &projection,
+            GroupConfirmationProjection::Preserve,
         );
         self.app.save_state(&self.state)?;
         Ok(SendSummary {
@@ -5920,6 +6279,7 @@ impl AppClient {
                 group_projection.as_ref(),
                 &source_message_id_hex,
             ) {
+                self.app.remember_directory_message_sender(&message)?;
                 self.app
                     .account_projection(&self.state.label)?
                     .record_message(&AppMessageProjection {
@@ -5956,42 +6316,64 @@ impl AppClient {
         }
     }
 
+    fn set_group_invite_confirmation(
+        &mut self,
+        group_id: &GroupId,
+        pending_confirmation: bool,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        group.pending_confirmation = pending_confirmation;
+        group.archived = archived;
+        let group = group.clone();
+        self.app.save_state(&self.state)?;
+        Ok(group)
+    }
+
     fn refresh_group(&mut self, group_id: &GroupId) {
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let admin_policy = self.admin_policy_for_group(group_id);
-        let message_retention = self.message_retention_for_group(group_id);
-        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
             return;
+        };
+        let projection = EventGroupProjection {
+            nostr_routing,
+            group_metadata: group_metadata.as_ref(),
+            admin_policy: self.admin_policy_for_group(group_id),
+            message_retention: self.message_retention_for_group(group_id),
+            agent_text_stream: self.agent_text_stream_for_group(group_id),
         };
         add_group(
             &mut self.state,
             group_id,
-            nostr_routing,
-            group_metadata.as_ref(),
-            admin_policy,
-            message_retention,
-            agent_text_stream,
+            &projection,
+            GroupConfirmationProjection::Preserve,
         );
     }
 
     fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let admin_policy = self.admin_policy_for_group(group_id);
-        let message_retention = self.message_retention_for_group(group_id);
-        let agent_text_stream = self.agent_text_stream_for_group(group_id);
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
+        let subscription = nostr_routing.subscription(group_id)?;
+        let projection = EventGroupProjection {
+            nostr_routing,
+            group_metadata: group_metadata.as_ref(),
+            admin_policy: self.admin_policy_for_group(group_id),
+            message_retention: self.message_retention_for_group(group_id),
+            agent_text_stream: self.agent_text_stream_for_group(group_id),
+        };
         add_group(
             &mut self.state,
             group_id,
-            nostr_routing.clone(),
-            group_metadata.as_ref(),
-            admin_policy,
-            message_retention,
-            agent_text_stream,
+            &projection,
+            GroupConfirmationProjection::Accepted,
         );
-        self.routing
-            .add_group(nostr_routing.subscription(group_id)?);
+        self.routing.add_group(subscription);
         Ok(())
     }
 
@@ -6282,14 +6664,21 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
     ) -> Result<(), KeyPackagePublishError> {
         let metadata = key_package_metadata(&publication.key_package)
             .map_err(|e| KeyPackagePublishError(e.to_string()))?;
-        if metadata.credential_identity_hex != hex::encode(publication.account_id.as_slice()) {
+        let account_id_hex = hex::encode(publication.account_id.as_slice());
+        if metadata.credential_identity_hex != account_id_hex {
             return Err(KeyPackagePublishError(
                 "KeyPackage credential identity does not match publication account".into(),
             ));
         }
-        let mut slot_id = [0_u8; 32];
-        OsRng.fill_bytes(&mut slot_id);
-        let key_package_id = hex::encode(slot_id);
+        let key_package_id = self
+            .app
+            .reusable_key_package_slot_id(&self.account_label, &account_id_hex)
+            .unwrap_or_else(|| {
+                let mut slot_id = [0_u8; 32];
+                OsRng.fill_bytes(&mut slot_id);
+                hex::encode(slot_id)
+            });
+        let key_package_ref_hex = metadata.key_package_ref_hex;
         let relay_client = self
             .app
             .relay_client_for_endpoints(&self.keys, &publication.endpoints);
@@ -6297,7 +6686,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
             key_package_slot_id: key_package_id.clone(),
-            key_package_ref: metadata.key_package_ref_hex,
+            key_package_ref: key_package_ref_hex.clone(),
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec![
                 "0x0006".into(),
@@ -6323,9 +6712,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             dir.join(format!("{}.json", self.account_label)),
             &KeyPackageRecord {
                 account_label: self.account_label.clone(),
-                account_id_hex: hex::encode(publication.account_id.as_slice()),
+                account_id_hex,
                 key_package_id,
+                key_package_ref_hex,
                 key_package_event_id,
+                published_at: unix_now_seconds(),
                 key_package_hex: hex::encode(publication.key_package.bytes()),
             },
         )
@@ -6452,11 +6843,13 @@ fn cached_key_package_from_entry(
     let Some(key_package) = entry.key_package else {
         return Ok(None);
     };
-    let decoded = validated_cached_key_package(&entry.account_id_hex, &key_package)?;
+    let (decoded, key_package_ref_hex) =
+        validated_cached_key_package_with_ref(&entry.account_id_hex, &key_package)?;
     Ok(Some(FetchedKeyPackage {
         account_id_hex: entry.account_id_hex,
         key_package: decoded,
         key_package_id: key_package.key_package_id,
+        key_package_ref_hex,
         key_package_event_id: key_package.key_package_event_id,
         created_at: key_package.created_at,
         source_relays: key_package.source_relays,
@@ -6468,6 +6861,14 @@ fn validated_cached_key_package(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
 ) -> Result<KeyPackage, AppError> {
+    validated_cached_key_package_with_ref(account_id_hex, key_package)
+        .map(|(key_package, _)| key_package)
+}
+
+fn validated_cached_key_package_with_ref(
+    account_id_hex: &str,
+    key_package: &DirectoryKeyPackage,
+) -> Result<(KeyPackage, String), AppError> {
     let decoded = key_package_from_hex_with_optional_source(
         &key_package.key_package_hex,
         &key_package.key_package_event_id,
@@ -6479,7 +6880,14 @@ fn validated_cached_key_package(
             "cached KeyPackage credential identity does not match directory account".into(),
         ));
     }
-    Ok(decoded)
+    if !key_package.key_package_ref_hex.is_empty()
+        && key_package.key_package_ref_hex != metadata.key_package_ref_hex
+    {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
+        ));
+    }
+    Ok((decoded, metadata.key_package_ref_hex))
 }
 
 fn key_package_from_hex_with_optional_source(
@@ -6610,6 +7018,7 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
         account_id_hex: event.pubkey,
         key_package,
         key_package_id,
+        key_package_ref_hex: metadata.key_package_ref_hex,
         key_package_event_id: event.id,
         created_at: event.created_at,
         source_relays,
@@ -7119,6 +7528,16 @@ struct EventGroupProjection<'a> {
     agent_text_stream: AppAgentTextStreamComponent,
 }
 
+#[derive(Clone, Debug)]
+enum GroupConfirmationProjection {
+    Preserve,
+    Accepted,
+    Pending {
+        via_welcome_message_id_hex: String,
+        welcomer_account_id_hex: Option<String>,
+    },
+}
+
 /// Strictly decode the inner Marmot app event from MLS plaintext and bind it to
 /// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
 /// canonical id does not match or the inner `pubkey` is not the authenticated
@@ -7221,11 +7640,17 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.nostr_routing.clone(),
-                    projection.group_metadata,
-                    projection.admin_policy.clone(),
-                    projection.message_retention.clone(),
-                    projection.agent_text_stream.clone(),
+                    projection,
+                    match event {
+                        GroupEvent::GroupCreated { .. } => GroupConfirmationProjection::Accepted,
+                        GroupEvent::GroupJoined { via_welcome, .. } => {
+                            GroupConfirmationProjection::Pending {
+                                via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
+                                welcomer_account_id_hex: None,
+                            }
+                        }
+                        _ => GroupConfirmationProjection::Preserve,
+                    },
                 );
             }
             summary.joined_groups.push(group_id.clone());
@@ -7241,11 +7666,8 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.nostr_routing.clone(),
-                    projection.group_metadata,
-                    projection.admin_policy.clone(),
-                    projection.message_retention.clone(),
-                    projection.agent_text_stream.clone(),
+                    projection,
+                    GroupConfirmationProjection::Preserve,
                 );
             }
             let sender_hex = hex::encode(sender.as_slice());
@@ -7273,11 +7695,8 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.nostr_routing.clone(),
-                    projection.group_metadata,
-                    projection.admin_policy.clone(),
-                    projection.message_retention.clone(),
-                    projection.agent_text_stream.clone(),
+                    projection,
+                    GroupConfirmationProjection::Preserve,
                 );
             }
             summary.events.push(event.clone());
@@ -7303,11 +7722,8 @@ fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
 fn add_group(
     state: &mut AccountState,
     group_id: &GroupId,
-    nostr_routing: AppGroupNostrRoutingComponent,
-    group_metadata: Option<&Group>,
-    admin_policy: AppGroupAdminPolicyComponent,
-    message_retention: AppGroupMessageRetentionComponent,
-    agent_text_stream: AppAgentTextStreamComponent,
+    projection: &EventGroupProjection<'_>,
+    confirmation: GroupConfirmationProjection,
 ) {
     let group_id_hex = hex::encode(group_id.as_slice());
     if let Some(existing) = state
@@ -7316,22 +7732,25 @@ fn add_group(
         .find(|group| group.group_id_hex == group_id_hex)
     {
         existing.refresh_from_group(
-            nostr_routing,
-            group_metadata,
-            admin_policy,
-            message_retention,
-            agent_text_stream,
+            projection.nostr_routing.clone(),
+            projection.group_metadata,
+            projection.admin_policy.clone(),
+            projection.message_retention.clone(),
+            projection.agent_text_stream.clone(),
         );
+        existing.apply_confirmation_state(confirmation);
         return;
     }
-    state.groups.push(AppGroupRecord::from_group(
+    let mut group = AppGroupRecord::from_group(
         group_id,
-        nostr_routing,
-        group_metadata,
-        admin_policy,
-        message_retention,
-        agent_text_stream,
-    ));
+        projection.nostr_routing.clone(),
+        projection.group_metadata,
+        projection.admin_policy.clone(),
+        projection.message_retention.clone(),
+        projection.agent_text_stream.clone(),
+    );
+    group.apply_confirmation_state(confirmation);
+    state.groups.push(group);
 }
 
 fn fail_if_publish_failed(failures: &[marmot_account::PublishFailure]) -> Result<(), AppError> {
@@ -7852,6 +8271,129 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), USER_DIRECTORY_SEARCH_MAX_FRONTIER);
+    }
+
+    #[test]
+    fn directory_search_uses_graph_cache_without_promoting_known_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let graph_user = format!("{:064x}", 42);
+
+        cache
+            .put(&UserDirectoryRecord {
+                account_id_hex: account.account_id_hex.clone(),
+                npub: npub_for_account_id_lossy(&account.account_id_hex),
+                local_account: None,
+                profile: None,
+                follows: vec![graph_user.clone()],
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap();
+        cache
+            .put_search_graph_record(
+                &directory::DirectorySearchGraphRecord {
+                    account_id_hex: graph_user.clone(),
+                    npub: npub_for_account_id_lossy(&graph_user),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("graph-needle".into()),
+                        display_name: None,
+                        about: None,
+                        picture: None,
+                        nip05: None,
+                        lud16: None,
+                        created_at: 1_700_000_001,
+                        source_relays: Vec::new(),
+                    }),
+                    follows: Some(Vec::new()),
+                    metadata_updated_at: Some(1_700_000_001),
+                    metadata_expires_at: None,
+                },
+                1_700_000_002,
+            )
+            .unwrap();
+
+        let results = app
+            .search_user_directory(UserDirectorySearch {
+                searcher_account_id_hex: account.account_id_hex.clone(),
+                query: "graph-needle".into(),
+                radius_start: 1,
+                radius_end: 1,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].account_id_hex, graph_user);
+        assert!(
+            app.directory_entry_for_account_id(&graph_user)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn received_message_sender_is_admitted_to_directory_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let sender = format!("{:064x}", 42);
+
+        assert!(
+            app.directory_entry_for_account_id(&sender)
+                .unwrap()
+                .is_none()
+        );
+        app.remember_directory_message_sender(&ReceivedMessage {
+            message_id_hex: "message-id".to_owned(),
+            sender: sender.clone(),
+            sender_display_name: None,
+            group_id: GroupId::new(vec![0x01]),
+            plaintext: "hello".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+        })
+        .unwrap();
+
+        let entry = app
+            .directory_entry_for_account_id(&sender)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.account_id_hex, sender);
+        assert!(entry.profile.is_none());
+        assert!(entry.follows.is_empty());
+    }
+
+    #[test]
+    fn directory_sync_plan_watches_local_accounts_and_known_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let contact = format!("{:064x}", 42);
+
+        app.remember_directory_user_with_reason(&contact, "message")
+            .unwrap();
+
+        let plan = app.directory_sync_plan().unwrap();
+        let watched = plan
+            .batches
+            .iter()
+            .flat_map(|batch| batch.authors.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            plan.endpoints,
+            vec![TransportEndpoint("wss://relay.example".to_owned())]
+        );
+        assert_eq!(plan.watched_user_count, 2);
+        assert!(watched.contains(&account.account_id_hex));
+        assert!(watched.contains(&contact));
     }
 
     #[test]

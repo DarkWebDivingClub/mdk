@@ -4801,6 +4801,7 @@ fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
     json!({
         "account_id": fetched.account_id_hex,
         "key_package_id": fetched.key_package_id,
+        "key_package_ref": fetched.key_package_ref_hex,
         "key_package_bytes": fetched.key_package.bytes().len(),
         "created_at": fetched.created_at,
         "source_relays": fetched.source_relays,

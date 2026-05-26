@@ -30,10 +30,10 @@ mod subscriptions;
 
 use conversions::{
     AccountSummaryFfi, AgentStreamStartFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppMessageRecordFfi, GroupDetailsFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi, SendSummaryFfi,
-    UserProfileMetadataFfi, group_details_ffi, group_id_from_hex, group_management_state_ffi,
-    media_records_ffi, normalize_member_ref_ffi,
+    AppGroupRecordFfi, AppMessageRecordFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi,
+    SendSummaryFfi, UserProfileMetadataFfi, group_details_ffi, group_id_from_hex,
+    group_management_state_ffi, media_records_ffi, normalize_member_ref_ffi,
 };
 pub use errors::MarmotKitError;
 use subscriptions::{
@@ -577,6 +577,32 @@ impl Marmot {
         }
         let summary = self.runtime.leave_group(&account_ref, &group_id).await?;
         Ok(summary.into())
+    }
+
+    pub async fn accept_group_invite(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<AppGroupRecordFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group = self
+            .runtime
+            .accept_group_invite(&account_ref, &group_id)
+            .await?;
+        Ok(group.into())
+    }
+
+    pub async fn decline_group_invite(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupInviteDeclineResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let result = self
+            .runtime
+            .decline_group_invite(&account_ref, &group_id)
+            .await?;
+        Ok(result.into())
     }
 
     pub async fn update_group_profile(

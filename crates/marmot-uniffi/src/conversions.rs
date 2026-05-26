@@ -12,10 +12,11 @@ use cgka_traits::GroupId;
 use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent,
-    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, ReceivedMessage,
-    RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
-    SendSummary, UserProfileMetadata, account_id_hex_from_ref, npub_for_account_id,
+    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, GroupInviteDeclineResult,
+    MarmotAppEvent, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
+    ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived,
+    RuntimeMessageUpdate, SendSummary, UserProfileMetadata, account_id_hex_from_ref,
+    npub_for_account_id,
 };
 
 use crate::errors::MarmotKitError;
@@ -307,6 +308,9 @@ pub struct AppGroupRecordFfi {
     pub relays: Vec<String>,
     pub nostr_group_id_hex: String,
     pub archived: bool,
+    pub pending_confirmation: bool,
+    pub welcomer_account_id_hex: Option<String>,
+    pub via_welcome_message_id_hex: Option<String>,
 }
 
 impl From<AppGroupRecord> for AppGroupRecordFfi {
@@ -329,6 +333,9 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             relays,
             nostr_group_id_hex,
             archived: value.archived,
+            pending_confirmation: value.pending_confirmation,
+            welcomer_account_id_hex: value.welcomer_account_id_hex,
+            via_welcome_message_id_hex: value.via_welcome_message_id_hex,
         }
     }
 }
@@ -400,6 +407,21 @@ pub struct GroupMutationResultFfi {
     pub summary: SendSummaryFfi,
     pub details: GroupDetailsFfi,
     pub management_state: GroupManagementStateFfi,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupInviteDeclineResultFfi {
+    pub group: AppGroupRecordFfi,
+    pub summary: SendSummaryFfi,
+}
+
+impl From<GroupInviteDeclineResult> for GroupInviteDeclineResultFfi {
+    fn from(value: GroupInviteDeclineResult) -> Self {
+        Self {
+            group: value.group.into(),
+            summary: value.summary.into(),
+        }
+    }
 }
 
 pub(crate) fn normalize_member_ref_ffi(member_ref: &str) -> Result<MemberRefFfi, MarmotKitError> {
@@ -814,6 +836,9 @@ mod tests {
             relays: vec![],
             nostr_group_id_hex: "02".repeat(32),
             archived: false,
+            pending_confirmation: false,
+            welcomer_account_id_hex: None,
+            via_welcome_message_id_hex: None,
         }
     }
 

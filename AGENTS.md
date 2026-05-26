@@ -11,7 +11,7 @@ This repo owns the candidate CGKA engine workspace:
 - production-shaped account-device session wrapper,
 - account orchestration,
 - first app runtime bridge,
-- in-memory and SQLCipher-backed storage backends,
+- SQLCipher-backed storage backend,
 - Nostr transport adapter and peeler,
 - raw QUIC agent text stream preview transport and memory-only broker,
 - first app CLI surface, daemon, and TUI,

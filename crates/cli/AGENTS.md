@@ -42,9 +42,9 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - `messages`: send text messages, list/search projected messages with Whitenoise-shaped cursor flags, and subscribe to
   runtime-owned typed message updates through the daemon.
 - `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
-- Reaction, delete, and retry message commands have implemented CLI behavior; keep their JSON shapes aligned with the
-  `Unreleased` changelog entries when changing them.
-- `media`, `notifications`, and user-driven invite/admin commands: keep the Whitenoise-shaped command names but return
+- Reaction, delete, retry, encrypted media, and admin/member management commands have implemented CLI behavior; keep
+  their JSON shapes aligned with the `Unreleased` changelog entries when changing them.
+- `notifications` and user-driven invite accept/decline commands: keep the Whitenoise-shaped command names but return
   `unsupported_command` until real behavior exists.
 - `stream`: anchor, watch, send, finish, and verify provisional QUIC agent text stream previews.
 - `sync`: diagnostic catch-up for processing relay events for the selected local signing account.

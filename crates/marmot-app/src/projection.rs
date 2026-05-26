@@ -23,6 +23,9 @@ struct RawGroupRow {
     image: AppGroupImageInput,
     admin_keys_hex: String,
     archived: bool,
+    pending_confirmation: bool,
+    welcomer_account_id_hex: Option<String>,
+    via_welcome_message_id_hex: Option<String>,
     nostr_routing_data_hex: String,
     agent_text_stream_data_hex: String,
 }
@@ -57,6 +60,9 @@ impl AccountProjectionDb {
                 image_media_type TEXT,
                 admin_keys_hex TEXT NOT NULL DEFAULT '',
                 archived INTEGER NOT NULL DEFAULT 0,
+                pending_confirmation INTEGER NOT NULL DEFAULT 0,
+                welcomer_account_id_hex TEXT,
+                via_welcome_message_id_hex TEXT,
                 updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS group_app_components (
@@ -117,6 +123,14 @@ impl AccountProjectionDb {
             "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(&conn, "groups", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(
+            &conn,
+            "groups",
+            "pending_confirmation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "groups", "welcomer_account_id_hex", "TEXT")?;
+        ensure_column(&conn, "groups", "via_welcome_message_id_hex", "TEXT")?;
         ensure_column(&conn, "messages", "message_id_hex", "TEXT")?;
         ensure_column(
             &conn,
@@ -177,6 +191,7 @@ impl AccountProjectionDb {
             "SELECT group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
                     image_upload_key_hex, image_media_type, admin_keys_hex, archived,
+                    pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
                     COALESCE((
                         SELECT component_data_hex FROM group_app_components c
                         WHERE c.group_id_hex = groups.group_id_hex
@@ -209,8 +224,11 @@ impl AccountProjectionDb {
                     },
                     admin_keys_hex: row.get(9)?,
                     archived: row.get::<_, i64>(10)? != 0,
-                    nostr_routing_data_hex: row.get(11)?,
-                    agent_text_stream_data_hex: row.get(12)?,
+                    pending_confirmation: row.get::<_, i64>(11)? != 0,
+                    welcomer_account_id_hex: row.get(12)?,
+                    via_welcome_message_id_hex: row.get(13)?,
+                    nostr_routing_data_hex: row.get(14)?,
+                    agent_text_stream_data_hex: row.get(15)?,
                 })
             },
         )?;
@@ -233,6 +251,9 @@ impl AccountProjectionDb {
                     AppAgentTextStreamComponent::from_bytes(&agent_text_stream_bytes);
             }
             group.archived = row.archived;
+            group.pending_confirmation = row.pending_confirmation;
+            group.welcomer_account_id_hex = row.welcomer_account_id_hex;
+            group.via_welcome_message_id_hex = row.via_welcome_message_id_hex;
             groups.push(group);
         }
 
@@ -289,9 +310,11 @@ impl AccountProjectionDb {
                 "INSERT INTO groups (
                     group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type, admin_keys_hex, archived, updated_at
+                    image_upload_key_hex, image_media_type, admin_keys_hex, archived,
+                    pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
+                    updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     endpoint = excluded.endpoint,
                     profile_name = excluded.profile_name,
@@ -303,6 +326,9 @@ impl AccountProjectionDb {
                     image_media_type = excluded.image_media_type,
                     admin_keys_hex = excluded.admin_keys_hex,
                     archived = excluded.archived,
+                    pending_confirmation = excluded.pending_confirmation,
+                    welcomer_account_id_hex = excluded.welcomer_account_id_hex,
+                    via_welcome_message_id_hex = excluded.via_welcome_message_id_hex,
                     updated_at = excluded.updated_at
                  WHERE groups.endpoint IS NOT excluded.endpoint
                     OR groups.profile_name IS NOT excluded.profile_name
@@ -313,7 +339,10 @@ impl AccountProjectionDb {
                     OR groups.image_upload_key_hex IS NOT excluded.image_upload_key_hex
                     OR groups.image_media_type IS NOT excluded.image_media_type
                     OR groups.admin_keys_hex IS NOT excluded.admin_keys_hex
-                    OR groups.archived IS NOT excluded.archived",
+                    OR groups.archived IS NOT excluded.archived
+                    OR groups.pending_confirmation IS NOT excluded.pending_confirmation
+                    OR groups.welcomer_account_id_hex IS NOT excluded.welcomer_account_id_hex
+                    OR groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex",
                 params![
                     &group.group_id_hex,
                     &group.endpoint,
@@ -326,6 +355,13 @@ impl AccountProjectionDb {
                     &group.image.media_type,
                     admin_keys_hex,
                     if group.archived { 1_i64 } else { 0_i64 },
+                    if group.pending_confirmation {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    &group.welcomer_account_id_hex,
+                    &group.via_welcome_message_id_hex,
                     now
                 ],
             )?;
