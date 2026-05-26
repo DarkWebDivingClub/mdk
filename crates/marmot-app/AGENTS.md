@@ -8,6 +8,12 @@ App runtime bridge for the first real Marmot app surfaces.
   adapter support together.
 - Keep runtime orchestration, managed account workers, subscriptions, and live agent stream watches in `src/runtime.rs`
   instead of regrowing `src/lib.rs`.
+- Keep app-client commands and query methods in `src/client.rs`; the crate root should construct clients but not absorb
+  their behavior again.
+- Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
+- Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in `src/media.rs`.
+- Keep the crate root focused on app construction, shared state, storage/projector wiring, directory bootstrap, account
+  relay-list helpers, and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.

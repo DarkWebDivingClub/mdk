@@ -45,6 +45,9 @@ the pending flag, and archives the local projection so normal chat lists hide it
 `MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live account workers, runtime event hubs, and
 the shared agent stream watch manager. The relay plane now also owns shared directory discovery fetches for relay lists,
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. Explicit catch-up remains
-available for repair and tests, but the daemon path is runtime-owned subscriptions plus typed events. Runtime
-orchestration lives in `src/runtime.rs`; the crate root keeps app DTOs, storage/projector wiring, and app-client
-behavior.
+available for repair and tests, but the daemon path is runtime-owned subscriptions plus typed events.
+
+The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
+list helpers, and public re-exports. Runtime orchestration lives in `src/runtime.rs`, app-client commands and queries
+live in `src/client.rs`, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media DTOs plus
+Blossom upload/download helpers live in `src/media.rs`.
