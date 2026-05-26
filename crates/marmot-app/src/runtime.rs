@@ -38,9 +38,9 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
     BackgroundNotificationCollection, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp,
     MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationUpdate, NotificationWakeSource, PushRegistration,
-    ReceivedMessage, SendSummary, SyncSummary, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, SendSummary, SyncSummary,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -1055,6 +1055,73 @@ impl MarmotAppRuntime {
         self.accounts
             .remove_push_registration(account_ref, registration)
             .await
+    }
+
+    pub fn notification_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        self.accounts.app.notification_settings(account_ref)
+    }
+
+    pub fn set_local_notifications_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        self.accounts
+            .app
+            .set_local_notifications_enabled(account_ref, enabled)
+    }
+
+    pub async fn set_native_push_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        if !enabled && let Some(registration) = self.accounts.app.push_registration(account_ref)? {
+            let _ = self
+                .remove_push_registration(account_ref, registration)
+                .await;
+        }
+        self.accounts
+            .app
+            .set_native_push_enabled(account_ref, enabled)
+    }
+
+    pub fn push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<PushRegistration>, AppError> {
+        self.accounts.app.push_registration(account_ref)
+    }
+
+    pub async fn upsert_push_registration(
+        &self,
+        account_ref: &str,
+        platform: PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistration, AppError> {
+        let registration = self.accounts.app.upsert_push_registration(
+            account_ref,
+            platform,
+            raw_token,
+            server_pubkey_hex,
+            relay_hint,
+        )?;
+        let _ = self.share_push_registration(account_ref).await;
+        Ok(registration)
+    }
+
+    pub async fn clear_push_registration(&self, account_ref: &str) -> Result<(), AppError> {
+        if let Some(registration) = self.accounts.app.push_registration(account_ref)? {
+            let _ = self
+                .remove_push_registration(account_ref, registration)
+                .await;
+        }
+        self.accounts.app.clear_push_registration(account_ref)
     }
 
     pub async fn group_push_debug_info(

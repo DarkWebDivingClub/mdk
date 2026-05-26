@@ -66,6 +66,7 @@ impl PushPlatform {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Result<Self, AppError> {
         match value {
             "apns" | "Apns" | "APNS" => Ok(Self::Apns),
@@ -264,7 +265,7 @@ pub fn parse_provider_token(platform: PushPlatform, raw_token: &str) -> Result<V
 
 fn parse_apns_hex_token(raw_token: &str) -> Result<Vec<u8>, AppError> {
     if raw_token.is_empty()
-        || raw_token.len() % 2 != 0
+        || !raw_token.len().is_multiple_of(2)
         || !raw_token
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -990,6 +991,86 @@ mod tests {
         let content = build_notification_rumor_content(&[token.clone(), token.clone()]).unwrap();
         let decoded = BASE64_STANDARD.decode(content).unwrap();
         assert_eq!(decoded.len(), MIP05_ENCRYPTED_TOKEN_LEN * 2);
+    }
+
+    #[tokio::test]
+    async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
+        use nostr::nips::nip59::UnwrappedGift;
+
+        let secret = server_secret();
+        let server_pubkey_hex = server_pubkey_hex(&secret);
+        let token = vec![7_u8; MIP05_ENCRYPTED_TOKEN_LEN];
+
+        let wrap = build_notification_gift_wrap(&server_pubkey_hex, &[token.clone(), token])
+            .await
+            .unwrap();
+        let event = wrap.to_verified_nostr_event().unwrap();
+
+        let server_keys = Keys::new(nostr::SecretKey::from(secret));
+        let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rumor.kind,
+            Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16)
+        );
+        let tag_slices: Vec<&[String]> = rumor.tags.iter().map(|tag| tag.as_slice()).collect();
+        assert_eq!(
+            tag_slices,
+            vec![
+                [
+                    NOTIFICATION_VERSION_TAG.to_owned(),
+                    MIP05_VERSION.to_owned()
+                ]
+                .as_slice()
+            ],
+            "rumor must carry only the version tag; any p/e/k/h/d/relays tag would leak routing metadata"
+        );
+
+        let decoded = BASE64_STANDARD.decode(&rumor.content).unwrap();
+        assert_eq!(decoded.len(), MIP05_ENCRYPTED_TOKEN_LEN * 2);
+    }
+
+    #[test]
+    fn malformed_push_gossip_returns_error_without_leaking_payload_content() {
+        let group_id_hex = "ab".repeat(32);
+        let garbage = "not-json {{ <invalid> deadbeefcafe";
+
+        for kind in [
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        ] {
+            let err = parse_push_gossip(kind, &group_id_hex, garbage)
+                .expect_err("garbage gossip must error");
+            assert!(matches!(err, AppError::InvalidPushGossip(_)));
+            let rendered = err.to_string();
+            assert!(
+                !rendered.contains("deadbeefcafe") && !rendered.contains(garbage),
+                "InvalidPushGossip display must not leak raw payload bytes (kind {kind})"
+            );
+        }
+    }
+
+    #[test]
+    fn push_gossip_with_wrong_version_is_rejected_as_advisory() {
+        let group_id_hex = "ab".repeat(32);
+        let stale_payload = r#"{"v":"mip04-legacy","tokens":[]}"#;
+        let err = parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            &group_id_hex,
+            stale_payload,
+        )
+        .expect_err("wrong version must error");
+        assert!(matches!(err, AppError::InvalidPushGossip(_)));
+    }
+
+    #[test]
+    fn unsupported_push_gossip_kind_returns_error_not_panic() {
+        let err = parse_push_gossip(99_999, "00".repeat(32).as_str(), "{}")
+            .expect_err("unsupported kind must error cleanly");
+        assert!(matches!(err, AppError::InvalidPushGossip(_)));
     }
 
     #[test]

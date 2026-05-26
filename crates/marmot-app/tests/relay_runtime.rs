@@ -13,8 +13,8 @@ use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, PushPlatform,
-    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
+    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, NotificationWakeSource,
+    PushPlatform, RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -866,6 +866,183 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         .await
         .unwrap();
     assert_eq!(alice_view.active_token_count, 0);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn removed_member_triggers_local_push_token_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup.clone()).await.unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "removal cleanup",
+            &[
+                bob.account.account_id_hex.clone(),
+                carol.account.account_id_hex.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+
+    for member in [&bob, &carol] {
+        app.set_native_push_enabled(&member.account.account_id_hex, true)
+            .unwrap();
+        app.upsert_push_registration(
+            &member.account.account_id_hex,
+            PushPlatform::Fcm,
+            &format!("token-{}", &member.account.account_id_hex[..8]),
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+        runtime
+            .share_push_registration(&member.account.account_id_hex)
+            .await
+            .unwrap();
+    }
+    runtime.catch_up_accounts().await.unwrap();
+
+    let bob_view_before = runtime
+        .group_push_debug_info(&bob.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert!(
+        bob_view_before
+            .tokens
+            .iter()
+            .any(|t| t.member_id_hex == carol.account.account_id_hex),
+        "bob should see carol's token before removal"
+    );
+
+    runtime
+        .remove_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&carol.account.account_id_hex),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let bob_view_after = runtime
+        .group_push_debug_info(&bob.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert!(
+        bob_view_after
+            .tokens
+            .iter()
+            .all(|t| t.member_id_hex != carol.account.account_id_hex),
+        "MemberRemoved engine event should drop carol's tokens from bob's projection"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_wake_collection_and_foreground_subscription_share_notification_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "concurrent wake",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+
+    app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    let bob_ref = bob.account.account_id_hex.clone();
+
+    let runtime_for_wake = runtime.clone();
+    let wake_handle = tokio::spawn(async move {
+        runtime_for_wake
+            .collect_notifications_after_wake(8_000, NotificationWakeSource::ApnsNse)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"hello over both consumers".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let wake = wake_handle.await.unwrap();
+    let mut subscription_updates = Vec::new();
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < drain_deadline {
+        match timeout(Duration::from_millis(250), subscription.recv()).await {
+            Ok(Some(update)) => subscription_updates.push(update),
+            Ok(None) => break,
+            Err(_) if !subscription_updates.is_empty() => break,
+            Err(_) => continue,
+        }
+    }
+
+    let wake_keys: Vec<String> = wake
+        .notifications
+        .iter()
+        .filter(|update| update.account_ref == bob_ref)
+        .map(|update| update.notification_key.clone())
+        .collect();
+    let sub_keys: Vec<String> = subscription_updates
+        .iter()
+        .filter(|update| update.account_ref == bob_ref)
+        .map(|update| update.notification_key.clone())
+        .collect();
+    assert!(
+        !wake_keys.is_empty(),
+        "wake collection should produce at least one update"
+    );
+    assert!(
+        !sub_keys.is_empty(),
+        "subscription should produce at least one update"
+    );
+    let wake_unique: std::collections::HashSet<_> = wake_keys.iter().cloned().collect();
+    assert_eq!(
+        wake_unique.len(),
+        wake_keys.len(),
+        "wake collection must dedup updates by notification_key within a single call"
+    );
+    let sub_unique: std::collections::HashSet<_> = sub_keys.iter().cloned().collect();
+    let common = wake_unique.intersection(&sub_unique).count();
+    assert!(
+        common > 0,
+        "at least one notification_key must appear in both consumers (stable identity across wake + subscription)"
+    );
 
     runtime.shutdown().await;
 }

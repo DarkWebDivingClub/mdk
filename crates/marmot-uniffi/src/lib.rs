@@ -1118,7 +1118,7 @@ impl Marmot {
         &self,
         account_ref: String,
     ) -> Result<NotificationSettingsFfi, MarmotKitError> {
-        Ok(self.app.notification_settings(&account_ref)?.into())
+        Ok(self.runtime.notification_settings(&account_ref)?.into())
     }
 
     pub fn set_local_notifications_enabled(
@@ -1127,7 +1127,7 @@ impl Marmot {
         enabled: bool,
     ) -> Result<NotificationSettingsFfi, MarmotKitError> {
         Ok(self
-            .app
+            .runtime
             .set_local_notifications_enabled(&account_ref, enabled)?
             .into())
     }
@@ -1137,20 +1137,10 @@ impl Marmot {
         account_ref: String,
         enabled: bool,
     ) -> Result<NotificationSettingsFfi, MarmotKitError> {
-        let existing = if enabled {
-            None
-        } else {
-            self.app.push_registration(&account_ref)?
-        };
-        if let Some(registration) = existing {
-            let _ = self
-                .runtime
-                .remove_push_registration(&account_ref, registration)
-                .await;
-        }
         Ok(self
-            .app
-            .set_native_push_enabled(&account_ref, enabled)?
+            .runtime
+            .set_native_push_enabled(&account_ref, enabled)
+            .await?
             .into())
     }
 
@@ -1158,7 +1148,10 @@ impl Marmot {
         &self,
         account_ref: String,
     ) -> Result<Option<PushRegistrationFfi>, MarmotKitError> {
-        Ok(self.app.push_registration(&account_ref)?.map(Into::into))
+        Ok(self
+            .runtime
+            .push_registration(&account_ref)?
+            .map(Into::into))
     }
 
     pub async fn upsert_push_registration(
@@ -1169,25 +1162,21 @@ impl Marmot {
         server_pubkey_hex: String,
         relay_hint: Option<String>,
     ) -> Result<PushRegistrationFfi, MarmotKitError> {
-        let registration = self.app.upsert_push_registration(
-            &account_ref,
-            platform.into(),
-            &raw_token,
-            &server_pubkey_hex,
-            relay_hint,
-        )?;
-        let _ = self.runtime.share_push_registration(&account_ref).await;
-        Ok(registration.into())
+        Ok(self
+            .runtime
+            .upsert_push_registration(
+                &account_ref,
+                platform.into(),
+                &raw_token,
+                &server_pubkey_hex,
+                relay_hint,
+            )
+            .await?
+            .into())
     }
 
     pub async fn clear_push_registration(&self, account_ref: String) -> Result<(), MarmotKitError> {
-        if let Some(registration) = self.app.push_registration(&account_ref)? {
-            let _ = self
-                .runtime
-                .remove_push_registration(&account_ref, registration)
-                .await;
-        }
-        self.app.clear_push_registration(&account_ref)?;
+        self.runtime.clear_push_registration(&account_ref).await?;
         Ok(())
     }
 
