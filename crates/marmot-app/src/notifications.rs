@@ -614,6 +614,7 @@ pub(crate) fn notification_update_from_event(
         } => notification_update_from_group_join(app, account_label, account_id_hex, group_id)
             .map(Some),
         MarmotAppEvent::GroupStateUpdated { .. }
+        | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::AccountError(_) => Ok(None),

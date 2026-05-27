@@ -1118,8 +1118,10 @@ impl AppClient {
                     tags: message.tags.clone(),
                     recorded_at: Some(source_recorded_at),
                 };
-                self.app
+                let projection_update = self
+                    .app
                     .record_account_app_event(&self.state.label, &message_projection)?;
+                summary.projection_updates.push(projection_update);
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
             }
             if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
@@ -1128,11 +1130,13 @@ impl AppClient {
                 ..
             } = event
             {
-                self.app.invalidate_timeline_source_message(
+                if let Some(projection_update) = self.app.invalidate_timeline_source_message(
                     &self.state.label,
                     &hex::encode(message_id.as_slice()),
                     &format!("{reason:?}"),
-                )?;
+                )? {
+                    summary.projection_updates.push(projection_update);
+                }
             }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;

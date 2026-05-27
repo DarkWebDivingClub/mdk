@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi, MarmotEventFfi,
-    MessageUpdateFfi, NotificationUpdateFfi, TimelinePageFfi,
+    MessageUpdateFfi, NotificationUpdateFfi, TimelinePageFfi, TimelineSubscriptionUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -129,6 +129,12 @@ pub struct TimelineMessagesSubscription {
 
 impl TimelineMessagesSubscription {
     pub(crate) fn new(inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
+        let _span = tracing::debug_span!(
+            target: "marmot_uniffi::conversion",
+            "timeline_subscription_snapshot_conversion",
+            method = "TimelineMessagesSubscription::new"
+        )
+        .entered();
         Arc::new(Self {
             snapshot: StdMutex::new(Some(inner.snapshot.clone().into())),
             inner: Mutex::new(inner),
@@ -144,7 +150,24 @@ impl TimelineMessagesSubscription {
 
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut inner = self.inner.lock().await;
-        inner.recv().await.map(|update| update.page.into())
+        inner.recv().await.map(|update| match update {
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page, .. } => page.into(),
+            marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => TimelinePageFfi {
+                messages: update
+                    .update
+                    .timeline_messages
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                has_more_before: false,
+                has_more_after: false,
+            },
+        })
+    }
+
+    pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.recv().await.map(Into::into)
     }
 }
 

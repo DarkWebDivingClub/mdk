@@ -40,12 +40,12 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage, SendSummary,
-    SyncSummary, TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    AppProjectionUpdate, BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult,
+    GroupPushDebugInfo, MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference,
+    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
+    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    SendSummary, SyncSummary, TimelineMessageQuery, TimelinePage, UserDirectoryRefresh,
+    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -482,6 +482,13 @@ pub struct RuntimeGroupEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeProjectionUpdate {
+    pub account_id_hex: String,
+    pub account_label: String,
+    pub update: AppProjectionUpdate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeAccountError {
     pub account_id_hex: String,
     pub account_label: String,
@@ -540,10 +547,13 @@ impl RuntimeMessagesSubscription {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeTimelineMessageUpdate {
-    pub account_id_hex: String,
-    pub account_label: String,
-    pub page: TimelinePage,
+pub enum RuntimeTimelineMessageUpdate {
+    Page {
+        account_id_hex: String,
+        account_label: String,
+        page: TimelinePage,
+    },
+    Projection(RuntimeProjectionUpdate),
 }
 
 pub struct RuntimeTimelineMessagesSubscription {
@@ -707,6 +717,7 @@ pub enum MarmotAppEvent {
     },
     MessageReceived(RuntimeMessageReceived),
     AgentStreamStarted(RuntimeAgentStreamMessage),
+    ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
 }
@@ -823,7 +834,15 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = app.timeline_messages_with_query(&account_label, query.clone())?;
+        let snapshot = {
+            let _span = tracing::debug_span!(
+                target: "marmot_app::runtime",
+                "timeline_subscription_snapshot",
+                method = "subscribe_timeline_messages"
+            )
+            .entered();
+            app.timeline_messages_with_query(&account_label, query.clone())?
+        };
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -835,6 +854,50 @@ impl MarmotAppRuntime {
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                 };
+                if let Some(update) = projection_update_from_event(&event)
+                    && projection_update_matches_query(
+                        update,
+                        &account_id_hex,
+                        group_id_hex.as_deref(),
+                    )
+                {
+                    if timeline_query_can_apply_projection_delta(&query) {
+                        if updates_tx
+                            .send(RuntimeTimelineMessageUpdate::Projection(update.clone()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let query_for_lookup = query.clone();
+                        let page = match blocking_app_task(move || {
+                            app_for_lookup.timeline_messages_with_query(
+                                &account_label_for_lookup,
+                                query_for_lookup,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(page) => page,
+                            Err(_) => continue,
+                        };
+                        if updates_tx
+                            .send(RuntimeTimelineMessageUpdate::Page {
+                                account_id_hex: account_id_hex.clone(),
+                                account_label: account_label.clone(),
+                                page,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 if !timeline_event_matches_query(&event, &account_id_hex, group_id_hex.as_deref()) {
                     continue;
                 }
@@ -853,7 +916,7 @@ impl MarmotAppRuntime {
                     Ok(page) => page,
                     Err(_) => continue,
                 };
-                let update = RuntimeTimelineMessageUpdate {
+                let update = RuntimeTimelineMessageUpdate::Page {
                     account_id_hex: account_id_hex.clone(),
                     account_label: account_label.clone(),
                     page,
@@ -968,7 +1031,15 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = app.chat_list(&account_label, include_archived)?;
+        let snapshot = {
+            let _span = tracing::debug_span!(
+                target: "marmot_app::runtime",
+                "chat_list_subscription_snapshot",
+                method = "subscribe_chat_list"
+            )
+            .entered();
+            app.chat_list(&account_label, include_archived)?
+        };
         let mut row_fingerprints = snapshot
             .iter()
             .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row)))
@@ -984,6 +1055,25 @@ impl MarmotAppRuntime {
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                 };
+                if let Some(update) = projection_update_from_event(&event)
+                    && update.account_id_hex == account_id_hex
+                {
+                    let Some(row) = update.update.chat_list_row.clone() else {
+                        continue;
+                    };
+                    if !include_archived && row.archived {
+                        continue;
+                    }
+                    let fingerprint = chat_list_row_fingerprint(&row);
+                    if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
+                        continue;
+                    }
+                    row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
+                    if updates_tx.send(row).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let Some((event_account_id_hex, group_id)) = chat_list_event_route(&event) else {
                     continue;
                 };
@@ -999,11 +1089,8 @@ impl MarmotAppRuntime {
                 }
                 let row = match blocking_app_task(move || {
                     app_for_lookup
-                        .chat_list(&account_label_for_lookup, include_archived_for_lookup)
-                        .map(|rows| {
-                            rows.into_iter()
-                                .find(|candidate| candidate.group_id_hex == group_id_hex)
-                        })
+                        .chat_list_row(&account_label_for_lookup, &group_id_hex)
+                        .map(|row| row.filter(|row| include_archived_for_lookup || !row.archived))
                 })
                 .await
                 {
@@ -3524,6 +3611,13 @@ fn publish_app_runtime_summary(
             }));
         }
     }
+    for update in &summary.projection_updates {
+        let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            update: update.clone(),
+        }));
+    }
     for event in &summary.events {
         let _ = events.send(MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
             account_id_hex: account_id_hex.to_owned(),
@@ -3771,44 +3865,51 @@ fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMes
         }
         MarmotAppEvent::GroupJoined { .. }
         | MarmotAppEvent::GroupStateUpdated { .. }
+        | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
 
 fn timeline_event_matches_query(
-    event: &MarmotAppEvent,
+    _event: &MarmotAppEvent,
+    _account_id_hex: &str,
+    _group_id_hex: Option<&str>,
+) -> bool {
+    false
+}
+
+fn projection_update_from_event(event: &MarmotAppEvent) -> Option<&RuntimeProjectionUpdate> {
+    match event {
+        MarmotAppEvent::ProjectionUpdated(update) => Some(update),
+        MarmotAppEvent::GroupJoined { .. }
+        | MarmotAppEvent::GroupStateUpdated { .. }
+        | MarmotAppEvent::MessageReceived(_)
+        | MarmotAppEvent::AgentStreamStarted(_)
+        | MarmotAppEvent::GroupEvent(_)
+        | MarmotAppEvent::AccountError(_) => None,
+    }
+}
+
+fn projection_update_matches_query(
+    update: &RuntimeProjectionUpdate,
     account_id_hex: &str,
     group_id_hex: Option<&str>,
 ) -> bool {
-    let (event_account_id_hex, group_id) = match event {
-        MarmotAppEvent::MessageReceived(update) => {
-            (&update.account_id_hex, &update.message.group_id)
-        }
-        MarmotAppEvent::AgentStreamStarted(update) => {
-            (&update.account_id_hex, &update.message.group_id)
-        }
-        MarmotAppEvent::GroupEvent(group_event) => match &group_event.event {
-            GroupEvent::MessageReceived { group_id, .. }
-            | GroupEvent::AppMessageInvalidated { group_id, .. } => {
-                (&group_event.account_id_hex, group_id)
-            }
-            GroupEvent::GroupCreated { .. }
-            | GroupEvent::GroupJoined { .. }
-            | GroupEvent::MemberAdded { .. }
-            | GroupEvent::MemberRemoved { .. }
-            | GroupEvent::EpochChanged { .. }
-            | GroupEvent::ForkRecovered { .. }
-            | GroupEvent::GroupUnrecoverable { .. } => return false,
-        },
-        MarmotAppEvent::GroupJoined { .. }
-        | MarmotAppEvent::GroupStateUpdated { .. }
-        | MarmotAppEvent::AccountError(_) => return false,
-    };
-    if event_account_id_hex != account_id_hex {
-        return false;
-    }
-    group_id_hex.is_none_or(|wanted| hex::encode(group_id.as_slice()) == wanted)
+    update.account_id_hex == account_id_hex
+        && group_id_hex.is_none_or(|wanted| update.update.group_id_hex == wanted)
+        && !update.update.timeline_messages.is_empty()
+}
+
+fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
+    query
+        .search
+        .as_ref()
+        .is_none_or(|search| search.trim().is_empty())
+        && query.pagination.before.is_none()
+        && query.pagination.before_message_id.is_none()
+        && query.pagination.after.is_none()
+        && query.pagination.after_message_id.is_none()
 }
 
 fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)> {
@@ -3823,11 +3924,12 @@ fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)>
             group_id,
             ..
         } => Some((account_id_hex, group_id)),
-        MarmotAppEvent::GroupEvent(group_event) => Some((
-            &group_event.account_id_hex,
-            group_id_from_event(&group_event.event),
-        )),
-        MarmotAppEvent::MessageReceived(_)
+        MarmotAppEvent::GroupEvent(group_event) => match &group_event.event {
+            GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => None,
+            event => Some((&group_event.account_id_hex, group_id_from_event(event))),
+        },
+        MarmotAppEvent::ProjectionUpdated(_)
+        | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::AccountError(_) => None,
     }
@@ -3835,9 +3937,6 @@ fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)>
 
 fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)> {
     match event {
-        MarmotAppEvent::MessageReceived(update) => {
-            Some((&update.account_id_hex, &update.message.group_id))
-        }
         MarmotAppEvent::GroupJoined {
             account_id_hex,
             group_id,
@@ -3848,11 +3947,14 @@ fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)> {
             group_id,
             ..
         } => Some((account_id_hex, group_id)),
-        MarmotAppEvent::GroupEvent(group_event) => Some((
-            &group_event.account_id_hex,
-            group_id_from_event(&group_event.event),
-        )),
-        MarmotAppEvent::AgentStreamStarted(_) | MarmotAppEvent::AccountError(_) => None,
+        MarmotAppEvent::GroupEvent(group_event) => match &group_event.event {
+            GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => None,
+            event => Some((&group_event.account_id_hex, group_id_from_event(event))),
+        },
+        MarmotAppEvent::ProjectionUpdated(_)
+        | MarmotAppEvent::MessageReceived(_)
+        | MarmotAppEvent::AgentStreamStarted(_)
+        | MarmotAppEvent::AccountError(_) => None,
     }
 }
 

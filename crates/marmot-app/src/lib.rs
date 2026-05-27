@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -60,7 +60,7 @@ use storage_sqlite::{
     AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
     AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherKey, SqliteAccountStorage,
     SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord,
+    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, TimelineProjectionUpdate,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
@@ -91,8 +91,9 @@ pub use runtime::{
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
     RuntimeChatListSubscription, RuntimeChatsSubscription, RuntimeEventsSubscription,
     RuntimeGroupEvent, RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
+    StreamStartView,
 };
 
 pub use agent_streams::{
@@ -193,6 +194,8 @@ pub struct MarmotApp {
     relay_plane: MarmotRelayPlane,
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
+    account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,6 +322,7 @@ pub struct SyncSummary {
     pub joined_groups: Vec<GroupId>,
     pub messages: Vec<ReceivedMessage>,
     pub events: Vec<GroupEvent>,
+    pub projection_updates: Vec<AppProjectionUpdate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -334,6 +338,13 @@ pub struct ReceivedMessage {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppProjectionUpdate {
+    pub group_id_hex: String,
+    pub timeline_messages: Vec<TimelineMessageRecord>,
+    pub chat_list_row: Option<ChatListRow>,
 }
 
 fn remember_seen_event(state: &mut AccountState, event_id: String) {
@@ -890,6 +901,8 @@ impl MarmotApp {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            account_storages: Arc::new(Mutex::new(HashMap::new())),
+            shared_storage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -919,6 +932,8 @@ impl MarmotApp {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            account_storages: Arc::new(Mutex::new(HashMap::new())),
+            shared_storage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1492,6 +1507,12 @@ impl MarmotApp {
         label: &str,
         query: TimelineMessageQuery,
     ) -> Result<TimelinePage, AppError> {
+        let _span = tracing::debug_span!(
+            target: "marmot_app::timeline",
+            "timeline_messages_with_query",
+            method = "timeline_messages_with_query"
+        )
+        .entered();
         self.ensure_account_state(label)?;
         Ok(self.account_storage(label)?.message_timeline(query)?)
     }
@@ -1508,6 +1529,20 @@ impl MarmotApp {
             .chat_list_rows(&account.account_id_hex, ChatListQuery { include_archived })?;
         self.hydrate_chat_list_rows(&mut rows)?;
         Ok(rows)
+    }
+
+    pub fn chat_list_row(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let mut row = self
+            .account_storage(&account.label)?
+            .chat_list_row(&account.account_id_hex, group_id_hex)?;
+        self.hydrate_chat_list_row(row.as_mut())?;
+        Ok(row)
     }
 
     pub fn initialize_chat_read_state(
@@ -2517,6 +2552,12 @@ impl MarmotApp {
     }
 
     fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "ensure_account_state",
+            method = "ensure_account_state"
+        )
+        .entered();
         self.account_home().account(label)?;
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
@@ -2638,21 +2679,45 @@ impl MarmotApp {
     }
 
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        if let Some(storage) = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+        {
+            return Ok(storage);
+        }
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "account_storage_open",
+            method = "account_storage"
+        )
+        .entered();
         let keys = self.account_home().load_signing_keys(label)?;
         let path = self.account_storage_path(label);
         let key = self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?;
-        Ok(SqliteAccountStorage::open_encrypted(&path, &key)?)
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key)?;
+        let mut storages = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(storages
+            .entry(label.to_owned())
+            .or_insert_with(|| storage.clone())
+            .clone())
     }
 
     pub(crate) fn record_account_app_event(
         &self,
         label: &str,
         message: &AppMessageProjection,
-    ) -> Result<(), AppError> {
+    ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
-        self.account_storage(label)?
+        let storage_update = self
+            .account_storage(label)?
             .record_app_event(&stored_app_event_from_projection(message, now))?;
-        Ok(())
+        self.app_projection_update(label, storage_update)
     }
 
     pub(crate) fn invalidate_timeline_source_message(
@@ -2660,11 +2725,26 @@ impl MarmotApp {
         label: &str,
         source_message_id_hex: &str,
         reason: &str,
-    ) -> Result<(), AppError> {
-        let _ = self
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
             .account_storage(label)?
             .invalidate_app_event_by_source(source_message_id_hex, reason)?;
-        Ok(())
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    fn app_projection_update(
+        &self,
+        label: &str,
+        storage_update: TimelineProjectionUpdate,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let chat_list_row = self.chat_list_row(label, &storage_update.group_id_hex)?;
+        Ok(AppProjectionUpdate {
+            group_id_hex: storage_update.group_id_hex,
+            timeline_messages: storage_update.messages,
+            chat_list_row,
+        })
     }
 
     pub(crate) fn prune_account_app_events_before(
@@ -2933,7 +3013,7 @@ impl MarmotApp {
         reason: &str,
     ) -> Result<(), AppError> {
         let proposed_entry = self.hydrate_directory_record(entry.clone())?;
-        let mut shared_storage = self.shared_storage()?;
+        let shared_storage = self.shared_storage()?;
         let shared_entry = shared_storage
             .public_directory_user(&proposed_entry.account_id_hex)?
             .map(|record| self.hydrate_public_directory_record(record))
@@ -2975,7 +3055,27 @@ impl MarmotApp {
     }
 
     fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
-        Ok(SqliteSharedStorage::open(self.shared_storage_path())?)
+        if let Some(storage) = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return Ok(storage);
+        }
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "shared_storage_open",
+            method = "shared_storage"
+        )
+        .entered();
+        let storage = SqliteSharedStorage::open(self.shared_storage_path())?;
+        let mut shared = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
     fn legacy_directory_cache_path(&self) -> PathBuf {

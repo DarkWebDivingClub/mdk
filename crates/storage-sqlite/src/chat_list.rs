@@ -76,6 +76,18 @@ impl SqliteAccountStorage {
         Ok(rows)
     }
 
+    pub fn chat_list_row(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> StorageResult<Option<ChatListRow>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let row = rebuild_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        tx.commit().storage()?;
+        Ok(row)
+    }
+
     pub fn initialize_chat_read_state(
         &self,
         local_account_id_hex: &str,
@@ -522,7 +534,7 @@ fn chat_list_rows_tx(
                 unread_count, first_unread_message_id_hex, last_read_message_id_hex,
                 last_read_timeline_at, updated_at
          FROM chat_list_rows
-         ORDER BY COALESCE(last_message_timeline_at, 0) DESC, group_id_hex"
+         ORDER BY last_message_timeline_at DESC, group_id_hex"
     } else {
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
@@ -533,7 +545,7 @@ fn chat_list_rows_tx(
                 last_read_timeline_at, updated_at
          FROM chat_list_rows
          WHERE archived = 0
-         ORDER BY COALESCE(last_message_timeline_at, 0) DESC, group_id_hex"
+         ORDER BY last_message_timeline_at DESC, group_id_hex"
     };
     let mut stmt = tx.prepare(sql).storage()?;
     stmt.query_map([], chat_list_row_from_row)
@@ -745,6 +757,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(row, None);
+    }
+
+    #[test]
+    fn chat_list_row_returns_refreshed_single_group_projection() {
+        let store = setup_store();
+        store
+            .record_app_event(&chat("latest", REMOTE, 10, "single row"))
+            .unwrap();
+
+        let row = store
+            .chat_list_row(LOCAL, GROUP)
+            .unwrap()
+            .expect("chat row");
+
+        assert_eq!(row.group_id_hex, GROUP);
+        assert_eq!(
+            row.last_message
+                .as_ref()
+                .map(|message| message.message_id_hex.as_str()),
+            Some("latest")
+        );
+        assert_eq!(store.chat_list_row(LOCAL, "missing-group").unwrap(), None);
     }
 
     #[test]

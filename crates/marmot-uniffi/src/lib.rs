@@ -51,9 +51,10 @@ pub use conversions::{
     LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
     MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
     NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineReactionEmojiFfi,
-    TimelineReactionSummaryFfi, TimelineUserReactionFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RuntimeProjectionUpdateFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineSubscriptionUpdateFfi, TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -1378,10 +1379,16 @@ impl Marmot {
         account_ref: String,
         query: TimelineMessageQueryFfi,
     ) -> Result<TimelinePageFfi, MarmotKitError> {
-        Ok(self
+        let page = self
             .runtime
-            .timeline_messages_with_query(&account_ref, timeline_query_from_ffi(query)?)?
-            .into())
+            .timeline_messages_with_query(&account_ref, timeline_query_from_ffi(query)?)?;
+        let _span = tracing::debug_span!(
+            target: "marmot_uniffi::conversion",
+            "timeline_page_conversion",
+            method = "timeline_messages"
+        )
+        .entered();
+        Ok(page.into())
     }
 
     /// Durable chat-list rows for fast app launch. Rows include the group
@@ -1391,12 +1398,14 @@ impl Marmot {
         account_ref: String,
         include_archived: bool,
     ) -> Result<Vec<ChatListRowFfi>, MarmotKitError> {
-        Ok(self
-            .runtime
-            .chat_list(&account_ref, include_archived)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let rows = self.runtime.chat_list(&account_ref, include_archived)?;
+        let _span = tracing::debug_span!(
+            target: "marmot_uniffi::conversion",
+            "chat_list_conversion",
+            method = "chat_list"
+        )
+        .entered();
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Establish the unread baseline the first time a user opens a group.

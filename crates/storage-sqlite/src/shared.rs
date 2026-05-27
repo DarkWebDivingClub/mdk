@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::SqliteResultExt;
@@ -8,9 +9,9 @@ use rusqlite::{OptionalExtension, params};
 
 const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SqliteSharedStorage {
-    conn: rusqlite::Connection,
+    conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,14 +101,17 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 "#,
         )
         .storage()?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub fn put_public_directory_user(
-        &mut self,
+        &self,
         record: &PublicDirectoryUserRecord,
     ) -> StorageResult<()> {
-        let tx = self.conn.transaction().storage()?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().storage()?;
         tx.execute(
             "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
@@ -162,8 +166,9 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
+        let conn = self.lock();
         let Some(mut record) = self
-            .conn
+            .conn_ref(&conn)
             .query_row(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
@@ -190,7 +195,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             return Ok(None);
         };
         let mut stmt = self
-            .conn
+            .conn_ref(&conn)
             .prepare(
                 "SELECT follow_account_id_hex FROM directory_user_follows
                  WHERE account_id_hex = ?1
@@ -206,15 +211,17 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     pub fn public_directory_users(&self) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT account_id_hex FROM directory_users ORDER BY account_id_hex")
-            .storage()?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
+        let ids = {
+            let conn = self.lock();
+            let mut stmt = self
+                .conn_ref(&conn)
+                .prepare("SELECT account_id_hex FROM directory_users ORDER BY account_id_hex")
+                .storage()?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+        };
         let mut records = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(record) = self.public_directory_user(&id)? {
@@ -226,14 +233,28 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 
     #[cfg(test)]
     fn table_columns(&self, table: &str) -> Vec<String> {
+        let conn = self.lock();
         let mut stmt = self
-            .conn
+            .conn_ref(&conn)
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, rusqlite::Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn conn_ref<'a>(
+        &self,
+        conn: &'a MutexGuard<'_, rusqlite::Connection>,
+    ) -> &'a rusqlite::Connection {
+        conn
     }
 }
 
@@ -279,7 +300,7 @@ mod tests {
 
     #[test]
     fn stores_public_directory_record_and_follows() {
-        let mut storage = SqliteSharedStorage::in_memory().unwrap();
+        let storage = SqliteSharedStorage::in_memory().unwrap();
         let record = PublicDirectoryUserRecord {
             account_id_hex: "aa".repeat(32),
             npub: "npub1example".to_owned(),

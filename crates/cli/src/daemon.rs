@@ -1289,7 +1289,14 @@ async fn handle_timeline_messages_subscription(
     }
 
     while let Some(update) = runtime_subscription.recv().await {
-        let response = timeline_page_stream_response(update.page, "TimelineUpdated", &runtime);
+        let response = match update {
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page, .. } => {
+                timeline_page_stream_response(page, "TimelineUpdated", &runtime)
+            }
+            marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => {
+                timeline_projection_stream_response(update, &runtime)
+            }
+        };
         if !write_stream_response(stream, &response).await {
             return Ok(());
         }
@@ -1719,6 +1726,30 @@ fn timeline_page_stream_response(
         "messages": messages,
         "has_more_before": page.has_more_before,
         "has_more_after": page.has_more_after,
+    }))
+}
+
+fn timeline_projection_stream_response(
+    update: marmot_app::RuntimeProjectionUpdate,
+    runtime: &marmot_app::MarmotAppRuntime,
+) -> DaemonStreamResponse {
+    let messages = update
+        .update
+        .timeline_messages
+        .into_iter()
+        .map(|message| {
+            let display_name = runtime.display_name_for_account_id(&message.sender);
+            crate::timeline_message_record_json(message, display_name)
+        })
+        .collect::<Vec<_>>();
+    DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": "TimelineProjectionUpdated",
+        "type": "timeline_projection_updated",
+        "account_id": update.account_id_hex,
+        "account_label": update.account_label,
+        "group_id": update.update.group_id_hex,
+        "messages": messages,
+        "chat_list_row": update.update.chat_list_row,
     }))
 }
 
@@ -3165,6 +3196,7 @@ async fn handle_app_runtime_event(
             );
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
+        marmot_app::MarmotAppEvent::ProjectionUpdated(_) => {}
         marmot_app::MarmotAppEvent::MessageReceived(message) => {
             // Raw message updates keep kind-1200 starts separate as
             // `AgentStreamStarted`; materialized timeline subscriptions include

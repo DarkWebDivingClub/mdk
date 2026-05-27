@@ -13,13 +13,14 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    ChatListAvatar, ChatListMessagePreview, ChatListRow, ForensicsDumpMode,
+    AppProjectionUpdate, ChatListAvatar, ChatListMessagePreview, ChatListRow, ForensicsDumpMode,
     GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
     LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult, MediaReference,
     MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
-    RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
+    RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
     TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction, UserProfileMetadata,
     account_id_hex_from_ref, npub_for_account_id,
 };
@@ -789,6 +790,61 @@ impl From<TimelinePage> for TimelinePageFfi {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineProjectionUpdateFfi {
+    pub group_id_hex: String,
+    pub messages: Vec<TimelineMessageRecordFfi>,
+    pub chat_list_row: Option<ChatListRowFfi>,
+}
+
+impl From<AppProjectionUpdate> for TimelineProjectionUpdateFfi {
+    fn from(value: AppProjectionUpdate) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            messages: value
+                .timeline_messages
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            chat_list_row: value.chat_list_row.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RuntimeProjectionUpdateFfi {
+    pub account_id_hex: String,
+    pub account_label: String,
+    pub update: TimelineProjectionUpdateFfi,
+}
+
+impl From<RuntimeProjectionUpdate> for RuntimeProjectionUpdateFfi {
+    fn from(value: RuntimeProjectionUpdate) -> Self {
+        Self {
+            account_id_hex: value.account_id_hex,
+            account_label: value.account_label,
+            update: value.update.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum TimelineSubscriptionUpdateFfi {
+    Page { page: TimelinePageFfi },
+    Projection { update: RuntimeProjectionUpdateFfi },
+}
+
+impl From<RuntimeTimelineMessageUpdate> for TimelineSubscriptionUpdateFfi {
+    fn from(value: RuntimeTimelineMessageUpdate) -> Self {
+        match value {
+            RuntimeTimelineMessageUpdate::Page { page, .. } => Self::Page { page: page.into() },
+            RuntimeTimelineMessageUpdate::Projection(update) => Self::Projection {
+                update: update.into(),
+            },
+        }
+    }
+}
+
 pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRecordFfi> {
     messages
         .into_iter()
@@ -1236,6 +1292,9 @@ pub enum MarmotEventFfi {
     MessageReceived {
         received: RuntimeMessageReceivedFfi,
     },
+    ProjectionUpdated {
+        update: RuntimeProjectionUpdateFfi,
+    },
     GroupEvent {
         account_id_hex: String,
         account_label: String,
@@ -1273,6 +1332,9 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
             MarmotAppEvent::MessageReceived(m) => Self::MessageReceived { received: m.into() },
+            MarmotAppEvent::ProjectionUpdated(update) => Self::ProjectionUpdated {
+                update: update.into(),
+            },
             MarmotAppEvent::GroupEvent(e) => Self::GroupEvent {
                 account_id_hex: e.account_id_hex,
                 account_label: e.account_label,

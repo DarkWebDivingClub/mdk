@@ -10,6 +10,8 @@ mod migration_0004_app_timeline;
 mod migration_0005_account_projection;
 #[path = "migrations/0006_chat_list_projection.rs"]
 mod migration_0006_chat_list_projection;
+#[path = "migrations/0007_timeline_projection_indexes.rs"]
+mod migration_0007_timeline_projection_indexes;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -51,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "0006_chat_list_projection",
         apply: migration_0006_chat_list_projection::apply,
+    },
+    Migration {
+        version: 7,
+        name: "0007_timeline_projection_indexes",
+        apply: migration_0007_timeline_projection_indexes::apply,
     },
 ];
 
@@ -190,7 +197,8 @@ mod tests {
                 (3, "0003_group_foreign_keys".to_string()),
                 (4, "0004_app_timeline".to_string()),
                 (5, "0005_account_projection".to_string()),
-                (6, "0006_chat_list_projection".to_string())
+                (6, "0006_chat_list_projection".to_string()),
+                (7, "0007_timeline_projection_indexes".to_string())
             ]
         );
     }
@@ -203,7 +211,7 @@ mod tests {
 
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            assert_eq!(applied_migrations(&store).len(), 6);
+            assert_eq!(applied_migrations(&store).len(), 7);
         }
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -215,7 +223,8 @@ mod tests {
                 (3, "0003_group_foreign_keys".to_string()),
                 (4, "0004_app_timeline".to_string()),
                 (5, "0005_account_projection".to_string()),
-                (6, "0006_chat_list_projection".to_string())
+                (6, "0006_chat_list_projection".to_string()),
+                (7, "0007_timeline_projection_indexes".to_string())
             ]
         );
     }
