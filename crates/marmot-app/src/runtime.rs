@@ -898,32 +898,6 @@ impl MarmotAppRuntime {
                     }
                     continue;
                 }
-                if !timeline_event_matches_query(&event, &account_id_hex, group_id_hex.as_deref()) {
-                    continue;
-                }
-                let app_for_lookup = app.clone();
-                let account_label_for_lookup = account_label.clone();
-                let query_for_lookup = query.clone();
-                if runtime_shutdown_requested(&stopping) {
-                    return;
-                }
-                let page = match blocking_app_task(move || {
-                    app_for_lookup
-                        .timeline_messages_with_query(&account_label_for_lookup, query_for_lookup)
-                })
-                .await
-                {
-                    Ok(page) => page,
-                    Err(_) => continue,
-                };
-                let update = RuntimeTimelineMessageUpdate::Page {
-                    account_id_hex: account_id_hex.clone(),
-                    account_label: account_label.clone(),
-                    page,
-                };
-                if updates_tx.send(update).await.is_err() {
-                    return;
-                }
             }
         });
         Ok(RuntimeTimelineMessagesSubscription {
@@ -3869,14 +3843,6 @@ fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMes
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::AccountError(_) => None,
     }
-}
-
-fn timeline_event_matches_query(
-    _event: &MarmotAppEvent,
-    _account_id_hex: &str,
-    _group_id_hex: Option<&str>,
-) -> bool {
-    false
 }
 
 fn projection_update_from_event(event: &MarmotAppEvent) -> Option<&RuntimeProjectionUpdate> {
