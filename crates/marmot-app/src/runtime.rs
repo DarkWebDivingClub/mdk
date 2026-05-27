@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use cgka_traits::agent_text_stream::{
@@ -16,9 +19,9 @@ use marmot_account::{AccountHomeError, AccountSummary};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{sleep, timeout};
 use transport_quic_broker::{
     BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_updates,
 };
@@ -32,10 +35,10 @@ use crate::notifications;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, AGENT_STREAM_START_LOOKBACK_LIMIT,
-    APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
-    APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord, AccountRelayListBootstrap,
-    AccountRelayListStatus, AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord,
-    AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
+    APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+    APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
+    AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
     BackgroundNotificationCollection, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp,
     MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
@@ -63,6 +66,7 @@ pub struct AccountManager {
 pub struct RuntimeSharedServices {
     relay_plane: MarmotRelayPlane,
     agent_streams: AgentStreamWatchManager,
+    lifecycle: RuntimeLifecycle,
 }
 
 impl Default for RuntimeSharedServices {
@@ -70,6 +74,7 @@ impl Default for RuntimeSharedServices {
         Self {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             agent_streams: AgentStreamWatchManager::default(),
+            lifecycle: RuntimeLifecycle::new(),
         }
     }
 }
@@ -79,6 +84,7 @@ impl RuntimeSharedServices {
         Self {
             relay_plane: app.relay_plane.clone(),
             agent_streams: AgentStreamWatchManager::default(),
+            lifecycle: RuntimeLifecycle::new(),
         }
     }
 
@@ -89,6 +95,165 @@ impl RuntimeSharedServices {
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
         self.agent_streams.clone()
     }
+
+    pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
+        self.lifecycle.clone()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeLifecycle {
+    inner: Arc<RuntimeLifecycleInner>,
+}
+
+struct RuntimeLifecycleInner {
+    stopping: AtomicBool,
+    stop_tx: watch::Sender<bool>,
+    active_account_opens: AtomicUsize,
+    account_opens_drained: Notify,
+}
+
+pub(crate) struct RuntimeAccountOpenPermit {
+    lifecycle: RuntimeLifecycle,
+    started_at: Instant,
+}
+
+impl RuntimeLifecycle {
+    fn new() -> Self {
+        let (stop_tx, _) = watch::channel(false);
+        Self {
+            inner: Arc::new(RuntimeLifecycleInner {
+                stopping: AtomicBool::new(false),
+                stop_tx,
+                active_account_opens: AtomicUsize::new(0),
+                account_opens_drained: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> bool {
+        let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
+        if !was_stopping {
+            self.inner.stop_tx.send_replace(true);
+        }
+        !was_stopping
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.inner.stopping.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_running(&self) -> Result<(), AppError> {
+        if self.is_stopping() {
+            Err(AppError::RuntimeStopping)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.inner.stop_tx.subscribe()
+    }
+
+    pub(crate) fn begin_account_open(&self) -> Result<RuntimeAccountOpenPermit, AppError> {
+        self.ensure_running()?;
+        self.inner
+            .active_account_opens
+            .fetch_add(1, Ordering::AcqRel);
+        if self.is_stopping() {
+            self.finish_account_open(Instant::now());
+            return Err(AppError::RuntimeStopping);
+        }
+        Ok(RuntimeAccountOpenPermit {
+            lifecycle: self.clone(),
+            started_at: Instant::now(),
+        })
+    }
+
+    pub(crate) async fn wait_for_account_opens_to_drain(&self, wait: Duration) -> bool {
+        if self.active_account_opens() == 0 {
+            return true;
+        }
+        if wait.is_zero() {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "shutdown",
+                active_account_opens = self.active_account_opens(),
+                "runtime account opens still running when shutdown budget expired",
+            );
+            return false;
+        }
+
+        let started_at = Instant::now();
+        let drained = timeout(wait, async {
+            while self.active_account_opens() != 0 {
+                self.inner.account_opens_drained.notified().await;
+            }
+        })
+        .await
+        .is_ok();
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        if drained {
+            tracing::debug!(
+                target: "marmot_app::runtime",
+                method = "shutdown",
+                elapsed_ms,
+                "runtime account opens drained during shutdown",
+            );
+        } else {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "shutdown",
+                elapsed_ms,
+                active_account_opens = self.active_account_opens(),
+                "runtime account opens did not drain before shutdown budget expired",
+            );
+        }
+        drained
+    }
+
+    fn active_account_opens(&self) -> usize {
+        self.inner.active_account_opens.load(Ordering::Acquire)
+    }
+
+    fn finish_account_open(&self, started_at: Instant) {
+        let previous = self
+            .inner
+            .active_account_opens
+            .fetch_sub(1, Ordering::AcqRel);
+        let remaining = previous.saturating_sub(1);
+        if remaining == 0 {
+            self.inner.account_opens_drained.notify_waiters();
+        }
+        tracing::debug!(
+            target: "marmot_app::runtime",
+            method = "runtime_account_open",
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            active_account_opens = remaining,
+            "runtime account open finished",
+        );
+    }
+}
+
+impl Drop for RuntimeAccountOpenPermit {
+    fn drop(&mut self) {
+        self.lifecycle.finish_account_open(self.started_at);
+    }
+}
+
+async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
+    if *stopping.borrow() {
+        return;
+    }
+    while stopping.changed().await.is_ok() {
+        if *stopping.borrow() {
+            return;
+        }
+    }
+}
+
+fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
+    *stopping.borrow()
 }
 
 struct ManagedAccountWorker {
@@ -103,9 +268,35 @@ impl ManagedAccountWorker {
         self.handle.abort();
     }
 
-    fn shutdown(self) -> JoinHandle<()> {
+    async fn shutdown(self) {
+        self.shutdown_with_timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT)
+            .await;
+    }
+
+    async fn shutdown_with_timeout(self, wait: Duration) {
         let _ = self.shutdown.send(());
-        self.handle
+        let mut handle = self.handle;
+        tokio::select! {
+            result = &mut handle => {
+                if let Err(err) = result {
+                    tracing::debug!(
+                        target: "marmot_app::runtime",
+                        method = "shutdown",
+                        error = %err,
+                        "managed account worker exited during shutdown",
+                    );
+                }
+            }
+            _ = sleep(wait) => {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "shutdown",
+                    "managed account worker shutdown timed out; aborting",
+                );
+                handle.abort();
+                let _ = timeout(Duration::from_millis(250), &mut handle).await;
+            }
+        }
     }
 }
 
@@ -115,6 +306,7 @@ struct AccountWorkerRuntime {
     account_id_hex: String,
     relay_plane: MarmotRelayPlane,
     events: broadcast::Sender<MarmotAppEvent>,
+    lifecycle: RuntimeLifecycle,
 }
 
 enum AccountWorkerCommand {
@@ -325,43 +517,81 @@ impl RuntimeMessageUpdate {
 pub struct RuntimeMessagesSubscription {
     pub snapshot: Vec<AppMessageRecord>,
     updates: mpsc::Receiver<RuntimeMessageUpdate>,
+    stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeMessagesSubscription {
     pub async fn recv(&mut self) -> Option<RuntimeMessageUpdate> {
-        self.updates.recv().await
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
     }
 }
 
 pub struct RuntimeChatsSubscription {
     pub snapshot: Vec<AppGroupRecord>,
     updates: mpsc::Receiver<AppGroupRecord>,
+    stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeChatsSubscription {
     pub async fn recv(&mut self) -> Option<AppGroupRecord> {
-        self.updates.recv().await
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
     }
 }
 
 pub struct RuntimeGroupStateSubscription {
     pub snapshot: AppGroupRecord,
     updates: mpsc::Receiver<AppGroupRecord>,
+    stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeGroupStateSubscription {
     pub async fn recv(&mut self) -> Option<AppGroupRecord> {
-        self.updates.recv().await
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
     }
 }
 
 pub struct RuntimeNotificationsSubscription {
     updates: mpsc::Receiver<NotificationUpdate>,
+    stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeNotificationsSubscription {
     pub async fn recv(&mut self) -> Option<NotificationUpdate> {
-        self.updates.recv().await
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
+    }
+}
+
+pub struct RuntimeEventsSubscription {
+    events: broadcast::Receiver<MarmotAppEvent>,
+    stopping: watch::Receiver<bool>,
+}
+
+impl RuntimeEventsSubscription {
+    pub async fn recv(&mut self) -> Option<MarmotAppEvent> {
+        loop {
+            tokio::select! {
+                event = self.events.recv() => {
+                    match event {
+                        Ok(event) => return Some(event),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+                _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
+            }
+        }
     }
 }
 
@@ -396,11 +626,15 @@ pub struct RuntimeAgentStreamWatch {
     pub stream_id_hex: String,
     updates: mpsc::Receiver<RuntimeAgentStreamUpdate>,
     abort: tokio::task::AbortHandle,
+    stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeAgentStreamWatch {
     pub async fn recv(&mut self) -> Option<RuntimeAgentStreamUpdate> {
-        self.updates.recv().await
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
     }
 }
 
@@ -451,6 +685,13 @@ impl MarmotAppRuntime {
         self.events.subscribe()
     }
 
+    pub fn subscribe_events(&self) -> RuntimeEventsSubscription {
+        RuntimeEventsSubscription {
+            events: self.events.subscribe(),
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
+        }
+    }
+
     pub fn display_name_for_account_id(&self, account_id_hex: &str) -> Option<String> {
         self.accounts
             .app
@@ -464,10 +705,12 @@ impl MarmotAppRuntime {
         account_ref: &str,
         query: AppMessageQuery,
     ) -> Result<RuntimeMessagesSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let account_id_hex = account.account_id_hex.clone();
         let group_id_hex = query.group_id_hex.clone();
         let mut events = self.events.subscribe();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
         let mut seen_message_ids = snapshot
             .iter()
@@ -482,10 +725,13 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
                 };
                 let Some(update) = runtime_message_update_from_event(event) else {
                     continue;
@@ -513,6 +759,7 @@ impl MarmotAppRuntime {
         Ok(RuntimeMessagesSubscription {
             snapshot,
             updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
 
@@ -521,11 +768,13 @@ impl MarmotAppRuntime {
         account_ref: &str,
         include_archived: bool,
     ) -> Result<RuntimeChatsSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let account_id_hex = account.account_id_hex.clone();
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot = if include_archived {
             app.groups(&account_label)?
         } else {
@@ -538,10 +787,13 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
                 };
                 let Some((event_account_id_hex, group_id)) = runtime_group_event_route(&event)
                 else {
@@ -553,6 +805,9 @@ impl MarmotAppRuntime {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
+                if runtime_shutdown_requested(&stopping) {
+                    return;
+                }
                 let group = match blocking_app_task(move || {
                     app_for_lookup.group(&account_label_for_lookup, &group_id_hex)
                 })
@@ -575,6 +830,7 @@ impl MarmotAppRuntime {
         Ok(RuntimeChatsSubscription {
             snapshot,
             updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
 
@@ -583,6 +839,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<RuntimeGroupStateSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let account_id_hex = account.account_id_hex.clone();
         let account_label = account.label.clone();
@@ -590,6 +847,7 @@ impl MarmotAppRuntime {
         let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let mut events = self.events.subscribe();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot = app
             .group(&account_label, &group_id_hex)?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
@@ -597,10 +855,13 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
                 };
                 let Some((event_account_id_hex, event_group_id)) =
                     runtime_group_event_route(&event)
@@ -613,6 +874,9 @@ impl MarmotAppRuntime {
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
                 let group_id_hex_for_lookup = group_id_hex.clone();
+                if runtime_shutdown_requested(&stopping) {
+                    return;
+                }
                 let group = match blocking_app_task(move || {
                     app_for_lookup.group(&account_label_for_lookup, &group_id_hex_for_lookup)
                 })
@@ -634,16 +898,23 @@ impl MarmotAppRuntime {
         Ok(RuntimeGroupStateSubscription {
             snapshot,
             updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
 
     pub fn subscribe_notifications(&self) -> Result<RuntimeNotificationsSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let mut events = self.events.subscribe();
         let app = self.accounts.app.clone();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
-                match events.recv().await {
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => event,
+                };
+                match event {
                     Ok(event) => {
                         match notifications::notification_update_from_event(&app, &event) {
                             Ok(Some(update)) => {
@@ -668,6 +939,7 @@ impl MarmotAppRuntime {
         });
         Ok(RuntimeNotificationsSubscription {
             updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
 
@@ -682,6 +954,7 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let app = self.accounts.app.clone();
         let account_ref_for_query = account_ref.to_owned();
@@ -729,23 +1002,27 @@ impl MarmotAppRuntime {
         );
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let handle = tokio::spawn(async move {
-            let final_update = watch_broker_candidates(
-                candidates,
-                server_cert_der,
-                insecure_local,
-                stream_id,
-                start_event_id,
-                Some(crypto),
-                updates_tx.clone(),
-            )
-            .await;
+            let final_update = tokio::select! {
+                _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                update = watch_broker_candidates(
+                    candidates,
+                    server_cert_der,
+                    insecure_local,
+                    stream_id,
+                    start_event_id,
+                    Some(crypto),
+                    updates_tx.clone(),
+                ) => update,
+            };
             let _ = updates_tx.send(final_update).await;
         });
         Ok(RuntimeAgentStreamWatch {
             stream_id_hex,
             updates: updates_rx,
             abort: handle.abort_handle(),
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
 
@@ -757,7 +1034,12 @@ impl MarmotAppRuntime {
         self.shared.clone()
     }
 
+    pub fn is_stopping(&self) -> bool {
+        self.shared.lifecycle().is_stopping()
+    }
+
     pub async fn start(&self) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
         self.sync_user_directory_subscriptions().await?;
         self.reconcile_accounts().await
     }
@@ -765,6 +1047,7 @@ impl MarmotAppRuntime {
     pub(crate) async fn sync_user_directory_subscriptions(
         &self,
     ) -> Result<DirectorySyncRunSummary, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let directory_sync = self.ensure_directory_sync_worker().await;
         directory_sync.request_rebuild_and_wait().await
     }
@@ -1462,12 +1745,27 @@ impl MarmotAppRuntime {
     }
 
     pub async fn shutdown(&self) {
+        let started_at = Instant::now();
+        self.shared.lifecycle().begin_shutdown();
         if let Some(directory_sync) = self.directory_sync.lock().await.take() {
             directory_sync.shutdown().await;
         }
         self.accounts.app.set_directory_sync_handle(None);
-        self.accounts.shutdown().await;
-        self.shared.relay_plane.shutdown().await;
+        let accounts = self.accounts.shutdown();
+        let relay_plane = self.shared.relay_plane.shutdown();
+        tokio::join!(accounts, relay_plane);
+        self.shared
+            .lifecycle()
+            .wait_for_account_opens_to_drain(
+                APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT.saturating_sub(started_at.elapsed()),
+            )
+            .await;
+        tracing::debug!(
+            target: "marmot_app::runtime",
+            method = "shutdown",
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "runtime shutdown completed",
+        );
     }
 }
 
@@ -1512,6 +1810,7 @@ impl AccountManager {
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let accounts = self
             .app
             .account_home()
@@ -1566,6 +1865,7 @@ impl AccountManager {
                         account_id_hex: account.account_id_hex.clone(),
                         relay_plane: self.shared.relay_plane().clone(),
                         events: self.events.clone(),
+                        lifecycle: self.shared.lifecycle(),
                     },
                     command_rx,
                     ready_tx,
@@ -1598,6 +1898,7 @@ impl AccountManager {
     }
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
         {
             let mut workers = self.workers.lock().await;
             if let Some(worker) = workers.remove(account_id_hex) {
@@ -1608,6 +1909,7 @@ impl AccountManager {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
         self.reconcile().await?;
         let commands = {
             let workers = self.workers.lock().await;
@@ -2169,6 +2471,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         if !account.local_signing {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
@@ -2189,6 +2492,7 @@ impl AccountManager {
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let imports_private_key = request.identity.as_deref().is_some_and(is_nostr_secret);
         let creates_new_private_key = request.identity.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
@@ -2213,6 +2517,7 @@ impl AccountManager {
         };
 
         let profile = if creates_new_private_key && account.local_signing {
+            self.shared.lifecycle().ensure_running()?;
             match self
                 .publish_default_profile_for_account(&account, &request)
                 .await
@@ -2227,6 +2532,7 @@ impl AccountManager {
         };
 
         let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
+            self.shared.lifecycle().ensure_running()?;
             match self.publish_initial_key_package_for_account(&account).await {
                 Ok(bytes) => Some(bytes),
                 Err(err) => {
@@ -2237,6 +2543,7 @@ impl AccountManager {
             None
         };
 
+        self.shared.lifecycle().ensure_running()?;
         let _ = self
             .app
             .refresh_user_directory_for_account_id(
@@ -2401,25 +2708,21 @@ impl AccountManager {
     }
 
     pub async fn shutdown(&self) {
-        let handles = {
+        self.shared.lifecycle().begin_shutdown();
+        let workers = {
             let mut workers = self.workers.lock().await;
             workers
                 .drain()
-                .map(|(_, worker)| worker.shutdown())
+                .map(|(_, worker)| worker)
                 .collect::<Vec<_>>()
         };
-        for handle in handles {
-            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, handle).await {
-                Ok(Ok(())) | Ok(Err(_)) => {}
-                Err(_) => {
-                    tracing::warn!(
-                        target: "marmot_app::runtime",
-                        method = "shutdown",
-                        "managed account worker shutdown timed out",
-                    );
-                }
-            }
+        let mut shutdowns = JoinSet::new();
+        for worker in workers {
+            shutdowns.spawn(async move {
+                worker.shutdown().await;
+            });
         }
+        while shutdowns.join_next().await.is_some() {}
     }
 }
 
@@ -2458,15 +2761,9 @@ fn spawn_app_runtime_account_worker(
     ready: oneshot::Sender<Result<(), String>>,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        let worker_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("account worker runtime");
-        worker_runtime.block_on(run_app_runtime_account_worker(
-            runtime, commands, ready, shutdown,
-        ));
-    })
+    tokio::spawn(run_app_runtime_account_worker(
+        runtime, commands, ready, shutdown,
+    ))
 }
 
 async fn run_app_runtime_account_worker(
@@ -2475,14 +2772,31 @@ async fn run_app_runtime_account_worker(
     ready: oneshot::Sender<Result<(), String>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let mut ready = Some(ready);
     let AccountWorkerRuntime {
         app,
         account_label,
         account_id_hex,
         relay_plane,
         events,
+        lifecycle,
     } = runtime;
-    let mut client = match app.runtime_client(&account_label, &relay_plane).await {
+    let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+    let mut client = match tokio::select! {
+        _ = &mut shutdown => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err("runtime startup cancelled".into()));
+            }
+            return;
+        }
+        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err("runtime startup cancelled".into()));
+            }
+            return;
+        }
+        result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+    } {
         Ok(client) => client,
         Err(err) => {
             let message = format!("runtime startup failed: {err}");
@@ -2492,12 +2806,28 @@ async fn run_app_runtime_account_worker(
                 &account_label,
                 message.clone(),
             );
-            let _ = ready.send(Err(message));
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(message));
+            }
             return;
         }
     };
 
-    match client.sync().await {
+    match tokio::select! {
+        _ = &mut shutdown => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err("runtime startup cancelled".into()));
+            }
+            return;
+        }
+        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err("runtime startup cancelled".into()));
+            }
+            return;
+        }
+        result = client.sync() => result,
+    } {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
         }
@@ -2510,11 +2840,16 @@ async fn run_app_runtime_account_worker(
             );
         }
     }
-    let _ = ready.send(Ok(()));
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
 
     loop {
         tokio::select! {
+            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                return;
+            }
             _ = &mut shutdown => {
                 return;
             }
@@ -2793,8 +3128,16 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             format!("runtime receive failed: {err}"),
                         );
-                        tokio::time::sleep(reconnect_backoff.next_delay()).await;
-                        match app.runtime_client(&account_label, &relay_plane).await {
+                        tokio::select! {
+                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                            _ = &mut shutdown => return,
+                            _ = sleep(reconnect_backoff.next_delay()) => {}
+                        }
+                        match tokio::select! {
+                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                            _ = &mut shutdown => return,
+                            result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+                        } {
                             Ok(reopened) => {
                                 client = reopened;
                             }
@@ -2805,7 +3148,11 @@ async fn run_app_runtime_account_worker(
                                     &account_label,
                                     format!("runtime restart failed: {setup_err}"),
                                 );
-                                tokio::time::sleep(reconnect_backoff.next_delay()).await;
+                                tokio::select! {
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                    _ = &mut shutdown => return,
+                                    _ = sleep(reconnect_backoff.next_delay()) => {}
+                                }
                             }
                         }
                     }
@@ -3191,4 +3538,58 @@ fn publish_app_runtime_account_error(
         account_label: account_label.to_owned(),
         message,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
+        let (commands, _commands_rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let worker = ManagedAccountWorker {
+            handle,
+            commands,
+            shutdown,
+        };
+
+        let started = std::time::Instant::now();
+        worker
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
+        let lifecycle = RuntimeLifecycle::new();
+        let (updates_tx, updates) = mpsc::channel(1);
+        let mut subscription = RuntimeMessagesSubscription {
+            snapshot: Vec::new(),
+            updates,
+            stopping: lifecycle.subscribe_shutdown(),
+        };
+
+        lifecycle.begin_shutdown();
+
+        assert!(subscription.recv().await.is_none());
+        drop(updates_tx);
+    }
+
+    #[test]
+    fn lifecycle_refuses_account_open_after_shutdown_begins() {
+        let lifecycle = RuntimeLifecycle::new();
+
+        lifecycle.begin_shutdown();
+
+        assert!(matches!(
+            lifecycle.begin_account_open(),
+            Err(AppError::RuntimeStopping)
+        ));
+    }
 }

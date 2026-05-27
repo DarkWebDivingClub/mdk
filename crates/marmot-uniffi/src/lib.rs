@@ -290,6 +290,13 @@ impl Marmot {
         self.runtime.shutdown().await;
     }
 
+    /// True once shutdown has started. Host apps can use this to avoid
+    /// launching more subscriptions or account work while they are moving to
+    /// the background.
+    pub fn is_stopping(&self) -> bool {
+        self.runtime.is_stopping()
+    }
+
     // -----------------------------------------------------------------------
     // Accounts
     // -----------------------------------------------------------------------
@@ -1262,7 +1269,7 @@ impl Marmot {
     /// type. Useful for global diagnostics; specific UIs prefer the
     /// per-account chats/messages/group-state subscriptions below.
     pub fn subscribe_events(&self) -> Arc<EventsSubscription> {
-        EventsSubscription::new(self.runtime.subscribe())
+        EventsSubscription::new(self.runtime.subscribe_events())
     }
 
     pub async fn subscribe_notifications(

@@ -30,6 +30,8 @@ const DIRECTORY_EVENT_BUFFER: usize = 1024;
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
 const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -398,8 +400,26 @@ impl MarmotRelayPlane {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
+            let timed_out = timeout(
+                RELAY_PLANE_SHUTDOWN_WAIT,
+                sdk_relay_client.client().shutdown(),
+            )
+            .await
+            .is_err();
+            if timed_out {
+                tracing::warn!(
+                    target: "marmot_app::relay_plane",
+                    method = "shutdown",
+                    "SDK relay pool shutdown timed out",
+                );
+            }
+        }
+        account_deliveries_write(&self.inner.transport.account_deliveries).clear();
         if let Some(handle) = self.inner.transport.router.lock().await.take() {
+            let mut handle = handle;
             handle.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
         }
         if let Some(handle) = self
             .inner
@@ -409,7 +429,9 @@ impl MarmotRelayPlane {
             .await
             .take()
         {
+            let mut handle = handle;
             handle.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
         }
     }
 

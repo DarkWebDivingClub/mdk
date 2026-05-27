@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use marmot_app::{
-    MarmotAppEvent, RuntimeAgentStreamWatch, RuntimeChatsSubscription,
+    RuntimeAgentStreamWatch, RuntimeChatsSubscription, RuntimeEventsSubscription,
     RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
@@ -123,11 +123,11 @@ impl GroupStateSubscription {
 /// the per-account chats/messages subscriptions).
 #[derive(uniffi::Object)]
 pub struct EventsSubscription {
-    inner: Mutex<broadcast::Receiver<MarmotAppEvent>>,
+    inner: Mutex<RuntimeEventsSubscription>,
 }
 
 impl EventsSubscription {
-    pub(crate) fn new(inner: broadcast::Receiver<MarmotAppEvent>) -> Arc<Self> {
+    pub(crate) fn new(inner: RuntimeEventsSubscription) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(inner),
         })
@@ -138,13 +138,7 @@ impl EventsSubscription {
 impl EventsSubscription {
     pub async fn next(&self) -> Option<MarmotEventFfi> {
         let mut inner = self.inner.lock().await;
-        loop {
-            match inner.recv().await {
-                Ok(event) => return Some(event.into()),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
+        inner.recv().await.map(Into::into)
     }
 }
 

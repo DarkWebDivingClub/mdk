@@ -84,9 +84,10 @@ pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeSharedServices, StreamStartView,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeSharedServices,
+    StreamStartView,
 };
 
 pub use agent_streams::{
@@ -134,6 +135,7 @@ const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
+const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
@@ -639,7 +641,7 @@ impl MarmotApp {
     }
 
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
-        self.client_with_relay_plane(label, &MarmotRelayPlane::full_history())
+        self.client_with_relay_plane(label, &MarmotRelayPlane::full_history(), None)
             .await
     }
 
@@ -647,27 +649,41 @@ impl MarmotApp {
         &self,
         label: &str,
         relay_plane: &MarmotRelayPlane,
+        lifecycle: runtime::RuntimeLifecycle,
     ) -> Result<AppClient, AppError> {
-        self.client_with_relay_plane(label, relay_plane).await
+        self.client_with_relay_plane(label, relay_plane, Some(lifecycle))
+            .await
     }
 
     async fn client_with_relay_plane(
         &self,
         label: &str,
         relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
         let app = self.clone();
         let label = label.to_owned();
         let relay_plane_for_open = relay_plane.clone();
         let relay_plane_for_rebuild = relay_plane.clone();
+        let permit = lifecycle
+            .as_ref()
+            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .transpose()?;
         let open = blocking_app_task(move || {
+            let _permit = permit;
             app.ensure_account_state(&label)?;
             app.open_account(&label, &relay_plane_for_open)
         })
         .await?;
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.ensure_running()?;
+        }
         let rebuild_since =
             relay_plane_for_rebuild.subscription_rebuild_since(open.state.last_transport_timestamp);
         open.runtime.activate_transport(rebuild_since).await?;
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.ensure_running()?;
+        }
         open.runtime.sync_transport_groups(rebuild_since).await?;
         Ok(AppClient {
             app: self.clone(),
@@ -4047,11 +4063,11 @@ mod tests {
     }
 
     #[test]
-    fn account_worker_is_spawned_on_blocking_pool() {
+    fn account_worker_is_spawned_as_abortable_async_task() {
         let source = include_str!("runtime.rs");
 
-        assert!(source.contains("tokio::task::spawn_blocking(move ||"));
-        assert!(source.contains("worker_runtime.block_on(run_app_runtime_account_worker"));
+        assert!(source.contains("tokio::spawn(run_app_runtime_account_worker"));
+        assert!(source.contains("managed account worker shutdown timed out; aborting"));
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub enum AppError {
     SqlcipherKeyDerivation(String),
     #[error("blocking app task failed: {0}")]
     BlockingTask(String),
+    #[error("marmot runtime is shutting down")]
+    RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
     ReactionNotFound,
     #[error("transport event stream closed")]

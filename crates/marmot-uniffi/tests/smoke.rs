@@ -52,6 +52,13 @@ async fn empty_kit_lifecycle() {
     // Shutdown must succeed even before start() — the constructor does no I/O
     // beyond opening the account-home dir, so there's nothing to tear down.
     kit.shutdown().await;
+    assert!(kit.is_stopping());
+    assert!(matches!(
+        kit.start()
+            .await
+            .expect_err("start after shutdown should be refused"),
+        MarmotKitError::RuntimeStopping
+    ));
 }
 
 #[test]

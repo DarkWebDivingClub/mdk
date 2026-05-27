@@ -19,6 +19,8 @@ pub enum MarmotKitError {
     Publish { details: String },
     #[error("transport closed")]
     TransportClosed,
+    #[error("marmot runtime is shutting down")]
+    RuntimeStopping,
     #[error("local account is not an admin of group {group_id_hex}")]
     NotGroupAdmin { group_id_hex: String },
     #[error("admin must self-demote before leaving group {group_id_hex}")]
@@ -61,6 +63,7 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidIdentity { details },
             AppError::Publish(details) => Self::Publish { details },
             AppError::TransportClosed => Self::TransportClosed,
+            AppError::RuntimeStopping => Self::RuntimeStopping,
             other => Self::Runtime {
                 details: other.to_string(),
             },
