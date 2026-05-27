@@ -1089,6 +1089,7 @@ impl AppClient {
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
+                source_recorded_at,
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
                     if let Err(err) = self
@@ -1125,18 +1126,15 @@ impl AppClient {
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
             }
             if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
-                message_id,
-                reason,
-                ..
+                message_id, reason, ..
             } = event
-            {
-                if let Some(projection_update) = self.app.invalidate_timeline_source_message(
+                && let Some(projection_update) = self.app.invalidate_timeline_source_message(
                     &self.state.label,
                     &hex::encode(message_id.as_slice()),
                     &format!("{reason:?}"),
-                )? {
-                    summary.projection_updates.push(projection_update);
-                }
+                )?
+            {
+                summary.projection_updates.push(projection_update);
             }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;

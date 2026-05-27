@@ -338,6 +338,11 @@ pub struct ReceivedMessage {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<Vec<String>>,
+    /// Source-event timestamp (seconds since epoch) for the MLS-delivered
+    /// message. Clients should sort the timeline by this value so chronology
+    /// reflects send time, not delivery time. Zero means the timestamp was
+    /// unavailable at decode time.
+    pub recorded_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4774,6 +4779,7 @@ mod tests {
             plaintext: "hello".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
+            recorded_at: 0,
         })
         .unwrap();
 
@@ -5373,11 +5379,19 @@ mod tests {
         });
         let bytes = event.encode().unwrap();
         let group_id = GroupId::new(vec![0x01]);
-        let message = groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1")
-            .expect("valid event is accepted");
+        let message = groups::decode_received_event(
+            &bytes,
+            SENDER_HEX,
+            None,
+            &group_id,
+            "msg1",
+            1_700_000_000,
+        )
+        .expect("valid event is accepted");
         assert_eq!(message.plaintext, "hi");
         assert_eq!(message.kind, MARMOT_APP_EVENT_KIND_CHAT);
         assert_eq!(message.sender, SENDER_HEX);
+        assert_eq!(message.recorded_at, 1_700_000_000);
     }
 
     #[test]
@@ -5391,7 +5405,7 @@ mod tests {
         let bytes = serde_json::to_vec(&event).unwrap();
         let group_id = GroupId::new(vec![0x01]);
         assert!(
-            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1").is_none()
+            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1", 0).is_none()
         );
     }
 
@@ -5405,7 +5419,8 @@ mod tests {
         let other_sender = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
         // The inner pubkey is SENDER_HEX, but MLS authenticated `other_sender`.
         assert!(
-            groups::decode_received_event(&bytes, other_sender, None, &group_id, "msg1").is_none()
+            groups::decode_received_event(&bytes, other_sender, None, &group_id, "msg1", 0)
+                .is_none()
         );
     }
 

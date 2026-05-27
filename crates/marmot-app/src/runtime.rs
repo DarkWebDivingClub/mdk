@@ -546,6 +546,10 @@ impl RuntimeMessagesSubscription {
     }
 }
 
+// `Page` carries a fully hydrated `TimelinePage`, so the variant sizes
+// differ — boxing either side would change the channel's public type
+// and propagate through every consumer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeTimelineMessageUpdate {
     Page {
@@ -703,6 +707,10 @@ impl Drop for RuntimeAgentStreamWatch {
     }
 }
 
+// Boxing the heavier variants would ripple through every public consumer of
+// this fan-out event type; the small overhead in the lighter variants is the
+// intentional trade-off.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarmotAppEvent {
     GroupJoined {

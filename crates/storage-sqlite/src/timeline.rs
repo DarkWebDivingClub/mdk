@@ -463,8 +463,7 @@ fn timeline_records_by_ids_tx(
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(message_ids.len())
+    let placeholders = std::iter::repeat_n("?", message_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -947,8 +946,7 @@ fn load_reply_previews(
     for (group_id_hex, mut message_ids) in targets_by_group {
         message_ids.sort();
         message_ids.dedup();
-        let placeholders = std::iter::repeat("?")
-            .take(message_ids.len())
+        let placeholders = std::iter::repeat_n("?", message_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -991,8 +989,7 @@ fn load_reply_previews_tx(
     for (group_id_hex, mut message_ids) in targets_by_group {
         message_ids.sort();
         message_ids.dedup();
-        let placeholders = std::iter::repeat("?")
-            .take(message_ids.len())
+        let placeholders = std::iter::repeat_n("?", message_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(

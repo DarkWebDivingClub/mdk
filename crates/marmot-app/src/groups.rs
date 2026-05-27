@@ -444,6 +444,7 @@ pub(crate) fn decode_received_event(
     sender_display_name: Option<String>,
     group_id: &GroupId,
     source_message_id_hex: &str,
+    source_recorded_at: u64,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -487,6 +488,7 @@ pub(crate) fn decode_received_event(
         plaintext: event.content,
         kind: event.kind,
         tags: event.tags,
+        recorded_at: source_recorded_at,
     })
 }
 
@@ -530,6 +532,7 @@ pub(crate) fn observe_event(
     event: &GroupEvent,
     group_projection: Option<&EventGroupProjection<'_>>,
     source_message_id_hex: &str,
+    source_recorded_at: u64,
 ) -> Option<ReceivedMessage> {
     match event {
         GroupEvent::GroupJoined { group_id, .. } | GroupEvent::GroupCreated { group_id } => {
@@ -579,6 +582,7 @@ pub(crate) fn observe_event(
                 sender_display_name,
                 group_id,
                 source_message_id_hex,
+                source_recorded_at,
             ) else {
                 summary.events.push(event.clone());
                 return None;

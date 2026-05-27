@@ -4517,6 +4517,7 @@ mod tests {
             plaintext: "hello".to_owned(),
             kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
+            recorded_at: 0,
         };
 
         let value = runtime_message_json(
@@ -4577,6 +4578,7 @@ mod tests {
             plaintext: "hello back".to_owned(),
             kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
+            recorded_at: 0,
         };
 
         let value = runtime_message_json(
