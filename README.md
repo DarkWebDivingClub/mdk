@@ -24,6 +24,8 @@ If you are landing in this repo for the first time, read these files in order:
 
 After that, choose the review lane that matches the question in front of you.
 
+Release checklists live in [`release.md`](release.md).
+
 ## Review Lanes
 
 Most reviewers should use one of these two paths.
