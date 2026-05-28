@@ -219,17 +219,36 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let row: Option<(String, String)> = tx
+        let row: Option<(String, String, u64, Vec<Vec<String>>)> = tx
             .query_row(
-                "SELECT group_id_hex, message_id_hex FROM app_events WHERE source_message_id_hex = ?1",
+                "SELECT group_id_hex, message_id_hex, kind, tags_json
+                 FROM app_events
+                 WHERE source_message_id_hex = ?1",
                 params![source_message_id_hex],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok((row.get(0)?, row.get(1)?, kind, tags))
+                },
             )
             .optional()
             .storage()?;
-        let Some((group_id_hex, message_id_hex)) = row else {
+        let Some((group_id_hex, message_id_hex, kind, tags)) = row else {
             return Ok(None);
         };
+        let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+            &tx,
+            &group_id_hex,
+            &message_id_hex,
+            kind,
+            &tags,
+        )?;
         tx.execute(
             "UPDATE app_events
              SET invalidated = 1, invalidation_reason = ?2
@@ -238,8 +257,6 @@ impl SqliteAccountStorage {
         )
         .storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
-        let mut affected_message_ids = BTreeSet::new();
-        affected_message_ids.insert(message_id_hex);
         let messages = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids)?;
         tx.commit().storage()?;
         Ok(Some(TimelineProjectionUpdate {
@@ -398,19 +415,35 @@ fn affected_timeline_message_ids_tx(
     tx: &Transaction<'_>,
     event: &StoredAppEvent,
 ) -> StorageResult<BTreeSet<String>> {
+    affected_timeline_message_ids_for_parts_tx(
+        tx,
+        &event.group_id_hex,
+        &event.message_id_hex,
+        event.kind,
+        &event.tags,
+    )
+}
+
+fn affected_timeline_message_ids_for_parts_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+) -> StorageResult<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
-    match event.kind {
+    match kind {
         MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
-            ids.insert(event.message_id_hex.clone());
+            ids.insert(message_id_hex.to_owned());
         }
         MARMOT_APP_EVENT_KIND_REACTION => {
-            ids.extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_DELETE => {
-            for target in tag_values(&event.tags, EVENT_REF_TAG) {
+            for target in tag_values(tags, EVENT_REF_TAG) {
                 ids.insert(target.to_owned());
                 if let Some(reaction_target) =
-                    reaction_target_message_id_tx(tx, &event.group_id_hex, target)?
+                    reaction_target_message_id_tx(tx, group_id_hex, target)?
                 {
                     ids.insert(reaction_target);
                 }
@@ -484,7 +517,7 @@ fn timeline_records_by_ids_tx(
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
-    attach_reply_previews_tx(tx, &mut messages)?;
+    attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
 }
 
@@ -900,36 +933,6 @@ fn attach_reply_previews(
     Ok(())
 }
 
-fn attach_reply_previews_tx(
-    tx: &Transaction<'_>,
-    messages: &mut [TimelineMessageRecord],
-) -> StorageResult<()> {
-    let targets = messages
-        .iter()
-        .filter_map(|message| {
-            message
-                .reply_to_message_id_hex
-                .as_ref()
-                .map(|target| (message.group_id_hex.clone(), target.clone()))
-        })
-        .collect::<HashSet<_>>();
-    if targets.is_empty() {
-        return Ok(());
-    }
-
-    let previews = load_reply_previews_tx(tx, targets)?;
-
-    for message in messages {
-        let Some(target) = message.reply_to_message_id_hex.as_ref() else {
-            continue;
-        };
-        message.reply_preview = previews
-            .get(&(message.group_id_hex.clone(), target.clone()))
-            .cloned();
-    }
-    Ok(())
-}
-
 fn load_reply_previews(
     conn: &Connection,
     targets: HashSet<(String, String)>,
@@ -958,49 +961,6 @@ fn load_reply_previews(
         params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
         params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
         let mut stmt = conn.prepare(&sql).storage()?;
-        let group_previews = stmt
-            .query_map(params_from_iter(params.iter()), reply_preview_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        for preview in group_previews {
-            previews.insert(
-                (group_id_hex.clone(), preview.message_id_hex.clone()),
-                preview,
-            );
-        }
-    }
-    Ok(previews)
-}
-
-fn load_reply_previews_tx(
-    tx: &Transaction<'_>,
-    targets: HashSet<(String, String)>,
-) -> StorageResult<HashMap<(String, String), TimelineReplyPreview>> {
-    let mut targets_by_group = BTreeMap::<String, Vec<String>>::new();
-    for (group_id_hex, message_id_hex) in targets {
-        targets_by_group
-            .entry(group_id_hex)
-            .or_default()
-            .push(message_id_hex);
-    }
-
-    let mut previews = HashMap::new();
-    for (group_id_hex, mut message_ids) in targets_by_group {
-        message_ids.sort();
-        message_ids.dedup();
-        let placeholders = std::iter::repeat_n("?", message_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted
-             FROM message_timeline
-             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
-        );
-        let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-        params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
-        params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-        let mut stmt = tx.prepare(&sql).storage()?;
         let group_previews = stmt
             .query_map(params_from_iter(params.iter()), reply_preview_from_row)
             .storage()?
@@ -1426,5 +1386,32 @@ mod tests {
         assert!(update.is_some());
 
         assert!(list(&store).is_empty());
+    }
+
+    #[test]
+    fn reaction_source_invalidation_returns_changed_target_projection() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+        store
+            .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_source("source-reaction-1", "losing_branch")
+            .unwrap()
+            .expect("projection update");
+
+        assert_eq!(update.messages.len(), 1);
+        assert_eq!(update.messages[0].message_id_hex, "target");
+        assert!(
+            update.messages[0]
+                .reactions
+                .by_emoji
+                .get("+")
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(update.messages[0].reactions.user_reactions.is_empty());
     }
 }

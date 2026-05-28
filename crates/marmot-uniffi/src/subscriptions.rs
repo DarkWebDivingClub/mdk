@@ -24,8 +24,9 @@ use marmot_app::{
 use tokio::sync::Mutex;
 
 use crate::conversions::{
-    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi, MarmotEventFfi,
-    MessageUpdateFfi, NotificationUpdateFfi, TimelinePageFfi, TimelineSubscriptionUpdateFfi,
+    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
+    ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
+    TimelinePageFfi, TimelineSubscriptionUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -85,6 +86,16 @@ impl ChatListSubscription {
     }
 
     pub async fn next(&self) -> Option<ChatListRowFfi> {
+        let mut inner = self.inner.lock().await;
+        loop {
+            match inner.recv().await? {
+                marmot_app::RuntimeChatListUpdate::Row(row) => return Some(row.into()),
+                marmot_app::RuntimeChatListUpdate::RemoveRow { .. } => continue,
+            }
+        }
+    }
+
+    pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
     }
@@ -151,7 +162,7 @@ impl TimelineMessagesSubscription {
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(|update| match update {
-            marmot_app::RuntimeTimelineMessageUpdate::Page { page, .. } => page.into(),
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => page.into(),
             marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => TimelinePageFfi {
                 messages: update
                     .update

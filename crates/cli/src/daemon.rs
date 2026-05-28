@@ -1290,7 +1290,7 @@ async fn handle_timeline_messages_subscription(
 
     while let Some(update) = runtime_subscription.recv().await {
         let response = match update {
-            marmot_app::RuntimeTimelineMessageUpdate::Page { page, .. } => {
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => {
                 timeline_page_stream_response(page, "TimelineUpdated", &runtime)
             }
             marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => {

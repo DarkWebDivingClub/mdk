@@ -89,11 +89,11 @@ pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatsSubscription, RuntimeEventsSubscription,
-    RuntimeGroupEvent, RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    StreamStartView,
+    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
 
 pub use agent_streams::{
@@ -196,6 +196,9 @@ pub struct MarmotApp {
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
+    account_state_ready: Arc<Mutex<HashSet<String>>>,
+    chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
+    chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -908,6 +911,9 @@ impl MarmotApp {
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             shared_storage: Arc::new(Mutex::new(None)),
+            account_state_ready: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -939,6 +945,9 @@ impl MarmotApp {
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             shared_storage: Arc::new(Mutex::new(None)),
+            account_state_ready: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1529,9 +1538,10 @@ impl MarmotApp {
     ) -> Result<Vec<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
         let mut rows = self
             .account_storage(&account.label)?
-            .chat_list_rows(&account.account_id_hex, ChatListQuery { include_archived })?;
+            .chat_list_rows(ChatListQuery { include_archived })?;
         self.hydrate_chat_list_rows(&mut rows)?;
         Ok(rows)
     }
@@ -1543,9 +1553,23 @@ impl MarmotApp {
     ) -> Result<Option<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
         let mut row = self
             .account_storage(&account.label)?
-            .chat_list_row(&account.account_id_hex, group_id_hex)?;
+            .chat_list_row(group_id_hex)?;
+        self.hydrate_chat_list_row(row.as_mut())?;
+        Ok(row)
+    }
+
+    fn refresh_chat_list_row(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        let mut row = self
+            .account_storage(&account.label)?
+            .refresh_chat_list_row(&account.account_id_hex, group_id_hex)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
     }
@@ -2553,6 +2577,10 @@ impl MarmotApp {
                 &stored_state_from_account_state(state),
                 MAX_SEEN_EVENT_IDS,
             )?;
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(state.label.clone());
         Ok(())
     }
 
@@ -2564,9 +2592,48 @@ impl MarmotApp {
         )
         .entered();
         self.account_home().account(label)?;
+        let mut ready = self
+            .account_state_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ready.contains(label) {
+            return Ok(());
+        }
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
             .ensure_account_projection(label)?;
+        ready.insert(label.to_owned());
+        Ok(())
+    }
+
+    fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
+        let stale = self
+            .chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&account.label);
+        let warmed = self
+            .chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&account.label);
+        if warmed && !stale {
+            return Ok(());
+        }
+        let storage = self.account_storage(&account.label)?;
+        if stale {
+            storage.refresh_chat_list_rows(&account.account_id_hex)?;
+        } else {
+            storage.ensure_chat_list_rows(&account.account_id_hex)?;
+        }
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account.label.clone());
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account.label);
         Ok(())
     }
 
@@ -2744,7 +2811,7 @@ impl MarmotApp {
         label: &str,
         storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
-        let chat_list_row = self.chat_list_row(label, &storage_update.group_id_hex)?;
+        let chat_list_row = self.refresh_chat_list_row(label, &storage_update.group_id_hex)?;
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,

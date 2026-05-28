@@ -47,14 +47,15 @@ uniffi::setup_scaffolding!();
 
 pub use conversions::{
     BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
-    ChatListRowFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
-    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
-    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RuntimeProjectionUpdateFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
-    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUserReactionFfi,
+    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi,
+    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
+    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    PushRegistrationFfi, RuntimeProjectionUpdateFfi, TimelineMessageQueryFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
+    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineSubscriptionUpdateFfi,
+    TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

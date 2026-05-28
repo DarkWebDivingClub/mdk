@@ -552,11 +552,7 @@ impl RuntimeMessagesSubscription {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeTimelineMessageUpdate {
-    Page {
-        account_id_hex: String,
-        account_label: String,
-        page: TimelinePage,
-    },
+    Page { page: TimelinePage },
     Projection(RuntimeProjectionUpdate),
 }
 
@@ -592,12 +588,18 @@ impl RuntimeChatsSubscription {
 
 pub struct RuntimeChatListSubscription {
     pub snapshot: Vec<ChatListRow>,
-    updates: mpsc::Receiver<ChatListRow>,
+    updates: mpsc::Receiver<RuntimeChatListUpdate>,
     stopping: watch::Receiver<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeChatListUpdate {
+    Row(ChatListRow),
+    RemoveRow { group_id_hex: String },
+}
+
 impl RuntimeChatListSubscription {
-    pub async fn recv(&mut self) -> Option<ChatListRow> {
+    pub async fn recv(&mut self) -> Option<RuntimeChatListUpdate> {
         tokio::select! {
             update = self.updates.recv() => update,
             _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
@@ -893,11 +895,7 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         if updates_tx
-                            .send(RuntimeTimelineMessageUpdate::Page {
-                                account_id_hex: account_id_hex.clone(),
-                                account_label: account_label.clone(),
-                                page,
-                            })
+                            .send(RuntimeTimelineMessageUpdate::Page { page })
                             .await
                             .is_err()
                         {
@@ -1041,17 +1039,30 @@ impl MarmotAppRuntime {
                     && update.account_id_hex == account_id_hex
                 {
                     let Some(row) = update.update.chat_list_row.clone() else {
+                        if !send_chat_list_remove_update(
+                            &updates_tx,
+                            &mut row_fingerprints,
+                            &update.update.group_id_hex,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         continue;
                     };
                     if !include_archived && row.archived {
+                        if !send_chat_list_remove_update(
+                            &updates_tx,
+                            &mut row_fingerprints,
+                            &row.group_id_hex,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         continue;
                     }
-                    let fingerprint = chat_list_row_fingerprint(&row);
-                    if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
-                        continue;
-                    }
-                    row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
-                    if updates_tx.send(row).await.is_err() {
+                    if !send_chat_list_row_update(&updates_tx, &mut row_fingerprints, row).await {
                         return;
                     }
                     continue;
@@ -1065,26 +1076,44 @@ impl MarmotAppRuntime {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
-                let include_archived_for_lookup = include_archived;
+                let group_id_hex_for_lookup = group_id_hex.clone();
                 if runtime_shutdown_requested(&stopping) {
                     return;
                 }
                 let row = match blocking_app_task(move || {
                     app_for_lookup
-                        .chat_list_row(&account_label_for_lookup, &group_id_hex)
-                        .map(|row| row.filter(|row| include_archived_for_lookup || !row.archived))
+                        .refresh_chat_list_row(&account_label_for_lookup, &group_id_hex_for_lookup)
                 })
                 .await
                 {
-                    Ok(Some(row)) => row,
-                    Ok(None) | Err(_) => continue,
+                    Ok(row) => row,
+                    Err(_) => continue,
                 };
-                let fingerprint = chat_list_row_fingerprint(&row);
-                if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
+                let Some(row) = row else {
+                    if !send_chat_list_remove_update(
+                        &updates_tx,
+                        &mut row_fingerprints,
+                        &group_id_hex,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                };
+                if !include_archived && row.archived {
+                    if !send_chat_list_remove_update(
+                        &updates_tx,
+                        &mut row_fingerprints,
+                        &row.group_id_hex,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     continue;
                 }
-                row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
-                if updates_tx.send(row).await.is_err() {
+                if !send_chat_list_row_update(&updates_tx, &mut row_fingerprints, row).await {
                     return;
                 }
             }
@@ -3956,6 +3985,38 @@ fn chat_list_row_fingerprint(row: &ChatListRow) -> String {
     serde_json::to_string(&stable).unwrap_or_else(|_| row.group_id_hex.clone())
 }
 
+async fn send_chat_list_row_update(
+    updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
+    row_fingerprints: &mut HashMap<String, String>,
+    row: ChatListRow,
+) -> bool {
+    let fingerprint = chat_list_row_fingerprint(&row);
+    if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
+        return true;
+    }
+    row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
+    updates_tx
+        .send(RuntimeChatListUpdate::Row(row))
+        .await
+        .is_ok()
+}
+
+async fn send_chat_list_remove_update(
+    updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
+    row_fingerprints: &mut HashMap<String, String>,
+    group_id_hex: &str,
+) -> bool {
+    if row_fingerprints.remove(group_id_hex).is_none() {
+        return true;
+    }
+    updates_tx
+        .send(RuntimeChatListUpdate::RemoveRow {
+            group_id_hex: group_id_hex.to_owned(),
+        })
+        .await
+        .is_ok()
+}
+
 fn publish_app_runtime_account_error(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -4028,6 +4089,23 @@ mod tests {
 
         assert!(subscription.recv().await.is_none());
         drop(updates_tx);
+    }
+
+    #[tokio::test]
+    async fn chat_list_remove_update_is_sent_once_for_visible_rows() {
+        let (updates_tx, mut updates_rx) = mpsc::channel(1);
+        let mut row_fingerprints = HashMap::from([("group".to_owned(), "fingerprint".to_owned())]);
+
+        assert!(send_chat_list_remove_update(&updates_tx, &mut row_fingerprints, "group").await);
+        assert_eq!(
+            updates_rx.recv().await,
+            Some(RuntimeChatListUpdate::RemoveRow {
+                group_id_hex: "group".to_owned()
+            })
+        );
+
+        assert!(send_chat_list_remove_update(&updates_tx, &mut row_fingerprints, "group").await);
+        assert!(updates_rx.try_recv().is_err());
     }
 
     #[test]
