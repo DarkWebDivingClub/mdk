@@ -34,6 +34,7 @@ pub mod account_identity_proof;
 pub mod app_components;
 
 pub(crate) mod app_payload;
+pub(crate) mod audit_helpers;
 pub mod auto_committer;
 pub mod canonicalization;
 pub mod capabilities;

@@ -99,6 +99,12 @@ impl<S: StorageProvider> Engine<S> {
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        self.audit_snapshot_created(
+            &group_id,
+            &recovery_snapshot,
+            pre_commit_epoch,
+            "pre_update_group_data_commit",
+        );
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =

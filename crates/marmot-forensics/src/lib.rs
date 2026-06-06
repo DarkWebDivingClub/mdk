@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod audit;
+
+pub use audit::{
+    AUDIT_LOG_SCHEMA_VERSION, AuditEvent, AuditEventKind, AuditRecord, DigestHex, EngineIdHex,
+    ForensicRecorder, ForkWinner, GroupRefHex, JsonlRecorder, MessageRefHex, NoopRecorder,
+    PeelerOutcomeKind, default_jsonl_path,
+};
+
 pub const FORENSICS_SCHEMA_VERSION: &str = "marmot-forensics/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

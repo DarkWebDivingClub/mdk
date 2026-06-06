@@ -2050,23 +2050,50 @@ impl MarmotApp {
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         let session_key =
             self.sqlcipher_key(label, &keys, &session_path, SqlcipherDatabaseKind::Session)?;
-        let session = AccountDeviceSession::open(
-            SessionConfig::new(
-                session_path,
-                session_key,
-                account_id.as_slice().to_vec(),
-                Box::new(peeler),
-            )
-            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-                keys: keys.clone(),
-            }))
-            .feature_registry(app_feature_registry())
-            .supported_app_components(self.supported_app_component_ids())
-            .convergence_policy(CanonicalizationPolicy {
-                settlement_quiescence_ms: 0,
-                ..CanonicalizationPolicy::default()
-            }),
-        )?;
+        // Optional forensic audit log. Set `MARMOT_AUDIT_LOG=1` (or any non-empty
+        // value) to enable per-account JSONL recording at
+        // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
+        // Temporary forensic measure; remove the file when done debugging.
+        let mut session_config = SessionConfig::new(
+            session_path,
+            session_key,
+            account_id.as_slice().to_vec(),
+            Box::new(peeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: keys.clone(),
+        }))
+        .feature_registry(app_feature_registry())
+        .supported_app_components(self.supported_app_component_ids())
+        .convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        });
+        if std::env::var("MARMOT_AUDIT_LOG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            let engine_id_hex =
+                hex::encode(&account_id.as_slice()[..8.min(account_id.as_slice().len())]);
+            let audit_path = self
+                .account_dir(label)
+                .join(format!("audit-{engine_id_hex}.jsonl"));
+            match marmot_forensics::JsonlRecorder::open(&audit_path, engine_id_hex.clone()) {
+                Ok(recorder) => {
+                    session_config = session_config.recorder(Box::new(recorder));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "marmot_app",
+                        method = "open_account",
+                        error = %e,
+                        "failed to open forensic audit log; continuing without it"
+                    );
+                }
+            }
+        }
+        let session = AccountDeviceSession::open(session_config)?;
 
         let publish_client = self.relay_client_for_endpoints(&keys, &self.relay_endpoints());
         let adapter = relay_plane.account_adapter(account_id.clone(), publish_client);

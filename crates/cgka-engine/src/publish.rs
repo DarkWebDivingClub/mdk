@@ -101,9 +101,25 @@ impl<S: StorageProvider> Engine<S> {
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_confirmed_event(
+                EpochId(new_epoch.0.saturating_sub(1)),
+                new_epoch,
+                crate::audit_helpers::pending_kind_str(kind),
+            ),
+        );
         if let Some(message_id) = self.promote_pending_commit_for_recovery(pending) {
             self.storage
                 .update_message_state(&message_id, MessageState::Processed)?;
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(message_id.as_slice()),
+                    MessageState::Processed,
+                    "publish_confirmed",
+                ),
+            );
         }
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
@@ -170,7 +186,20 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_group(&g)?;
         }
 
-        let (group_id, _prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
+        let kind = self
+            .epoch_manager
+            .kind_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
+        let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_rolled_back_event(
+                pending_epoch_pre,
+                prior_epoch,
+                crate::audit_helpers::pending_kind_str(kind),
+            ),
+        );
         self.pending_auto_removed.remove(&pending);
         self.forget_pending_commit_for_recovery(pending)?;
         self.replay_buffered_messages(&group_id).await?;

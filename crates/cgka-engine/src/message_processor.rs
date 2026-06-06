@@ -188,7 +188,33 @@ impl<S: StorageProvider> Engine<S> {
 
             // Peel.
             let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
-            let peeled = match self.peeler.peel_group_message(msg, &ctx).await {
+            let msg_id_hex = hex::encode(msg.id.as_slice());
+            let peel_result = self.peeler.peel_group_message(msg, &ctx).await;
+            // Record the raw peeler verdict before any fallback attempt.
+            let raw_outcome = match &peel_result {
+                Ok(_) => marmot_forensics::PeelerOutcomeKind::Success,
+                Err(PeelerError::DecryptFailed) => {
+                    marmot_forensics::PeelerOutcomeKind::DecryptFailed
+                }
+                Err(PeelerError::StaleEpoch { .. }) => {
+                    marmot_forensics::PeelerOutcomeKind::StaleEpoch
+                }
+                Err(PeelerError::Malformed(_)) => marmot_forensics::PeelerOutcomeKind::Malformed,
+                Err(_) => marmot_forensics::PeelerOutcomeKind::Other,
+            };
+            self.audit_group(
+                &group_id,
+                marmot_forensics::AuditEventKind::PeelerOutcome {
+                    msg_id: msg_id_hex.clone(),
+                    outcome: raw_outcome,
+                    fallback_snapshot_used: false,
+                    detail: match &peel_result {
+                        Err(e) => Some(format!("{e}")),
+                        Ok(_) => None,
+                    },
+                },
+            );
+            let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
                     if let Some(peeled) = self
@@ -199,6 +225,15 @@ impl<S: StorageProvider> Engine<S> {
                         )
                         .await?
                     {
+                        self.audit_group(
+                            &group_id,
+                            marmot_forensics::AuditEventKind::PeelerOutcome {
+                                msg_id: msg_id_hex.clone(),
+                                outcome: marmot_forensics::PeelerOutcomeKind::Success,
+                                fallback_snapshot_used: true,
+                                detail: Some("recovered_after_decrypt_failed".to_string()),
+                            },
+                        );
                         peeled
                     } else {
                         self.persist_transport_message(
@@ -207,6 +242,14 @@ impl<S: StorageProvider> Engine<S> {
                             current_epoch,
                             MessageState::PeelDeferred,
                         )?;
+                        self.audit_group(
+                            &group_id,
+                            crate::audit_helpers::message_state_changed_event(
+                                msg_id_hex.clone(),
+                                MessageState::PeelDeferred,
+                                "peel_failed_no_snapshot",
+                            ),
+                        );
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
@@ -221,6 +264,15 @@ impl<S: StorageProvider> Engine<S> {
                         )
                         .await?
                     {
+                        self.audit_group(
+                            &group_id,
+                            marmot_forensics::AuditEventKind::PeelerOutcome {
+                                msg_id: msg_id_hex.clone(),
+                                outcome: marmot_forensics::PeelerOutcomeKind::Success,
+                                fallback_snapshot_used: true,
+                                detail: Some("recovered_after_stale_epoch".to_string()),
+                            },
+                        );
                         peeled
                     } else {
                         self.persist_transport_message(
@@ -229,6 +281,14 @@ impl<S: StorageProvider> Engine<S> {
                             current_epoch,
                             MessageState::Failed,
                         )?;
+                        self.audit_group(
+                            &group_id,
+                            crate::audit_helpers::message_state_changed_event(
+                                msg_id_hex.clone(),
+                                MessageState::Failed,
+                                "stale_epoch_no_snapshot",
+                            ),
+                        );
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
@@ -472,6 +532,12 @@ impl<S: StorageProvider> Engine<S> {
                     let recovery_snapshot =
                         self.fork_recovery
                             .create_snapshot(&self.storage, &group_id, before)?;
+                    self.audit_snapshot_created(
+                        &group_id,
+                        &recovery_snapshot,
+                        before,
+                        "pre_inbound_commit_apply",
+                    );
                     let before_members = group_lifecycle::marmot_members(&mls_group);
                     self.retain_current_epoch_snapshot_for_group(&group_id)?;
                     // Extract capabilities from Add proposals before the
@@ -563,6 +629,21 @@ impl<S: StorageProvider> Engine<S> {
                     // proposals, so store it before attempting to commit the
                     // pending proposal queue.
                     let decision = crate::auto_committer::decide(&mls_group, &queued);
+                    let decision_str = match &decision {
+                        crate::auto_committer::AutoCommitDecision::Commit => "commit",
+                        crate::auto_committer::AutoCommitDecision::Observe => "observe",
+                    };
+                    self.audit_group(
+                        &group_id,
+                        marmot_forensics::AuditEventKind::AutoCommitDecision {
+                            proposal_kind: crate::audit_helpers::proposal_kind_str(
+                                queued.proposal(),
+                            )
+                            .to_string(),
+                            decision: decision_str.to_string(),
+                            reason: None,
+                        },
+                    );
                     let auto_removed = match queued.proposal() {
                         Proposal::Remove(r) => member_id_at_leaf(&mls_group, r.removed())
                             .into_iter()
@@ -589,6 +670,12 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             pre_commit_epoch,
                         )?;
+                        self.audit_snapshot_created(
+                            &group_id,
+                            &recovery_snapshot,
+                            pre_commit_epoch,
+                            "pre_auto_commit",
+                        );
                         let pre_commit_ctx =
                             group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
                         let (commit_out, _welcome_opt, _gi) = mls_group
@@ -972,6 +1059,12 @@ impl<S: StorageProvider> Engine<S> {
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        self.audit_snapshot_created(
+            &group_id,
+            &recovery_snapshot,
+            pre_commit_epoch,
+            "pre_invite_commit",
+        );
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =
@@ -1180,6 +1273,12 @@ impl<S: StorageProvider> Engine<S> {
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        self.audit_snapshot_created(
+            &group_id,
+            &recovery_snapshot,
+            pre_commit_epoch,
+            "pre_remove_members_commit",
+        );
         self.epoch_manager
             .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =
@@ -1821,6 +1920,7 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
         payload: StoredMessagePayload,
     ) -> Result<(), EngineError> {
+        let id_hex = hex::encode(id.as_slice());
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1831,6 +1931,10 @@ impl<S: StorageProvider> Engine<S> {
             state,
             payload,
         })?;
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::message_state_changed_event(id_hex, state, "persist"),
+        );
         Ok(())
     }
 
@@ -1840,6 +1944,11 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
     ) -> Result<(), EngineError> {
         self.storage.update_message_state(id, state)?;
+        self.audit(crate::audit_helpers::message_state_changed_event(
+            hex::encode(id.as_slice()),
+            state,
+            "state_update",
+        ));
         Ok(())
     }
 

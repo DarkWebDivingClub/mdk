@@ -24,7 +24,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use marmot_forensics::{ForensicsEngineGroupState, ForensicsExportOptions};
+use marmot_forensics::{ForensicRecorder, ForensicsEngineGroupState, ForensicsExportOptions};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
 const TRACE_TARGET: &str = "cgka_session::session";
@@ -49,6 +49,7 @@ pub struct SessionConfig {
     supported_app_components: AppComponentSet,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
+    recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
 impl SessionConfig {
@@ -68,7 +69,15 @@ impl SessionConfig {
             supported_app_components: AppComponentSet::new(default_group_components()),
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
+            recorder: None,
         }
+    }
+
+    /// Install a forensic audit-log recorder. Without this call the engine
+    /// uses the no-op recorder.
+    pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
     }
 
     pub fn feature_registry(mut self, registry: FeatureRegistry) -> Self {
@@ -173,15 +182,18 @@ impl AccountDeviceSession {
             &config.database_key,
             config.storage_options,
         )?;
-        let mut engine = EngineBuilder::new(storage)
+        let mut builder = EngineBuilder::new(storage)
             .identity(config.identity)
             .account_identity_proof_signer(config.account_identity_proof_signer.ok_or_else(
                 || EngineError::Other("account identity proof signer is required".into()),
             )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
-            .peeler(config.peeler)
-            .build()?;
+            .peeler(config.peeler);
+        if let Some(recorder) = config.recorder {
+            builder = builder.recorder(recorder);
+        }
+        let mut engine = builder.build()?;
         engine.hydrate_stable_groups_from_storage()?;
         engine.set_convergence_policy(config.convergence_policy);
         tracing::debug!(

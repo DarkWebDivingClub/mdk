@@ -154,6 +154,7 @@ impl<S: StorageProvider> Engine<S> {
                 .collect(),
         };
 
+        let max_rewind_commits = policy.convergence.max_rewind_commits;
         let result = canonicalize_stored_openmls_messages(
             &self.storage,
             group_id,
@@ -162,6 +163,18 @@ impl<S: StorageProvider> Engine<S> {
             policy,
             now_ms,
         )?;
+        self.audit_group(
+            group_id,
+            marmot_forensics::AuditEventKind::ConvergenceDecision {
+                current_tip_epoch: previous_tip.0,
+                candidate_count: 0,
+                eligible_count: 0,
+                max_rewind_commits,
+                selected_branch_id: result.selected_branch_id.clone(),
+                selected_fork_epoch: None,
+                selected_tip_epoch: result.selected_tip,
+            },
+        );
         if matches!(
             result.convergence_status,
             ConvergenceStatus::Syncing | ConvergenceStatus::Resolving

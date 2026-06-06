@@ -26,6 +26,7 @@ use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, NoopRecorder};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -72,6 +73,12 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
     pub(crate) convergence_clock_started_at: Instant,
+
+    /// Forensic audit-log recorder. Defaults to [`NoopRecorder`] when the
+    /// session is built without one. Engine call sites emit typed events
+    /// at every state-relevant decision point so a later analyzer can
+    /// reconstruct what each device saw and decided.
+    pub(crate) recorder: Box<dyn ForensicRecorder>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -87,6 +94,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
+    recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
 impl<S: StorageProvider> EngineBuilder<S> {
@@ -100,6 +108,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
+            recorder: None,
         }
     }
 
@@ -141,6 +150,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
     pub fn max_past_epochs(mut self, max_past_epochs: usize) -> Self {
         self.max_past_epochs = max_past_epochs;
+        self
+    }
+
+    /// Install a forensic audit-log recorder. Without this call the engine
+    /// uses [`NoopRecorder`] and emits no audit events.
+    pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
+        self.recorder = Some(recorder);
         self
     }
 
@@ -191,6 +207,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
+            recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
         })
     }
 }
@@ -233,6 +250,43 @@ impl<S: StorageProvider> Engine<S> {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Emit an audit-log event with no group attribution.
+    pub(crate) fn audit(&self, kind: AuditEventKind) {
+        self.recorder.record(AuditRecord {
+            group_ref: None,
+            kind,
+        });
+    }
+
+    /// Emit an audit-log event attributed to a specific group.
+    pub(crate) fn audit_group(&self, group_id: &GroupId, kind: AuditEventKind) {
+        self.recorder.record(AuditRecord {
+            group_ref: Some(hex::encode(group_id.as_slice())),
+            kind,
+        });
+    }
+
+    /// Emit a `SnapshotCreated` audit event. Call this immediately after
+    /// `self.fork_recovery.create_snapshot(&self.storage, ...)` succeeds.
+    /// Kept separate from the `create_snapshot` call so callers preserve
+    /// disjoint-field borrow patterns when a `provider` is alive.
+    pub(crate) fn audit_snapshot_created(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+        source_epoch: EpochId,
+        reason: &str,
+    ) {
+        self.audit_group(
+            group_id,
+            AuditEventKind::SnapshotCreated {
+                snapshot_name: snapshot_name.to_string(),
+                source_epoch: source_epoch.0,
+                reason: reason.to_string(),
+            },
+        );
     }
 
     /// Return the Marmot group metadata mirrored from signed MLS group state.
@@ -352,7 +406,15 @@ impl<S: StorageProvider> Engine<S> {
 #[async_trait]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
-        self.do_ingest(msg).await
+        self.audit(crate::audit_helpers::ingest_entry_event(&msg));
+        let msg_id_hex = hex::encode(msg.id.as_slice());
+        let result = self.do_ingest(msg).await;
+        if let Ok(ref outcome) = result {
+            self.audit(crate::audit_helpers::ingest_outcome_event(
+                msg_id_hex, outcome,
+            ));
+        }
+        result
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {
@@ -364,7 +426,18 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
-        self.do_send(intent).await
+        let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
+        self.audit(AuditEventKind::SendEntry {
+            intent_kind: intent_kind.clone(),
+        });
+        let result = self.do_send(intent).await;
+        if let Ok(ref send_result) = result {
+            self.audit(crate::audit_helpers::send_outcome_event(
+                intent_kind,
+                send_result,
+            ));
+        }
+        result
     }
 
     async fn advance_convergence(

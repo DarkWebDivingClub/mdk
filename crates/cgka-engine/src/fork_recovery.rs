@@ -22,6 +22,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
+use marmot_forensics::{AuditEventKind, ForkWinner};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -236,12 +237,36 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
+        let candidate_digest_hex = hex::encode(Sha256::digest(candidate_mls_bytes));
         let resolution = self.fork_recovery.resolve(
             &self.storage,
             group_id,
             source_epoch,
             candidate_mls_bytes,
         )?;
+        let (winner, incumbent_digest_hex, invalidated_msg_id) = match &resolution {
+            ForkResolution::CandidateWins {
+                invalidated,
+                invalidated_storage_id,
+                ..
+            } => (
+                ForkWinner::Candidate,
+                Some(hex::encode(invalidated.commit_digest)),
+                Some(hex::encode(invalidated_storage_id.as_slice())),
+            ),
+            ForkResolution::IncumbentWins => (ForkWinner::Incumbent, None, None),
+            ForkResolution::MissingSnapshot => (ForkWinner::MissingSnapshot, None, None),
+        };
+        self.audit_group(
+            group_id,
+            AuditEventKind::ForkResolution {
+                source_epoch: source_epoch.0,
+                candidate_digest: candidate_digest_hex,
+                incumbent_digest: incumbent_digest_hex,
+                winner,
+                invalidated_msg_id,
+            },
+        );
         if let ForkResolution::CandidateWins {
             invalidated_storage_id,
             ..
@@ -256,6 +281,14 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(()) | Err(StorageError::NotFound) => {}
                 Err(e) => return Err(EngineError::Storage(e)),
             }
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(invalidated_storage_id.as_slice()),
+                    MessageState::EpochInvalidated,
+                    "fork_loser",
+                ),
+            );
         }
         Ok(resolution)
     }
