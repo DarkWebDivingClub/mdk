@@ -209,6 +209,132 @@ async fn subscribed_group_event_becomes_account_scoped_delivery() {
 }
 
 #[tokio::test]
+async fn observe_relay_event_records_every_relay_copy_for_spread() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoints = [
+        TransportEndpoint("wss://group-a.example".into()),
+        TransportEndpoint("wss://group-b.example".into()),
+        TransportEndpoint("wss://group-c.example".into()),
+    ];
+
+    // The same logical event seen from three relays on the raw per-relay tap.
+    for endpoint in &endpoints {
+        adapter
+            .observe_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("group-sub".into()),
+                event: group_event("11", &transport_group_id),
+            })
+            .await;
+    }
+
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 1, "one logical message observed");
+    assert_eq!(spread.corroborated, 1, "corroborated by later relay copies");
+    assert_eq!(
+        spread.spread.sample_count(),
+        2,
+        "two laggard copies recorded as spread samples"
+    );
+    // Per-relay attribution: the first relay delivered first, the rest later.
+    // Indices are assigned in first-seen order (a, b, c) and reported ascending.
+    assert_eq!(spread.per_relay.len(), 3);
+    assert_eq!(spread.per_relay[0].delivered_first, 1);
+    assert_eq!(spread.per_relay[0].first_deliverer_rate(), Some(1.0));
+    assert_eq!(spread.per_relay[1].delivered_later, 1);
+    assert_eq!(spread.per_relay[2].delivered_later, 1);
+}
+
+#[tokio::test]
+async fn deduplicated_delivery_path_does_not_record_spread() {
+    // The relay pool delivers one deduplicated `Event` per message, so the
+    // delivery path must never feed cross-relay spread; otherwise the metric
+    // would only ever see the first relay's copy.
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let transport_group_id = vec![0xC3; 32];
+
+    adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://group.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event: group_event("11", &transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 0, "delivery path must not feed spread");
+    assert_eq!(spread.spread.sample_count(), 0);
+}
+
+#[tokio::test]
+async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint_a = TransportEndpoint("wss://group-a.example".into());
+    let endpoint_b = TransportEndpoint("wss://group-b.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    // Reconstruct the group subscription id the adapter issued.
+    let sub_id = NostrSubscription::Group {
+        account_id,
+        group_id,
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    // Tracked but not yet synced: no endpoint has reached EOSE.
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(false));
+
+    // A first event (observed on the per-relay tap) then EOSE from endpoint A:
+    // still draining endpoint B.
+    adapter
+        .observe_relay_event(NostrRelayEvent {
+            endpoint: endpoint_a.clone(),
+            subscription_id: Some(sub_id.clone()),
+            event: group_event("11", &transport_group_id),
+        })
+        .await;
+    adapter.handle_relay_eose(endpoint_a, sub_id.clone()).await;
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(false));
+
+    // EOSE from endpoint B closes the gate.
+    adapter.handle_relay_eose(endpoint_b, sub_id.clone()).await;
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(true));
+
+    let sync = adapter.relay_sync().await;
+    // Inbox + group subscriptions are both tracked.
+    assert_eq!(sync.tracked_subscriptions, 2);
+    assert_eq!(sync.synced_subscriptions, 1);
+    assert_eq!(sync.eose.sample_count(), 2);
+    assert_eq!(sync.first_event.sample_count(), 1);
+
+    // Unknown subscriptions report no sync state.
+    assert_eq!(adapter.subscription_synced("nope").await, None);
+}
+
+#[tokio::test]
 async fn synced_group_subscriptions_replace_old_routes() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());

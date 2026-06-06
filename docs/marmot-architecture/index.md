@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-05-19
+updated: 2026-06-06
 tags: [marmot, architecture, index]
 ---
 
@@ -96,6 +96,14 @@ These are longer working documents. Go here when you need depth, not orientation
 
 - **Doc:** [`distributed-convergence.md`](./distributed-convergence.md)
   - **What it covers:** Draft convergence model for selecting one MLS branch from unordered multi-relay input.
+
+- **Doc:** [`relay-delivery-telemetry.md`](./relay-delivery-telemetry.md)
+  - **What it covers:** Measuring relay delivery behavior to tune convergence quiescence; cross-relay arrival spread,
+    quiescence regimes, and the backfill/reconciliation backstop.
+
+- **Doc:** [`relay-observability.md`](./relay-observability.md)
+  - **What it covers:** Export contract for client-side relay performance telemetry: the opt-in/aggregate/k-anonymous
+    privacy contract, metric catalogue, collection architecture, and the proposed observability.md amendment.
 
 - **Doc:** [`../../spec/README.md`](../../spec/README.md)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.

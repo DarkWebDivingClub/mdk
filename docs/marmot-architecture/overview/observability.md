@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-05-09
+updated: 2026-06-06
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -58,3 +58,22 @@ CLI output generators such as the conformance report writer and Tamarin policy-c
 The Nostr adapter does not implement its own reconnect loop. The optional `nostr-sdk` client relies on SDK
 `RelayOptions` for reconnect/backoff, retry interval adjustment, jitter, relay status, and connection stats. Marmot
 exposes only aggregate/redacted relay-health summaries.
+
+## Opt-in relay telemetry export
+
+Separately from runtime tracing and logging (whose rules above are unchanged), Marmot MAY export relay performance
+telemetry to a first-party metrics endpoint, carrying **relay identity as a metric label**, only when all of the
+following hold:
+
+- the user has explicitly opted in (off by default, revocable);
+- the endpoint is Marmot-operated and reached over TLS;
+- the export carries no account, member, device, group, subscription, pubkey, message, event, or IP-derived field;
+- the data is aggregate counts and fixed-bucket histograms over a window — no per-event or per-timestamp rows;
+- per-relay series are gated by k-anonymity at the dashboard (deployment parameter `k`; `k = 1` is permitted only for
+  internal testing and MUST be raised before any external rollout);
+- source IPs are not persisted against series.
+
+Relay identity is the sole identifier permitted to leave the device, and only as the subject being measured, never as an
+identifier of the reporter. This carve-out applies to the export channel alone and never to logs or traces. The full
+contract, metric catalogue, and architecture live in
+[`../relay-observability.md`](../relay-observability.md).
