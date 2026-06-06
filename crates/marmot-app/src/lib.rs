@@ -81,6 +81,7 @@ mod messages;
 mod notifications;
 mod projection;
 mod relay_plane;
+mod relay_telemetry_export;
 mod runtime;
 
 pub(crate) use groups::AppGroupImageInput;
@@ -102,7 +103,7 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use client::AppClient;
-pub use config::MarmotAppConfig;
+pub use config::{MarmotAppConfig, RelayTelemetryExportConfig};
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
@@ -130,11 +131,22 @@ pub use notifications::{
     PushPlatform, PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
     encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
 };
-pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
+pub use relay_plane::{
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
+    RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+};
+pub use relay_telemetry_export::{
+    ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
+    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch, metric_names,
+};
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,
     TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineReactionSummary,
     TimelineReplyPreview, TimelineUserReaction,
+};
+pub use transport_nostr_adapter::{
+    DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
+    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
 };
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
@@ -887,6 +899,15 @@ struct OpenAppAccount {
 impl MarmotApp {
     pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
         Self::with_relays(root, vec![relay_url.into()])
+    }
+
+    /// Snapshot the device-local relay telemetry of this app's relay plane.
+    ///
+    /// Aggregate and privacy-safe. Live numbers accumulate in the long-running
+    /// daemon runtime; a standalone command queries its own (typically empty)
+    /// relay plane.
+    pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
+        self.relay_plane.relay_telemetry().await
     }
 
     pub fn with_relay_and_config(

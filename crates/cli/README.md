@@ -240,8 +240,15 @@ dm settings theme dark
 dm settings language en
 dm users show <npub-or-hex>
 dm users search <query> --radius 0..2
+dm relay-stats
+dm relay-stats --json
 dm reset --confirm
 ```
+
+`dm relay-stats` prints device-local relay performance telemetry — aggregate lifecycle counters, cross-relay arrival
+spread, per-relay first-deliverer and first-event/EOSE timing, and redacted relay health. It reads the live `dmd`
+runtime when a daemon socket exists. The numbers are aggregate-only and per-relay rows use opaque device-local indices,
+never relay URLs.
 
 `notifications subscribe`, chat mute/unmute, and user-driven invite accept/decline commands currently return
 `unsupported_command` rather than faking behavior.

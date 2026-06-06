@@ -44,8 +44,8 @@ pub use relay_list::{
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
-    RelayDeliveryTelemetry, RelayIndex, RelayIndexRegistry, RelayLatencyStats, RelaySyncSnapshot,
-    RelaySyncTelemetry,
+    RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
+    RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot, RelaySyncTelemetry,
 };
 
 const DELIVERY_BUFFER: usize = 1024;
@@ -152,7 +152,7 @@ enum NostrSubscriptionRouteKey {
 ///
 /// These counters are diagnostic. They must not feed convergence or branch
 /// selection.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NostrAdapterMetrics {
     pub active_accounts: usize,
     pub active_group_subscriptions: usize,
@@ -290,6 +290,18 @@ impl NostrTransportAdapter {
             .await
             .sync
             .subscription_synced(subscription_id)
+    }
+
+    /// Resolve opaque relay indices to relay endpoints for the opt-in export
+    /// label boundary.
+    ///
+    /// This is the ONLY path that turns a device-local [`RelayIndex`] into a
+    /// relay URL. It requires a [`RelayExportConsent`], which must be minted
+    /// only where the user has opted in to relay telemetry export. Privacy
+    /// contract: `docs/marmot-architecture/relay-observability.md`.
+    pub async fn resolve_relay_labels(&self, _consent: RelayExportConsent) -> RelayLabelResolution {
+        let state = self.state.read().await;
+        RelayLabelResolution::from_pairs(state.relay_index.resolutions())
     }
 
     /// Local monotonic timestamp in milliseconds for delivery telemetry. Never

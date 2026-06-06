@@ -7,8 +7,11 @@ guarantees, and how they reach a first-party metrics stack. It is the broad-obse
 exports nothing.
 
 The privacy carve-out below is accepted and the matching amendment is now in
-[`overview/observability.md`](./overview/observability.md). Implementation (relay-plane rollup, opt-in exporter,
-dashboards) is still pending; no telemetry leaves the device until those land.
+[`overview/observability.md`](./overview/observability.md). Local visibility (`dm relay-stats`), the opt-in
+index→identity resolution boundary, the relay-plane rollup, and the opt-in OTLP exporter are now implemented; the
+exporter's wire encoding and push live behind the `marmot-app` `otlp-export` build feature, and the dashboards plus the
+k-anonymity gate remain ops work. No telemetry leaves the device unless a user opts in **and** a first-party endpoint is
+configured.
 
 ## Purpose
 
@@ -106,6 +109,11 @@ adapter (per-relay raw)  ->  relay plane (aggregate across accounts)  ->  export
   exporter never sees per-account structure.
 - **Exporter** is a new, opt-in component that converts the rollup into the export series and pushes them. It is the only
   code that resolves relay identity into a label, and it enforces the contract (no client labels, aggregate only).
+  Implemented as `marmot_app::RelayTelemetryExporter`, constructed only through the opt-in gate
+  `MarmotRelayPlane::telemetry_exporter`. The privacy-critical mapping (`build_export_batch`) lives in the default build
+  and is fully tested; the OTLP protobuf encoding and the TLS `POST` to `{endpoint}/v1/metrics` are behind the
+  `otlp-export` feature. The export batch is a flat list of points each carrying at most a single `relay` label —
+  there is structurally no field for any other identifier.
 
 Export mechanism: clients roam and are not scrapeable servers, so this is **push**, not pull — Prometheus `remote_write`
 to a first-party receiver, or OTLP to a collector, behind an IP-stripping proxy. Cardinality is bounded by the number of
@@ -151,9 +159,17 @@ This amendment is **accepted and now applied** in [`overview/observability.md`](
 2. **Per-relay attribution** in the adapter — *done*: per-relay first-event / EOSE latency histograms and the
    first-deliverer rate, behind opaque local indices (`RelayLatencyStats`, `RelayDeliveryStats`). Useful for local
    analysis today and independent of the export decision.
-3. **Relay-plane rollup**: cross-account aggregation of the per-relay series into an export-ready snapshot.
-4. **Opt-in exporter**: consent surface, push binding (`remote_write`/OTLP), contract enforcement, off by default.
+3. **Relay-plane rollup** — *done*: cross-account aggregation of the per-relay series into an export-ready snapshot
+   (`MarmotRelayPlane::telemetry_rollup`), keyed by opaque relay index, with an optional engine-metrics seam.
+4. **Opt-in exporter** — *done*: off-by-default opt-in gate, index→identity resolution behind a consent token, contract
+   enforcement in the export-batch types, and an OTLP/HTTP push binding (behind the `otlp-export` feature). Local
+   visibility landed first via `dm relay-stats`.
 5. **Dashboards and k-anonymity gate** in the first-party stack; relay ranking and the quiescence-tuning view.
+
+Wiring the exporter's periodic `run` loop into a long-running host (e.g. `dmd`) against the production first-party
+endpoint is an ops step and is intentionally out of scope here; `RelayTelemetryExporter::export_once` / `run` are the
+entry points, and the production endpoint must be stood up behind the IP-stripping proxy with `k` raised before any
+external reporters are added.
 
 Server-side strfry fleet telemetry is independent and can proceed in parallel at any time.
 

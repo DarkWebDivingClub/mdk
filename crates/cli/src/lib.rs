@@ -20,10 +20,12 @@ use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHA
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    UserDirectorySearch, UserProfileMetadata, tag_value,
+    AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL,
+    DurationHistogramSnapshot, FetchedKeyPackage, MarmotApp, MarmotAppRuntime, MediaReference,
+    MediaUploadRequest, RelayDeliverySpread, RelayDeliveryStats, RelayLatencyStats,
+    RelaySyncSnapshot, RelayTelemetrySnapshot, StreamStartView, SyncSummary, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, TimelinePagination, UserDirectorySearch,
+    UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -293,6 +295,11 @@ enum Command {
     },
     #[command(hide = true)]
     Sync,
+    #[command(
+        name = "relay-stats",
+        about = "Show device-local relay performance telemetry (aggregate, no relay URLs)"
+    )]
+    RelayStats,
     #[command(about = "Delete all local Darkmatter CLI data after confirmation")]
     Reset {
         #[arg(long, help = "Required safety flag before deleting local data")]
@@ -1541,6 +1548,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             ensure_local_signing(&account)?;
             sync_command(&app, account).await
         }
+        Command::RelayStats => relay_stats_command(&app).await,
         Command::Reset { confirm } => reset_command(&home, confirm),
     }
 }
@@ -4525,6 +4533,166 @@ async fn sync_command(
     })
 }
 
+async fn relay_stats_command(app: &MarmotApp) -> Result<CommandOutput, DmError> {
+    relay_stats_output(app.relay_telemetry().await)
+}
+
+pub(crate) async fn relay_stats_command_with_runtime(
+    runtime: &MarmotAppRuntime,
+) -> Result<CommandOutput, DmError> {
+    relay_stats_output(
+        runtime
+            .shared_services()
+            .relay_plane()
+            .relay_telemetry()
+            .await,
+    )
+}
+
+fn relay_stats_output(snapshot: RelayTelemetrySnapshot) -> Result<CommandOutput, DmError> {
+    let json = serde_json::to_value(&snapshot)?;
+    Ok(CommandOutput {
+        plain: relay_stats_plain(&snapshot),
+        json,
+    })
+}
+
+/// Render a percentile of a duration histogram for the human view.
+///
+/// `n/a` when there are no samples; `>Nms` when the percentile falls in the
+/// overflow region above the largest bucket bound.
+fn relay_stats_percentile(hist: &DurationHistogramSnapshot, percentile: f64) -> String {
+    if hist.sample_count() == 0 {
+        return "n/a".to_owned();
+    }
+    match hist.approx_percentile_ms(percentile) {
+        Some(ms) => format!("{ms}ms"),
+        None => match hist.buckets.last() {
+            Some(bucket) => format!(">{}ms", bucket.upper_bound_ms),
+            None => "n/a".to_owned(),
+        },
+    }
+}
+
+fn relay_stats_plain(snapshot: &RelayTelemetrySnapshot) -> String {
+    let metrics = &snapshot.metrics;
+    let spread = &snapshot.delivery_spread;
+    let sync = &snapshot.sync;
+    let health = &snapshot.health;
+
+    let mut lines = vec!["relay telemetry (device-local, aggregate, no relay URLs)".to_owned()];
+    lines.push(format!(
+        "accounts={} group_subscriptions={} created={} removed={}",
+        metrics.active_accounts,
+        metrics.active_group_subscriptions,
+        metrics.subscriptions_created,
+        metrics.subscriptions_removed,
+    ));
+    lines.push(format!(
+        "inbound: seen={} delivered={} dropped={}",
+        metrics.inbound_events_seen,
+        metrics.inbound_events_delivered,
+        metrics.inbound_events_dropped,
+    ));
+    lines.push(format!(
+        "publish: attempts={} successes={} failures={}",
+        metrics.publish_attempts, metrics.publish_successes, metrics.publish_failures,
+    ));
+    lines.push(format!(
+        "delivery spread: observed={} corroborated={} single_source={} samples={} p50={} p99={}",
+        spread.observed,
+        spread.corroborated,
+        spread.single_source,
+        spread.spread.sample_count(),
+        relay_stats_percentile(&spread.spread, 0.5),
+        relay_stats_percentile(&spread.spread, 0.99),
+    ));
+    lines.push(format!(
+        "sync: tracked_subscriptions={} synced={} first_event_p50={} eose_p50={}",
+        sync.tracked_subscriptions,
+        sync.synced_subscriptions,
+        relay_stats_percentile(&sync.first_event, 0.5),
+        relay_stats_percentile(&sync.eose, 0.5),
+    ));
+
+    let per_relay = relay_stats_per_relay_rows(spread, sync);
+    if per_relay.is_empty() {
+        lines.push("per-relay: none observed yet".to_owned());
+    } else {
+        lines.push("per-relay (opaque device-local index):".to_owned());
+        lines.extend(per_relay);
+    }
+
+    lines.push(format!(
+        "relay health: sdk_backed={} total={} connected={} connecting={} disconnected={} attempts={} successes={}",
+        health.sdk_backed,
+        health.total_relays,
+        health.connected,
+        health.connecting,
+        health.disconnected,
+        health.connection_attempts,
+        health.connection_successes,
+    ));
+    lines.join("\n")
+}
+
+/// Join the per-relay delivery attribution and sync-timing rows by opaque relay
+/// index into one line per relay.
+fn relay_stats_per_relay_rows(
+    spread: &RelayDeliverySpread,
+    sync: &RelaySyncSnapshot,
+) -> Vec<String> {
+    let mut indices: Vec<u32> = spread
+        .per_relay
+        .iter()
+        .map(|stats| stats.relay_index)
+        .chain(sync.per_relay.iter().map(|stats| stats.relay_index))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    indices
+        .into_iter()
+        .map(|index| {
+            let delivery = spread
+                .per_relay
+                .iter()
+                .find(|stats| stats.relay_index == index);
+            let latency = sync
+                .per_relay
+                .iter()
+                .find(|stats| stats.relay_index == index);
+            relay_stats_per_relay_line(index, delivery, latency)
+        })
+        .collect()
+}
+
+fn relay_stats_per_relay_line(
+    index: u32,
+    delivery: Option<&RelayDeliveryStats>,
+    latency: Option<&RelayLatencyStats>,
+) -> String {
+    let mut parts = vec![format!("  relay#{index}")];
+    if let Some(delivery) = delivery {
+        let rate = delivery
+            .first_deliverer_rate()
+            .map(|rate| format!("{:.0}%", rate * 100.0))
+            .unwrap_or_else(|| "n/a".to_owned());
+        parts.push(format!(
+            "first_deliverer={rate} delivered_first={} delivered_later={}",
+            delivery.delivered_first, delivery.delivered_later,
+        ));
+    }
+    if let Some(latency) = latency {
+        parts.push(format!(
+            "first_event_p50={} eose_p50={}",
+            relay_stats_percentile(&latency.first_event, 0.5),
+            relay_stats_percentile(&latency.eose, 0.5),
+        ));
+    }
+    parts.join(" ")
+}
+
 fn sync_plain(summary: &SyncSummary) -> String {
     let mut lines = Vec::new();
     for group_id in &summary.joined_groups {
@@ -5724,8 +5892,95 @@ mod tests {
     use super::{
         AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
         apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
-        relay_endpoints, resolve_relay,
+        relay_endpoints, relay_stats_output, relay_stats_plain, resolve_relay,
     };
+    use marmot_app::{
+        DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
+        RelayDeliveryStats, RelayLatencyStats, RelayPlaneHealth, RelaySyncSnapshot,
+        RelayTelemetrySnapshot,
+    };
+
+    fn one_sample_histogram(upper_bound_ms: u64) -> DurationHistogramSnapshot {
+        DurationHistogramSnapshot {
+            buckets: vec![HistogramBucket {
+                upper_bound_ms,
+                count: 1,
+            }],
+            overflow_count: 0,
+        }
+    }
+
+    fn sample_relay_telemetry() -> RelayTelemetrySnapshot {
+        RelayTelemetrySnapshot {
+            metrics: NostrAdapterMetrics {
+                active_accounts: 1,
+                active_group_subscriptions: 2,
+                inbound_events_seen: 9,
+                inbound_events_delivered: 7,
+                inbound_events_dropped: 2,
+                publish_attempts: 3,
+                publish_successes: 3,
+                ..NostrAdapterMetrics::default()
+            },
+            delivery_spread: RelayDeliverySpread {
+                observed: 5,
+                corroborated: 4,
+                single_source: 1,
+                spread: one_sample_histogram(50),
+                per_relay: vec![RelayDeliveryStats {
+                    relay_index: 0,
+                    delivered_first: 3,
+                    delivered_later: 1,
+                }],
+            },
+            sync: RelaySyncSnapshot {
+                tracked_subscriptions: 2,
+                synced_subscriptions: 1,
+                first_event: one_sample_histogram(20),
+                eose: one_sample_histogram(100),
+                per_relay: vec![RelayLatencyStats {
+                    relay_index: 0,
+                    first_event: one_sample_histogram(20),
+                    eose: one_sample_histogram(100),
+                }],
+            },
+            health: RelayPlaneHealth {
+                sdk_backed: true,
+                total_relays: 1,
+                connected: 1,
+                connection_attempts: 1,
+                connection_successes: 1,
+                ..RelayPlaneHealth::default()
+            },
+        }
+    }
+
+    #[test]
+    fn relay_stats_plain_reports_aggregates_with_opaque_relay_indices() {
+        let plain = relay_stats_plain(&sample_relay_telemetry());
+        assert!(plain.contains("inbound: seen=9 delivered=7 dropped=2"));
+        assert!(plain.contains("delivery spread: observed=5 corroborated=4"));
+        // Per-relay rows use the opaque index and never a relay URL.
+        assert!(plain.contains("relay#0"));
+        assert!(plain.contains("first_deliverer=75%"));
+        assert!(plain.contains("eose_p50=100ms"));
+        assert!(
+            !plain.contains("wss://") && !plain.contains("ws://"),
+            "local relay stats must not surface relay URLs: {plain}"
+        );
+    }
+
+    #[test]
+    fn relay_stats_output_json_preserves_snapshot_shape() {
+        let output = relay_stats_output(sample_relay_telemetry()).expect("snapshot serializes");
+        assert_eq!(output.json["metrics"]["inbound_events_delivered"], 7);
+        assert_eq!(
+            output.json["delivery_spread"]["per_relay"][0]["relay_index"],
+            0
+        );
+        assert_eq!(output.json["sync"]["synced_subscriptions"], 1);
+        assert_eq!(output.json["health"]["connected"], 1);
+    }
 
     #[test]
     fn default_home_uses_user_data_location_instead_of_current_directory() {

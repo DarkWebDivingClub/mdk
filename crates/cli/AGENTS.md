@@ -48,6 +48,9 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
   `unsupported_command` until real behavior exists.
 - `stream`: anchor, watch, send, finish, and verify provisional QUIC agent text stream previews.
 - `sync`: diagnostic catch-up for processing relay events for the selected local signing account.
+- `relay-stats`: print device-local relay performance telemetry (aggregate counters, cross-relay spread, per-relay
+  first-deliverer and first-event/EOSE timing, redacted relay health). Reads the live `dmd` runtime when a socket
+  exists. Aggregate-only; per-relay rows use opaque device-local indices, never relay URLs.
 - `daemon`: start, stop, and inspect `dmd`.
 - `tui`: open the Ratatui interface over the real `dm --json` command surface.
 

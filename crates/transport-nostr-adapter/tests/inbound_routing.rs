@@ -9,7 +9,7 @@ use cgka_traits::{
 };
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
-    NostrTransportAdapter,
+    NostrTransportAdapter, RelayExportConsent, RelayIndex,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
@@ -245,6 +245,38 @@ async fn observe_relay_event_records_every_relay_copy_for_spread() {
     assert_eq!(spread.per_relay[0].first_deliverer_rate(), Some(1.0));
     assert_eq!(spread.per_relay[1].delivered_later, 1);
     assert_eq!(spread.per_relay[2].delivered_later, 1);
+}
+
+#[tokio::test]
+async fn resolve_relay_labels_maps_observed_indices_to_endpoints() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoints = [
+        TransportEndpoint("wss://group-a.example".into()),
+        TransportEndpoint("wss://group-b.example".into()),
+    ];
+
+    // Observing per-relay copies assigns opaque indices in first-seen order.
+    for endpoint in &endpoints {
+        adapter
+            .observe_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("group-sub".into()),
+                event: group_event("11", &transport_group_id),
+            })
+            .await;
+    }
+
+    // The export boundary resolves those indices back to relay URLs, but only
+    // when handed an explicit opt-in consent token.
+    let resolution = adapter
+        .resolve_relay_labels(RelayExportConsent::affirm())
+        .await;
+    assert_eq!(resolution.len(), 2);
+    assert_eq!(resolution.label_for(RelayIndex(0)), Some(&endpoints[0]));
+    assert_eq!(resolution.label_for(RelayIndex(1)), Some(&endpoints[1]));
+    assert_eq!(resolution.label_for(RelayIndex(2)), None);
 }
 
 #[tokio::test]

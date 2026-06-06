@@ -65,6 +65,11 @@ rustls-pemfile = "2"
 nostr = { version = "0.44.2", default-features = false, features = ["std", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
+# OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
+# relay telemetry straight to the OTLP protobuf and POST it over the existing
+# reqwest/rustls stack, so the SDK's record-time histogram API is not needed.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics"] }
+prost = "0.14"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
 tempfile = "3"
 

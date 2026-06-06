@@ -29,6 +29,7 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
+use serde::{Deserialize, Serialize};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by
 /// spread and sync-timing measurements.
@@ -59,7 +60,9 @@ const DEFAULT_TRACKING_WINDOW_MS: u64 = 60_000;
 /// Never a relay URL. The endpoint-to-index mapping lives in
 /// [`RelayIndexRegistry`] and stays on the device, so per-relay telemetry can
 /// exist without exporting relay URLs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct RelayIndex(pub u32);
 
 /// Device-local assignment of stable opaque indices to relay endpoints.
@@ -79,6 +82,88 @@ impl RelayIndexRegistry {
         self.next += 1;
         self.indices.insert(endpoint.clone(), index);
         index
+    }
+
+    /// Resolve an opaque index back to its relay endpoint, if one is assigned.
+    ///
+    /// This is the only reverse mapping in the module. It exists solely for the
+    /// opt-in export label boundary; the adapter gates access behind
+    /// [`RelayExportConsent`], so callers cannot reach a populated registry
+    /// without one.
+    pub fn resolve(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
+        self.indices
+            .iter()
+            .find_map(|(endpoint, candidate)| (*candidate == index).then_some(endpoint))
+    }
+
+    /// Every assigned `(index, endpoint)` pair, ascending by index.
+    pub fn resolutions(&self) -> Vec<(RelayIndex, TransportEndpoint)> {
+        let mut pairs: Vec<(RelayIndex, TransportEndpoint)> = self
+            .indices
+            .iter()
+            .map(|(endpoint, index)| (*index, endpoint.clone()))
+            .collect();
+        pairs.sort_by_key(|(index, _)| index.0);
+        pairs
+    }
+}
+
+/// Capability that authorizes resolving opaque [`RelayIndex`] values back to
+/// relay endpoints for the opt-in telemetry export boundary.
+///
+/// Relay identity is the sole identifier permitted to leave the device, and
+/// only as the subject being measured (see
+/// `docs/marmot-architecture/relay-observability.md`). Turning a device-local
+/// index into a relay URL therefore requires one of these tokens, and a token
+/// MUST be minted only where the user has explicitly opted in to export. There
+/// is deliberately no other path from an index to a relay URL.
+#[derive(Clone, Copy, Debug)]
+pub struct RelayExportConsent {
+    _seal: (),
+}
+
+impl RelayExportConsent {
+    /// Affirm the relay-telemetry export opt-in.
+    ///
+    /// Call ONLY from the opt-in export boundary, after confirming the user has
+    /// enabled export. Minting a consent token anywhere else violates the
+    /// privacy contract in `relay-observability.md`.
+    pub fn affirm() -> Self {
+        Self { _seal: () }
+    }
+}
+
+/// Resolved relay-identity labels for the export boundary.
+///
+/// Maps opaque device-local [`RelayIndex`] values to their relay endpoints.
+/// Produced only behind [`RelayExportConsent`]; this is the one place a relay
+/// URL is attached to telemetry, and only for first-party export.
+#[derive(Clone, Debug, Default)]
+pub struct RelayLabelResolution {
+    labels: HashMap<RelayIndex, TransportEndpoint>,
+}
+
+impl RelayLabelResolution {
+    /// Build a resolution from `(index, endpoint)` pairs.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (RelayIndex, TransportEndpoint)>) -> Self {
+        Self {
+            labels: pairs.into_iter().collect(),
+        }
+    }
+
+    /// Relay endpoint label for an index, if known.
+    pub fn label_for(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
+        self.labels.get(&index)
+    }
+
+    /// Number of resolved relay labels.
+    pub fn len(&self) -> usize {
+        self.labels.len()
+    }
+
+    /// Whether no relay labels are resolved.
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty()
     }
 }
 
@@ -142,7 +227,7 @@ fn aggregate_histograms<'a>(
 }
 
 /// One histogram bucket of a duration distribution.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistogramBucket {
     /// Inclusive upper bound of the bucket, in milliseconds.
     pub upper_bound_ms: u64,
@@ -154,7 +239,7 @@ pub struct HistogramBucket {
 ///
 /// Contains only counts and millisecond bucket bounds: no message ids, relay
 /// endpoints, subscription ids, or payload-derived values.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurationHistogramSnapshot {
     /// Histogram by ascending upper bound.
     pub buckets: Vec<HistogramBucket>,
@@ -318,7 +403,7 @@ impl RelayDeliveryTelemetry {
 }
 
 /// Per-relay delivery attribution for one relay.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayDeliveryStats {
     /// Opaque device-local relay index.
     pub relay_index: u32,
@@ -338,7 +423,7 @@ impl RelayDeliveryStats {
 }
 
 /// Aggregate cross-relay arrival-spread snapshot.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RelayDeliverySpread {
     /// Distinct logical messages observed within the tracking window.
     pub observed: u64,
@@ -499,7 +584,7 @@ fn subscription_is_synced(sub: &SubscriptionProgress) -> bool {
 }
 
 /// Per-relay first-event and EOSE latency for one relay.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayLatencyStats {
     /// Opaque device-local relay index.
     pub relay_index: u32,
@@ -513,7 +598,7 @@ pub struct RelayLatencyStats {
 ///
 /// Counts, opaque relay indices, and millisecond histograms only: no
 /// subscription ids or relay endpoints.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelaySyncSnapshot {
     /// Subscriptions currently tracked.
     pub tracked_subscriptions: u64,
@@ -547,6 +632,36 @@ mod tests {
         let first = registry.index_for(&a);
         assert_eq!(registry.index_for(&b), RelayIndex(1));
         assert_eq!(registry.index_for(&a), first, "stable across calls");
+    }
+
+    #[test]
+    fn registry_resolves_indices_back_to_endpoints() {
+        let mut registry = RelayIndexRegistry::default();
+        let a = TransportEndpoint("wss://a".into());
+        let b = TransportEndpoint("wss://b".into());
+        let ia = registry.index_for(&a);
+        let ib = registry.index_for(&b);
+
+        assert_eq!(registry.resolve(ia), Some(&a));
+        assert_eq!(registry.resolve(ib), Some(&b));
+        assert_eq!(registry.resolve(RelayIndex(99)), None);
+        assert_eq!(registry.resolutions(), vec![(ia, a), (ib, b)]);
+    }
+
+    #[test]
+    fn relay_label_resolution_maps_indices_to_endpoints() {
+        let resolution = RelayLabelResolution::from_pairs([
+            (RelayIndex(0), TransportEndpoint("wss://a".into())),
+            (RelayIndex(1), TransportEndpoint("wss://b".into())),
+        ]);
+        assert_eq!(resolution.len(), 2);
+        assert!(!resolution.is_empty());
+        assert_eq!(
+            resolution.label_for(RelayIndex(1)),
+            Some(&TransportEndpoint("wss://b".into()))
+        );
+        assert_eq!(resolution.label_for(RelayIndex(2)), None);
+        assert!(RelayLabelResolution::default().is_empty());
     }
 
     #[test]

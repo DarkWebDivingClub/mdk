@@ -10,17 +10,20 @@ use cgka_traits::{
     TransportPublishRequest, TransportPublishTarget,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayPoolNotification, RelayUrl,
-    SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
+    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrTransportAdapter,
+    DurationHistogramSnapshot, NostrAdapterMetrics, NostrPublishOutcome, NostrRelayClient,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrTransportAdapter, RelayDeliverySpread,
+    RelayExportConsent, RelayLabelResolution, RelaySyncSnapshot,
 };
+
+use crate::config::RelayTelemetryExportConfig;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
@@ -97,6 +100,189 @@ pub struct RelayPlaneHealth {
     pub directory_completed_subscription_syncs: usize,
     pub directory_subscriptions_created: usize,
     pub directory_subscriptions_removed: usize,
+}
+
+/// Device-local relay telemetry bundled for local inspection.
+///
+/// This is the read model behind `dm relay-stats`: it surfaces the adapter's
+/// existing aggregate, privacy-safe snapshots (lifecycle counters, cross-relay
+/// arrival spread, subscription sync timing) alongside redacted relay health.
+///
+/// Per-relay attribution stays behind opaque [`transport_nostr_adapter::RelayIndex`]
+/// values here — resolving an index to a relay URL is reserved for the opt-in
+/// export boundary, never for this local read path.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayTelemetrySnapshot {
+    /// Adapter lifecycle counters (accounts, subscriptions, inbound, publish).
+    pub metrics: NostrAdapterMetrics,
+    /// Cross-relay arrival spread and per-relay first-deliverer attribution.
+    pub delivery_spread: RelayDeliverySpread,
+    /// First-event / EOSE subscription sync timing, aggregate and per relay.
+    pub sync: RelaySyncSnapshot,
+    /// Redacted relay-pool and directory health.
+    pub health: RelayPlaneHealth,
+}
+
+/// Export-ready rollup of device-local relay telemetry.
+///
+/// This is the aggregation home for the export path. There is a single shared
+/// adapter per device, so the per-relay series are already merged across every
+/// local account; this rollup reorganizes them into the export shape and is the
+/// one place additional per-account dedup would live if telemetry ever became
+/// per-account. It stays keyed by the opaque [`transport_nostr_adapter::RelayIndex`];
+/// resolving an index to a relay URL is the exporter's job, behind opt-in.
+///
+/// Privacy-safe: counts, fixed-bucket millisecond histograms, and opaque relay
+/// indices only — no account, group, subscription, or URL fields.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayTelemetryRollup {
+    /// Per-relay export records, ascending by opaque relay index.
+    pub relays: Vec<RelayRollupEntry>,
+    /// Population-level cross-relay arrival spread (inherently no relay label).
+    pub cross_relay_spread: DurationHistogramSnapshot,
+    /// Distinct logical messages observed within the tracking window.
+    pub messages_observed: u64,
+    /// Messages corroborated by at least a second distinct relay.
+    pub messages_corroborated: u64,
+    /// Messages seen on exactly one relay within the window.
+    pub messages_single_source: u64,
+    /// Device-wide relay connection attempts (for connection success rate).
+    pub connection_attempts: u64,
+    /// Device-wide successful relay connections.
+    pub connection_successes: u64,
+    /// Device-wide publish attempts (aggregate; per-relay/per-kind publish
+    /// attribution is a future adapter enhancement, see `relay-observability.md`).
+    pub publish_attempts: u64,
+    /// Device-wide accepted publishes.
+    pub publish_successes: u64,
+    /// Device-wide failed publishes.
+    pub publish_failures: u64,
+    /// Optional engine-side reorg metrics, folded in once the parallel
+    /// `observed_reorg_rate` workstream lands. `None` until then.
+    pub engine: Option<EngineReorgMetrics>,
+}
+
+impl RelayTelemetryRollup {
+    /// Derived `observed_reorg_rate = post_settle_reorgs / settles` from the
+    /// folded-in engine metrics, if present and non-empty.
+    pub fn observed_reorg_rate(&self) -> Option<f64> {
+        let engine = self.engine.as_ref()?;
+        (engine.settles > 0).then(|| engine.post_settle_reorgs as f64 / engine.settles as f64)
+    }
+}
+
+/// One relay's export-ready record, keyed by opaque device-local index.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayRollupEntry {
+    /// Opaque device-local relay index (resolved to a URL only at export).
+    pub relay_index: u32,
+    /// First-event latency from subscribe time, in local-time milliseconds.
+    pub first_event_latency: DurationHistogramSnapshot,
+    /// EOSE latency from subscribe time, in local-time milliseconds.
+    pub eose_latency: DurationHistogramSnapshot,
+    /// Copies this relay surfaced first (delivery + first-deliverer signal).
+    pub delivered_first: u64,
+    /// Copies this relay corroborated after another relay surfaced first.
+    pub delivered_later: u64,
+}
+
+impl RelayRollupEntry {
+    /// Total copies this relay delivered (`relay_delivery_count`).
+    pub fn delivery_count(&self) -> u64 {
+        self.delivered_first + self.delivered_later
+    }
+
+    /// Copies that corroborated a message another relay surfaced first
+    /// (`relay_redundant_count`).
+    pub fn redundant_count(&self) -> u64 {
+        self.delivered_later
+    }
+
+    /// Fraction of this relay's copies that arrived first, in `0.0..=1.0`.
+    /// `None` when the relay has delivered nothing.
+    pub fn first_deliverer_rate(&self) -> Option<f64> {
+        let total = self.delivery_count();
+        (total > 0).then(|| self.delivered_first as f64 / total as f64)
+    }
+}
+
+/// Engine-side relay-tuning metrics folded into the export rollup.
+///
+/// Owned by the engine (the parallel `observed_reorg_rate` workstream), not the
+/// adapter. This is the seam: [`MarmotRelayPlane::telemetry_rollup`] accepts it
+/// as an optional input and the exporter ships it over the same OTLP path.
+/// `None` until the engine metric lands. Shapes mirror `relay-delivery-telemetry.md`
+/// "Validation: post-settle reorg rate"; the engine session may extend it
+/// (for example with `reorg_rewind_depth`) without disturbing the seam.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineReorgMetrics {
+    /// Settle episodes, summed across groups (denominator).
+    pub settles: u64,
+    /// Settles later superseded by a diverging branch (numerator).
+    pub post_settle_reorgs: u64,
+    /// Local time from a superseded settle to the reorg, in milliseconds — the
+    /// extra quiescence that would have avoided each reorg.
+    pub reorg_lateness_ms: DurationHistogramSnapshot,
+}
+
+/// Reshape the adapter snapshots into the export-ready rollup. Pure so the
+/// aggregation is unit-testable without a live relay plane.
+fn rollup_from_snapshots(
+    spread: RelayDeliverySpread,
+    sync: RelaySyncSnapshot,
+    metrics: NostrAdapterMetrics,
+    health: RelayPlaneHealth,
+    engine: Option<EngineReorgMetrics>,
+) -> RelayTelemetryRollup {
+    let mut indices: Vec<u32> = spread
+        .per_relay
+        .iter()
+        .map(|stats| stats.relay_index)
+        .chain(sync.per_relay.iter().map(|stats| stats.relay_index))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let relays = indices
+        .into_iter()
+        .map(|relay_index| {
+            let delivery = spread
+                .per_relay
+                .iter()
+                .find(|stats| stats.relay_index == relay_index);
+            let latency = sync
+                .per_relay
+                .iter()
+                .find(|stats| stats.relay_index == relay_index);
+            RelayRollupEntry {
+                relay_index,
+                first_event_latency: latency
+                    .map(|stats| stats.first_event.clone())
+                    .unwrap_or_default(),
+                eose_latency: latency.map(|stats| stats.eose.clone()).unwrap_or_default(),
+                delivered_first: delivery
+                    .map(|stats| stats.delivered_first)
+                    .unwrap_or_default(),
+                delivered_later: delivery
+                    .map(|stats| stats.delivered_later)
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    RelayTelemetryRollup {
+        relays,
+        cross_relay_spread: spread.spread,
+        messages_observed: spread.observed,
+        messages_corroborated: spread.corroborated,
+        messages_single_source: spread.single_source,
+        connection_attempts: health.connection_attempts as u64,
+        connection_successes: health.connection_successes as u64,
+        publish_attempts: metrics.publish_attempts as u64,
+        publish_successes: metrics.publish_successes as u64,
+        publish_failures: metrics.publish_failures as u64,
+        engine,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -277,6 +463,70 @@ impl MarmotRelayPlane {
             return RelayPlaneHealth::from_sdk(sdk_relay_client.relay_health().await, directory);
         }
         RelayPlaneHealth::from_directory(directory)
+    }
+
+    /// Snapshot the device-local relay telemetry for local inspection.
+    ///
+    /// Aggregate and privacy-safe: counts, millisecond histogram buckets, and
+    /// opaque relay indices only. There is a single shared adapter per device,
+    /// so these counters already span every local account. Resolving the opaque
+    /// indices to relay URLs is reserved for the opt-in export path.
+    pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
+        let adapter = &self.inner.transport.adapter;
+        RelayTelemetrySnapshot {
+            metrics: adapter.metrics().await,
+            delivery_spread: adapter.delivery_spread().await,
+            sync: adapter.relay_sync().await,
+            health: self.relay_health().await,
+        }
+    }
+
+    /// Resolve opaque relay indices to relay endpoints — the export label
+    /// boundary.
+    ///
+    /// Crate-private and reachable only through the exporter. It returns `None`
+    /// unless [`RelayTelemetryExportConfig::export_allowed`] holds (the same
+    /// gate as [`MarmotRelayPlane::telemetry_exporter`]); only then does it mint
+    /// a [`RelayExportConsent`] and ask the adapter to reverse-map indices to
+    /// relay URLs. No other code path turns a device-local index into a relay
+    /// URL. See the privacy contract in `relay-observability.md`.
+    pub(crate) async fn resolve_relay_labels(
+        &self,
+        config: &RelayTelemetryExportConfig,
+    ) -> Option<RelayLabelResolution> {
+        // Same gate as `telemetry_exporter`: resolution cannot happen unless
+        // export is opted in, has an endpoint, and that endpoint is TLS.
+        if !config.export_allowed() {
+            return None;
+        }
+        let consent = RelayExportConsent::affirm();
+        Some(
+            self.inner
+                .transport
+                .adapter
+                .resolve_relay_labels(consent)
+                .await,
+        )
+    }
+
+    /// Aggregate the device-local per-relay telemetry into one export-ready
+    /// rollup, optionally folding in engine-side reorg metrics.
+    ///
+    /// Keyed by opaque relay index — no relay URLs. The single shared adapter
+    /// already merges across local accounts, so today this is a near-passthrough
+    /// reshaping; it is the seam where multi-account dedup and engine metrics are
+    /// combined for export. `engine` is `None` until the parallel
+    /// `observed_reorg_rate` workstream lands.
+    pub async fn telemetry_rollup(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+    ) -> RelayTelemetryRollup {
+        let adapter = &self.inner.transport.adapter;
+        let spread = adapter.delivery_spread().await;
+        let sync = adapter.relay_sync().await;
+        let metrics = adapter.metrics().await;
+        let health = self.relay_health().await;
+        rollup_from_snapshots(spread, sync, metrics, health, engine)
     }
 
     pub(crate) async fn fetch_directory_events(
@@ -711,6 +961,55 @@ fn spawn_relay_notification_forwarder(
                                     event,
                                 });
                             }
+                            Ok(false)
+                        }
+                        RelayPoolNotification::Message {
+                            relay_url,
+                            message:
+                                RelayMessage::Event {
+                                    subscription_id,
+                                    event,
+                                },
+                        } => {
+                            // Raw per-relay copy (not deduplicated): telemetry
+                            // only, so cross-relay arrival spread and per-relay
+                            // first-event timing see every relay's copy. Delivery
+                            // happens on the deduplicated `Event` arm above. Keep
+                            // this in sync with the relay plane's own tap; the
+                            // SDK client's standalone forwarder is unused here.
+                            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                                tracing::trace!(
+                                    target: "marmot_app::relay_plane",
+                                    method = "spawn_relay_notification_forwarder",
+                                    "observing per-relay event copy"
+                                );
+                                adapter
+                                    .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
+                                        endpoint: TransportEndpoint(relay_url.to_string()),
+                                        subscription_id: Some(subscription_id.to_string()),
+                                        event,
+                                    })
+                                    .await;
+                            }
+                            Ok(false)
+                        }
+                        RelayPoolNotification::Message {
+                            relay_url,
+                            message: RelayMessage::EndOfStoredEvents(subscription_id),
+                        } => {
+                            // EOSE tap: advances the per-relay initial-sync gate
+                            // and records EOSE latency. No delivery.
+                            tracing::trace!(
+                                target: "marmot_app::relay_plane",
+                                method = "spawn_relay_notification_forwarder",
+                                "forwarding SDK relay end-of-stored-events"
+                            );
+                            adapter
+                                .handle_relay_eose(
+                                    TransportEndpoint(relay_url.to_string()),
+                                    subscription_id.to_string(),
+                                )
+                                .await;
                             Ok(false)
                         }
                         RelayPoolNotification::Shutdown => {
@@ -1190,6 +1489,222 @@ mod tests {
             NostrSubscription::AccountInbox { endpoints, .. }
             | NostrSubscription::Group { endpoints, .. } => endpoints.len() == 1,
         }));
+    }
+
+    #[tokio::test]
+    async fn relay_telemetry_reflects_activation_through_the_plane() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let group_id = GroupId::new(vec![0xC3; 32]);
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id,
+                    transport_group_id: vec![0xD4; 32],
+                    endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+                }],
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let telemetry = relay_plane.relay_telemetry().await;
+        // The single shared adapter records subscription lifecycle and the
+        // initial-sync gate as soon as an account activates, so the bundled
+        // snapshot is populated without any relay traffic.
+        assert_eq!(telemetry.metrics.active_accounts, 1);
+        assert!(telemetry.metrics.subscriptions_created >= 2);
+        assert!(telemetry.sync.tracked_subscriptions >= 2);
+        // No SDK relay client is wired in this unit harness.
+        assert!(!telemetry.health.sdk_backed);
+        // No relay copies were observed, so spread stays empty (no URLs leak).
+        assert_eq!(telemetry.delivery_spread.spread.sample_count(), 0);
+    }
+
+    #[test]
+    fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
+        use transport_nostr_adapter::{HistogramBucket, RelayDeliveryStats, RelayLatencyStats};
+
+        let hist = |count: u64| DurationHistogramSnapshot {
+            buckets: vec![HistogramBucket {
+                upper_bound_ms: 50,
+                count,
+            }],
+            overflow_count: 0,
+        };
+
+        let spread = RelayDeliverySpread {
+            observed: 5,
+            corroborated: 4,
+            single_source: 1,
+            spread: hist(3),
+            per_relay: vec![
+                RelayDeliveryStats {
+                    relay_index: 0,
+                    delivered_first: 3,
+                    delivered_later: 1,
+                },
+                RelayDeliveryStats {
+                    relay_index: 1,
+                    delivered_first: 0,
+                    delivered_later: 2,
+                },
+            ],
+        };
+        let sync = RelaySyncSnapshot {
+            tracked_subscriptions: 2,
+            synced_subscriptions: 1,
+            first_event: hist(2),
+            eose: hist(2),
+            per_relay: vec![
+                RelayLatencyStats {
+                    relay_index: 0,
+                    first_event: hist(1),
+                    eose: hist(1),
+                },
+                RelayLatencyStats {
+                    relay_index: 2,
+                    first_event: hist(1),
+                    eose: hist(1),
+                },
+            ],
+        };
+        let metrics = NostrAdapterMetrics {
+            publish_attempts: 4,
+            publish_successes: 3,
+            publish_failures: 1,
+            ..NostrAdapterMetrics::default()
+        };
+        let health = RelayPlaneHealth {
+            connection_attempts: 6,
+            connection_successes: 5,
+            ..RelayPlaneHealth::default()
+        };
+
+        let rollup = rollup_from_snapshots(spread, sync, metrics, health, None);
+
+        // Union of per-relay indices {0,1,2}, ascending.
+        assert_eq!(
+            rollup
+                .relays
+                .iter()
+                .map(|entry| entry.relay_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // Index 0: both delivery and latency rows present.
+        let relay0 = &rollup.relays[0];
+        assert_eq!(relay0.delivery_count(), 4);
+        assert_eq!(relay0.redundant_count(), 1);
+        assert_eq!(relay0.first_deliverer_rate(), Some(0.75));
+        assert_eq!(relay0.first_event_latency.sample_count(), 1);
+
+        // Index 1: delivery only -> empty latency histograms.
+        let relay1 = &rollup.relays[1];
+        assert_eq!(relay1.delivery_count(), 2);
+        assert_eq!(relay1.first_deliverer_rate(), Some(0.0));
+        assert_eq!(relay1.eose_latency.sample_count(), 0);
+
+        // Index 2: latency only -> zero delivery counts.
+        let relay2 = &rollup.relays[2];
+        assert_eq!(relay2.delivery_count(), 0);
+        assert_eq!(relay2.first_deliverer_rate(), None);
+        assert_eq!(relay2.eose_latency.sample_count(), 1);
+
+        // Population-level and device-wide fields carry through.
+        assert_eq!(rollup.cross_relay_spread.sample_count(), 3);
+        assert_eq!(rollup.messages_corroborated, 4);
+        assert_eq!(rollup.messages_single_source, 1);
+        assert_eq!(rollup.connection_attempts, 6);
+        assert_eq!(rollup.connection_successes, 5);
+        assert_eq!(rollup.publish_successes, 3);
+        assert_eq!(rollup.observed_reorg_rate(), None);
+    }
+
+    #[test]
+    fn rollup_observed_reorg_rate_uses_folded_engine_metrics() {
+        let rollup = RelayTelemetryRollup {
+            engine: Some(EngineReorgMetrics {
+                settles: 8,
+                post_settle_reorgs: 2,
+                reorg_lateness_ms: DurationHistogramSnapshot::default(),
+            }),
+            ..RelayTelemetryRollup::default()
+        };
+        assert_eq!(rollup.observed_reorg_rate(), Some(0.25));
+
+        // Engine present but with no settles yet: rate is undefined, not 0/0.
+        let empty_engine = RelayTelemetryRollup {
+            engine: Some(EngineReorgMetrics::default()),
+            ..RelayTelemetryRollup::default()
+        };
+        assert_eq!(empty_engine.observed_reorg_rate(), None);
+    }
+
+    #[tokio::test]
+    async fn telemetry_rollup_is_empty_without_observed_relay_traffic() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let rollup = relay_plane.telemetry_rollup(None).await;
+        assert!(rollup.relays.is_empty());
+        assert_eq!(rollup.cross_relay_spread.sample_count(), 0);
+        assert!(rollup.engine.is_none());
+    }
+
+    #[tokio::test]
+    async fn relay_label_resolution_is_gated_behind_opt_in() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let endpoint = TransportEndpoint("wss://relay.example".into());
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        // Off by default: no opt-in means no relay-identity resolution at all.
+        let disabled = RelayTelemetryExportConfig::disabled();
+        assert!(relay_plane.resolve_relay_labels(&disabled).await.is_none());
+
+        // Opted in but no endpoint: still no resolution (same gate as the
+        // exporter).
+        let no_endpoint = RelayTelemetryExportConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            relay_plane
+                .resolve_relay_labels(&no_endpoint)
+                .await
+                .is_none()
+        );
+
+        // Opted in with a TLS endpoint: the export boundary resolves the opaque
+        // index for the activated inbox endpoint back to its relay URL.
+        let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example");
+        let resolution = relay_plane
+            .resolve_relay_labels(&enabled)
+            .await
+            .expect("opt-in resolves labels");
+        assert!(!resolution.is_empty());
+        assert!(
+            resolution
+                .label_for(transport_nostr_adapter::RelayIndex(0))
+                .is_some()
+        );
     }
 
     #[tokio::test]

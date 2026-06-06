@@ -32,6 +32,9 @@ for reconnect/backoff and relay status mechanics.
 - Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
+- Keep per-relay telemetry keyed by the opaque `RelayIndex`. `resolve_relay_labels` (gated behind a
+  `RelayExportConsent` token) is the only path that turns an index back into a relay URL, and exists solely for the
+  opt-in export boundary. Do not add another reverse mapping or resolve indices outside that boundary.
 - Do not log relay URLs, account ids, group ids, message ids, subscription ids, pubkeys, plaintext, ciphertext, or
   payload-derived values.
 - Use tracing `target` plus `method` fields so crate/module/method are visible while diagnostic data stays

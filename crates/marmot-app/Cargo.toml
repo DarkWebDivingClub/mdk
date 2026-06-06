@@ -5,6 +5,13 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
+# privacy-critical mapping and opt-in gate stay in the default build; this
+# feature only adds the OTLP protobuf dependencies and the push transport.
+otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+
 [dependencies]
 async-trait.workspace = true
 cgka-engine.workspace = true
@@ -17,6 +24,8 @@ marmot-account.workspace = true
 marmot-forensics.workspace = true
 nostr.workspace = true
 nostr-sdk.workspace = true
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 rand.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

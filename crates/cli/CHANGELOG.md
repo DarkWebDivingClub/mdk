@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Added `dm relay-stats`, which prints the device-local relay performance telemetry (aggregate lifecycle counters,
+  cross-relay arrival spread, per-relay first-deliverer and first-event/EOSE timing, and redacted relay health). The
+  command runs against the live `dmd` runtime when a daemon socket exists. Output is aggregate-only and uses opaque
+  device-local relay indices — never relay URLs.
 - Added Whitenoise-shaped identity and plural command entrypoints: `dm create-identity`, `dm login`, `dm whoami`,
   `dm accounts`, and `dm groups`.
 - Added the remaining Whitenoise-shaped top-level command names (`debug`, `logout`, `export-nsec`, `media`,

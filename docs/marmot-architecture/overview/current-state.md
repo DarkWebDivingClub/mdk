@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-27
+updated: 2026-06-06
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -130,7 +130,11 @@ variants.
   invite group evolution, insufficient acks, publish errors, subscription gating, duplicate delivery, reordered delivery,
   invite commit/welcome order variants, and terminal stale-epoch invite commits through the real session, adapter, and
   peeler stack. Production relay auth, relay safety policy, full KeyPackage metadata derivation through the transport
-  layer, richer telemetry export, and account key-management wiring still need integration.
+  layer, and account key-management wiring still need integration. The opt-in relay-telemetry export pipeline is built:
+local visibility via `dm relay-stats`, an opt-in index→identity resolution boundary, a relay-plane rollup, and an
+opt-in OTLP exporter (wire encoding behind the `marmot-app` `otlp-export` feature) — all aggregate, off by default, and
+carrying relay identity as the sole label. Wiring its periodic push into a long-running host against the production
+first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md).
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in

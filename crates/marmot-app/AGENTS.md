@@ -30,9 +30,16 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
+- Keep the relay-telemetry export path in `relay_plane.rs` (rollup) and `relay_telemetry_export.rs` (exporter). It is
+  opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
+  resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
+  the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
+  build. See `docs/marmot-architecture/relay-observability.md`.
 
 ## Verification
 
 ```sh
 cargo test -p marmot-app
+# Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):
+cargo test -p marmot-app --features otlp-export
 ```
