@@ -44,8 +44,8 @@ configuration:
 - account inbox relays are the user's always-on welcome / gift-wrap relays;
 - group subscriptions and group-message publish targets come from the group's current
   `marmot.transport.nostr.routing.v1` app component;
-- KeyPackage publication targets come from the user's NIP-65-style KeyPackage relay-list discovery data, currently
-  documented in the Marmot drafts as kind `10051`;
+- KeyPackage publication targets come from the user's kind `10002` NIP-65 relay list (the same outbox relays the
+  account publishes through); there is no dedicated KeyPackage relay list;
 - publish acknowledgement thresholds remain app policy over the chosen endpoint set.
 
 `StaticTransportRouting` is only the simple configured implementation used by tests and early harnesses.

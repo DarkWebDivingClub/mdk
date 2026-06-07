@@ -63,9 +63,9 @@ use storage_sqlite::{
     StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, TimelineProjectionUpdate,
 };
 use transport_nostr_adapter::{
-    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
-    KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind, NostrAccountRelayListPublication,
-    NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient,
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
+    NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrKeyPackagePublication,
+    NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -261,7 +261,6 @@ pub struct AccountRelayListStatus {
     pub bootstrap_relays: Vec<String>,
     pub nip65: AccountRelayListState,
     pub inbox: AccountRelayListState,
-    pub key_package: AccountRelayListState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,10 +307,6 @@ impl AccountRelayListStatus {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 relays: Vec::new(),
             },
-            key_package: AccountRelayListState {
-                kind: KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
-                relays: Vec::new(),
-            },
         };
         status.refresh();
         status
@@ -325,9 +320,6 @@ impl AccountRelayListStatus {
         }
         if self.inbox.relays.is_empty() {
             self.missing.push("inbox".into());
-        }
-        if self.key_package.relays.is_empty() {
-            self.missing.push("key_package".into());
         }
         self.complete = self.missing.is_empty();
     }
@@ -1065,7 +1057,6 @@ impl MarmotApp {
             &[
                 NostrAccountRelayListKind::Nip65,
                 NostrAccountRelayListKind::Inbox,
-                NostrAccountRelayListKind::KeyPackage,
             ],
         )
         .await
@@ -1093,7 +1084,6 @@ impl MarmotApp {
             .filter_map(|name| match name.as_str() {
                 "nip65" => Some(NostrAccountRelayListKind::Nip65),
                 "inbox" => Some(NostrAccountRelayListKind::Inbox),
-                "key_package" => Some(NostrAccountRelayListKind::KeyPackage),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1135,7 +1125,6 @@ impl MarmotApp {
         let list_kind = match list_kind {
             "nip65" => NostrAccountRelayListKind::Nip65,
             "inbox" => NostrAccountRelayListKind::Inbox,
-            "key_package" | "key-package" => NostrAccountRelayListKind::KeyPackage,
             other => {
                 return Err(AppError::RelayDirectory(format!(
                     "unsupported relay list type: {other}"
@@ -1156,10 +1145,6 @@ impl MarmotApp {
 
     pub fn account_inbox_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
         Ok(self.account_relay_list_status(label)?.inbox.relays)
-    }
-
-    pub fn account_key_package_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
-        Ok(self.account_relay_list_status(label)?.key_package.relays)
     }
 
     pub async fn set_account_nip65_relays(
@@ -1186,21 +1171,6 @@ impl MarmotApp {
         self.set_account_relay_list_kind(
             label,
             NostrAccountRelayListKind::Inbox,
-            relays,
-            bootstrap_relays,
-        )
-        .await
-    }
-
-    pub async fn set_account_key_package_relays(
-        &self,
-        label: &str,
-        relays: Vec<TransportEndpoint>,
-        bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        self.set_account_relay_list_kind(
-            label,
-            NostrAccountRelayListKind::KeyPackage,
             relays,
             bootstrap_relays,
         )
@@ -1309,7 +1279,7 @@ impl MarmotApp {
         } else {
             self.account_relay_list_status_for_account_id(account_id_hex)?
         };
-        if !has_explicit_bootstrap_relays && relay_lists.key_package.relays.is_empty() {
+        if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
             let source_relays = self.directory_source_relays(&[]);
             if !source_relays.is_empty() {
                 relay_lists = self
@@ -1318,12 +1288,12 @@ impl MarmotApp {
             }
         }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
-        if relay_lists.key_package.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+        if relay_lists.nip65.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
         }
 
         let source_relays = relay_lists
-            .key_package
+            .nip65
             .relays
             .iter()
             .cloned()
@@ -2215,22 +2185,39 @@ impl MarmotApp {
         let account_id_hex = keys.public_key().to_hex();
         let mut packages = self.local_key_package_records(label)?;
 
-        let relay_lists = if bootstrap_relays.is_empty() {
-            self.account_relay_list_status_for_account_id(&account_id_hex)?
-        } else {
+        let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
+        let mut relay_lists = if has_explicit_bootstrap_relays {
             self.fetch_account_relay_list_status_for_account_id(&account_id_hex, bootstrap_relays)
                 .await?
+        } else {
+            self.account_relay_list_status_for_account_id(&account_id_hex)?
         };
-        let mut source_relays = relay_lists
-            .key_package
+        // Discover the account's NIP-65 list via default relays when it is not
+        // cached yet, mirroring fetch_latest_key_package_for_account_id. We never
+        // pull KeyPackage events from arbitrary default relays: the source set is
+        // always the account's own NIP-65 relays, and we fail closed when that
+        // list is missing.
+        if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
+            let discovery_relays = self.directory_source_relays(&[]);
+            if !discovery_relays.is_empty() {
+                relay_lists = self
+                    .fetch_account_relay_list_status_for_account_id(
+                        &account_id_hex,
+                        discovery_relays,
+                    )
+                    .await?;
+            }
+        }
+        if relay_lists.nip65.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+        }
+        let source_relays = relay_lists
+            .nip65
             .relays
             .iter()
             .cloned()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        if source_relays.is_empty() {
-            source_relays = self.directory_source_relays(&[]);
-        }
 
         if !source_relays.is_empty() {
             let mut relay_records = self
@@ -2272,7 +2259,7 @@ impl MarmotApp {
             endpoints = self.key_package_endpoints(&relay_lists);
         }
         if endpoints.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
         }
 
         let event = NostrTransportEvent::new_unsigned(
@@ -2308,7 +2295,7 @@ impl MarmotApp {
         record: KeyPackageRecord,
     ) -> Result<AccountKeyPackageRecord, AppError> {
         let source_relays = self
-            .account_key_package_relays(&record.account_label)
+            .account_nip65_relays(&record.account_label)
             .unwrap_or_default();
         Ok(AccountKeyPackageRecord {
             account_label: Some(record.account_label),
@@ -2348,8 +2335,8 @@ impl MarmotApp {
         let keys = self.account_home().load_signing_keys(label)?;
         let account_id_hex = keys.public_key().to_hex();
         let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-        if relay_lists.key_package.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+        if relay_lists.nip65.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
         }
         let publisher = AppKeyPackagePublisher {
             app: self.clone(),
@@ -2383,10 +2370,10 @@ impl MarmotApp {
             if let Some(key_package) = entry.key_package {
                 return validated_cached_key_package(&account_id, &key_package);
             }
-            if !entry.relay_lists.key_package.relays.is_empty() {
+            if !entry.relay_lists.nip65.relays.is_empty() {
                 let source_relays = entry
                     .relay_lists
-                    .key_package
+                    .nip65
                     .relays
                     .iter()
                     .cloned()
@@ -2775,9 +2762,13 @@ impl MarmotApp {
         &self,
         relay_lists: &AccountRelayListStatus,
     ) -> Vec<TransportEndpoint> {
-        if !relay_lists.key_package.relays.is_empty() {
+        // KeyPackages publish to (and are fetched from) the account's NIP-65
+        // (kind 10002) outbox relays; there is no dedicated KeyPackage relay
+        // list. Fall back to the configured default relays when the account has
+        // no NIP-65 list yet.
+        if !relay_lists.nip65.relays.is_empty() {
             return relay_lists
-                .key_package
+                .nip65
                 .relays
                 .iter()
                 .cloned()
@@ -3103,7 +3094,6 @@ impl MarmotApp {
         match record.event.kind {
             KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.relays = relays,
             KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.relays = relays,
-            KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => entry.relay_lists.key_package.relays = relays,
             _ => return Ok(()),
         }
         push_unique_strings(
@@ -3129,9 +3119,7 @@ impl MarmotApp {
                 let follow_list = follow_list_from_record(record);
                 self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
             }
-            KIND_NIP65_RELAY_LIST
-            | KIND_MARMOT_INBOX_RELAY_LIST
-            | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => {
+            KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST => {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;
             }
             KIND_MARMOT_KEY_PACKAGE => {
@@ -3750,7 +3738,6 @@ fn relay_list_status_from_records(
         match record.event.kind {
             KIND_NIP65_RELAY_LIST => status.nip65.relays = relays,
             KIND_MARMOT_INBOX_RELAY_LIST => status.inbox.relays = relays,
-            KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => status.key_package.relays = relays,
             _ => continue,
         }
         push_unique_strings(
@@ -3776,9 +3763,7 @@ fn fresh_relay_list_status_from_records(
         if record.event.pubkey != account_id_hex
             || !matches!(
                 record.event.kind,
-                KIND_NIP65_RELAY_LIST
-                    | KIND_MARMOT_INBOX_RELAY_LIST
-                    | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
+                KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST
             )
         {
             return true;
@@ -3794,14 +3779,10 @@ fn fresh_relay_list_status_from_records(
 }
 
 fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
-    [
-        KIND_NIP65_RELAY_LIST,
-        KIND_MARMOT_INBOX_RELAY_LIST,
-        KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
-    ]
-    .into_iter()
-    .map(|kind| DirectoryEventQuery::new(kind, vec![account_id_hex.clone()], 12))
-    .collect()
+    [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+        .into_iter()
+        .map(|kind| DirectoryEventQuery::new(kind, vec![account_id_hex.clone()], 12))
+        .collect()
 }
 
 fn latest_key_package_from_records(
@@ -3925,9 +3906,7 @@ fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppErr
 }
 
 fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
-    !status.nip65.relays.is_empty()
-        || !status.inbox.relays.is_empty()
-        || !status.key_package.relays.is_empty()
+    !status.nip65.relays.is_empty() || !status.inbox.relays.is_empty()
 }
 
 fn fill_missing_relay_lists_from_cached(
@@ -3939,9 +3918,6 @@ fn fill_missing_relay_lists_from_cached(
     }
     if status.inbox.relays.is_empty() {
         status.inbox.relays = cached.inbox.relays.clone();
-    }
-    if status.key_package.relays.is_empty() {
-        status.key_package.relays = cached.key_package.relays.clone();
     }
     if status.bootstrap_relays.is_empty() {
         status.bootstrap_relays = cached.bootstrap_relays.clone();
@@ -4569,7 +4545,7 @@ fn remove_sqlite_file_set(path: &Path) -> Result<(), AppError> {
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
     let tag_name = match event.kind {
         KIND_NIP65_RELAY_LIST => "r",
-        KIND_MARMOT_INBOX_RELAY_LIST | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => "relay",
+        KIND_MARMOT_INBOX_RELAY_LIST => "relay",
         _ => return Vec::new(),
     };
     let mut relays = Vec::new();
@@ -4667,7 +4643,7 @@ mod tests {
 
         let queries = relay_list_queries(account_id_hex.clone());
 
-        assert_eq!(queries.len(), 3);
+        assert_eq!(queries.len(), 2);
         let kinds = queries
             .iter()
             .map(|query| {
@@ -4678,11 +4654,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            vec![
-                KIND_NIP65_RELAY_LIST,
-                KIND_MARMOT_INBOX_RELAY_LIST,
-                KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
-            ]
+            vec![KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
         );
     }
 

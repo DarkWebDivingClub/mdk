@@ -1538,7 +1538,6 @@ pub struct AccountRelayListsFfi {
     pub bootstrap_relays: Vec<String>,
     pub nip65: RelayListFfi,
     pub inbox: RelayListFfi,
-    pub key_package: RelayListFfi,
 }
 
 impl From<AccountRelayListStatus> for AccountRelayListsFfi {
@@ -1550,7 +1549,6 @@ impl From<AccountRelayListStatus> for AccountRelayListsFfi {
             bootstrap_relays: value.bootstrap_relays,
             nip65: value.nip65.into(),
             inbox: value.inbox.into(),
-            key_package: value.key_package.into(),
         }
     }
 }

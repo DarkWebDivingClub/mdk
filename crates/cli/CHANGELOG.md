@@ -63,6 +63,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Removed the kind `10051` KeyPackage relay list. KeyPackage kind `30443` events now publish to, and are fetched from,
+  the account's kind `10002` NIP-65 relays. The `key_package` relay type is no longer accepted by `dm relays`, account
+  relay-list status no longer reports a `key_package` list, and account bootstrap only requires the NIP-65 and inbox
+  relay lists.
 - Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-hosted
   runtime subscription model. The older singular `dm message` spelling still works during the transition.
 - `dm messages subscribe` can now omit the group argument to stream live updates across all local groups for the
@@ -105,9 +109,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   subscription model.
 - Nostr SDK relay connect and publish calls are now bounded by timeouts so first-run account setup fails with JSON
   instead of hanging indefinitely when a local relay does not ACK publishes.
-- `dm create-identity` and `dm login --nsec-stdin` publish the required NIP-65, inbox, and KeyPackage relay lists for
-  new local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login
-  --nsec-stdin --relay <url>` remains the command-local import fallback.
+- `dm create-identity` and `dm login --nsec-stdin` publish the required NIP-65 and inbox relay lists, plus the initial
+  KeyPackage event, for new local signing identities from daemon account-relay defaults when relay-list flags are
+  omitted; `dm login --nsec-stdin --relay <url>` remains the command-local import fallback.
 - Newly created local identities now publish matching Nostr `name` and `display_name` values using two-word pseudonyms
   instead of account-id-derived Marmot labels.
 - Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay

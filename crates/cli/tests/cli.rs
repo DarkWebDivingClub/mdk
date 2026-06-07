@@ -1809,7 +1809,7 @@ fn account_create_uses_global_relay_for_required_relay_lists() {
     );
     assert_eq!(created["relay_lists"]["nip65"]["kind"], 10002);
     assert_eq!(created["relay_lists"]["inbox"]["kind"], 10050);
-    assert_eq!(created["relay_lists"]["key_package"]["kind"], 10051);
+    assert!(created["relay_lists"]["key_package"].is_null());
 }
 
 #[test]
@@ -1872,7 +1872,7 @@ fn account_create_publishes_required_relay_lists_from_default_relays() {
     );
     assert_eq!(created["relay_lists"]["nip65"]["kind"], 10002);
     assert_eq!(created["relay_lists"]["inbox"]["kind"], 10050);
-    assert_eq!(created["relay_lists"]["key_package"]["kind"], 10051);
+    assert!(created["relay_lists"]["key_package"].is_null());
 
     let account_id = created["account_id"].as_str().expect("account id");
     let status = run_json(home.path(), &["account", "status", account_id]);
@@ -1897,10 +1897,7 @@ fn account_create_reports_missing_relay_lists_without_storing_the_nsec() {
         &format!("{nsec}\n"),
     );
     assert_eq!(error["code"], "missing_relay_lists");
-    assert_eq!(
-        error["missing"],
-        serde_json::json!(["nip65", "inbox", "key_package"])
-    );
+    assert_eq!(error["missing"], serde_json::json!(["nip65", "inbox"]));
     assert_eq!(error["repair"]["requires"], "--default-relays");
     assert!(!error.to_string().contains(nsec));
 
@@ -1974,10 +1971,7 @@ fn account_import_requires_explicit_repair_before_publishing_missing_relay_lists
     );
 
     assert_eq!(error["code"], "missing_relay_lists");
-    assert_eq!(
-        error["missing"],
-        serde_json::json!(["nip65", "inbox", "key_package"])
-    );
+    assert_eq!(error["missing"], serde_json::json!(["nip65", "inbox"]));
     assert_eq!(
         error["repair"]["publish_missing"],
         "--publish-missing-relay-lists"
@@ -2059,7 +2053,7 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
     assert_eq!(fetched["account_id"], account_id);
     assert_eq!(fetched["key_package_bytes"].as_u64(), Some(published_bytes));
     assert_eq!(
-        fetched["relay_lists"]["key_package"]["relays"],
+        fetched["relay_lists"]["nip65"]["relays"],
         serde_json::json!([relay])
     );
     assert_eq!(fetched["source_relays"], serde_json::json!([relay]));

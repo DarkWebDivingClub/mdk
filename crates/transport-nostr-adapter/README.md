@@ -16,7 +16,8 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 - Publishes already-wrapped `TransportMessage`s to target endpoints and returns endpoint-level publish reports.
 - Builds and publishes Marmot kind `30443` KeyPackage events through the same relay-client boundary when supplied with
   the MIP-00 metadata.
-- Builds NIP-65 kind `10002`, Marmot inbox kind `10050`, and Marmot KeyPackage kind `10051` account relay-list events.
+- Builds NIP-65 kind `10002` and Marmot inbox kind `10050` account relay-list events. KeyPackages are published to the
+  NIP-65 relays; there is no dedicated KeyPackage relay list.
 - Removes stale group subscriptions when an active account's group set changes.
 - Exposes adapter-local lifecycle metrics for diagnostics.
 - With the `sdk` feature, plans `nostr-sdk` filters/subscription ids, signs unsigned group events with the configured
@@ -62,9 +63,9 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 
 The app-runtime layer now projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
-The next expansion is to derive KeyPackage publish targets from the user's kind `10051` KeyPackage relay list and keep
-directory/profile discovery coalesced in the shared runtime relay plane. Kind `30443` is the Marmot KeyPackage event
-kind; do not substitute deprecated NIP-104 key package kinds for this path.
+KeyPackage publish targets are derived from the user's kind `10002` NIP-65 relay list (there is no dedicated KeyPackage
+relay list), and directory/profile discovery is coalesced in the shared runtime relay plane. Kind `30443` is the Marmot
+KeyPackage event kind; do not substitute deprecated NIP-104 key package kinds for this path.
 
 ## Run tests
 

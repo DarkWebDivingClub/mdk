@@ -1,7 +1,7 @@
 ---
 title: "Nostr Account Transport Notes"
 created: 2026-05-11
-updated: 2026-05-11
+updated: 2026-06-07
 tags: [marmot, overview, nostr, transport, accounts]
 status: working-note
 ---
@@ -40,9 +40,8 @@ It should track:
 - follow lists and follower-derived user records;
 - mute lists and relay block decisions;
 - profile metadata needed by the app;
-- NIP-65 relay lists;
-- inbox relay lists;
-- kind `10051` KeyPackage relay lists.
+- NIP-65 relay lists (also the outbox relays used for KeyPackage publication);
+- inbox relay lists.
 
 This is close to the shape whitenoise-rs already has: users and accounts are different records, with relationship and
 relay data kept fresh in the background.
@@ -59,13 +58,12 @@ exists.
 
 For the current Marmot design that includes:
 
-- a NIP-65 relay list;
+- a NIP-65 relay list (kind `10002`), whose relays are also the outbox for KeyPackage publication;
 - an inbox relay list for welcome gift wraps;
-- a kind `10051` KeyPackage relay list;
 - enough local directory state to publish welcomes and KeyPackages correctly.
 
-Missing kind `10051` should be handled by account setup. It should not become a permanent runtime mystery for KeyPackage
-publication.
+A missing NIP-65 relay list should be handled by account setup. It should not become a permanent runtime mystery for
+KeyPackage publication.
 
 ### Shared Relay Plane
 
@@ -79,7 +77,7 @@ It should:
 - subscribe to each account's inbox relays for welcomes;
 - subscribe to group relays for every active group on every account;
 - publish group messages to group relays;
-- publish KeyPackages to relays from kind `10051`;
+- publish KeyPackages to relays from the account's kind `10002` NIP-65 list;
 - publish account relay-list events during bootstrap and updates.
 
 Multi-account dedupe belongs here, below `marmot-account`. The account runtime should not need a global view of every
@@ -156,6 +154,7 @@ The next Nostr-facing code should be small:
 
 - harden relay safety policy around `marmot.transport.nostr.routing.v1`;
 - keep group subscriptions and publish targets projected from signed routing state;
-- define how a Nostr-backed service publishes kind `30443` KeyPackages using kind `10051` relay-list data.
+- define how a Nostr-backed service publishes kind `30443` KeyPackages using the account's kind `10002` NIP-65
+  relay-list data.
 
 The engine work remains the center of gravity.

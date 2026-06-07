@@ -205,19 +205,13 @@ async fn relay_list_binding_methods_are_public() {
 
     assert!(kit.account_nip65_relays("missing".into()).is_err());
     assert!(kit.account_inbox_relays("missing".into()).is_err());
-    assert!(kit.account_key_package_relays("missing".into()).is_err());
     assert!(
         kit.set_account_nip65_relays("missing".into(), relays.clone(), relays.clone())
             .await
             .is_err()
     );
     assert!(
-        kit.set_account_inbox_relays("missing".into(), relays.clone(), relays.clone())
-            .await
-            .is_err()
-    );
-    assert!(
-        kit.set_account_key_package_relays("missing".into(), relays.clone(), relays)
+        kit.set_account_inbox_relays("missing".into(), relays.clone(), relays)
             .await
             .is_err()
     );

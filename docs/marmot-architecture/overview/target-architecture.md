@@ -3,7 +3,7 @@ title: "Target Architecture — Four Components"
 created: 2026-04-19
 tags: [marmot, overview, architecture, components]
 status: overview
-updated: 2026-05-20
+updated: 2026-06-07
 ---
 
 # Target Architecture — Four Components
@@ -143,7 +143,7 @@ The production perimeter is still partly outside this workspace: relay auth, rel
 key-management integration, persistence operations policy, and packaging.
 
 The Nostr routing source of truth is the signed `marmot.transport.nostr.routing.v1` app component for group routes and
-the user's kind `10051` KeyPackage relay list for KeyPackage publication. The generic account runtime remains
+the user's kind `10002` NIP-65 relay list for KeyPackage publication. The generic account runtime remains
 transport-agnostic; Nostr-specific relay safety and full KeyPackage event publication should stay with the Nostr
 transport/app-runtime layer.
 

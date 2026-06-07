@@ -9,7 +9,6 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::{NostrPublishOutcome, NostrRelayClient};
 
 pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
-pub const KIND_MARMOT_KEY_PACKAGE_RELAY_LIST: u64 = 10_051;
 
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";

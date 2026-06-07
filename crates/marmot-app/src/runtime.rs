@@ -2132,11 +2132,6 @@ impl MarmotAppRuntime {
         self.accounts.app.account_inbox_relays(&account.label)
     }
 
-    pub fn account_key_package_relays(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
-        let account = self.accounts.resolve(account_ref)?;
-        self.accounts.app.account_key_package_relays(&account.label)
-    }
-
     pub async fn set_account_nip65_relays(
         &self,
         account_ref: &str,
@@ -2160,19 +2155,6 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .set_account_inbox_relays(&account.label, relays, bootstrap_relays)
-            .await
-    }
-
-    pub async fn set_account_key_package_relays(
-        &self,
-        account_ref: &str,
-        relays: Vec<TransportEndpoint>,
-        bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        let account = self.accounts.resolve(account_ref)?;
-        self.accounts
-            .app
-            .set_account_key_package_relays(&account.label, relays, bootstrap_relays)
             .await
     }
 

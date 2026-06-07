@@ -11,7 +11,6 @@ const MARMOT_RELAY_TAG: &str = "relay";
 pub enum NostrAccountRelayListKind {
     Nip65,
     Inbox,
-    KeyPackage,
 }
 
 impl NostrAccountRelayListKind {
@@ -19,7 +18,6 @@ impl NostrAccountRelayListKind {
         match self {
             Self::Nip65 => "nip65",
             Self::Inbox => "inbox",
-            Self::KeyPackage => "key_package",
         }
     }
 
@@ -27,14 +25,13 @@ impl NostrAccountRelayListKind {
         match self {
             Self::Nip65 => KIND_NIP65_RELAY_LIST,
             Self::Inbox => KIND_MARMOT_INBOX_RELAY_LIST,
-            Self::KeyPackage => crate::KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
         }
     }
 
     fn relay_tag(self) -> &'static str {
         match self {
             Self::Nip65 => NIP65_RELAY_TAG,
-            Self::Inbox | Self::KeyPackage => MARMOT_RELAY_TAG,
+            Self::Inbox => MARMOT_RELAY_TAG,
         }
     }
 }
@@ -111,19 +108,6 @@ mod tests {
         assert_eq!(
             event.tags[0],
             vec!["relay".to_string(), "wss://relay1.example".to_string()]
-        );
-    }
-
-    #[test]
-    fn marmot_key_package_relay_list_uses_kind_10051_and_relay_tags() {
-        let publication = sample_publication(NostrAccountRelayListKind::KeyPackage);
-
-        let event = publication.to_event().unwrap();
-
-        assert_eq!(event.kind, crate::KIND_MARMOT_KEY_PACKAGE_RELAY_LIST);
-        assert_eq!(
-            event.tags[1],
-            vec!["relay".to_string(), "wss://relay2.example".to_string()]
         );
     }
 

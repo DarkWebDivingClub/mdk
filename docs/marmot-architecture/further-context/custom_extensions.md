@@ -1,7 +1,7 @@
 ---
 title: "Custom Proposals & Extensions — When to Inherit vs Define"
 created: 2026-04-18
-updated: 2026-04-19
+updated: 2026-06-07
 tags: [marmot, mls, extensions, proposals, capabilities, design]
 status: exploration
 related:
@@ -279,13 +279,6 @@ ExternalInit, PreSharedKey) plus the SelfRemove proposal from draft-ietf-mls-ext
   - **Published to relays?:** Yes
   - **Signed?:** Yes
   - **Purpose:** Relay discovery for push notification server
-
-- **Kind:** `10051`
-  - **Name:** KeyPackage relay list
-  - **Defined by:** MIP-00
-  - **Published to relays?:** Yes
-  - **Signed?:** Yes
-  - **Purpose:** Relay discovery for a user's KeyPackages
 
 - **Kind:** `30443`
   - **Name:** KeyPackage (addressable)

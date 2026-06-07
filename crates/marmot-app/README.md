@@ -18,10 +18,11 @@ The app runtime exposes those projections through account status, group listing/
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases
 directly.
 
-New-account bootstrap publishes the required NIP-65, inbox kind `10050`, KeyPackage kind `10051` relay-list events, a
-kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. Import flows can
-check whether those lists are already present before writing local account state. The same status API can fetch those
-relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
+New-account bootstrap publishes the required NIP-65 kind `10002` and inbox kind `10050` relay-list events, a
+kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. KeyPackages are
+published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay list. Import flows
+can check whether those lists are already present before writing local account state. The same status API can fetch
+those relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
 KeyPackage ref separately; normal publish reuses the cached last-resort package, while explicit rotate creates a new
 package under the same slot.

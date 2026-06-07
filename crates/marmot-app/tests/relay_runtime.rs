@@ -220,7 +220,7 @@ async fn publish_account_relay_lists_at(
     declared_relay_url: &str,
     created_at: u64,
 ) {
-    for (kind, tag_name) in [(10002, "r"), (10050, "relay"), (10051, "relay")] {
+    for (kind, tag_name) in [(10002, "r"), (10050, "relay")] {
         publish_nostr_event_at(
             home,
             label,
@@ -561,7 +561,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
 }
 
 #[tokio::test]
-async fn app_runtime_rotate_repairs_missing_key_package_relay_list() {
+async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("bob").unwrap();
@@ -570,26 +570,24 @@ async fn app_runtime_rotate_repairs_missing_key_package_relay_list() {
     app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
         .unwrap();
-    let incomplete = app
+    let complete = app
         .publish_account_relay_list_kind("bob", "inbox", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
         .unwrap();
-    assert_eq!(incomplete.missing, vec!["key_package"]);
+    assert!(complete.complete);
+    assert!(complete.missing.is_empty());
 
     let runtime = MarmotAppRuntime::new(app.clone());
     let bob = home.account("bob").unwrap().account_id_hex;
     let rotated_bytes = runtime.rotate_key_package("bob").await.unwrap();
-    let repaired = app
-        .fetch_account_relay_list_status_for_account_id(&bob, vec![endpoint(&url)])
-        .await
-        .unwrap();
     let fetched = app
         .fetch_latest_key_package_for_account_id(&bob, vec![endpoint(&url)])
         .await
         .unwrap();
 
-    assert!(repaired.complete);
-    assert_eq!(repaired.key_package.relays, vec![url]);
+    // KeyPackages publish to and are fetched from the account's NIP-65 outbox
+    // relays; there is no dedicated KeyPackage relay list.
+    assert_eq!(fetched.relay_lists.nip65.relays, vec![url]);
     assert_eq!(fetched.key_package.bytes().len(), rotated_bytes);
 
     runtime.shutdown().await;
@@ -1990,7 +1988,6 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
     assert_eq!(status.bootstrap_relays, vec![seed_url.clone()]);
     assert_eq!(status.nip65.kind, 10002);
     assert_eq!(status.inbox.kind, 10050);
-    assert_eq!(status.key_package.kind, 10051);
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
@@ -2007,7 +2004,6 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
-    let (_key_package_relay, key_package_url) = mock_relay().await;
 
     let status = app
         .set_account_nip65_relays(
@@ -2031,25 +2027,11 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
         )
         .await
         .unwrap();
+    assert!(status.complete);
     assert_eq!(status.inbox.relays, vec![inbox_url.clone()]);
     assert_eq!(
         app.account_inbox_relays("alice").unwrap(),
         vec![inbox_url.clone()]
-    );
-
-    let status = app
-        .set_account_key_package_relays(
-            "alice",
-            vec![endpoint(&key_package_url)],
-            vec![endpoint(&seed_url)],
-        )
-        .await
-        .unwrap();
-    assert!(status.complete);
-    assert_eq!(status.key_package.relays, vec![key_package_url.clone()]);
-    assert_eq!(
-        app.account_key_package_relays("alice").unwrap(),
-        vec![key_package_url.clone()]
     );
 }
 
@@ -2077,10 +2059,7 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
         .unwrap();
 
     assert!(!missing_from_seed_b.complete);
-    assert_eq!(
-        missing_from_seed_b.missing,
-        vec!["nip65", "inbox", "key_package"]
-    );
+    assert_eq!(missing_from_seed_b.missing, vec!["nip65", "inbox"]);
     assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
 }
 

@@ -1,7 +1,7 @@
 ---
 title: "whitenoise-rs Integration Map"
 created: 2026-05-11
-updated: 2026-05-13
+updated: 2026-06-07
 tags: [marmot, overview, cgka, integration, whitenoise]
 status: working-note
 ---
@@ -75,15 +75,14 @@ A first whitenoise-rs shim would need to do the following.
 
 ### Account Bootstrap
 
-- ensure NIP-65 relay list state exists;
+- ensure NIP-65 relay list state exists (its relays are also the outbox for KeyPackage publication);
 - ensure inbox relay list state exists;
-- ensure kind `10051` KeyPackage relay-list state exists;
 - publish or repair missing account relay-list events before normal runtime publication depends on them.
 
 ### KeyPackage Publication
 
 - call `fresh_key_package`;
-- publish kind `30443` KeyPackage events to relays from kind `10051`;
+- publish kind `30443` KeyPackage events to the account's kind `10002` NIP-65 relays;
 - record enough result state to decide whether the account setup needs repair.
 
 This probably belongs in the Nostr transport/account service, not inside the engine.
@@ -127,7 +126,7 @@ These are the current points likely to hurt during integration.
 6. Scenario vectors now capture pending confirmations and rollbacks. They do not yet capture selected stale outcomes.
    Some integration behavior is tested in Rust but not portable.
 8. Error values are engine-oriented. Login/setup flows may need higher-level recovery actions such as "publish missing
-   kind 10051" or "repair inbox relays".
+   kind 10002 NIP-65 relays" or "repair inbox relays".
 
 ## First Shim Methods
 

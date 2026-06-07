@@ -809,7 +809,7 @@ enum RelaysCommand {
         #[arg(
             long = "type",
             value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
+            help = "Relay list type: nip65 or inbox"
         )]
         relay_type: Option<String>,
     },
@@ -820,7 +820,7 @@ enum RelaysCommand {
         #[arg(
             long = "type",
             value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
+            help = "Relay list type: nip65 or inbox"
         )]
         relay_type: String,
     },
@@ -831,7 +831,7 @@ enum RelaysCommand {
         #[arg(
             long = "type",
             value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
+            help = "Relay list type: nip65 or inbox"
         )]
         relay_type: String,
     },
@@ -1878,10 +1878,6 @@ fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayListStatus {
             kind: 10050,
             relays: Vec::new(),
         },
-        key_package: marmot_app::AccountRelayListState {
-            kind: 10051,
-            relays: Vec::new(),
-        },
     }
 }
 
@@ -2011,12 +2007,12 @@ pub(crate) async fn key_package_command_with_runtime(
             let account = resolve_account(account_home, account_flag)?;
             let relay_lists =
                 app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
-            let fetched = if relay_lists.key_package.relays.is_empty() {
+            let fetched = if relay_lists.nip65.relays.is_empty() {
                 None
             } else {
                 app.fetch_latest_key_package_for_account_id(
                     &account.account_id_hex,
-                    relay_endpoints(relay_lists.key_package.relays.clone())?,
+                    relay_endpoints(relay_lists.nip65.relays.clone())?,
                 )
                 .await
                 .ok()
@@ -3478,11 +3474,9 @@ fn relays_for_type(
     match relay_type.map(normalize_relay_type).transpose()?.as_deref() {
         Some("nip65") => Ok(status.nip65.relays.clone()),
         Some("inbox") => Ok(status.inbox.relays.clone()),
-        Some("key_package") => Ok(status.key_package.relays.clone()),
         None => {
             let mut relays = status.default_relays.clone();
             relays.extend(status.inbox.relays.clone());
-            relays.extend(status.key_package.relays.clone());
             relays.sort();
             relays.dedup();
             Ok(relays)
@@ -3495,8 +3489,7 @@ fn normalize_relay_type(value: &str) -> Result<String, DmError> {
     match value {
         "nip65" => Ok("nip65".to_owned()),
         "inbox" => Ok("inbox".to_owned()),
-        "key_package" | "key-package" => Ok("key_package".to_owned()),
-        _ => unsupported_command("relays", "relay type must be nip65, inbox, or key_package"),
+        _ => unsupported_command("relays", "relay type must be nip65 or inbox"),
     }
 }
 
@@ -5396,7 +5389,6 @@ fn relay_lists_json(status: AccountRelayListStatus) -> Value {
         "bootstrap_relays": status.bootstrap_relays,
         "nip65": status.nip65,
         "inbox": status.inbox,
-        "key_package": status.key_package,
     })
 }
 

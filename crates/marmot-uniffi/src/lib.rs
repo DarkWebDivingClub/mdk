@@ -451,7 +451,7 @@ impl Marmot {
         })
     }
 
-    /// Publish (or re-publish) NIP-65, inbox, and key-package relay lists for
+    /// Publish (or re-publish) the NIP-65 and inbox relay lists for
     /// `account_ref`. Idempotent — safe to call on every launch.
     pub async fn publish_relay_lists(
         &self,
@@ -475,13 +475,6 @@ impl Marmot {
 
     pub fn account_inbox_relays(&self, account_ref: String) -> Result<Vec<String>, MarmotKitError> {
         Ok(self.runtime.account_inbox_relays(&account_ref)?)
-    }
-
-    pub fn account_key_package_relays(
-        &self,
-        account_ref: String,
-    ) -> Result<Vec<String>, MarmotKitError> {
-        Ok(self.runtime.account_key_package_relays(&account_ref)?)
     }
 
     /// List the local and relay-discovered Marmot KeyPackage publications for
@@ -553,23 +546,6 @@ impl Marmot {
         let status = self
             .runtime
             .set_account_inbox_relays(
-                &account_ref,
-                endpoints(&relays),
-                endpoints(&bootstrap_relays),
-            )
-            .await?;
-        Ok(status.into())
-    }
-
-    pub async fn set_account_key_package_relays(
-        &self,
-        account_ref: String,
-        relays: Vec<String>,
-        bootstrap_relays: Vec<String>,
-    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
-        let status = self
-            .runtime
-            .set_account_key_package_relays(
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
