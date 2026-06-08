@@ -26,7 +26,8 @@ use tokio::sync::Mutex;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    TimelinePageFfi, TimelineSubscriptionUpdateFfi,
+    RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi, TimelineMessageRecordFfi,
+    TimelinePageFfi, TimelineProjectionUpdateFfi, TimelineSubscriptionUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -135,19 +136,22 @@ impl MessagesSubscription {
 #[derive(uniffi::Object)]
 pub struct TimelineMessagesSubscription {
     snapshot: StdMutex<Option<TimelinePageFfi>>,
+    current_page: StdMutex<TimelinePageFfi>,
     inner: Mutex<RuntimeTimelineMessagesSubscription>,
 }
 
 impl TimelineMessagesSubscription {
-    pub(crate) fn new(inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
+    pub(crate) fn new(mut inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
         let _span = tracing::debug_span!(
             target: "marmot_uniffi::conversion",
             "timeline_subscription_snapshot_conversion",
             method = "TimelineMessagesSubscription::new"
         )
         .entered();
+        let snapshot: TimelinePageFfi = inner.take_snapshot().into();
         Arc::new(Self {
-            snapshot: StdMutex::new(Some(inner.snapshot.clone().into())),
+            snapshot: StdMutex::new(Some(snapshot.clone())),
+            current_page: StdMutex::new(snapshot),
             inner: Mutex::new(inner),
         })
     }
@@ -161,25 +165,73 @@ impl TimelineMessagesSubscription {
 
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut inner = self.inner.lock().await;
-        inner.recv().await.map(|update| match update {
-            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => page.into(),
-            marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => TimelinePageFfi {
-                messages: update
-                    .update
-                    .timeline_messages
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-                has_more_before: false,
-                has_more_after: false,
-            },
-        })
+        let update = inner.recv().await?;
+        let mut current_page = self
+            .current_page
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match update {
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => {
+                *current_page = page.into();
+            }
+            marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => {
+                let update = RuntimeProjectionUpdateFfi::from(update);
+                apply_timeline_projection_update(&mut current_page, update.update);
+            }
+        }
+        Some(current_page.clone())
     }
 
     pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
     }
+}
+
+fn apply_timeline_projection_update(
+    page: &mut TimelinePageFfi,
+    update: TimelineProjectionUpdateFfi,
+) {
+    if update.changes.is_empty() {
+        for message in update.messages {
+            upsert_timeline_message(&mut page.messages, message);
+        }
+    } else {
+        for change in update.changes {
+            match change {
+                TimelineMessageChangeFfi::Upsert { message, .. } => {
+                    upsert_timeline_message(&mut page.messages, message);
+                }
+                TimelineMessageChangeFfi::Remove { message_id_hex, .. } => {
+                    page.messages
+                        .retain(|message| message.message_id_hex != message_id_hex);
+                }
+            }
+        }
+    }
+    sort_timeline_messages(&mut page.messages);
+}
+
+fn upsert_timeline_message(
+    messages: &mut Vec<TimelineMessageRecordFfi>,
+    message: TimelineMessageRecordFfi,
+) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.message_id_hex == message.message_id_hex)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+}
+
+fn sort_timeline_messages(messages: &mut [TimelineMessageRecordFfi]) {
+    messages.sort_by(|left, right| {
+        left.timeline_at
+            .cmp(&right.timeline_at)
+            .then_with(|| left.message_id_hex.cmp(&right.message_id_hex))
+    });
 }
 
 #[derive(uniffi::Object)]
@@ -284,6 +336,10 @@ fn take_snapshot<T>(snapshot: &StdMutex<Option<T>>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversions::{
+        ChatListUpdateTriggerFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
+        TimelineUpdateTriggerFfi,
+    };
 
     #[test]
     fn take_snapshot_recovers_from_poisoned_lock() {
@@ -295,6 +351,89 @@ mod tests {
 
         assert_eq!(take_snapshot(&snapshot), Some("initial"));
         assert_eq!(take_snapshot(&snapshot), None);
+    }
+
+    #[test]
+    fn timeline_projection_update_upserts_into_retained_page() {
+        let mut page = TimelinePageFfi {
+            messages: vec![timeline_record("older", 10)],
+            has_more_before: true,
+            has_more_after: false,
+        };
+
+        apply_timeline_projection_update(
+            &mut page,
+            TimelineProjectionUpdateFfi {
+                group_id_hex: "group".to_owned(),
+                messages: Vec::new(),
+                changes: vec![TimelineMessageChangeFfi::Upsert {
+                    trigger: TimelineUpdateTriggerFfi::NewMessage,
+                    message: timeline_record("newer", 20),
+                }],
+                chat_list_row: None,
+                chat_list_trigger: ChatListUpdateTriggerFfi::NewLastMessage,
+            },
+        );
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.message_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older", "newer"]
+        );
+        assert!(page.has_more_before);
+    }
+
+    #[test]
+    fn timeline_projection_update_removes_from_retained_page() {
+        let mut page = TimelinePageFfi {
+            messages: vec![timeline_record("keep", 10), timeline_record("remove", 20)],
+            has_more_before: false,
+            has_more_after: false,
+        };
+
+        apply_timeline_projection_update(
+            &mut page,
+            TimelineProjectionUpdateFfi {
+                group_id_hex: "group".to_owned(),
+                messages: Vec::new(),
+                changes: vec![TimelineMessageChangeFfi::Remove {
+                    message_id_hex: "remove".to_owned(),
+                    reason: TimelineRemoveReasonFfi::Invalidated,
+                }],
+                chat_list_row: None,
+                chat_list_trigger: ChatListUpdateTriggerFfi::LastMessageDeleted,
+            },
+        );
+
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].message_id_hex, "keep");
+    }
+
+    fn timeline_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecordFfi {
+        TimelineMessageRecordFfi {
+            message_id_hex: message_id_hex.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: "group".to_owned(),
+            sender: "sender".to_owned(),
+            plaintext: message_id_hex.to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            timeline_at,
+            received_at: timeline_at,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media_json: None,
+            agent_text_stream_json: None,
+            reactions: TimelineReactionSummaryFfi {
+                by_emoji: Vec::new(),
+                user_reactions: Vec::new(),
+            },
+            deleted: false,
+            deleted_by_message_id_hex: None,
+        }
     }
 }
 

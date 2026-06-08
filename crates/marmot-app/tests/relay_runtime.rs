@@ -15,7 +15,8 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime, MediaReference, MediaUploadRequest, NotificationWakeSource, PushPlatform,
-    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
+    RuntimeMessageUpdate, TimelineMessageQuery, UserDirectorySearch, UserProfileMetadata,
+    tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1838,6 +1839,25 @@ where
     .expect("runtime message update")
 }
 
+async fn wait_for_timeline_update<F>(
+    subscription: &mut marmot_app::RuntimeTimelineMessagesSubscription,
+    mut matches_update: F,
+) -> marmot_app::RuntimeTimelineMessageUpdate
+where
+    F: FnMut(&marmot_app::RuntimeTimelineMessageUpdate) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("timeline update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime timeline update")
+}
+
 #[tokio::test]
 async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_updates() {
     let dir = tempfile::tempdir().unwrap();
@@ -1889,6 +1909,74 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
     })
     .await;
     assert_eq!(updated.group_id_hex, group_id_hex);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "runtime timeline",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let query = TimelineMessageQuery {
+        group_id_hex: Some(group_id_hex.clone()),
+        ..TimelineMessageQuery::default()
+    };
+    let mut timeline = runtime
+        .subscribe_timeline_messages(&alice_id, query.clone())
+        .unwrap();
+    assert!(timeline.snapshot.messages.is_empty());
+
+    runtime
+        .send_message(&alice_id, &group_id, b"persist through reopen".to_vec())
+        .await
+        .unwrap();
+    let update = wait_for_timeline_update(&mut timeline, |update| {
+        matches!(
+            update,
+            marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
+                if projection.update.timeline_messages.iter().any(|message| {
+                    message.direction == "sent" && message.plaintext == "persist through reopen"
+                })
+        )
+    })
+    .await;
+    assert!(matches!(
+        update,
+        marmot_app::RuntimeTimelineMessageUpdate::Projection(_)
+    ));
+    drop(timeline);
+
+    let reopened = runtime
+        .subscribe_timeline_messages(&alice_id, query)
+        .unwrap();
+    assert_eq!(reopened.snapshot.messages.len(), 1);
+    assert_eq!(reopened.snapshot.messages[0].direction, "sent");
+    assert_eq!(reopened.snapshot.messages[0].sender, alice_id);
+    assert_eq!(
+        reopened.snapshot.messages[0].plaintext,
+        "persist through reopen"
+    );
 
     runtime.shutdown().await;
 }
@@ -2745,12 +2833,43 @@ async fn account_storage_records_received_messages() {
     assert_eq!(alice_messages[0].direction, "sent");
     assert_eq!(alice_messages[0].sender, alice_id);
     assert_eq!(alice_messages[0].plaintext, "persist this projection");
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url.clone())
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(alice_timeline.messages.len(), 1);
+    assert_eq!(alice_timeline.messages[0].direction, "sent");
+    assert_eq!(alice_timeline.messages[0].sender, alice_id);
+    assert_eq!(
+        alice_timeline.messages[0].plaintext,
+        "persist this projection"
+    );
 
     alice.sync().await.unwrap();
     let alice_messages = MarmotApp::with_relay(dir.path(), url.clone())
         .messages("alice")
         .unwrap();
     assert_eq!(alice_messages.len(), 1);
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url.clone())
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(alice_timeline.messages.len(), 1);
+    assert_eq!(alice_timeline.messages[0].direction, "sent");
+    assert_eq!(
+        alice_timeline.messages[0].plaintext,
+        "persist this projection"
+    );
 
     bob.sync().await.unwrap();
 

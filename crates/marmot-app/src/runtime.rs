@@ -836,6 +836,17 @@ pub struct RuntimeTimelineMessagesSubscription {
 }
 
 impl RuntimeTimelineMessagesSubscription {
+    pub fn take_snapshot(&mut self) -> TimelinePage {
+        std::mem::replace(
+            &mut self.snapshot,
+            TimelinePage {
+                messages: Vec::new(),
+                has_more_before: false,
+                has_more_after: false,
+            },
+        )
+    }
+
     pub async fn recv(&mut self) -> Option<RuntimeTimelineMessageUpdate> {
         tokio::select! {
             update = self.updates.recv() => update,
@@ -5010,6 +5021,47 @@ mod tests {
 
         assert!(subscription.recv().await.is_none());
         drop(updates_tx);
+    }
+
+    #[test]
+    fn timeline_subscription_take_snapshot_drains_retained_page() {
+        let lifecycle = RuntimeLifecycle::new();
+        let (_updates_tx, updates) = mpsc::channel(1);
+        let mut subscription = RuntimeTimelineMessagesSubscription {
+            snapshot: TimelinePage {
+                messages: vec![crate::TimelineMessageRecord {
+                    message_id_hex: "message-1".to_owned(),
+                    source_message_id_hex: None,
+                    group_id_hex: "group-1".to_owned(),
+                    direction: "inbound".to_owned(),
+                    sender: "sender-1".to_owned(),
+                    plaintext: "hello".to_owned(),
+                    kind: 9,
+                    tags: Vec::new(),
+                    timeline_at: 1,
+                    received_at: 1,
+                    deleted: false,
+                    deleted_by_message_id_hex: None,
+                    reply_to_message_id_hex: None,
+                    reply_preview: None,
+                    media: None,
+                    agent_text_stream: None,
+                    reactions: Default::default(),
+                }],
+                has_more_before: true,
+                has_more_after: false,
+            },
+            updates,
+            stopping: lifecycle.subscribe_shutdown(),
+        };
+
+        let snapshot = subscription.take_snapshot();
+
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.has_more_before);
+        assert!(subscription.snapshot.messages.is_empty());
+        assert!(!subscription.snapshot.has_more_before);
+        assert!(!subscription.snapshot.has_more_after);
     }
 
     #[tokio::test]
