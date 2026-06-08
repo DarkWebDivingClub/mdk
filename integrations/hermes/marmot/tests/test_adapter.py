@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import importlib.util
 import json
 import sys
@@ -217,6 +218,58 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(event["type"], "inbound_message")
         self.assertEqual(event["text"], "ping")
+
+    async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
+        release_event = asyncio.Event()
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "ack",
+                },
+            )
+            await release_event.wait()
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "sender_account_id_hex": "44" * 32,
+                    "text": "after idle",
+                },
+            )
+            await writer.drain()
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+        events = client.inbound_events(account_id_hex="11" * 32)
+
+        pending_event = asyncio.create_task(anext(events))
+        try:
+            await asyncio.sleep(0.05)
+            self.assertFalse(pending_event.done())
+
+            release_event.set()
+            event = await asyncio.wait_for(pending_event, timeout=1.0)
+
+            self.assertEqual(event["type"], "inbound_message")
+            self.assertEqual(event["text"], "after idle")
+        finally:
+            release_event.set()
+            if not pending_event.done():
+                pending_event.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending_event
+            await events.aclose()
 
     async def test_request_timeout_is_retryable_agent_control_error(self):
         release = asyncio.Event()

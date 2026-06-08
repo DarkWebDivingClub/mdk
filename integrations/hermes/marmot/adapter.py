@@ -35,6 +35,7 @@ STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 DEFAULT_STREAMING_CURSOR = "\u2589"
+_DEFAULT_READ_TIMEOUT = object()
 
 
 class AgentControlError(RuntimeError):
@@ -231,7 +232,7 @@ class MarmotAgentControlClient:
                 raise AgentControlError(f"expected subscribe ack, got {ack.get('type')!r}")
 
             while True:
-                envelope = await self._read_envelope(reader, allow_eof=True)
+                envelope = await self._read_envelope(reader, allow_eof=True, timeout=None)
                 if envelope is None:
                     return
                 self._validate_response_id(envelope, request_id)
@@ -266,9 +267,14 @@ class MarmotAgentControlClient:
         reader: asyncio.StreamReader,
         *,
         allow_eof: bool = False,
+        timeout: Any = _DEFAULT_READ_TIMEOUT,
     ) -> Optional[Dict[str, Any]]:
+        read_timeout = self.request_timeout if timeout is _DEFAULT_READ_TIMEOUT else timeout
         try:
-            raw = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+            if read_timeout is None:
+                raw = await reader.readline()
+            else:
+                raw = await asyncio.wait_for(reader.readline(), timeout=float(read_timeout))
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while reading agent control response",

@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_control::{
     AgentControlAccount, AgentControlDebugFinalSend, AgentControlEnvelope, AgentControlError,
@@ -30,6 +31,7 @@ const AGENT_SOCKET_MODE: u32 = 0o600;
 const ALLOWLIST_DIR: &str = "agent-allowlist";
 const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
+const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {
@@ -171,17 +173,17 @@ impl AgentConnector {
         }
         let response = match self.handle_request(request.payload).await {
             Ok(response) => response,
-            Err(err) => self.error_response(&err),
+            Err(err) => self.error_response("handle_connection", &err),
         };
         let response = AgentControlEnvelope::new(request.id, response);
         write_frame(&mut write_half, &response).await?;
         Ok(())
     }
 
-    fn error_response(&self, err: &ConnectorError) -> AgentControlResponse {
+    fn error_response(&self, method: &'static str, err: &ConnectorError) -> AgentControlResponse {
         tracing::warn!(
             target: "agent_connector",
-            method = "handle_connection",
+            method = method,
             error_code = err.privacy_safe_code(),
             "control request failed"
         );
@@ -700,14 +702,34 @@ impl AgentConnector {
         let mut debug_events = self.debug_events.subscribe();
         if let Err(err) = self.runtime.catch_up_accounts().await {
             let err = ConnectorError::from(err);
-            let response = AgentControlEnvelope::new(request_id, self.error_response(&err));
+            let response = AgentControlEnvelope::new(
+                request_id,
+                self.error_response("stream_inbound_events", &err),
+            );
             write_frame(writer, &response).await?;
             return Ok(());
         }
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_frame(writer, &response).await?;
+        let mut catch_up_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
+            INBOUND_CATCH_UP_INTERVAL,
+        );
+        catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
+                _ = catch_up_interval.tick() => {
+                    if let Err(err) = self.runtime.catch_up_accounts().await {
+                        let err = ConnectorError::from(err);
+                        let response = AgentControlEnvelope::new(
+                            request_id.clone(),
+                            self.error_response("stream_inbound_events", &err),
+                        );
+                        write_frame(writer, &response).await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
                 event = runtime_events.recv() => {
                     let Ok(event) = event else {
                         continue;
@@ -1239,9 +1261,49 @@ pub fn bind_connector_socket(socket: &Path) -> Result<UnixListener, ConnectorErr
     if let Some(parent) = socket.parent() {
         prepare_socket_dir(parent)?;
     }
-    let listener = UnixListener::bind(socket)?;
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+            remove_stale_socket(socket, &error)?;
+            UnixListener::bind(socket)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     harden_socket_permissions(socket)?;
     Ok(listener)
+}
+
+fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::Result<()> {
+    let metadata = match std::fs::metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            bind_error.kind(),
+            "agent connector socket path exists and is not a Unix socket",
+        ));
+    }
+    match StdUnixStream::connect(socket) {
+        Ok(_) => Err(std::io::Error::new(
+            bind_error.kind(),
+            "agent connector socket is already in use",
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            match std::fs::remove_file(socket) {
+                Ok(()) => Ok(()),
+                Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(remove_error) => Err(remove_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_socket_dir(parent: &Path) -> std::io::Result<()> {
@@ -1300,6 +1362,34 @@ mod tests {
     use crate::{AgentConnector, AgentConnectorConfig, bind_connector_socket, serve_socket};
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    #[tokio::test]
+    async fn connector_socket_bind_removes_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let listener = bind_connector_socket(&socket).unwrap();
+        drop(listener);
+
+        let listener = bind_connector_socket(&socket).unwrap();
+
+        assert!(
+            listener.local_addr().is_ok(),
+            "expected connector socket to rebind after stale socket cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_socket_bind_preserves_existing_non_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"not a socket").unwrap();
+
+        let error = bind_connector_socket(&socket).unwrap_err();
+
+        assert_eq!(error.code(), "io_error");
+        assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+    }
 
     #[tokio::test]
     async fn connector_socket_serves_account_list() {

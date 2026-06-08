@@ -10,8 +10,9 @@ For a real Hermes install, install it by copying or symlinking this directory to
 ~/.hermes/plugins/marmot
 ```
 
-The current Hermes plugin docs describe platform plugins as directories directly
-under `~/.hermes/plugins/<name>/` with `PLUGIN.yaml` and `adapter.py`.
+The current Hermes plugin loader expects platform plugins as directories directly
+under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
+adapter implementation files.
 
 ## Repeatable Dev Setup
 

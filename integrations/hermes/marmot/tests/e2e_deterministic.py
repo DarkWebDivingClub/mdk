@@ -159,11 +159,21 @@ def load_marmot_adapter_module(plugin_path: Path):
     return module
 
 
+def assert_plugin_discovery_registers_marmot_platform() -> None:
+    from hermes_cli.plugins import discover_plugins
+    from gateway.platform_registry import platform_registry
+
+    discover_plugins(force=True)
+    if not platform_registry.is_registered("marmot"):
+        raise AssertionError("Hermes plugin discovery did not register Marmot platform")
+
+
 async def run() -> None:
     plugin_path = Path(os.environ.get("HERMES_HOME", "")) / "plugins" / "marmot" / "adapter.py"
     if not plugin_path.exists():
         raise SystemExit(f"plugin adapter not found: {plugin_path}")
 
+    assert_plugin_discovery_registers_marmot_platform()
     module = load_marmot_adapter_module(plugin_path)
 
     from gateway.config import PlatformConfig

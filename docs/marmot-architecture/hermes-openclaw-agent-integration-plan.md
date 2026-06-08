@@ -250,10 +250,10 @@ joined event.
 
 ## Workstream 6: Hermes Platform Shim
 
-Hermes supports gateway platform adapters through `BasePlatformAdapter` and `ctx.register_platform`. Current Hermes docs
-show third-party platform plugins as user-installed plugin directories under `~/.hermes/plugins/<name>/`, each containing
-`PLUGIN.yaml` and `adapter.py`. The Darkmatter source copy lives at `integrations/hermes/marmot/` and can be copied or
-symlinked to `~/.hermes/plugins/marmot/`.
+Hermes supports gateway platform adapters through `BasePlatformAdapter` and `ctx.register_platform`. Current Hermes
+loads third-party platform plugins as user-installed plugin directories under `~/.hermes/plugins/<name>/`, each
+containing `plugin.yaml`, `__init__.py`, and adapter implementation files. The Darkmatter source copy lives at
+`integrations/hermes/marmot/` and can be copied or symlinked to `~/.hermes/plugins/marmot/`.
 
 Shim responsibilities:
 
