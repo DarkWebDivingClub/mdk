@@ -15,6 +15,10 @@ Options:
   --hermes-ref REF         Optional branch, tag, or commit to checkout
   --account-id-hex HEX     Export MARMOT_ACCOUNT_ID_HEX in env.sh
   --group-id-hex HEX       Export MARMOT_GROUP_ID_HEX in env.sh
+  --auth-token TOKEN       Write TOKEN to ROOT/control.token and use token-gated control requests
+  --auth-token-file PATH   Export MARMOT_AGENT_AUTH_TOKEN_FILE and pass it to dm-agent
+  --socket-dir-mode OCTAL  dm-agent control socket directory mode (default: 0700)
+  --socket-mode OCTAL      dm-agent control socket mode (default: 0600)
   --relay URL              Add a dm-agent --relay argument; may be repeated
   --quic-candidate URI     Add a MARMOT_QUIC_CANDIDATES entry; may be repeated
   --quic-candidates CSV    Comma-separated MARMOT_QUIC_CANDIDATES value
@@ -30,6 +34,7 @@ After setup:
   ROOT/smoke-plugin.sh
   ROOT/e2e-deterministic.sh
   ROOT/e2e-connector.sh
+  ROOT/bootstrap-agent.sh [--qr]
   ROOT/run-dm-agent.sh [extra dm-agent flags]
   ROOT/run-hermes-gateway.sh [extra Hermes gateway flags]
 
@@ -44,6 +49,10 @@ hermes_ref="${HERMES_AGENT_REF:-}"
 marmot_home=""
 account_id="${MARMOT_ACCOUNT_ID_HEX:-}"
 group_id="${MARMOT_GROUP_ID_HEX:-}"
+auth_token="${MARMOT_AGENT_AUTH_TOKEN:-}"
+auth_token_file="${MARMOT_AGENT_AUTH_TOKEN_FILE:-}"
+socket_dir_mode="${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
+socket_mode="${MARMOT_AGENT_SOCKET_MODE:-0600}"
 skip_hermes_install=0
 enable_plugin=1
 install_uv=0
@@ -76,6 +85,22 @@ while [ "$#" -gt 0 ]; do
             ;;
         --group-id-hex)
             group_id="$2"
+            shift 2
+            ;;
+        --auth-token)
+            auth_token="$2"
+            shift 2
+            ;;
+        --auth-token-file)
+            auth_token_file="$2"
+            shift 2
+            ;;
+        --socket-dir-mode)
+            socket_dir_mode="$2"
+            shift 2
+            ;;
+        --socket-mode)
+            socket_mode="$2"
             shift 2
             ;;
         --relay)
@@ -145,6 +170,23 @@ fi
 
 mkdir -p "$dev_root" "$hermes_home/plugins" "$marmot_home/dev" "$dev_root/logs"
 
+if [ -n "$auth_token" ] && [ -z "$auth_token_file" ]; then
+    auth_token_file="$dev_root/control.token"
+fi
+
+if [ -n "$auth_token_file" ]; then
+    auth_token_parent="$(dirname "$auth_token_file")"
+    mkdir -p "$auth_token_parent"
+    auth_token_file="$(cd "$auth_token_parent" && pwd)/$(basename "$auth_token_file")"
+    if [ -n "$auth_token" ]; then
+        (umask 077 && printf '%s\n' "$auth_token" >"$auth_token_file")
+        chmod 600 "$auth_token_file"
+    elif [ ! -f "$auth_token_file" ]; then
+        echo "error: auth token file not found: $auth_token_file" >&2
+        exit 1
+    fi
+fi
+
 if [ -e "$plugin_target" ] && [ ! -L "$plugin_target" ]; then
     if [ "$force" -ne 1 ]; then
         echo "error: $plugin_target exists and is not a symlink; rerun with --force to replace it" >&2
@@ -205,6 +247,7 @@ ERROR
 
 write_env_file() {
     local quic_csv=""
+    local relay_csv=""
     local candidate
     if [ "${#quic_candidates[@]}" -gt 0 ]; then
         for candidate in "${quic_candidates[@]}"; do
@@ -212,6 +255,16 @@ write_env_file() {
                 quic_csv="$candidate"
             else
                 quic_csv="$quic_csv,$candidate"
+            fi
+        done
+    fi
+    local relay
+    if [ "${#relays[@]}" -gt 0 ]; then
+        for relay in "${relays[@]}"; do
+            if [ -z "$relay_csv" ]; then
+                relay_csv="$relay"
+            else
+                relay_csv="$relay_csv,$relay"
             fi
         done
     fi
@@ -225,12 +278,15 @@ write_env_file() {
         printf 'export HERMES_HOME=%q\n' "$hermes_home"
         printf 'export MARMOT_HOME=%q\n' "$marmot_home"
         printf 'export MARMOT_AGENT_SOCKET=%q\n' "$marmot_home/dev/dm-agent.sock"
+        printf 'export MARMOT_AGENT_AUTH_TOKEN_FILE=%q\n' "$auth_token_file"
+        printf 'export MARMOT_AGENT_SOCKET_DIR_MODE=%q\n' "$socket_dir_mode"
+        printf 'export MARMOT_AGENT_SOCKET_MODE=%q\n' "$socket_mode"
         printf 'export MARMOT_ACCOUNT_ID_HEX=%q\n' "$account_id"
         printf 'export MARMOT_GROUP_ID_HEX=%q\n' "$group_id"
+        printf 'export MARMOT_RELAYS=%q\n' "$relay_csv"
         printf 'export MARMOT_QUIC_CANDIDATES=%q\n' "$quic_csv"
         printf 'export PATH=%q:"$PATH"\n' "$hermes_repo/.venv/bin"
         echo 'dm_agent_relay_args=('
-        local relay
         if [ "${#relays[@]}" -gt 0 ]; then
             for relay in "${relays[@]}"; do
                 printf '  %q\n' "--relay"
@@ -247,7 +303,14 @@ write_helper_scripts() {
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 cd "$DARKMATTER_REPO"
-exec cargo run -p agent-connector --bin dm-agent -- --home "$MARMOT_HOME" "${dm_agent_relay_args[@]}" "$@"
+dm_agent_control_args=(
+    --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
+    --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0600}"
+)
+if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
+    dm_agent_control_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
+fi
+exec cargo run -p agent-connector --bin dm-agent -- --home "$MARMOT_HOME" "${dm_agent_control_args[@]}" "${dm_agent_relay_args[@]}" "$@"
 SCRIPT
 
     cat >"$dev_root/run-hermes-gateway.sh" <<'SCRIPT'
@@ -317,6 +380,18 @@ source "$dev_root/env.sh"
 exec "$DARKMATTER_REPO/scripts/hermes_marmot_connector_e2e.sh" --root "$dev_root"
 SCRIPT
 
+    cat >"$dev_root/bootstrap-agent.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+bootstrap_args=(--socket "$MARMOT_AGENT_SOCKET")
+if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
+    bootstrap_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
+fi
+exec "$DARKMATTER_REPO/scripts/hermes_marmot_bootstrap_agent.py" "${bootstrap_args[@]}" "$@"
+SCRIPT
+
     cat >"$dev_root/start-dm-agent.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -371,6 +446,7 @@ SCRIPT
         "$dev_root/smoke-plugin.sh" \
         "$dev_root/e2e-deterministic.sh" \
         "$dev_root/e2e-connector.sh" \
+        "$dev_root/bootstrap-agent.sh" \
         "$dev_root/start-dm-agent.sh" \
         "$dev_root/start-hermes-gateway.sh" \
         "$dev_root/stop-dev-processes.sh"
@@ -388,6 +464,7 @@ enable_hermes_plugin() {
         export HERMES_HOME="$hermes_home"
         export MARMOT_HOME="$marmot_home"
         export MARMOT_AGENT_SOCKET="$marmot_home/dev/dm-agent.sock"
+        export MARMOT_AGENT_AUTH_TOKEN_FILE="$auth_token_file"
         cd "$hermes_repo"
         .venv/bin/hermes plugins enable marmot
     )
@@ -417,6 +494,7 @@ if [ "$print_env" -eq 1 ]; then
     echo "  $(printf '%q' "$dev_root/smoke-plugin.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-deterministic.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-connector.sh")"
+    echo "  $(printf '%q' "$dev_root/bootstrap-agent.sh") --qr"
     echo "  $(printf '%q' "$dev_root/run-dm-agent.sh")"
     echo "  $(printf '%q' "$dev_root/run-hermes-gateway.sh")"
     echo "  scripts/hermes_marmot_dev_teardown.sh --root $(printf '%q' "$dev_root") --force"

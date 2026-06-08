@@ -69,6 +69,21 @@ hermes-dev-teardown args="":
 hermes-dev-script-test:
     integrations/hermes/marmot/tests/test_dev_scripts.sh
 
+hermes-bootstrap-test:
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests -p 'test_bootstrap_agent.py'
+
+hermes-phone-test-up:
+    docker compose --profile hermes-phone-test up -d --build hermes-marmot-phone-test
+
+hermes-phone-test-bootstrap:
+    docker compose exec hermes-marmot-phone-test marmot-agent-bootstrap --qr
+
+hermes-phone-test-logs:
+    docker compose logs -f hermes-marmot-phone-test
+
+hermes-phone-test-down:
+    docker compose --profile hermes-phone-test down
+
 hermes-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail

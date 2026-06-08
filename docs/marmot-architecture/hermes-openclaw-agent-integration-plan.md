@@ -1,7 +1,7 @@
 ---
 title: "Hermes And OpenClaw Agent Integration Plan"
 created: 2026-06-06
-updated: 2026-06-07
+updated: 2026-06-08
 tags: [marmot, architecture, agents, hermes, openclaw, quic]
 status: working-plan
 ---
@@ -84,7 +84,9 @@ dm-agent connector
 5. Keep the local socket deployment explicit.
 
    Same-UID Unix socket auth is a good v1 default when the connector and gateway run as the same Unix user. Docker,
-   separate service users, or remote gateway hosts need a different control-plane auth story before production use.
+   separate service users, or remote gateway hosts need explicit control-plane auth. The implemented v1 production path is
+   a token-gated local Unix socket with group-readable socket permissions. Remote gateway hosts still need a later
+   TLS-authenticated control plane.
 
 ## Workstream 1: Reusable Stream Composition
 
@@ -192,8 +194,9 @@ Default auth mode:
 
 Deployment constraint:
 
-- Hermes/OpenClaw and `dm-agent` must run as the same Unix user for v1, or the operator must opt into a later token or
-  TLS-authenticated control plane.
+- Hermes/OpenClaw and `dm-agent` must run as the same Unix user with mode `0600`, or as local users in a shared Unix group
+  with a configured auth token, mode `0660`, and a non-world-accessible parent directory.
+- No TCP control listener exists in v1. Split-host gateways require a later TLS-authenticated control plane.
 
 ## Workstream 4: Invite Authorization And Welcomer Metadata
 

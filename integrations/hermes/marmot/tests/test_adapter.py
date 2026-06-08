@@ -182,6 +182,31 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["group_id_hex"], "22" * 32)
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
 
+    async def test_auth_token_is_written_when_configured(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "account_list",
+                    "accounts": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, auth_token="test-token")
+
+        response = await client.account_list()
+
+        self.assertEqual(response["type"], "account_list")
+        self.assertEqual(requests[0]["auth_token"], "test-token")
+
     async def test_inbound_subscription_requires_ack_then_yields_events(self):
         async def handler(reader, writer):
             request = await read_json_line(reader)
@@ -374,6 +399,21 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.config_cls(extra={"account_id_hex": "not-hex"}),
                 client=object(),
             )
+
+    async def test_adapter_reads_auth_token_file_for_control_client(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            token_file = Path(tempdir) / "control.token"
+            token_file.write_text("file-token\n", encoding="utf-8")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "socket_path": str(Path(tempdir) / "dm-agent.sock"),
+                        "auth_token_file": str(token_file),
+                    }
+                )
+            )
+
+        self.assertEqual(adapter.client.auth_token, "file-token")
 
     async def test_send_maps_hermes_chat_to_marmot_send_final(self):
         class FakeClient:

@@ -107,9 +107,10 @@ class AgentTextStreamTranscript:
 class MarmotAgentControlClient:
     """Small NDJSON client for ``crates/agent-control``."""
 
-    def __init__(self, socket_path: str | Path, *, request_timeout: float = 30.0):
+    def __init__(self, socket_path: str | Path, *, request_timeout: float = 30.0, auth_token: Optional[str] = None):
         self.socket_path = str(Path(socket_path).expanduser())
         self.request_timeout = float(request_timeout)
+        self.auth_token = str(auth_token).strip() if auth_token else None
 
     async def request(self, payload: Dict[str, Any], *, request_id: Optional[str] = None) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
@@ -249,6 +250,8 @@ class MarmotAgentControlClient:
             "id": request_id,
             **payload,
         }
+        if self.auth_token:
+            envelope["auth_token"] = self.auth_token
         frame = json.dumps(envelope, separators=(",", ":")).encode("utf-8") + b"\n"
         if len(frame) > MAX_FRAME_BYTES:
             raise AgentControlError("agent control frame is too large", code="frame_too_large")
@@ -395,7 +398,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("marmot"))
         extra = getattr(config, "extra", {}) or {}
         self.socket_path = resolve_socket_path(extra)
-        self.client = client or MarmotAgentControlClient(self.socket_path)
+        self.client = client or MarmotAgentControlClient(self.socket_path, auth_token=resolve_auth_token(extra))
         self.account_id_hex = _optional_hex(
             _first_config_value(extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX"),
             "MARMOT_ACCOUNT_ID_HEX",
@@ -745,6 +748,9 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         seed["group_id_hex"] = group
     if candidates:
         seed["quic_candidates"] = _split_config_list(candidates)
+    auth_token_file = os.getenv("MARMOT_AGENT_AUTH_TOKEN_FILE", "").strip()
+    if auth_token_file:
+        seed["auth_token_file"] = auth_token_file
 
     home_channel = os.getenv("MARMOT_HOME_CHANNEL", "").strip()
     if home_channel:
@@ -801,6 +807,36 @@ def resolve_socket_path(extra: Dict[str, Any]) -> str:
 
     home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME") or DEFAULT_SOCKET_HOME
     return str(Path(str(home)).expanduser() / "dev" / "dm-agent.sock")
+
+
+def resolve_auth_token(extra: Dict[str, Any]) -> Optional[str]:
+    configured = _first_config_value(extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN")
+    if configured:
+        token = str(configured).strip()
+        if token:
+            return token
+
+    configured_path = _first_config_value(
+        extra,
+        "auth_token_file",
+        "agent_auth_token_file",
+        env="MARMOT_AGENT_AUTH_TOKEN_FILE",
+    )
+    if not configured_path:
+        return None
+
+    path = Path(str(configured_path)).expanduser()
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise AgentControlError(
+            f"failed to read Marmot agent auth token file: {path}",
+            code="auth_token_file",
+            retryable=True,
+        ) from exc
+    if not token:
+        raise AgentControlError("Marmot agent auth token file is empty", code="auth_token_file")
+    return token
 
 
 def resolve_quic_candidates(extra: Dict[str, Any]) -> list[str]:

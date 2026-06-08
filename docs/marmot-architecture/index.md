@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-06-07
+updated: 2026-06-08
 tags: [marmot, architecture, index]
 ---
 
@@ -60,6 +60,10 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`hermes-openclaw-agent-integration-plan.md`](./hermes-openclaw-agent-integration-plan.md)
   - **What it covers:** Working plan for hosting Hermes Agent and OpenClaw as server-side Marmot members with a
     `dm-agent` connector, local gateway shims, invite allowlists, and QUIC previews.
+
+- **Doc:** [`hermes-agent-production-runbook.md`](./hermes-agent-production-runbook.md)
+  - **What it covers:** Supervised deployment path for Hermes Agent with `dm-agent`, token-gated local control sockets,
+    systemd templates, and a Docker-to-phone manual test.
 
 - **Doc:** [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md)
   - **What it covers:** Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors,

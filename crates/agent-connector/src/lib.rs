@@ -37,9 +37,12 @@ const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 pub struct AgentConnectorConfig {
     pub home: PathBuf,
     pub socket: PathBuf,
+    pub socket_dir_mode: u32,
+    pub socket_mode: u32,
     pub relays: Vec<String>,
     pub allow_any: bool,
     pub debug_controls: bool,
+    pub auth_token: Option<String>,
 }
 
 impl AgentConnectorConfig {
@@ -49,9 +52,12 @@ impl AgentConnectorConfig {
         Self {
             home,
             socket,
+            socket_dir_mode: AGENT_SOCKET_DIR_MODE,
+            socket_mode: AGENT_SOCKET_MODE,
             relays: Vec::new(),
             allow_any: false,
             debug_controls: false,
+            auth_token: None,
         }
     }
 }
@@ -62,6 +68,7 @@ pub struct AgentConnector {
     allowlists: AllowlistStore,
     allow_any: bool,
     debug_controls: bool,
+    auth_token: Option<String>,
     debug_events: broadcast::Sender<AgentControlEvent>,
     debug_final_sends: DebugFinalSendStore,
     streams: StreamSessionStore,
@@ -87,6 +94,7 @@ impl AgentConnector {
             allowlists,
             allow_any: config.allow_any,
             debug_controls: config.debug_controls,
+            auth_token: config.auth_token,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
             streams: StreamSessionStore::default(),
@@ -154,7 +162,8 @@ impl AgentConnector {
     }
 
     pub async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
-        authorize_connector_peer(&stream)?;
+        let peer_uid = stream.peer_cred()?.uid();
+        let peer_authorized_by_uid = peer_uid == current_effective_uid();
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let Some(request): Option<AgentControlEnvelope<AgentControlRequest>> =
@@ -162,6 +171,16 @@ impl AgentConnector {
         else {
             return Ok(());
         };
+        if let Err(err) =
+            self.authorize_control_request(peer_authorized_by_uid, request.auth_token.as_deref())
+        {
+            let response = AgentControlEnvelope::new(
+                request.id,
+                self.error_response("authorize_control_request", &err),
+            );
+            write_frame(&mut write_half, &response).await?;
+            return Ok(());
+        }
         if let AgentControlRequest::SubscribeInbound {
             account_id_hex,
             group_id_hex,
@@ -190,6 +209,25 @@ impl AgentConnector {
         AgentControlResponse::Error {
             code: err.code().to_owned(),
             message: err.client_message().to_owned(),
+        }
+    }
+
+    fn authorize_control_request(
+        &self,
+        peer_authorized_by_uid: bool,
+        auth_token: Option<&str>,
+    ) -> Result<(), ConnectorError> {
+        if let Some(expected) = self.auth_token.as_deref() {
+            if auth_token_matches(expected, auth_token) {
+                return Ok(());
+            }
+            return Err(ConnectorError::Unauthorized);
+        }
+
+        if peer_authorized_by_uid {
+            Ok(())
+        } else {
+            Err(ConnectorError::Unauthorized)
         }
     }
 
@@ -819,7 +857,12 @@ impl AgentConnector {
 }
 
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
-    let listener = bind_connector_socket(&config.socket)?;
+    validate_control_plane_config(&config)?;
+    let listener = bind_connector_socket_with_mode(
+        &config.socket,
+        config.socket_dir_mode,
+        config.socket_mode,
+    )?;
     let connector = AgentConnector::open(config)?;
     connector.start().await?;
     loop {
@@ -1219,6 +1262,10 @@ pub enum ConnectorError {
     Io(#[from] std::io::Error),
     #[error("debug controls are disabled")]
     DebugControlsDisabled,
+    #[error("agent control request is unauthorized")]
+    Unauthorized,
+    #[error("unsafe agent control plane configuration: {0}")]
+    UnsafeControlPlaneConfig(&'static str),
     #[error("agent stream error: {0}")]
     Stream(String),
 }
@@ -1233,6 +1280,8 @@ impl ConnectorError {
             Self::Json(_) => "json_error",
             Self::Io(_) => "io_error",
             Self::DebugControlsDisabled => "debug_controls_disabled",
+            Self::Unauthorized => "unauthorized",
+            Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
         }
     }
@@ -1240,6 +1289,8 @@ impl ConnectorError {
     pub fn client_message(&self) -> &'static str {
         match self {
             Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::Unauthorized => "agent control request is unauthorized",
+            Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",
             Self::Stream(_) => "agent stream request failed",
@@ -1258,8 +1309,16 @@ pub fn default_socket_path(home: &Path) -> PathBuf {
 }
 
 pub fn bind_connector_socket(socket: &Path) -> Result<UnixListener, ConnectorError> {
+    bind_connector_socket_with_mode(socket, AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE)
+}
+
+pub fn bind_connector_socket_with_mode(
+    socket: &Path,
+    socket_dir_mode: u32,
+    socket_mode: u32,
+) -> Result<UnixListener, ConnectorError> {
     if let Some(parent) = socket.parent() {
-        prepare_socket_dir(parent)?;
+        prepare_socket_dir(parent, socket_dir_mode)?;
     }
     let listener = match UnixListener::bind(socket) {
         Ok(listener) => listener,
@@ -1269,7 +1328,7 @@ pub fn bind_connector_socket(socket: &Path) -> Result<UnixListener, ConnectorErr
         }
         Err(error) => return Err(error.into()),
     };
-    harden_socket_permissions(socket)?;
+    harden_socket_permissions(socket, socket_mode)?;
     Ok(listener)
 }
 
@@ -1306,33 +1365,68 @@ fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::R
     }
 }
 
-fn prepare_socket_dir(parent: &Path) -> std::io::Result<()> {
+fn prepare_socket_dir(parent: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(parent)?;
-    std::fs::set_permissions(
-        parent,
-        std::fs::Permissions::from_mode(AGENT_SOCKET_DIR_MODE),
-    )
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))
 }
 
-fn harden_socket_permissions(socket: &Path) -> std::io::Result<()> {
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(AGENT_SOCKET_MODE))
-}
-
-fn authorize_connector_peer(stream: &UnixStream) -> std::io::Result<()> {
-    let peer_uid = stream.peer_cred()?.uid();
-    let server_uid = current_effective_uid();
-    if peer_uid == server_uid {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "agent connector peer UID does not match server UID",
-        ))
-    }
+fn harden_socket_permissions(socket: &Path, mode: u32) -> std::io::Result<()> {
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(mode))
 }
 
 fn current_effective_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
+}
+
+fn validate_control_plane_config(config: &AgentConnectorConfig) -> Result<(), ConnectorError> {
+    validate_control_plane_mode(config.socket_dir_mode, "socket directory mode")?;
+    validate_control_plane_mode(config.socket_mode, "socket mode")?;
+
+    if config.auth_token.as_deref().is_some_and(str::is_empty) {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "auth token must not be empty",
+        ));
+    }
+
+    if config.auth_token.is_none()
+        && (config.socket_dir_mode != AGENT_SOCKET_DIR_MODE
+            || config.socket_mode != AGENT_SOCKET_MODE)
+    {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "non-default socket modes require an auth token",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_control_plane_mode(mode: u32, field: &'static str) -> Result<(), ConnectorError> {
+    if mode & !0o777 != 0 {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(field));
+    }
+    if mode & 0o007 != 0 {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "world-accessible control sockets are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn auth_token_matches(expected: &str, provided: Option<&str>) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let max_len = expected.len().max(provided.len());
+    let mut diff = expected.len() ^ provided.len();
+    for i in 0..max_len {
+        diff |= usize::from(
+            expected.get(i).copied().unwrap_or_default()
+                ^ provided.get(i).copied().unwrap_or_default(),
+        );
+    }
+    diff == 0
 }
 
 fn endpoint(url: &str) -> cgka_traits::TransportEndpoint {
@@ -1359,9 +1453,27 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::time::{Duration, sleep, timeout};
 
-    use crate::{AgentConnector, AgentConnectorConfig, bind_connector_socket, serve_socket};
+    use crate::{
+        AgentConnector, AgentConnectorConfig, bind_connector_socket,
+        bind_connector_socket_with_mode, serve_socket,
+    };
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn test_config(
+        home: &Path,
+        socket: impl Into<std::path::PathBuf>,
+        relays: Vec<String>,
+        allow_any: bool,
+        debug_controls: bool,
+    ) -> AgentConnectorConfig {
+        let mut config = AgentConnectorConfig::new(home);
+        config.socket = socket.into();
+        config.relays = relays;
+        config.allow_any = allow_any;
+        config.debug_controls = debug_controls;
+        config
+    }
 
     #[tokio::test]
     async fn connector_socket_bind_removes_stale_socket() {
@@ -1392,18 +1504,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_socket_bind_applies_configured_group_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+
+        let listener = bind_connector_socket_with_mode(&socket, 0o770, 0o660).unwrap();
+
+        assert!(
+            listener.local_addr().is_ok(),
+            "expected connector socket to bind with configured permissions"
+        );
+        assert_eq!(
+            socket
+                .parent()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o770
+        );
+        assert_eq!(
+            socket.metadata().unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_control_plane_requires_token_for_group_shared_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+        config.socket_dir_mode = 0o770;
+        config.socket_mode = 0o660;
+
+        let error = serve_socket(config).await.unwrap_err();
+
+        assert_eq!(error.code(), "unsafe_control_plane_config");
+    }
+
+    #[tokio::test]
+    async fn connector_control_plane_rejects_world_accessible_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+        config.auth_token = Some("shared-secret".to_owned());
+        config.socket_mode = 0o666;
+
+        let error = serve_socket(config).await.unwrap_err();
+
+        assert_eq!(error.code(), "unsafe_control_plane_config");
+    }
+
+    #[tokio::test]
     async fn connector_socket_serves_account_list() {
         let dir = tempfile::tempdir().unwrap();
         let account_home = AccountHome::open(dir.path());
         let account = account_home.create_account("agent").unwrap();
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: Vec::new(),
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
         assert_eq!(
@@ -1447,6 +1613,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_socket_requires_configured_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_home = AccountHome::open(dir.path());
+        let account = account_home.create_account("agent").unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+        config.auth_token = Some("test-token".to_owned());
+        let connector = AgentConnector::open(config).unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+
+        let denied = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "req-no-token",
+            AgentControlRequest::AccountList,
+        )
+        .await;
+
+        let AgentControlResponse::Error { code, .. } = denied.payload else {
+            panic!("expected unauthorized response without token");
+        };
+        assert_eq!(denied.id.as_deref(), Some("req-no-token"));
+        assert_eq!(code, "unauthorized");
+
+        let wrong = serve_control_request_once_with_auth(
+            &connector,
+            &listener,
+            &socket,
+            "req-wrong-token",
+            AgentControlRequest::AccountList,
+            Some("wrong-token"),
+        )
+        .await;
+
+        let AgentControlResponse::Error { code, .. } = wrong.payload else {
+            panic!("expected unauthorized response with wrong token");
+        };
+        assert_eq!(wrong.id.as_deref(), Some("req-wrong-token"));
+        assert_eq!(code, "unauthorized");
+
+        let allowed = serve_control_request_once_with_auth(
+            &connector,
+            &listener,
+            &socket,
+            "req-token",
+            AgentControlRequest::AccountList,
+            Some("test-token"),
+        )
+        .await;
+
+        assert_eq!(allowed.id.as_deref(), Some("req-token"));
+        let AgentControlResponse::AccountList { accounts } = allowed.payload else {
+            panic!("expected account list response with correct token");
+        };
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id_hex, account.account_id_hex);
+    }
+
+    #[tokio::test]
     async fn connector_socket_subscribes_to_inbound_messages() {
         let dir = tempfile::tempdir().unwrap();
         let relay = MockRelay::run().await.unwrap();
@@ -1474,13 +1700,13 @@ mod tests {
 
         let group_id_hex = hex::encode(group_id.as_slice());
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let server = tokio::spawn(serve_socket(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        }));
+        let server = tokio::spawn(serve_socket(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        )));
 
         let subscriber = connect_with_retry(&socket).await;
         let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
@@ -1559,13 +1785,13 @@ mod tests {
         let group_id_hex = "22".repeat(32);
         let message_id_hex = "33".repeat(32);
         let sender_account_id_hex = "44".repeat(32);
-        let server = tokio::spawn(serve_socket(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: Vec::new(),
-            allow_any: false,
-            debug_controls: true,
-        }));
+        let server = tokio::spawn(serve_socket(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            true,
+        )));
 
         let subscriber = connect_with_retry(&socket).await;
         let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
@@ -1668,13 +1894,13 @@ mod tests {
     async fn connector_debug_controls_are_disabled_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: Vec::new(),
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
 
@@ -1699,13 +1925,13 @@ mod tests {
         let agent = account_home.create_account("agent").unwrap();
         let welcomer = account_home.create_account("welcomer").unwrap();
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: Vec::new(),
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
 
@@ -1782,13 +2008,13 @@ mod tests {
         agent_setup_runtime.shutdown().await;
 
         let socket = agent_dir.path().join("dev").join("dm-agent.sock");
-        let server = tokio::spawn(serve_socket(AgentConnectorConfig {
-            home: agent_dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        }));
+        let server = tokio::spawn(serve_socket(test_config(
+            agent_dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        )));
         let added = send_control_request(
             &socket,
             "req-allow-human",
@@ -1849,13 +2075,13 @@ mod tests {
         agent_setup_runtime.shutdown().await;
 
         let socket = agent_dir.path().join("dev").join("dm-agent.sock");
-        let server = tokio::spawn(serve_socket(AgentConnectorConfig {
-            home: agent_dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        }));
+        let server = tokio::spawn(serve_socket(test_config(
+            agent_dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        )));
         assert!(matches!(
             send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
                 .await
@@ -1907,13 +2133,13 @@ mod tests {
         agent_setup_runtime.shutdown().await;
 
         let socket = agent_dir.path().join("dev").join("dm-agent.sock");
-        let server = tokio::spawn(serve_socket(AgentConnectorConfig {
-            home: agent_dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: true,
-            debug_controls: false,
-        }));
+        let server = tokio::spawn(serve_socket(test_config(
+            agent_dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            true,
+            false,
+        )));
         assert!(matches!(
             send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
                 .await
@@ -1945,13 +2171,13 @@ mod tests {
     async fn connector_socket_creates_local_account() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: Vec::new(),
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
         let server = tokio::spawn(async move { connector.serve_once(&listener).await });
@@ -1992,13 +2218,13 @@ mod tests {
         let account = account_home.create_account("agent").unwrap();
         let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url.clone()],
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
         let server = tokio::spawn(async move { connector.serve_once(&listener).await });
@@ -2049,13 +2275,13 @@ mod tests {
         let account_home = AccountHome::open(dir.path());
         let account = account_home.create_account("agent").unwrap();
         let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: dir.path().join("dev").join("dm-agent.sock"),
-            relays: vec![relay_url.clone()],
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            dir.path().join("dev").join("dm-agent.sock"),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
         .unwrap();
 
         connector.start().await.unwrap();
@@ -2100,13 +2326,13 @@ mod tests {
 
         let group_id_hex = hex::encode(group_id.as_slice());
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
         let server = tokio::spawn(async move { connector.serve_once(&listener).await });
@@ -2166,13 +2392,13 @@ mod tests {
         let group_id_hex = hex::encode(group_id.as_slice());
         let stream_id_hex = hex::encode([0x77; 32]);
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
 
@@ -2288,13 +2514,13 @@ mod tests {
         let group_id_hex = hex::encode(group_id.as_slice());
         let stream_id_hex = hex::encode([0x88; 32]);
         let socket = dir.path().join("dev").join("dm-agent.sock");
-        let connector = AgentConnector::open(AgentConnectorConfig {
-            home: dir.path().to_path_buf(),
-            socket: socket.clone(),
-            relays: vec![relay_url],
-            allow_any: false,
-            debug_controls: false,
-        })
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url],
+            false,
+            false,
+        ))
         .unwrap();
         let listener = bind_connector_socket(&socket).unwrap();
 
@@ -2374,10 +2600,22 @@ mod tests {
         id: &str,
         request: AgentControlRequest,
     ) -> AgentControlEnvelope<AgentControlResponse> {
+        send_control_request_with_auth(socket, id, request, None).await
+    }
+
+    async fn send_control_request_with_auth(
+        socket: &Path,
+        id: &str,
+        request: AgentControlRequest,
+        auth_token: Option<&str>,
+    ) -> AgentControlEnvelope<AgentControlResponse> {
         let client = connect_with_retry(socket).await;
         let (client_read, mut client_write) = tokio::io::split(client);
         let mut client_read = BufReader::new(client_read);
-        let request = AgentControlEnvelope::request(Some(id.to_owned()), request);
+        let mut request = AgentControlEnvelope::request(Some(id.to_owned()), request);
+        if let Some(auth_token) = auth_token {
+            request = request.with_auth_token(auth_token);
+        }
         write_frame(&mut client_write, &request).await.unwrap();
         timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut client_read))
             .await
@@ -2396,6 +2634,22 @@ mod tests {
         let (server, response) = tokio::join!(
             connector.serve_once(listener),
             send_control_request(socket, id, request)
+        );
+        server.unwrap();
+        response
+    }
+
+    async fn serve_control_request_once_with_auth(
+        connector: &AgentConnector,
+        listener: &tokio::net::UnixListener,
+        socket: &Path,
+        id: &str,
+        request: AgentControlRequest,
+        auth_token: Option<&str>,
+    ) -> AgentControlEnvelope<AgentControlResponse> {
+        let (server, response) = tokio::join!(
+            connector.serve_once(listener),
+            send_control_request_with_auth(socket, id, request, auth_token)
         );
         server.unwrap();
         response

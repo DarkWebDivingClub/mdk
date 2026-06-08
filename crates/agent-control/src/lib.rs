@@ -26,6 +26,8 @@ pub struct AgentControlEnvelope<T> {
     pub marmot_agent_control: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
     #[serde(flatten)]
     pub payload: T,
 }
@@ -35,12 +37,18 @@ impl<T> AgentControlEnvelope<T> {
         Self {
             marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1.to_owned(),
             id,
+            auth_token: None,
             payload,
         }
     }
 
     pub fn request(id: Option<String>, payload: T) -> Self {
         Self::new(id, payload)
+    }
+
+    pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Self {
+        self.auth_token = Some(auth_token.into());
+        self
     }
 
     pub fn validate_protocol(&self) -> Result<(), AgentControlError> {
@@ -304,6 +312,22 @@ mod tests {
         assert_eq!(json["append_text"], "lo");
         assert!(json.get("text").is_none());
         assert!(json.get("replace_text").is_none());
+
+        let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn envelope_auth_token_round_trips_when_present() {
+        let frame = AgentControlEnvelope::request(
+            Some("req-auth".to_owned()),
+            AgentControlRequest::AccountList,
+        )
+        .with_auth_token("test-token");
+
+        let encoded = encode_frame(&frame).unwrap();
+        let json: Value = serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(json["auth_token"], "test-token");
 
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded, frame);

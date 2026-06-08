@@ -12,6 +12,12 @@ optional_env:
   - name: MARMOT_AGENT_SOCKET
     description: "Unix socket for dm-agent; defaults to $MARMOT_HOME/dev/dm-agent.sock"
     password: false
+  - name: MARMOT_AGENT_AUTH_TOKEN
+    description: "Bearer token for a token-gated dm-agent control socket"
+    password: true
+  - name: MARMOT_AGENT_AUTH_TOKEN_FILE
+    description: "Path to a bearer token file for a token-gated dm-agent control socket"
+    password: false
   - name: MARMOT_ACCOUNT_ID_HEX
     description: "Agent account pubkey/account id hex; required when dm-agent has more than one account"
     password: false

@@ -32,7 +32,7 @@ The setup script creates these paths under that root:
 - `marmot-agent-home` for isolated `dm-agent` state.
 - `hermes-home/plugins/marmot` as a symlink back to this plugin directory.
 - helper scripts: `smoke-plugin.sh`, `e2e-deterministic.sh`,
-  `e2e-connector.sh`,
+  `e2e-connector.sh`, `bootstrap-agent.sh`,
   `run-dm-agent.sh`, `run-hermes-gateway.sh`, `start-dm-agent.sh`,
   `start-hermes-gateway.sh`, and `stop-dev-processes.sh`.
 
@@ -49,7 +49,16 @@ just hermes-dev-setup --skip-hermes-install --print-env
 just hermes-dev-setup --hermes-ref main --print-env
 
 # Include relay and QUIC preview settings for generated helpers.
-just hermes-dev-setup --relay wss://relay.example --quic-candidate quic://127.0.0.1:4433 --print-env
+just hermes-dev-setup \
+  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.us.whitenoise.chat \
+  --quic-candidate quic://quic-broker.ipf.dev:4450 \
+  --print-env
+
+# Use a token-gated local control socket for a group-shared Hermes/dm-agent setup.
+openssl rand -hex 32 > /tmp/hermes-marmot-control.token
+chmod 0600 /tmp/hermes-marmot-control.token
+just hermes-dev-setup --auth-token-file /tmp/hermes-marmot-control.token --socket-dir-mode 0770 --socket-mode 0660 --print-env
 ```
 
 Smoke-test the plugin import against the isolated Hermes venv:
@@ -101,12 +110,46 @@ Delete the whole throwaway setup:
 just hermes-dev-teardown --force
 ```
 
-## Configuration
+## Docker Phone Test
 
-Start the connector first:
+The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `dm-agent`, Hermes,
+the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the Dark Matter repo root.
+They start or exec into the container for you. The container uses the pilot public relays and broker:
 
 ```sh
-cargo run -p agent-connector --bin dm-agent -- --home ~/.marmot-agent --relay wss://relay.example
+export OPENAI_API_KEY=...
+just hermes-phone-test-up
+just hermes-phone-test-bootstrap
+```
+
+Use the provider secret and optional `HERMES_MODEL` or `HERMES_PROVIDER` settings that match your Hermes setup. The
+Compose service passes through common provider variables when they are set in your shell.
+
+The bootstrap command prints the agent account hex, `npub`, relay, QUIC candidate, invite URI, and QR code. Run logs in
+another terminal while testing from the phone:
+
+```sh
+just hermes-phone-test-logs
+```
+
+For this manual test the container starts `dm-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
+without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
+
+Stop the container without deleting the agent account:
+
+```sh
+just hermes-phone-test-down
+```
+
+## Configuration
+
+Start the connector first with the same public Nostr relay set the phone uses:
+
+```sh
+cargo run -p agent-connector --bin dm-agent -- \
+  --home ~/.marmot-agent \
+  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.us.whitenoise.chat
 ```
 
 Then configure Hermes with environment variables:
@@ -114,12 +157,36 @@ Then configure Hermes with environment variables:
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agent"
 export MARMOT_ACCOUNT_ID_HEX="<agent-account-pubkey-hex>"
-export MARMOT_QUIC_CANDIDATES="quic://127.0.0.1:4433"
+export MARMOT_QUIC_CANDIDATES="quic://quic-broker.ipf.dev:4450"
 ```
 
 `MARMOT_AGENT_SOCKET` can override the socket path. If it is not set, the plugin
 uses `$MARMOT_HOME/dev/dm-agent.sock`. If `MARMOT_ACCOUNT_ID_HEX` is omitted and
 `dm-agent` has exactly one local account, the adapter selects it automatically.
+
+The default control socket is same-UID only: parent directory `0700`, socket
+`0600`, no TCP listener. If Hermes and `dm-agent` run as different local service
+users, use a token file and group-readable socket modes:
+
+```sh
+install -d -m 0750 ~/.marmot-agent
+openssl rand -hex 32 > ~/.marmot-agent/control.token
+chmod 0600 ~/.marmot-agent/control.token
+
+cargo run -p agent-connector --bin dm-agent -- \
+  --home ~/.marmot-agent \
+  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.us.whitenoise.chat \
+  --auth-token-file ~/.marmot-agent/control.token \
+  --socket-dir-mode 0770 \
+  --socket-mode 0660
+
+export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agent/control.token"
+```
+
+`MARMOT_AGENT_AUTH_TOKEN` is also supported for launcher-managed secrets. Prefer
+`MARMOT_AGENT_AUTH_TOKEN_FILE` for shell and service-manager setups so the token
+does not appear in process environments by default.
 
 ## Behavior
 
