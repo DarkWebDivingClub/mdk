@@ -1174,7 +1174,7 @@ impl Marmot {
     /// Supply non-persisted OTLP runtime metadata: optional metrics URL
     /// override, bearer token from the host app's build-time secret, and
     /// resource attributes from the platform shell.
-    pub fn set_relay_telemetry_runtime_config(
+    pub async fn set_relay_telemetry_runtime_config(
         &self,
         config: RelayTelemetryRuntimeConfigFfi,
     ) -> Result<(), MarmotKitError> {
@@ -1185,7 +1185,7 @@ impl Marmot {
 
     /// Persist device-wide relay telemetry export settings and return the
     /// normalized settings that were stored.
-    pub fn set_relay_telemetry_settings(
+    pub async fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettingsFfi,
     ) -> Result<RelayTelemetrySettingsFfi, MarmotKitError> {
