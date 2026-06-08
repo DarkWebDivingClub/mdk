@@ -963,7 +963,10 @@ fn system_time_ms(time: SystemTime) -> Option<u64> {
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
-fn validate_audit_upload_endpoint(endpoint: &str) -> Result<String, AppError> {
+fn validate_audit_upload_endpoint(
+    endpoint: &str,
+    authorization_bearer_token: Option<&str>,
+) -> Result<String, AppError> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err(AppError::AuditLogUpload(
@@ -973,6 +976,14 @@ fn validate_audit_upload_endpoint(endpoint: &str) -> Result<String, AppError> {
     if !config::endpoint_transport_allowed(endpoint) {
         return Err(AppError::AuditLogUpload(
             "forensic upload endpoint must be https, or loopback http for local testing".to_owned(),
+        ));
+    }
+    if !config::endpoint_host_is_loopback(endpoint)
+        && authorization_bearer_token.is_none_or(|token| token.trim().is_empty())
+    {
+        return Err(AppError::AuditLogUpload(
+            "forensic upload endpoint requires an authorization bearer token unless it is loopback"
+                .to_owned(),
         ));
     }
     Ok(endpoint.to_owned())
@@ -1215,13 +1226,15 @@ impl MarmotApp {
             .clone()
             .normalize()
             .map_err(AppError::AuditLogUpload)?;
-        let endpoint = validate_audit_upload_endpoint(
-            &config
-                .resolved_endpoint(self.service_endpoints())
-                .ok_or_else(|| {
-                    AppError::AuditLogUpload("forensic upload endpoint is empty".into())
-                })?,
-        )?;
+        let endpoint = config
+            .resolved_endpoint(self.service_endpoints())
+            .ok_or_else(|| AppError::AuditLogUpload("forensic upload endpoint is empty".into()))
+            .and_then(|endpoint| {
+                validate_audit_upload_endpoint(
+                    &endpoint,
+                    config.authorization_bearer_token.as_deref(),
+                )
+            })?;
         let file = tokio::fs::File::open(&path).await?;
         let bytes_sent = file.metadata().await?.len();
         if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {

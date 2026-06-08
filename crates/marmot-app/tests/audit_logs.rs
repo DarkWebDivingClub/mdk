@@ -410,6 +410,31 @@ async fn post_audit_log_file_posts_jsonl_body() {
 }
 
 #[tokio::test]
+async fn post_audit_log_file_rejects_remote_endpoint_without_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let audit_path = home
+        .account_dir(&account.label)
+        .join("audit-unauthenticated-remote.jsonl");
+    std::fs::write(&audit_path, b"{\"seq\":1}\n").unwrap();
+
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let err = app
+        .post_audit_log_file(
+            &audit_path.to_string_lossy(),
+            "https://goggles.example/api/v1/audit-logs/",
+        )
+        .await
+        .expect_err("remote forensic audit upload should require authorization");
+
+    assert!(
+        err.to_string().contains("authorization bearer token"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn post_audit_log_file_rejects_oversized_files_before_upload() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());

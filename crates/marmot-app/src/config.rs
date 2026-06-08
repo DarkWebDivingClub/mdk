@@ -385,6 +385,13 @@ pub(crate) fn endpoint_transport_allowed(endpoint: &str) -> bool {
     }
 }
 
+pub(crate) fn endpoint_host_is_loopback(endpoint: &str) -> bool {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host().map(host_is_loopback))
+        .unwrap_or(false)
+}
+
 fn host_is_loopback(host: url::Host<&str>) -> bool {
     match host {
         url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
