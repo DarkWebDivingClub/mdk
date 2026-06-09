@@ -125,8 +125,9 @@ just hermes-phone-test-bootstrap
 Use the provider secret and optional `HERMES_MODEL` or `HERMES_PROVIDER` settings that match your Hermes setup. The
 Compose service passes through common provider variables when they are set in your shell.
 
-The bootstrap command prints the agent account hex, `npub`, relay, QUIC candidate, invite URI, and QR code. Run logs in
-another terminal while testing from the phone:
+The bootstrap command prints the agent account hex, `npub`, `nprofile`, relay hints, QUIC preview candidate, and QR
+code. The QR payload is the `nprofile`; QUIC preview candidates are printed for diagnostics and are still announced by
+Hermes in the first agent-stream start message. Run logs in another terminal while testing from the phone:
 
 ```sh
 just hermes-phone-test-logs

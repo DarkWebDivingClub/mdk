@@ -13,6 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "hermes_marmot_bootstrap_agent.py"
 ACCOUNT_ID = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4"
 NPUB = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+NPROFILE = (
+    "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpremhxue69uhhyetvv9uju"
+    "et49emks6t5v4hxjmmnv5hxx6rpwsq3uamnwvaz7tmjv4kxz7fww4ejuamgd96x2mn0d9ek2tnrdpshgjt0jd0"
+)
 DEFAULT_RELAYS = [
     "wss://relay.eu.whiteniose.chat",
     "wss://relay.us.whitenoise.chat",
@@ -103,9 +107,12 @@ class BootstrapAgentScriptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(output["created"])
         self.assertEqual(output["account_id_hex"], ACCOUNT_ID)
         self.assertEqual(output["npub"], NPUB)
+        self.assertEqual(output["nprofile"], NPROFILE)
+        self.assertEqual(output["qr_payload"], NPROFILE)
         self.assertEqual(output["relays"], DEFAULT_RELAYS)
         self.assertIn("quic://quic-broker.ipf.dev:4450", output["quic_candidates"])
-        self.assertIn(f"account={ACCOUNT_ID}", output["invite_uri"])
+        self.assertNotIn("invite_uri", output)
+        self.assertNotIn("quic://", output["qr_payload"])
         self.assertEqual([request["type"] for request in requests], ["account_list", "account_create"])
 
     async def test_reuses_existing_agent_account_and_repairs_key_package(self):
@@ -192,6 +199,8 @@ class BootstrapAgentScriptTests(unittest.IsolatedAsyncioTestCase):
         output = json.loads(result.stdout)
         self.assertEqual(output["relays"], ["wss://relay.one"])
         self.assertEqual(output["quic_candidates"], ["quic://one", "quic://two", "quic://three"])
+        self.assertTrue(output["qr_payload"].startswith("nprofile1"))
+        self.assertNotIn("quic://one", output["qr_payload"])
 
     async def test_qr_mode_renders_with_qrencode_when_available(self):
         async def handler(reader, writer):
@@ -234,7 +243,8 @@ class BootstrapAgentScriptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"Agent account hex: {ACCOUNT_ID}", result.stdout)
         self.assertIn(f"Agent npub: {NPUB}", result.stdout)
-        self.assertIn("FAKE-QR:marmot-agent:v1?", result.stdout)
+        self.assertIn(f"Agent nprofile: {NPROFILE}", result.stdout)
+        self.assertIn(f"FAKE-QR:{NPROFILE}", result.stdout)
 
 
 if __name__ == "__main__":

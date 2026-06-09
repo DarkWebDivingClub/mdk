@@ -14,7 +14,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 
 
 PROTOCOL = "marmot.agent-control.v1"
@@ -113,18 +112,17 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         result["npub"] = npub_for_account_id(result["account_id_hex"])
-        result["invite_uri"] = build_invite_uri(
+        result["nprofile"] = nprofile_for_account_id(
             result["account_id_hex"],
-            result["npub"],
             config["relays"],
-            config["quic_candidates"],
         )
+        result["qr_payload"] = result["nprofile"]
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
             print_human_result(result)
             if args.qr:
-                render_qr(result["invite_uri"])
+                render_qr(result["qr_payload"])
         return 0
     except BootstrapError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -331,9 +329,30 @@ def normalize_account_id_hex(value: str) -> str:
 
 def npub_for_account_id(account_id_hex: str) -> str:
     raw = bytes.fromhex(normalize_account_id_hex(account_id_hex))
+    return bech32_encode("npub", raw)
+
+
+def nprofile_for_account_id(account_id_hex: str, relays: list[str]) -> str:
+    raw = bytes.fromhex(normalize_account_id_hex(account_id_hex))
+    tlv = bytearray()
+    append_tlv(tlv, 0, raw)
+    for relay in relays:
+        append_tlv(tlv, 1, relay.encode("utf-8"))
+    return bech32_encode("nprofile", bytes(tlv))
+
+
+def append_tlv(out: bytearray, tlv_type: int, value: bytes) -> None:
+    if len(value) > 255:
+        raise BootstrapError("nprofile relay hint is too long")
+    out.append(tlv_type)
+    out.append(len(value))
+    out.extend(value)
+
+
+def bech32_encode(hrp: str, raw: bytes) -> str:
     data = convert_bits(raw, 8, 5, pad=True)
-    checksum = bech32_create_checksum("npub", data)
-    return "npub1" + "".join(BECH32_CHARSET[value] for value in data + checksum)
+    checksum = bech32_create_checksum(hrp, data)
+    return hrp + "1" + "".join(BECH32_CHARSET[value] for value in data + checksum)
 
 
 def convert_bits(data: bytes, from_bits: int, to_bits: int, *, pad: bool) -> list[int]:
@@ -380,18 +399,6 @@ def bech32_polymod(values: list[int]) -> int:
     return chk
 
 
-def build_invite_uri(
-    account_id_hex: str,
-    npub: str,
-    relays: list[str],
-    quic_candidates: list[str],
-) -> str:
-    pairs: list[tuple[str, str]] = [("account", account_id_hex), ("npub", npub)]
-    pairs.extend(("relay", relay) for relay in relays)
-    pairs.extend(("quic", candidate) for candidate in quic_candidates)
-    return "marmot-agent:v1?" + urlencode(pairs)
-
-
 def print_human_result(result: dict[str, Any]) -> None:
     action = "created" if result["created"] else "reused"
     print("Marmot agent bootstrap complete")
@@ -399,20 +406,21 @@ def print_human_result(result: dict[str, Any]) -> None:
     print(f"Agent label: {result['label']}")
     print(f"Agent account hex: {result['account_id_hex']}")
     print(f"Agent npub: {result['npub']}")
+    print(f"Agent nprofile: {result['nprofile']}")
     print(f"Relay(s): {', '.join(result['relays'])}")
     if result["quic_candidates"]:
         print(f"QUIC candidate(s): {', '.join(result['quic_candidates'])}")
     else:
         print("QUIC candidate(s): none")
     print(f"KeyPackage: {'published or repaired' if result['key_package_published'] else 'skipped'}")
-    print(f"Invite URI: {result['invite_uri']}")
+    print(f"QR payload: {result['qr_payload']}")
 
 
 def render_qr(payload: str) -> None:
     qrencode = shutil.which("qrencode")
     print()
     if not qrencode:
-        print("QR code: qrencode is not installed; use the Invite URI above.")
+        print("QR code: qrencode is not installed; use the QR payload above.")
         return
     print("QR code:")
     subprocess.run([qrencode, "-t", "ANSIUTF8", payload], check=True)
