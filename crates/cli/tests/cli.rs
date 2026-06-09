@@ -1754,12 +1754,13 @@ fn media_upload_and_download_round_trip_through_blossom() {
             blossom.url(),
         ],
     );
-    let encrypted_hash = upload["encrypted_hash_hex"]
+    let uploaded_attachment = &upload["attachments"][0];
+    let encrypted_hash = uploaded_attachment["media"]["ciphertext_sha256"]
         .as_str()
         .expect("encrypted hash");
     let stored = blossom.blob(encrypted_hash).expect("stored encrypted blob");
     assert_ne!(stored, plaintext);
-    let file_hash = upload["media"]["file_hash_hex"]
+    let file_hash = uploaded_attachment["media"]["plaintext_sha256"]
         .as_str()
         .expect("plaintext hash")
         .to_owned();
@@ -1767,7 +1768,7 @@ fn media_upload_and_download_round_trip_through_blossom() {
     run_json(home.path(), &["--account", &bob, "sync"]);
     let listed = run_json(home.path(), &["--account", &bob, "media", "list", group_id]);
     assert_eq!(listed["media"][0]["caption"], "caption");
-    assert_eq!(listed["media"][0]["file_hash_hex"], file_hash);
+    assert_eq!(listed["media"][0]["plaintext_sha256"], file_hash);
 
     let output_path = home.path().join("downloaded-note.txt");
     let output_path_string = output_path.to_string_lossy().to_string();

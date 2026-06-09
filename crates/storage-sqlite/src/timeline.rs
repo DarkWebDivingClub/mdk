@@ -19,6 +19,7 @@ pub struct StoredAppEvent {
     pub group_id_hex: String,
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
+    pub source_epoch: Option<u64>,
     pub direction: String,
     pub sender: String,
     pub plaintext: String,
@@ -48,6 +49,7 @@ pub struct TimelineMessageQuery {
 pub struct TimelineMessageRecord {
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
+    pub source_epoch: Option<u64>,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
@@ -150,6 +152,7 @@ struct RawAppEvent {
     group_id_hex: String,
     message_id_hex: String,
     source_message_id_hex: Option<String>,
+    source_epoch: Option<u64>,
     direction: String,
     sender: String,
     plaintext: String,
@@ -165,6 +168,7 @@ struct RawAppEvent {
 struct TimelineRow {
     message_id_hex: String,
     source_message_id_hex: Option<String>,
+    source_epoch: Option<u64>,
     direction: String,
     group_id_hex: String,
     sender: String,
@@ -219,12 +223,13 @@ impl SqliteAccountStorage {
         let affected_message_ids = affected_timeline_message_ids_tx(&tx, event)?;
         tx.execute(
             "INSERT INTO app_events (
-                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                 plaintext, kind, tags_json, recorded_at, received_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                 source_message_id_hex = excluded.source_message_id_hex,
+                source_epoch = excluded.source_epoch,
                 direction = excluded.direction,
                 sender = excluded.sender,
                 plaintext = excluded.plaintext,
@@ -238,6 +243,7 @@ impl SqliteAccountStorage {
                 &event.group_id_hex,
                 &event.message_id_hex,
                 &event.source_message_id_hex,
+                optional_u64_to_i64(event.source_epoch)?,
                 &event.direction,
                 &event.sender,
                 &event.plaintext,
@@ -419,16 +425,17 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for row in rows {
         tx.execute(
             "INSERT INTO message_timeline (
-                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
                 deleted, deleted_by_message_id_hex, invalidation_status
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 &row.group_id_hex,
                 &row.message_id_hex,
                 &row.source_message_id_hex,
+                optional_u64_to_i64(row.source_epoch)?,
                 &row.direction,
                 &row.sender,
                 &row.plaintext,
@@ -480,7 +487,7 @@ fn app_events_for_rebuild_tx(
     // deletes) so a losing-branch event never mutates canonical content.
     let mut stmt = tx
         .prepare(
-            "SELECT group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+            "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
                     invalidated, invalidation_reason
              FROM app_events
@@ -770,7 +777,7 @@ fn timeline_records_by_ids_tx(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT message_id_hex, source_message_id_hex, direction, group_id_hex, sender,
+        "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
                 deleted, deleted_by_message_id_hex, invalidation_status
@@ -889,7 +896,7 @@ fn timeline_query_sql(
     };
     Ok((
         format!(
-            "SELECT message_id_hex, source_message_id_hex, direction, group_id_hex, sender,
+            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
                     plaintext, kind, tags_json, timeline_at, received_at,
                     reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
                     deleted, deleted_by_message_id_hex, invalidation_status
@@ -1037,6 +1044,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
     TimelineRow {
         message_id_hex: event.message_id_hex.clone(),
         source_message_id_hex: event.source_message_id_hex.clone(),
+        source_epoch: event.source_epoch,
         direction: event.direction.clone(),
         group_id_hex: event.group_id_hex.clone(),
         sender: event.sender.clone(),
@@ -1061,6 +1069,7 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
     TimelineRow {
         message_id_hex: event.message_id_hex.clone(),
         source_message_id_hex: event.source_message_id_hex.clone(),
+        source_epoch: event.source_epoch,
         direction: event.direction.clone(),
         group_id_hex: event.group_id_hex.clone(),
         sender: event.sender.clone(),
@@ -1141,17 +1150,20 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         group_id_hex: row.get(0)?,
         message_id_hex: row.get(1)?,
         source_message_id_hex: row.get(2)?,
-        direction: row.get(3)?,
-        sender: row.get(4)?,
-        plaintext: row.get(5)?,
-        kind: row.get::<_, i64>(6)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(7)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(err))
+        source_epoch: row
+            .get::<_, Option<i64>>(3)?
+            .and_then(|value| value.try_into().ok()),
+        direction: row.get(4)?,
+        sender: row.get(5)?,
+        plaintext: row.get(6)?,
+        kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
+        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        invalidated: row.get::<_, i64>(10)? != 0,
-        invalidation_reason: row.get(11)?,
+        recorded_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+        invalidated: row.get::<_, i64>(11)? != 0,
+        invalidation_reason: row.get(12)?,
     })
 }
 
@@ -1159,44 +1171,47 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
     Ok(TimelineMessageRecord {
         message_id_hex: row.get(0)?,
         source_message_id_hex: row.get(1)?,
-        direction: row.get(2)?,
-        group_id_hex: row.get(3)?,
-        sender: row.get(4)?,
-        plaintext: row.get(5)?,
-        kind: row.get::<_, i64>(6)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(7)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(err))
+        source_epoch: row
+            .get::<_, Option<i64>>(2)?
+            .and_then(|value| value.try_into().ok()),
+        direction: row.get(3)?,
+        group_id_hex: row.get(4)?,
+        sender: row.get(5)?,
+        plaintext: row.get(6)?,
+        kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
+        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        timeline_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        reply_to_message_id_hex: row.get(10)?,
+        timeline_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+        reply_to_message_id_hex: row.get(11)?,
         reply_preview: None,
-        media: optional_value_from_json(row.get::<_, Option<String>>(11)?).map_err(|err| {
+        media: optional_value_from_json(row.get::<_, Option<String>>(12)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                12,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(12)?).map_err(
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(13)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    12,
+                    13,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        reactions: reaction_summary_from_json(row.get::<_, String>(13)?).map_err(|err| {
+        reactions: reaction_summary_from_json(row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                13,
+                14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        deleted: row.get::<_, i64>(14)? != 0,
-        deleted_by_message_id_hex: row.get(15)?,
-        invalidation_status: row.get(16)?,
+        deleted: row.get::<_, i64>(15)? != 0,
+        deleted_by_message_id_hex: row.get(16)?,
+        invalidation_status: row.get(17)?,
     })
 }
 
@@ -1329,6 +1344,10 @@ fn u64_to_i64(value: u64) -> StorageResult<i64> {
     })
 }
 
+fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
+    value.map(u64_to_i64).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1357,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: id.to_owned(),
             source_message_id_hex: Some(format!("source-{id}")),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: sender.to_owned(),
             plaintext: plaintext.to_owned(),
@@ -1353,6 +1373,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: id.to_owned(),
             source_message_id_hex: Some(format!("source-{id}")),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: sender.to_owned(),
             plaintext: emoji.to_owned(),
@@ -1368,6 +1389,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: id.to_owned(),
             source_message_id_hex: Some(format!("source-{id}")),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: sender.to_owned(),
             plaintext: plaintext.to_owned(),
@@ -1386,6 +1408,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: id.to_owned(),
             source_message_id_hex: Some(format!("source-{id}")),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: sender.to_owned(),
             plaintext: String::new(),
@@ -1697,6 +1720,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: "start".to_owned(),
             source_message_id_hex: Some("source-start".to_owned()),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: "agent".to_owned(),
             plaintext: String::new(),
@@ -1709,6 +1733,7 @@ mod tests {
             group_id_hex: "11".repeat(32),
             message_id_hex: "final".to_owned(),
             source_message_id_hex: Some("source-final".to_owned()),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: "agent".to_owned(),
             plaintext: "done".to_owned(),

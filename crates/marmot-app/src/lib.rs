@@ -31,6 +31,7 @@ pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
@@ -115,14 +116,16 @@ pub use config::{
 };
 pub use error::AppError;
 pub use groups::{
-    AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
-    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppGroupAdminPolicyComponent,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
+    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
 pub use ids::{account_id_hex_from_ref, npub_for_account_id};
 pub use media::{
-    DEFAULT_BLOSSOM_SERVER_URL, MediaDownloadResult, MediaReference, MediaUploadRequest,
-    MediaUploadResult,
+    DEFAULT_BLOSSOM_SERVER_URL, ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference,
+    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
+    MediaUploadRequest, MediaUploadResult,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
@@ -361,6 +364,7 @@ pub struct ReceivedMessage {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub group_id: GroupId,
+    pub source_epoch: u64,
     /// Displayed text for the inner app event (its `content`).
     pub plaintext: String,
     /// Nostr `kind` of the inner Marmot app event.
@@ -445,6 +449,8 @@ pub struct AppMessageRecord {
     /// Nostr `tags` of the inner Marmot app event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<Vec<String>>,
+    #[serde(default)]
+    pub source_epoch: Option<u64>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -632,6 +638,7 @@ struct AppMessageProjection {
     plaintext: String,
     kind: u64,
     tags: Vec<Vec<String>>,
+    source_epoch: Option<u64>,
     recorded_at: Option<u64>,
 }
 
@@ -723,6 +730,13 @@ fn stored_components_from_app_group(group: &AppGroupRecord) -> Vec<StoredAccount
             component_data_hex: group.avatar_url.data_hex.clone(),
         });
     }
+    if group.encrypted_media.required {
+        components.push(StoredAccountGroupComponent {
+            component_id: group.encrypted_media.component_id,
+            component_name: group.encrypted_media.component.clone(),
+            component_data_hex: group.encrypted_media.data_hex.clone(),
+        });
+    }
     components
 }
 
@@ -767,6 +781,13 @@ fn app_group_from_stored_group(stored: StoredAccountGroup) -> Result<AppGroupRec
         let avatar_bytes = hex::decode(avatar_hex)?;
         group.avatar_url = AppGroupAvatarUrlComponent::from_bytes(&avatar_bytes);
     }
+    if let Some(media_hex) =
+        account_component_data_hex(&stored.components, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
+        && !media_hex.is_empty()
+    {
+        let media_bytes = hex::decode(media_hex)?;
+        group.encrypted_media = AppGroupEncryptedMediaComponent::from_bytes(&media_bytes);
+    }
     group.archived = stored.archived;
     group.pending_confirmation = stored.pending_confirmation;
     group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
@@ -804,6 +825,7 @@ fn app_message_record_from_stored(record: StoredAppMessageRecord) -> AppMessageR
         plaintext: record.plaintext,
         kind: record.kind,
         tags: record.tags,
+        source_epoch: record.source_epoch,
         recorded_at: record.recorded_at,
         received_at: record.received_at,
     }
@@ -822,6 +844,7 @@ fn stored_app_event_from_projection(
         plaintext: message.plaintext.clone(),
         kind: message.kind,
         tags: message.tags.clone(),
+        source_epoch: message.source_epoch,
         recorded_at: message.recorded_at.unwrap_or(received_at),
         received_at,
     }
@@ -837,6 +860,7 @@ fn stored_app_event_from_message_record(record: &AppMessageRecord) -> StoredAppE
         plaintext: record.plaintext.clone(),
         kind: record.kind,
         tags: record.tags.clone(),
+        source_epoch: record.source_epoch,
         recorded_at: record.recorded_at,
         received_at: record.received_at,
     }
@@ -3942,6 +3966,7 @@ impl MarmotApp {
         let mut components = default_group_components();
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
         components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
+        components.insert(GROUP_ENCRYPTED_MEDIA_COMPONENT_ID);
         components.into_iter().collect()
     }
 
@@ -5697,6 +5722,7 @@ mod tests {
             sender: sender.clone(),
             sender_display_name: None,
             group_id: GroupId::new(vec![0x01]),
+            source_epoch: 0,
             plaintext: "hello".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -5920,6 +5946,7 @@ mod tests {
                 plaintext: "from legacy".to_owned(),
                 kind: 9,
                 tags: Vec::new(),
+                source_epoch: None,
                 recorded_at: Some(1_700_000_101),
             })
             .unwrap();
@@ -5977,6 +6004,7 @@ mod tests {
                 plaintext: "should stay legacy-only".to_owned(),
                 kind: 9,
                 tags: Vec::new(),
+                source_epoch: None,
                 recorded_at: Some(1_700_000_102),
             })
             .unwrap();
@@ -6224,16 +6252,40 @@ mod tests {
     }
 
     #[test]
-    fn media_intent_builds_kind_nine_with_imeta_tag() {
+    fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
         let event = build(AppMessageIntent::Media {
-            reference: MediaReference {
-                url: "https://media.example/a.png".to_owned(),
-                file_hash_hex: hex::encode([0x11_u8; 32]),
-                nonce_hex: hex::encode([0x22_u8; 12]),
-                file_name: "a.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "mip04-v2".to_owned(),
-            },
+            attachments: vec![
+                MediaAttachmentReference {
+                    locators: vec![MediaLocator {
+                        kind: "blossom-v1".to_owned(),
+                        value: "https://media.example/a.png".to_owned(),
+                    }],
+                    ciphertext_sha256: hex::encode([0x33_u8; 32]),
+                    plaintext_sha256: hex::encode([0x11_u8; 32]),
+                    nonce_hex: hex::encode([0x22_u8; 12]),
+                    file_name: "a.png".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+                    source_epoch: 7,
+                    dim: Some("10x20".to_owned()),
+                    thumbhash: Some("thumb".to_owned()),
+                },
+                MediaAttachmentReference {
+                    locators: vec![MediaLocator {
+                        kind: "blossom-v1".to_owned(),
+                        value: "https://media.example/b.mp4".to_owned(),
+                    }],
+                    ciphertext_sha256: hex::encode([0x44_u8; 32]),
+                    plaintext_sha256: hex::encode([0x55_u8; 32]),
+                    nonce_hex: hex::encode([0x66_u8; 12]),
+                    file_name: "b.mp4".to_owned(),
+                    media_type: "video/mp4".to_owned(),
+                    version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+                    source_epoch: 7,
+                    dim: None,
+                    thumbhash: None,
+                },
+            ],
             caption: Some("cap".to_owned()),
         });
         assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
@@ -6241,22 +6293,28 @@ mod tests {
         let imeta = event
             .tags
             .iter()
-            .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
-            .unwrap();
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+            .collect::<Vec<_>>();
+        assert_eq!(imeta.len(), 2);
         assert!(
-            imeta
+            imeta[0]
                 .iter()
-                .any(|field| field == "url https://media.example/a.png")
+                .any(|field| field == "locator blossom-v1 https://media.example/a.png")
         );
-        assert!(imeta.iter().any(|field| field == "m image/png"));
-        assert!(!imeta.iter().any(|field| field.starts_with("size ")));
-        assert!(imeta.iter().any(|field| field == "filename a.png"));
+        assert!(imeta[0].iter().any(|field| field == "m image/png"));
+        assert!(imeta[0].iter().any(|field| field == "filename a.png"));
         assert!(
-            imeta
+            imeta[0]
                 .iter()
-                .any(|field| field == "n 222222222222222222222222")
+                .any(|field| field == "nonce 222222222222222222222222")
         );
-        assert!(imeta.iter().any(|field| field == "v mip04-v2"));
+        assert!(imeta[0].iter().any(|field| field == "v encrypted-media-v1"));
+        assert!(imeta[0].iter().any(|field| field == "thumbhash thumb"));
+        assert!(
+            imeta[1]
+                .iter()
+                .any(|field| field == "locator blossom-v1 https://media.example/b.mp4")
+        );
     }
 
     #[test]
@@ -6340,6 +6398,7 @@ mod tests {
             SENDER_HEX,
             None,
             &group_id,
+            0,
             "msg1",
             1_700_000_000,
         )
@@ -6361,7 +6420,8 @@ mod tests {
         let bytes = serde_json::to_vec(&event).unwrap();
         let group_id = GroupId::new(vec![0x01]);
         assert!(
-            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, "msg1", 0).is_none()
+            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0)
+                .is_none()
         );
     }
 
@@ -6375,7 +6435,7 @@ mod tests {
         let other_sender = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
         // The inner pubkey is SENDER_HEX, but MLS authenticated `other_sender`.
         assert!(
-            groups::decode_received_event(&bytes, other_sender, None, &group_id, "msg1", 0)
+            groups::decode_received_event(&bytes, other_sender, None, &group_id, 0, "msg1", 0)
                 .is_none()
         );
     }

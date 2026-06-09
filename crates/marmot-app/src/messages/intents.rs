@@ -7,7 +7,7 @@ use cgka_traits::app_event::{
     STREAM_TYPE_TAG,
 };
 
-use crate::{AgentTextStreamFinishRequest, AppError, MediaReference};
+use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
 use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
 
 /// Value of the `stream-type` tag on an agent text stream start event.
@@ -39,7 +39,7 @@ pub(crate) enum AppMessageIntent {
         target_message_id: String,
     },
     Media {
-        reference: MediaReference,
+        attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     },
     StreamStart {
@@ -128,11 +128,31 @@ pub(crate) fn build_inner_event(
                 String::new(),
             ))
         }
-        AppMessageIntent::Media { reference, caption } => {
-            reference.validate()?;
+        AppMessageIntent::Media {
+            attachments,
+            caption,
+        } => {
+            if attachments.is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "media message requires at least one attachment".into(),
+                ));
+            }
+            let source_epoch = attachments[0].source_epoch;
+            for attachment in attachments {
+                attachment.validate()?;
+                if attachment.source_epoch != source_epoch {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "media attachments in one message must share a source epoch".into(),
+                    ));
+                }
+            }
+            let tags = attachments
+                .iter()
+                .map(MediaAttachmentReference::imeta_tag)
+                .collect();
             Ok(event(
                 MARMOT_APP_EVENT_KIND_CHAT,
-                vec![reference.imeta_tag()],
+                tags,
                 caption.clone().unwrap_or_default(),
             ))
         }

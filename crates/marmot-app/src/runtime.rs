@@ -39,17 +39,18 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, AGENT_STREAM_START_LOOKBACK_LIMIT,
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
-    AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaDownloadResult, MediaReference, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
-    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest,
+    AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AuditLogFile, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PushPlatform,
+    PushRegistration, ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, SendSummary, SyncSummary, TimelineMessageChange, TimelineMessageQuery,
+    TimelinePage, TimelineUpdateTrigger, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -712,6 +713,11 @@ enum AccountWorkerCommand {
         disappearing_message_secs: u64,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    ReplaceEncryptedMediaBlobEndpoints {
+        group_id: GroupId,
+        endpoints: Vec<AppBlobEndpoint>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     UpdateGroupAvatarUrl {
         group_id: GroupId,
         url: Option<String>,
@@ -736,7 +742,7 @@ enum AccountWorkerCommand {
     },
     DownloadMedia {
         group_id: GroupId,
-        reference: MediaReference,
+        reference: MediaAttachmentReference,
         respond: oneshot::Sender<Result<MediaDownloadResult, AppError>>,
     },
     StartAgentTextStream {
@@ -2169,6 +2175,17 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn replace_encrypted_media_blob_endpoints(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        endpoints: Vec<AppBlobEndpoint>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .replace_encrypted_media_blob_endpoints(account_ref, group_id, endpoints)
+            .await
+    }
+
     pub async fn update_group_avatar_url(
         &self,
         account_ref: &str,
@@ -2485,11 +2502,11 @@ impl MarmotAppRuntime {
     }
 
     /// Send a media attachment as a kind-9 chat carrying a NIP-92 `imeta` tag.
-    pub async fn send_media_reference(
+    pub async fn send_media_attachments(
         &self,
         account_ref: &str,
         group_id: &GroupId,
-        reference: MediaReference,
+        attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
         let summary = self
@@ -2497,7 +2514,10 @@ impl MarmotAppRuntime {
             .send_app_event(
                 account_ref,
                 group_id,
-                AppMessageIntent::Media { reference, caption },
+                AppMessageIntent::Media {
+                    attachments,
+                    caption,
+                },
             )
             .await?;
         let _ = self.publish_chat_list_projection_refresh(
@@ -2523,7 +2543,7 @@ impl MarmotAppRuntime {
         &self,
         account_ref: &str,
         group_id: &GroupId,
-        reference: MediaReference,
+        reference: MediaAttachmentReference,
     ) -> Result<MediaDownloadResult, AppError> {
         self.accounts
             .download_media(account_ref, group_id, reference)
@@ -3381,6 +3401,28 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn replace_encrypted_media_blob_endpoints(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        endpoints: Vec<AppBlobEndpoint>,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
+                group_id: group_id.clone(),
+                endpoints,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("replace_encrypted_media_blob_endpoints");
+        Ok(summary)
+    }
+
     pub async fn update_group_avatar_url(
         &self,
         account_ref: &str,
@@ -3624,7 +3666,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         group_id: &GroupId,
-        reference: MediaReference,
+        reference: MediaAttachmentReference,
     ) -> Result<MediaDownloadResult, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -4203,6 +4245,24 @@ async fn run_app_runtime_account_worker(
                         let result = client
                             .update_message_retention(&group_id, disappearing_message_secs)
                             .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
+                        group_id,
+                        endpoints,
+                        respond,
+                    }) => {
+                        let result = client
+                            .replace_encrypted_media_blob_endpoints(&group_id, endpoints)
+                            .await;
+                        if result.is_ok() {
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::UpdateGroupAvatarUrl {
@@ -5169,6 +5229,7 @@ mod tests {
                 messages: vec![crate::TimelineMessageRecord {
                     message_id_hex: "message-1".to_owned(),
                     source_message_id_hex: None,
+                    source_epoch: None,
                     group_id_hex: "group-1".to_owned(),
                     direction: "inbound".to_owned(),
                     sender: "sender-1".to_owned(),
@@ -5293,6 +5354,7 @@ mod tests {
                     vec![STREAM_TAG.to_owned(), stream_id_hex.clone()],
                     vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
                 ],
+                source_epoch: None,
                 recorded_at: 0,
                 received_at: 0,
             }],

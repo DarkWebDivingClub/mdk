@@ -5,8 +5,9 @@ use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_components_list,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, decode_components_list, decode_encrypted_media_policy_v1,
     decode_group_avatar_url_v1, decode_nostr_routing_v1, decode_quic_varint,
     encode_component_vectors, encode_components_list,
 };
@@ -401,6 +402,7 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
         GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
+        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
         _ => Ok(()),
     }
 }
@@ -421,6 +423,7 @@ pub(crate) fn validate_app_component_update(
         GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
         GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
+        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
         _ => Ok(()),
     }
 }
@@ -497,6 +500,12 @@ fn validate_agent_text_stream_policy(bytes: &[u8]) -> Result<(), EngineError> {
     AgentTextStreamQuicPolicyV1::decode_component_state(bytes)
         .map(|_| ())
         .map_err(|e| EngineError::Serialize(format!("invalid agent text stream component: {e}")))
+}
+
+fn validate_encrypted_media_policy(bytes: &[u8]) -> Result<(), EngineError> {
+    decode_encrypted_media_policy_v1(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media component: {e}")))
 }
 
 fn decode_var_bytes(

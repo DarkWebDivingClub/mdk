@@ -56,6 +56,7 @@ pub struct StoredAppMessageRecord {
     pub plaintext: String,
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
+    pub source_epoch: Option<u64>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -365,10 +366,10 @@ impl SqliteAccountStorage {
         let sql = match (&query.group_id_hex, query.limit) {
             (Some(_), Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, recorded_at, received_at
+                        kind, tags_json, source_epoch, recorded_at, received_at
                  FROM (
                     SELECT insert_order, message_id_hex, direction, group_id_hex, sender,
-                           plaintext, kind, tags_json, recorded_at, received_at
+                           plaintext, kind, tags_json, source_epoch, recorded_at, received_at
                     FROM app_events
                     WHERE group_id_hex = ?1
                     ORDER BY recorded_at DESC, received_at DESC, insert_order DESC
@@ -378,17 +379,17 @@ impl SqliteAccountStorage {
             }
             (Some(_), None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, recorded_at, received_at
+                        kind, tags_json, source_epoch, recorded_at, received_at
                  FROM app_events
                  WHERE group_id_hex = ?1
                  ORDER BY recorded_at, received_at, insert_order"
             }
             (None, Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, recorded_at, received_at
+                        kind, tags_json, source_epoch, recorded_at, received_at
                  FROM (
                     SELECT insert_order, message_id_hex, direction, group_id_hex, sender,
-                           plaintext, kind, tags_json, recorded_at, received_at
+                           plaintext, kind, tags_json, source_epoch, recorded_at, received_at
                     FROM app_events
                     ORDER BY recorded_at DESC, received_at DESC, insert_order DESC
                     LIMIT ?1
@@ -397,7 +398,7 @@ impl SqliteAccountStorage {
             }
             (None, None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, recorded_at, received_at
+                        kind, tags_json, source_epoch, recorded_at, received_at
                  FROM app_events
                  ORDER BY recorded_at, received_at, insert_order"
             }
@@ -886,8 +887,11 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         tags: tags_from_json(row.get::<_, String>(6)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(err))
         })?,
-        recorded_at: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
+        source_epoch: row
+            .get::<_, Option<i64>>(7)?
+            .and_then(|value| value.try_into().ok()),
+        recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
     })
 }
 
@@ -1024,6 +1028,7 @@ mod tests {
             group_id_hex: group_id_hex.to_owned(),
             message_id_hex: id.to_owned(),
             source_message_id_hex: Some(format!("source-{id}")),
+            source_epoch: None,
             direction: "received".to_owned(),
             sender: "sender".to_owned(),
             plaintext: id.to_owned(),

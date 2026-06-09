@@ -10,22 +10,23 @@ use std::collections::{HashMap, HashSet};
 
 use cgka_traits::GroupId;
 use marmot_app::{
-    AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
-    AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus, AppBlobEndpoint,
+    AppGroupAdminPolicyComponent, AppGroupEncryptedMediaComponent, AppGroupMemberRecord,
+    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppMessageRecord, AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource, ChatListAvatar,
     ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult,
-    MediaReference, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
-    NotificationSettings, NotificationTrigger, NotificationUpdate, NotificationUser,
-    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
-    RuntimeAgentStreamUpdate, RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeProjectionUpdate, RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange,
-    TimelineMessageRecord, TimelinePage, TimelineReactionSummary, TimelineRemoveReason,
-    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata,
-    account_id_hex_from_ref, npub_for_account_id,
+    GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaAttachmentReference,
+    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationTrigger,
+    NotificationUpdate, NotificationUser, NotificationWakeSource, PushPlatform, PushRegistration,
+    ReceivedMessage, RelayPlaneHealth, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, RuntimeAgentStreamUpdate, RuntimeChatListUpdate,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
+    RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange, TimelineMessageRecord,
+    TimelinePage, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
+    npub_for_account_id,
 };
 
 use crate::errors::MarmotKitError;
@@ -559,46 +560,101 @@ impl From<GroupPushDebugInfo> for GroupPushDebugInfoFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct MediaReferenceFfi {
-    pub url: String,
-    pub file_hash_hex: String,
-    pub nonce_hex: String,
-    pub file_name: String,
-    pub media_type: String,
-    pub version: String,
+pub struct MediaLocatorFfi {
+    pub kind: String,
+    pub value: String,
 }
 
-impl From<MediaReference> for MediaReferenceFfi {
-    fn from(value: MediaReference) -> Self {
+impl From<MediaLocator> for MediaLocatorFfi {
+    fn from(value: MediaLocator) -> Self {
         Self {
-            url: value.url,
-            file_hash_hex: value.file_hash_hex,
-            nonce_hex: value.nonce_hex,
-            file_name: value.file_name,
-            media_type: value.media_type,
-            version: value.version,
+            kind: value.kind,
+            value: value.value,
         }
     }
 }
 
-impl From<MediaReferenceFfi> for MediaReference {
-    fn from(value: MediaReferenceFfi) -> Self {
+impl From<MediaLocatorFfi> for MediaLocator {
+    fn from(value: MediaLocatorFfi) -> Self {
         Self {
-            url: value.url,
-            file_hash_hex: value.file_hash_hex,
+            kind: value.kind,
+            value: value.value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaAttachmentReferenceFfi {
+    pub locators: Vec<MediaLocatorFfi>,
+    pub ciphertext_sha256: String,
+    pub plaintext_sha256: String,
+    pub nonce_hex: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub version: String,
+    pub source_epoch: u64,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl From<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
+    fn from(value: MediaAttachmentReference) -> Self {
+        Self {
+            locators: value.locators.into_iter().map(Into::into).collect(),
+            ciphertext_sha256: value.ciphertext_sha256,
+            plaintext_sha256: value.plaintext_sha256,
             nonce_hex: value.nonce_hex,
             file_name: value.file_name,
             media_type: value.media_type,
             version: value.version,
+            source_epoch: value.source_epoch,
+            dim: value.dim,
+            thumbhash: value.thumbhash,
+        }
+    }
+}
+
+impl From<MediaAttachmentReferenceFfi> for MediaAttachmentReference {
+    fn from(value: MediaAttachmentReferenceFfi) -> Self {
+        Self {
+            locators: value.locators.into_iter().map(Into::into).collect(),
+            ciphertext_sha256: value.ciphertext_sha256,
+            plaintext_sha256: value.plaintext_sha256,
+            nonce_hex: value.nonce_hex,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            version: value.version,
+            source_epoch: value.source_epoch,
+            dim: value.dim,
+            thumbhash: value.thumbhash,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaUploadAttachmentRequestFfi {
+    pub file_name: String,
+    pub media_type: String,
+    pub plaintext: Vec<u8>,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl From<MediaUploadAttachmentRequestFfi> for MediaUploadAttachmentRequest {
+    fn from(value: MediaUploadAttachmentRequestFfi) -> Self {
+        Self {
+            file_name: value.file_name,
+            media_type: value.media_type,
+            plaintext: value.plaintext,
+            dim: value.dim,
+            thumbhash: value.thumbhash,
         }
     }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaUploadRequestFfi {
-    pub file_name: String,
-    pub media_type: String,
-    pub plaintext: Vec<u8>,
+    pub attachments: Vec<MediaUploadAttachmentRequestFfi>,
     pub caption: Option<String>,
     pub send: bool,
     pub blossom_server: Option<String>,
@@ -607,9 +663,7 @@ pub struct MediaUploadRequestFfi {
 impl From<MediaUploadRequestFfi> for MediaUploadRequest {
     fn from(value: MediaUploadRequestFfi) -> Self {
         Self {
-            file_name: value.file_name,
-            media_type: value.media_type,
-            plaintext: value.plaintext,
+            attachments: value.attachments.into_iter().map(Into::into).collect(),
             caption: value.caption,
             send: value.send,
             blossom_server: value.blossom_server,
@@ -618,19 +672,28 @@ impl From<MediaUploadRequestFfi> for MediaUploadRequest {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct MediaUploadResultFfi {
-    pub reference: MediaReferenceFfi,
-    pub encrypted_hash_hex: String,
+pub struct MediaUploadAttachmentResultFfi {
+    pub reference: MediaAttachmentReferenceFfi,
     pub encrypted_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaUploadResultFfi {
+    pub attachments: Vec<MediaUploadAttachmentResultFfi>,
     pub sent: Option<SendSummaryFfi>,
 }
 
 impl From<MediaUploadResult> for MediaUploadResultFfi {
     fn from(value: MediaUploadResult) -> Self {
         Self {
-            reference: value.reference.into(),
-            encrypted_hash_hex: value.encrypted_hash_hex,
-            encrypted_size_bytes: value.encrypted_size_bytes,
+            attachments: value
+                .attachments
+                .into_iter()
+                .map(|attachment| MediaUploadAttachmentResultFfi {
+                    reference: attachment.reference.into(),
+                    encrypted_size_bytes: attachment.encrypted_size_bytes,
+                })
+                .collect(),
             sent: value.sent.map(Into::into),
         }
     }
@@ -658,10 +721,11 @@ impl From<MediaDownloadResult> for MediaDownloadResultFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaRecordFfi {
     pub message_id_hex: String,
+    pub attachment_index: u32,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
-    pub reference: MediaReferenceFfi,
+    pub reference: MediaAttachmentReferenceFfi,
     pub caption: Option<String>,
     pub recorded_at: u64,
     pub received_at: u64,
@@ -1207,49 +1271,77 @@ impl From<RuntimeTimelineMessageUpdate> for TimelineSubscriptionUpdateFfi {
 }
 
 pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRecordFfi> {
-    messages
-        .into_iter()
-        .filter_map(|message| {
-            let reference = media_reference_from_tags(&message.tags)?;
-            let caption = (!message.plaintext.is_empty()).then_some(message.plaintext);
-            Some(MediaRecordFfi {
-                message_id_hex: message.message_id_hex,
-                direction: message.direction,
-                group_id_hex: message.group_id_hex,
-                sender: message.sender,
-                reference,
-                caption,
+    let mut records = Vec::new();
+    for message in messages {
+        let caption = (!message.plaintext.is_empty()).then_some(message.plaintext.clone());
+        for (attachment_index, reference) in media_attachments_from_message(&message)
+            .into_iter()
+            .enumerate()
+        {
+            records.push(MediaRecordFfi {
+                message_id_hex: message.message_id_hex.clone(),
+                attachment_index: attachment_index.try_into().unwrap_or(u32::MAX),
+                direction: message.direction.clone(),
+                group_id_hex: message.group_id_hex.clone(),
+                sender: message.sender.clone(),
+                reference: reference.into(),
+                caption: caption.clone(),
                 recorded_at: message.recorded_at,
                 received_at: message.received_at,
-            })
-        })
+            });
+        }
+    }
+    records
+}
+
+fn media_attachments_from_message(message: &AppMessageRecord) -> Vec<MediaAttachmentReference> {
+    message
+        .tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter_map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch))
         .collect()
 }
 
-fn media_reference_from_tags(tags: &[Vec<String>]) -> Option<MediaReferenceFfi> {
-    let fields = tags
-        .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .map(|tag| {
-            tag.iter()
-                .skip(1)
-                .filter_map(|field| field.split_once(' '))
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect::<HashMap<_, _>>()
-        })?;
+fn media_attachment_from_imeta_tag(
+    tag: &[String],
+    source_epoch: Option<u64>,
+) -> Option<MediaAttachmentReference> {
+    let mut locators = Vec::new();
+    let mut fields = HashMap::new();
+    for field in tag.iter().skip(1) {
+        if field.starts_with("blurhash ") {
+            return None;
+        }
+        if let Some(rest) = field.strip_prefix("locator ") {
+            let (kind, value) = rest.split_once(' ')?;
+            locators.push(MediaLocator {
+                kind: kind.to_owned(),
+                value: value.to_owned(),
+            });
+            continue;
+        }
+        if let Some((key, value)) = field.split_once(' ') {
+            fields.insert(key.to_owned(), value.to_owned());
+        }
+    }
     let required = |key: &str| {
         fields
             .get(key)
             .cloned()
             .filter(|value| !value.trim().is_empty())
     };
-    Some(MediaReferenceFfi {
-        url: required("url")?,
-        file_hash_hex: required("x")?,
-        nonce_hex: required("n")?,
+    Some(MediaAttachmentReference {
+        locators,
+        ciphertext_sha256: required("ciphertext_sha256")?,
+        plaintext_sha256: required("plaintext_sha256")?,
+        nonce_hex: required("nonce")?,
         file_name: required("filename")?,
         media_type: required("m")?,
         version: required("v")?,
+        source_epoch: source_epoch.unwrap_or_default(),
+        dim: fields.get("dim").cloned(),
+        thumbhash: fields.get("thumbhash").cloned(),
     })
 }
 
@@ -1267,6 +1359,7 @@ pub struct AppGroupRecordFfi {
     pub avatar_url: Option<String>,
     pub avatar_dim: Option<String>,
     pub avatar_thumbhash: Option<String>,
+    pub encrypted_media: AppGroupEncryptedMediaComponentFfi,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
@@ -1296,10 +1389,62 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             avatar_url: avatar.present.then_some(avatar.url),
             avatar_dim: avatar.dim,
             avatar_thumbhash: avatar.thumbhash,
+            encrypted_media: value.encrypted_media.into(),
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AppBlobEndpointFfi {
+    pub locator_kind: String,
+    pub base_url: String,
+}
+
+impl From<AppBlobEndpoint> for AppBlobEndpointFfi {
+    fn from(value: AppBlobEndpoint) -> Self {
+        Self {
+            locator_kind: value.locator_kind,
+            base_url: value.base_url,
+        }
+    }
+}
+
+impl From<AppBlobEndpointFfi> for AppBlobEndpoint {
+    fn from(value: AppBlobEndpointFfi) -> Self {
+        Self {
+            locator_kind: value.locator_kind,
+            base_url: value.base_url,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AppGroupEncryptedMediaComponentFfi {
+    pub component_id: u32,
+    pub component: String,
+    pub required: bool,
+    pub media_format: String,
+    pub allowed_locator_kinds: Vec<String>,
+    pub default_blob_endpoints: Vec<AppBlobEndpointFfi>,
+}
+
+impl From<AppGroupEncryptedMediaComponent> for AppGroupEncryptedMediaComponentFfi {
+    fn from(value: AppGroupEncryptedMediaComponent) -> Self {
+        Self {
+            component_id: u32::from(value.component_id),
+            component: value.component,
+            required: value.required,
+            media_format: value.media_format,
+            allowed_locator_kinds: value.allowed_locator_kinds,
+            default_blob_endpoints: value
+                .default_blob_endpoints
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -1816,6 +1961,17 @@ mod tests {
             avatar_url: None,
             avatar_dim: None,
             avatar_thumbhash: None,
+            encrypted_media: AppGroupEncryptedMediaComponentFfi {
+                component_id: 0x8008,
+                component: "marmot.group.encrypted-media.v1".into(),
+                required: true,
+                media_format: "encrypted-media-v1".into(),
+                allowed_locator_kinds: vec!["blossom-v1".into()],
+                default_blob_endpoints: vec![AppBlobEndpointFfi {
+                    locator_kind: "blossom-v1".into(),
+                    base_url: "https://blossom.primal.net".into(),
+                }],
+            },
             archived: false,
             pending_confirmation: false,
             welcomer_account_id_hex: None,
@@ -1873,6 +2029,7 @@ mod tests {
         let record = TimelineMessageRecord {
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
+            source_epoch: Some(7),
             direction: "received".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),

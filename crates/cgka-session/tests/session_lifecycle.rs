@@ -304,6 +304,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello through session"),
         }]
@@ -362,6 +363,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello after restart"),
         }]

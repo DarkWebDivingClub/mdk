@@ -308,13 +308,17 @@ impl<S: StorageProvider> Engine<S> {
     ) {
         for observation in observations {
             let OpenMlsReplayObservation::ApplicationProcessed {
-                sender, payload, ..
+                source_epoch,
+                sender,
+                payload,
+                ..
             } = observation
             else {
                 continue;
             };
             self.events_buf.push_back(GroupEvent::MessageReceived {
                 group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(*source_epoch),
                 sender: MemberId::new(sender.clone()),
                 payload: payload.clone(),
             });

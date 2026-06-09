@@ -14,6 +14,10 @@ mod migration_0006_chat_list_projection;
 mod migration_0007_timeline_projection_indexes;
 #[path = "migrations/0008_timeline_invalidation_status.rs"]
 mod migration_0008_timeline_invalidation_status;
+#[path = "migrations/0009_app_event_source_epoch.rs"]
+mod migration_0009_app_event_source_epoch;
+#[path = "migrations/0010_encrypted_media_epoch_secrets.rs"]
+mod migration_0010_encrypted_media_epoch_secrets;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -65,6 +69,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "0008_timeline_invalidation_status",
         apply: migration_0008_timeline_invalidation_status::apply,
+    },
+    Migration {
+        version: 9,
+        name: "0009_app_event_source_epoch",
+        apply: migration_0009_app_event_source_epoch::apply,
+    },
+    Migration {
+        version: 10,
+        name: "0010_encrypted_media_epoch_secrets",
+        apply: migration_0010_encrypted_media_epoch_secrets::apply,
     },
 ];
 
@@ -193,22 +207,17 @@ mod tests {
             .unwrap()
     }
 
+    fn expected_migrations() -> Vec<(i64, String)> {
+        MIGRATIONS
+            .iter()
+            .map(|migration| (migration.version, migration.name.to_string()))
+            .collect()
+    }
+
     #[test]
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        assert_eq!(
-            applied_migrations(&store),
-            vec![
-                (1, "0001_initial_schema".to_string()),
-                (2, "0002_account_device_signers".to_string()),
-                (3, "0003_group_foreign_keys".to_string()),
-                (4, "0004_app_timeline".to_string()),
-                (5, "0005_account_projection".to_string()),
-                (6, "0006_chat_list_projection".to_string()),
-                (7, "0007_timeline_projection_indexes".to_string()),
-                (8, "0008_timeline_invalidation_status".to_string())
-            ]
-        );
+        assert_eq!(applied_migrations(&store), expected_migrations());
     }
 
     #[test]
@@ -219,23 +228,11 @@ mod tests {
 
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            assert_eq!(applied_migrations(&store).len(), 8);
+            assert_eq!(applied_migrations(&store).len(), MIGRATIONS.len());
         }
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(
-            applied_migrations(&reopened),
-            vec![
-                (1, "0001_initial_schema".to_string()),
-                (2, "0002_account_device_signers".to_string()),
-                (3, "0003_group_foreign_keys".to_string()),
-                (4, "0004_app_timeline".to_string()),
-                (5, "0005_account_projection".to_string()),
-                (6, "0006_chat_list_projection".to_string()),
-                (7, "0007_timeline_projection_indexes".to_string()),
-                (8, "0008_timeline_invalidation_status".to_string())
-            ]
-        );
+        assert_eq!(applied_migrations(&reopened), expected_migrations());
     }
 
     #[test]

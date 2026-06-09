@@ -5,8 +5,10 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_LABEL, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
+    ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -23,17 +25,19 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    ENCRYPTED_MEDIA_EXPORTER_LABEL, download_encrypted_media, upload_encrypted_media,
+    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, media_imeta_tags_are_valid,
+    upload_encrypted_media,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
-    AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppError,
-    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupMemberRecord,
-    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppRuntime, AppTransportRouting,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT,
+    AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppBlobEndpoint,
+    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupEncryptedMediaComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
+    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection,
+    AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT,
     SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
     remember_seen_event, unix_now_seconds,
 };
@@ -107,6 +111,7 @@ impl AppClient {
                 .to_app_component_data()
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
+        app_components.push(self.encrypted_media_component_for_new_group()?);
 
         let (group_id, effects) = self
             .runtime
@@ -187,10 +192,6 @@ impl AppClient {
     ) -> Result<SecretBytes, AppError> {
         self.ensure_group(group_id)?;
         Ok(self.runtime.exporter_secret(group_id, label, length)?)
-    }
-
-    fn encrypted_media_exporter_secret(&self, group_id: &GroupId) -> Result<SecretBytes, AppError> {
-        self.exporter_secret(group_id, ENCRYPTED_MEDIA_EXPORTER_LABEL, 32)
     }
 
     pub async fn invite_members(
@@ -364,6 +365,48 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    pub async fn replace_encrypted_media_blob_endpoints(
+        &mut self,
+        group_id: &GroupId,
+        endpoints: Vec<AppBlobEndpoint>,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let mut allowed_locator_kinds = Vec::new();
+        for endpoint in &endpoints {
+            if !allowed_locator_kinds
+                .iter()
+                .any(|kind| kind == &endpoint.locator_kind)
+            {
+                allowed_locator_kinds.push(endpoint.locator_kind.clone());
+            }
+        }
+        let policy = EncryptedMediaPolicyV1::new(
+            ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
+            allowed_locator_kinds,
+            endpoints.into_iter().map(|endpoint| BlobStoreEndpointV1 {
+                locator_kind: endpoint.locator_kind,
+                base_url: endpoint.base_url,
+            }),
+            true,
+        )
+        .map_err(AppError::InvalidEncryptedMedia)?;
+        let component = AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()?;
+
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![component],
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
     /// Set (or clear) the group's URL-based avatar (`marmot.group.avatar-url.v1`).
     /// Passing `url = None` clears the avatar to the absent state. The URL is
     /// validated and normalized before it is committed.
@@ -471,6 +514,12 @@ impl AppClient {
             }
             other => other,
         };
+        let source_epoch = match &intent {
+            AppMessageIntent::Media { attachments, .. } => attachments
+                .first()
+                .map(|attachment| attachment.source_epoch),
+            _ => None,
+        };
         let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
         let payload = encode_inner_event(&event)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -478,8 +527,13 @@ impl AppClient {
 
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
-            let update =
-                self.record_local_app_event_projection(&group_id_hex, &sender, &event, None)?;
+            let update = self.record_local_app_event_projection(
+                &group_id_hex,
+                &sender,
+                &event,
+                None,
+                source_epoch,
+            )?;
             on_local_projection(update);
         }
 
@@ -531,6 +585,7 @@ impl AppClient {
                 &sender,
                 &event,
                 source_message_id_hex,
+                source_epoch,
             )?;
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
@@ -558,6 +613,7 @@ impl AppClient {
         sender: &str,
         event: &MarmotInnerEvent,
         source_message_id_hex: Option<String>,
+        source_epoch: Option<u64>,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
         let message_projection = AppMessageProjection {
             message_id_hex: event.id.clone(),
@@ -568,6 +624,7 @@ impl AppClient {
             plaintext: event.content.clone(),
             kind: event.kind,
             tags: event.tags.clone(),
+            source_epoch,
             recorded_at: Some(event.created_at),
         };
         let update = self
@@ -861,14 +918,20 @@ impl AppClient {
         Ok(summary)
     }
 
-    pub async fn send_media_reference(
+    pub async fn send_media_attachments(
         &mut self,
         group_id: &GroupId,
-        reference: MediaReference,
+        attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
         let (_event, summary) = self
-            .send_app_event(group_id, AppMessageIntent::Media { reference, caption })
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Media {
+                    attachments,
+                    caption,
+                },
+            )
             .await?;
         Ok(summary)
     }
@@ -880,17 +943,33 @@ impl AppClient {
     ) -> Result<MediaUploadResult, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
-        let exporter_secret = self.encrypted_media_exporter_secret(group_id)?;
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
+        let default_endpoint = policy.default_blob_endpoints.first().ok_or_else(|| {
+            AppError::InvalidEncryptedMedia("encrypted media policy has no default endpoint".into())
+        })?;
+        let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let keys = self
             .app
             .account_home()
             .load_signing_keys(&self.state.label)?;
         let should_send = request.send;
         let caption = request.caption.clone();
-        let mut result = upload_encrypted_media(request, exporter_secret.as_ref(), &keys).await?;
+        let mut result = upload_encrypted_media(
+            request,
+            source_epoch,
+            media_secret.as_ref(),
+            &keys,
+            default_endpoint,
+        )
+        .await?;
         if should_send {
+            let attachments = result
+                .attachments
+                .iter()
+                .map(|attachment| attachment.reference.clone())
+                .collect();
             result.sent = Some(
-                self.send_media_reference(group_id, result.reference.clone(), caption)
+                self.send_media_attachments(group_id, attachments, caption)
                     .await?,
             );
         }
@@ -900,12 +979,19 @@ impl AppClient {
     pub async fn download_media(
         &mut self,
         group_id: &GroupId,
-        reference: MediaReference,
+        reference: MediaAttachmentReference,
     ) -> Result<MediaDownloadResult, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
-        let exporter_secret = self.encrypted_media_exporter_secret(group_id)?;
-        download_encrypted_media(reference, exporter_secret.as_ref()).await
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
+        let media_secret =
+            self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch)?;
+        download_encrypted_media(
+            reference,
+            media_secret.as_ref(),
+            &policy.default_blob_endpoints,
+        )
+        .await
     }
 
     pub async fn start_agent_text_stream(
@@ -1025,6 +1111,7 @@ impl AppClient {
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
+            encrypted_media: self.encrypted_media_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1169,6 +1256,7 @@ impl AppClient {
                         message_retention: self.message_retention_for_group(group_id),
                         agent_text_stream: self.agent_text_stream_for_group(group_id),
                         avatar_url: self.avatar_url_for_group(group_id),
+                        encrypted_media: self.encrypted_media_for_group(group_id),
                     })
                 })
                 .transpose()?;
@@ -1197,6 +1285,20 @@ impl AppClient {
                         .retain(|candidate| candidate.message_id_hex != message.message_id_hex);
                     continue;
                 }
+                if message.kind == MARMOT_APP_EVENT_KIND_CHAT
+                    && media_imeta_tags_are_valid(&message.tags)
+                    && let Err(err) = self.remember_encrypted_media_secret_if_current(
+                        &message.group_id,
+                        message.source_epoch,
+                    )
+                {
+                    tracing::warn!(
+                        target: "marmot_app::media",
+                        method = "ingest_delivery",
+                        error_code = "encrypted_media_secret_cache_skipped",
+                        "failed to cache encrypted media source epoch secret: {err}",
+                    );
+                }
                 self.app.remember_directory_message_sender(&message)?;
                 let message_projection = AppMessageProjection {
                     message_id_hex: message.message_id_hex.clone(),
@@ -1207,6 +1309,7 @@ impl AppClient {
                     plaintext: message.plaintext.clone(),
                     kind: message.kind,
                     tags: message.tags.clone(),
+                    source_epoch: Some(message.source_epoch),
                     recorded_at: Some(source_recorded_at),
                 };
                 let projection_update = self
@@ -1289,6 +1392,7 @@ impl AppClient {
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
+            encrypted_media: self.encrypted_media_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1309,6 +1413,7 @@ impl AppClient {
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
+            encrypted_media: self.encrypted_media_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1366,6 +1471,118 @@ impl AppClient {
             .flatten()
             .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
             .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
+    }
+
+    fn encrypted_media_for_group(&self, group_id: &GroupId) -> AppGroupEncryptedMediaComponent {
+        self.runtime
+            .app_component(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppGroupEncryptedMediaComponent::disabled)
+    }
+
+    fn encrypted_media_policy_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<EncryptedMediaPolicyV1, AppError> {
+        self.encrypted_media_for_group(group_id).endpoint_policy()
+    }
+
+    fn encrypted_media_secret(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(u64, SecretBytes), AppError> {
+        let (epoch, secret) = self
+            .runtime
+            .safe_export_secret_with_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
+        Ok((epoch.0, secret))
+    }
+
+    fn encrypted_media_secret_for_epoch(
+        &mut self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<SecretBytes, AppError> {
+        if let Some(secret) = self.cached_encrypted_media_epoch_secret(group_id, source_epoch)? {
+            return Ok(SecretBytes::new(secret));
+        }
+        let current_epoch = self
+            .runtime
+            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
+        if current_epoch.0 != source_epoch {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "missing encrypted media secret for epoch {source_epoch}"
+            )));
+        }
+        self.encrypted_media_secret(group_id)
+            .map(|(_, secret)| secret)
+    }
+
+    fn remember_encrypted_media_secret_if_current(
+        &mut self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<(), AppError> {
+        let current_epoch = self
+            .runtime
+            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
+        if current_epoch.0 == source_epoch {
+            let _ = self.encrypted_media_secret(group_id)?;
+        }
+        Ok(())
+    }
+
+    fn remember_encrypted_media_epoch_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+        secret: &[u8],
+    ) -> Result<(), AppError> {
+        self.app
+            .account_storage(&self.state.label)?
+            .remember_encrypted_media_epoch_secret(
+                &hex::encode(group_id.as_slice()),
+                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                source_epoch,
+                secret,
+            )?;
+        Ok(())
+    }
+
+    fn cached_encrypted_media_epoch_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .encrypted_media_epoch_secret(
+                &hex::encode(group_id.as_slice()),
+                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                source_epoch,
+            )?)
+    }
+
+    fn encrypted_media_component_for_new_group(&self) -> Result<AppComponentData, AppError> {
+        let endpoints = if self
+            .app
+            .service_endpoints()
+            .encrypted_media_blob_endpoints
+            .is_empty()
+        {
+            vec![DEFAULT_BLOSSOM_SERVER_URL.to_owned()]
+        } else {
+            self.app
+                .service_endpoints()
+                .encrypted_media_blob_endpoints
+                .clone()
+        };
+        let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
+            .map_err(AppError::InvalidEncryptedMedia)?;
+        AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()
     }
 
     fn refresh_group_routes(&mut self) -> Result<(), AppError> {

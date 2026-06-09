@@ -86,6 +86,7 @@ impl LegacyAccountProjectionDb {
                 plaintext TEXT NOT NULL,
                 kind INTEGER NOT NULL DEFAULT 9,
                 tags_json TEXT,
+                source_epoch INTEGER,
                 recorded_at INTEGER,
                 received_at INTEGER NOT NULL
             );
@@ -176,6 +177,7 @@ impl LegacyAccountProjectionDb {
         ensure_column(&conn, "messages", "recorded_at", "INTEGER")?;
         ensure_column(&conn, "messages", "kind", "INTEGER NOT NULL DEFAULT 9")?;
         ensure_column(&conn, "messages", "tags_json", "TEXT")?;
+        ensure_column(&conn, "messages", "source_epoch", "INTEGER")?;
         ensure_column(
             &conn,
             "account_state",
@@ -486,9 +488,9 @@ impl LegacyAccountProjectionDb {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (
                 message_id_hex, direction, group_id_hex, sender, plaintext,
-                kind, tags_json, received_at, recorded_at
+                kind, tags_json, source_epoch, received_at, recorded_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &message.message_id_hex,
                 &message.direction,
@@ -497,6 +499,9 @@ impl LegacyAccountProjectionDb {
                 &message.plaintext,
                 message.kind as i64,
                 serialize_tags(&message.tags)?,
+                message
+                    .source_epoch
+                    .and_then(|value| i64::try_from(value).ok()),
                 now,
                 recorded_at,
             ],
@@ -511,11 +516,11 @@ impl LegacyAccountProjectionDb {
         let sql = match (&query.group_id_hex, query.limit) {
             (Some(_), Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json,
+                        kind, tags_json, source_epoch,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
-                           kind, tags_json,
+                           kind, tags_json, source_epoch,
                            recorded_at, received_at FROM messages
                     WHERE group_id_hex = ?1
                     ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
@@ -524,18 +529,18 @@ impl LegacyAccountProjectionDb {
             }
             (Some(_), None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json,
+                        kind, tags_json, source_epoch,
                         COALESCE(recorded_at, received_at), received_at FROM messages
                  WHERE group_id_hex = ?1
                  ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
             (None, Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json,
+                        kind, tags_json, source_epoch,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
-                           kind, tags_json,
+                           kind, tags_json, source_epoch,
                            recorded_at, received_at FROM messages
                     ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
                     LIMIT ?1
@@ -543,15 +548,15 @@ impl LegacyAccountProjectionDb {
             }
             (None, None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json,
+                        kind, tags_json, source_epoch,
                         COALESCE(recorded_at, received_at), received_at FROM messages
                  ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
         };
         let mut statement = self.conn.prepare(sql)?;
         let map_row = |row: &rusqlite::Row<'_>| {
-            let recorded_at = row.get::<_, i64>(7)?;
-            let received_at = row.get::<_, i64>(8)?;
+            let recorded_at = row.get::<_, i64>(8)?;
+            let received_at = row.get::<_, i64>(9)?;
             Ok(AppMessageRecord {
                 message_id_hex: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 direction: row.get(1)?,
@@ -560,6 +565,9 @@ impl LegacyAccountProjectionDb {
                 plaintext: row.get(4)?,
                 kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
                 tags: deserialize_tags_row(row.get::<_, Option<String>>(6)?, 6)?,
+                source_epoch: row
+                    .get::<_, Option<i64>>(7)?
+                    .and_then(|value| value.try_into().ok()),
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
             })
@@ -1323,6 +1331,7 @@ mod tests {
                 plaintext: message_id_hex.to_owned(),
                 kind: 9,
                 tags: Vec::new(),
+                source_epoch: None,
                 recorded_at: Some(recorded_at),
             })
             .unwrap();

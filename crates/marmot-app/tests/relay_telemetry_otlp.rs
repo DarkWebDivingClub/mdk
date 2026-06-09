@@ -330,6 +330,7 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
     let config = MarmotAppConfig::default().with_service_endpoints(MarmotServiceEndpoints {
         relay_telemetry_otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
         audit_log_tracker_endpoint: None,
+        encrypted_media_blob_endpoints: Vec::new(),
     });
     let app = MarmotApp::with_relay_and_config(tmp.path(), relay.url().await.to_string(), config);
     let runtime = MarmotAppRuntime::new(app);

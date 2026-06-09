@@ -54,8 +54,8 @@ remaining non-target identity. Full design in
 
 ### 7. MIP-01 group image encryption stays Marmot-custom as-is.
 
-Epoch-independent image key is a deliberate operational trade-off, not a flaw. MIP-04 per-file media encryption is
-different and is a Safe framework candidate.
+Epoch-independent image key is a deliberate operational trade-off, not a flaw. Encrypted media V1 is different and uses
+`SafeExportSecret(0x8008)` through `marmot.group.encrypted-media.v1`.
 
 ---
 

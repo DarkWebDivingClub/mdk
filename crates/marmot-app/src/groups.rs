@@ -5,13 +5,15 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_avatar_url_v1,
-    decode_nostr_routing_v1, encode_component_vectors, encode_group_avatar_url_v1,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
+    EncryptedMediaPolicyV1, GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
+    GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
+    encode_component_vectors, encode_encrypted_media_policy_v1, encode_group_avatar_url_v1,
     encode_nostr_routing_v1, encode_quic_varint,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
@@ -20,6 +22,7 @@ use cgka_traits::group::Group;
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
+use crate::media::media_imeta_tags_are_valid;
 use crate::{AccountState, AppError, ReceivedMessage, SendSummary, SyncSummary};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +41,8 @@ pub struct AppGroupRecord {
     pub message_retention: AppGroupMessageRetentionComponent,
     #[serde(default)]
     pub agent_text_stream: AppAgentTextStreamComponent,
+    #[serde(default)]
+    pub encrypted_media: AppGroupEncryptedMediaComponent,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
@@ -140,7 +145,30 @@ pub struct AppAgentTextStreamComponent {
     pub data_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppBlobEndpoint {
+    pub locator_kind: String,
+    pub base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupEncryptedMediaComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub required: bool,
+    pub media_format: String,
+    pub allowed_locator_kinds: Vec<String>,
+    pub default_blob_endpoints: Vec<AppBlobEndpoint>,
+    pub data_hex: String,
+}
+
 impl Default for AppAgentTextStreamComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl Default for AppGroupEncryptedMediaComponent {
     fn default() -> Self {
         Self::disabled()
     }
@@ -173,6 +201,7 @@ impl AppGroupRecord {
             admin_policy,
             message_retention,
             agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
             archived: false,
             pending_confirmation: false,
             welcomer_account_id_hex: None,
@@ -189,6 +218,7 @@ impl AppGroupRecord {
         message_retention: AppGroupMessageRetentionComponent,
         agent_text_stream: AppAgentTextStreamComponent,
         avatar_url: AppGroupAvatarUrlComponent,
+        encrypted_media: AppGroupEncryptedMediaComponent,
     ) -> Self {
         let (profile_name, profile_description) = group
             .map(|group| (group.name.clone(), group.description.clone()))
@@ -204,25 +234,20 @@ impl AppGroupRecord {
         );
         record.agent_text_stream = agent_text_stream;
         record.avatar_url = avatar_url;
+        record.encrypted_media = encrypted_media;
         record
     }
 
-    pub(crate) fn refresh_from_group(
-        &mut self,
-        nostr_routing: AppGroupNostrRoutingComponent,
-        group: Option<&Group>,
-        admin_policy: AppGroupAdminPolicyComponent,
-        message_retention: AppGroupMessageRetentionComponent,
-        agent_text_stream: AppAgentTextStreamComponent,
-        avatar_url: AppGroupAvatarUrlComponent,
-    ) {
+    pub(crate) fn refresh_from_group(&mut self, projection: &EventGroupProjection<'_>) {
+        let nostr_routing = projection.nostr_routing.clone();
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
-        self.admin_policy = admin_policy;
-        self.message_retention = message_retention;
-        self.agent_text_stream = agent_text_stream;
-        self.avatar_url = avatar_url;
-        if let Some(group) = group {
+        self.admin_policy = projection.admin_policy.clone();
+        self.message_retention = projection.message_retention.clone();
+        self.agent_text_stream = projection.agent_text_stream.clone();
+        self.avatar_url = projection.avatar_url.clone();
+        self.encrypted_media = projection.encrypted_media.clone();
+        if let Some(group) = projection.group_metadata {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
         }
@@ -498,6 +523,89 @@ impl AppAgentTextStreamComponent {
     }
 }
 
+impl AppGroupEncryptedMediaComponent {
+    pub(crate) fn new(policy: EncryptedMediaPolicyV1) -> Result<Self, AppError> {
+        let data =
+            encode_encrypted_media_policy_v1(&policy).map_err(AppError::InvalidEncryptedMedia)?;
+        let decoded =
+            decode_encrypted_media_policy_v1(&data).map_err(AppError::InvalidEncryptedMedia)?;
+        Ok(Self::from_policy(decoded, data))
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match decode_encrypted_media_policy_v1(bytes) {
+            Ok(policy) => Self::from_policy(policy, bytes.to_vec()),
+            Err(_) => Self {
+                component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
+                required: true,
+                media_format: String::new(),
+                allowed_locator_kinds: Vec::new(),
+                default_blob_endpoints: Vec::new(),
+                data_hex: hex::encode(bytes),
+            },
+        }
+    }
+
+    fn from_policy(policy: EncryptedMediaPolicyV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
+            required: true,
+            media_format: policy.media_format,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            default_blob_endpoints: policy
+                .default_blob_endpoints
+                .into_iter()
+                .map(|endpoint| AppBlobEndpoint {
+                    locator_kind: endpoint.locator_kind,
+                    base_url: endpoint.base_url,
+                })
+                .collect(),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self {
+            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
+            required: false,
+            media_format: String::new(),
+            allowed_locator_kinds: Vec::new(),
+            default_blob_endpoints: Vec::new(),
+            data_hex: String::new(),
+        }
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+
+    pub(crate) fn endpoint_policy(&self) -> Result<EncryptedMediaPolicyV1, AppError> {
+        if !self.required {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group does not require encrypted media".into(),
+            ));
+        }
+        EncryptedMediaPolicyV1::new(
+            self.media_format.clone(),
+            self.allowed_locator_kinds.clone(),
+            self.default_blob_endpoints
+                .iter()
+                .map(|endpoint| BlobStoreEndpointV1 {
+                    locator_kind: endpoint.locator_kind.clone(),
+                    base_url: endpoint.base_url.clone(),
+                }),
+            true,
+        )
+        .map_err(AppError::InvalidEncryptedMedia)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AppGroupImageInput {
     pub(crate) image_hash_hex: String,
@@ -514,6 +622,7 @@ pub(crate) struct EventGroupProjection<'a> {
     pub(crate) message_retention: AppGroupMessageRetentionComponent,
     pub(crate) agent_text_stream: AppAgentTextStreamComponent,
     pub(crate) avatar_url: AppGroupAvatarUrlComponent,
+    pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
 }
 
 #[derive(Clone, Debug)]
@@ -535,6 +644,7 @@ pub(crate) fn decode_received_event(
     sender_hex: &str,
     sender_display_name: Option<String>,
     group_id: &GroupId,
+    source_epoch: u64,
     source_message_id_hex: &str,
     source_recorded_at: u64,
 ) -> Option<ReceivedMessage> {
@@ -562,7 +672,7 @@ pub(crate) fn decode_received_event(
             .tags
             .iter()
             .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        && !media_imeta_is_valid(&event.tags)
+        && !media_imeta_tags_are_valid(&event.tags)
     {
         tracing::warn!(
             target: "marmot_app::ingest",
@@ -577,44 +687,12 @@ pub(crate) fn decode_received_event(
         sender: sender_hex.to_owned(),
         sender_display_name,
         group_id: group_id.clone(),
+        source_epoch,
         plaintext: event.content,
         kind: event.kind,
         tags: event.tags,
         recorded_at: source_recorded_at,
     })
-}
-
-fn media_imeta_is_valid(tags: &[Vec<String>]) -> bool {
-    let Some(imeta) = tags
-        .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
-    else {
-        return true;
-    };
-    let fields = imeta
-        .iter()
-        .skip(1)
-        .filter_map(|field| field.split_once(' '))
-        .collect::<HashMap<_, _>>();
-    let required = ["url", "m", "filename", "x", "n", "v"];
-    if required
-        .iter()
-        .any(|name| fields.get(name).is_none_or(|value| value.trim().is_empty()))
-    {
-        return false;
-    }
-    if fields.get("v") != Some(&"mip04-v2") {
-        return false;
-    }
-    match hex::decode(fields["x"]) {
-        Ok(hash) if hash.len() == 32 => {}
-        _ => return false,
-    }
-    match hex::decode(fields["n"]) {
-        Ok(nonce) if nonce.len() == 12 => {}
-        _ => return false,
-    }
-    true
 }
 
 pub(crate) fn observe_event(
@@ -656,6 +734,7 @@ pub(crate) fn observe_event(
         GroupEvent::MessageReceived {
             group_id,
             sender,
+            epoch,
             payload,
         } => {
             if let Some(projection) = group_projection {
@@ -677,6 +756,7 @@ pub(crate) fn observe_event(
                 &sender_hex,
                 sender_display_name,
                 group_id,
+                epoch.0,
                 source_message_id_hex,
                 source_recorded_at,
             ) else {
@@ -728,14 +808,7 @@ pub(crate) fn add_group(
         .iter_mut()
         .find(|group| group.group_id_hex == group_id_hex)
     {
-        existing.refresh_from_group(
-            projection.nostr_routing.clone(),
-            projection.group_metadata,
-            projection.admin_policy.clone(),
-            projection.message_retention.clone(),
-            projection.agent_text_stream.clone(),
-            projection.avatar_url.clone(),
-        );
+        existing.refresh_from_group(projection);
         existing.apply_confirmation_state(confirmation);
         return;
     }
@@ -747,6 +820,7 @@ pub(crate) fn add_group(
         projection.message_retention.clone(),
         projection.agent_text_stream.clone(),
         projection.avatar_url.clone(),
+        projection.encrypted_media.clone(),
     );
     group.apply_confirmation_state(confirmation);
     state.groups.push(group);

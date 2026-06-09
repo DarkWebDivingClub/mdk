@@ -46,16 +46,19 @@ use subscriptions::{
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogTrackerUpdateResultFfi,
-    AuditLogUploadResultFfi, AuditLogUploadSourceFfi, BackgroundNotificationCollectionFfi,
-    ChatListAvatarFfi, ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
+    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditLogFileFfi, AuditLogSettingsFfi,
+    AuditLogTrackerConfigFfi, AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi,
+    AuditLogUploadSourceFfi, BackgroundNotificationCollectionFfi, ChatListAvatarFfi,
+    ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
     ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
-    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
-    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    LocalPushRegistrationDebugFfi, MediaAttachmentReferenceFfi, MediaDownloadResultFfi,
+    MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
+    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    PushRegistrationFfi, RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi,
+    RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi,
@@ -733,6 +736,27 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Replace the group's encrypted-media default blob endpoints as a full
+    /// `marmot.group.encrypted-media.v1` component update. Requires the caller
+    /// to be an admin.
+    pub async fn replace_encrypted_media_blob_endpoints(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        endpoints: Vec<AppBlobEndpointFfi>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .replace_encrypted_media_blob_endpoints(
+                &account_ref,
+                &group_id,
+                endpoints.into_iter().map(Into::into).collect(),
+            )
+            .await?;
+        Ok(summary.into())
+    }
+
     /// Grant admin rights to `member_ref` (npub or hex). Requires the caller
     /// to be an admin; publishes a group state update.
     pub async fn promote_admin(
@@ -1000,25 +1024,30 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Send an already-uploaded encrypted media reference as a kind-9 chat
-    /// carrying a NIP-92 `imeta` tag.
-    pub async fn send_media_reference(
+    /// Send already-uploaded encrypted media attachments as a kind-9 chat
+    /// carrying ordered NIP-92 `imeta` tags.
+    pub async fn send_media_attachments(
         &self,
         account_ref: String,
         group_id_hex: String,
-        reference: MediaReferenceFfi,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
         caption: Option<String>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let summary = self
             .runtime
-            .send_media_reference(&account_ref, &group_id, reference.into(), caption)
+            .send_media_attachments(
+                &account_ref,
+                &group_id,
+                attachments.into_iter().map(Into::into).collect(),
+                caption,
+            )
             .await?;
         Ok(summary.into())
     }
 
-    /// Encrypt plaintext, upload the ciphertext to Blossom, and optionally
-    /// send the resulting media reference into the group.
+    /// Encrypt plaintext attachments, upload the ciphertext blobs, and
+    /// optionally send the resulting media references into the group.
     pub async fn upload_media(
         &self,
         account_ref: String,
@@ -1033,13 +1062,13 @@ impl Marmot {
         Ok(upload.into())
     }
 
-    /// Fetch an encrypted Blossom blob and decrypt it using the group's
-    /// MIP-04 encrypted-media exporter secret.
+    /// Fetch an encrypted media blob and decrypt it using the group's
+    /// encrypted media component secret.
     pub async fn download_media(
         &self,
         account_ref: String,
         group_id_hex: String,
-        reference: MediaReferenceFfi,
+        reference: MediaAttachmentReferenceFfi,
     ) -> Result<MediaDownloadResultFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let download = self

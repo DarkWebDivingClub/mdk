@@ -31,7 +31,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   `dm messages retry` group-convergence retries. Message projections and `messages subscribe` now expose typed
   `app_message` metadata for reactions, deletions, and media references.
 - Added `dm media list <group>`, which lists typed media references already projected from group message history.
-- Added `dm media upload` and `dm media download` over encrypted `mip04-v2` media and Blossom, using
+- Added `dm media upload` and `dm media download` over `encrypted-media-v1` media and Blossom, using
   `https://blossom.primal.net` as the default upload server.
 - Added `dm messages subscribe <group>`, a daemon-backed newline-delimited stream that emits typed `message`,
   `agent_stream_start`, `agent_stream_final`, `agent_stream_delta`, and `stream_preview` updates, including live

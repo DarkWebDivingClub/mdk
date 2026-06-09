@@ -250,6 +250,7 @@ pub enum GroupEvent {
     MessageReceived {
         group_id: GroupId,
         sender: MemberId,
+        epoch: EpochId,
         payload: Vec<u8>,
     },
     AppMessageInvalidated {

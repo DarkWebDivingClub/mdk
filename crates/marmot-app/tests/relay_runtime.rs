@@ -14,9 +14,9 @@ use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
-    MarmotAppRuntime, MediaReference, MediaUploadRequest, NotificationWakeSource, PushPlatform,
-    RuntimeMessageUpdate, TimelineMessageQuery, UserDirectorySearch, UserProfileMetadata,
-    tag_value,
+    MarmotAppRuntime, MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadRequest, NotificationWakeSource, PushPlatform, RuntimeMessageUpdate,
+    TimelineMessageQuery, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -373,7 +373,11 @@ async fn publish_key_package_at(
                 "0x0008".to_owned(),
                 "0x000a".to_owned(),
             ],
-            vec!["app_components".to_owned(), "0x8006".to_owned()],
+            vec![
+                "app_components".to_owned(),
+                "0x8006".to_owned(),
+                "0x8008".to_owned(),
+            ],
         ],
         BASE64_STANDARD.encode(key_package.bytes()),
         created_at,
@@ -2195,16 +2199,40 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
-    bob.send_media_reference(
+    bob.send_media_attachments(
         &group_id,
-        MediaReference {
-            url: "https://media.example/diagram.png".to_owned(),
-            file_hash_hex: hex::encode([0x42_u8; 32]),
-            nonce_hex: hex::encode([0x24_u8; 12]),
-            file_name: "diagram.png".to_owned(),
-            media_type: "image/png".to_owned(),
-            version: "mip04-v2".to_owned(),
-        },
+        vec![
+            MediaAttachmentReference {
+                locators: vec![MediaLocator {
+                    kind: "blossom-v1".to_owned(),
+                    value: "https://media.example/diagram.png".to_owned(),
+                }],
+                ciphertext_sha256: hex::encode([0x11_u8; 32]),
+                plaintext_sha256: hex::encode([0x42_u8; 32]),
+                nonce_hex: hex::encode([0x24_u8; 12]),
+                file_name: "diagram.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                version: "encrypted-media-v1".to_owned(),
+                source_epoch: 0,
+                dim: Some("800x600".to_owned()),
+                thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
+            },
+            MediaAttachmentReference {
+                locators: vec![MediaLocator {
+                    kind: "blossom-v1".to_owned(),
+                    value: "https://media.example/audio.ogg".to_owned(),
+                }],
+                ciphertext_sha256: hex::encode([0x12_u8; 32]),
+                plaintext_sha256: hex::encode([0x43_u8; 32]),
+                nonce_hex: hex::encode([0x25_u8; 12]),
+                file_name: "audio.ogg".to_owned(),
+                media_type: "audio/ogg".to_owned(),
+                version: "encrypted-media-v1".to_owned(),
+                source_epoch: 0,
+                dim: None,
+                thumbhash: None,
+            },
+        ],
         Some("launch diagram".to_owned()),
     )
     .await
@@ -2213,41 +2241,57 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     // Media is a kind-9 chat: content is the caption, attachment is an `imeta`.
     assert_eq!(media.messages[0].plaintext, "launch diagram");
     assert_eq!(media.messages[0].kind, MARMOT_APP_EVENT_KIND_CHAT);
-    let imeta = media.messages[0]
+    let imeta_tags: Vec<_> = media.messages[0]
         .tags
         .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .expect("media carries an imeta tag");
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .collect();
+    assert_eq!(imeta_tags.len(), 2);
+    let imeta = imeta_tags[0];
     assert!(
         imeta
             .iter()
-            .any(|field| field == "url https://media.example/diagram.png")
+            .any(|field| field == "locator blossom-v1 https://media.example/diagram.png")
     );
     assert!(imeta.iter().any(|field| field == "m image/png"));
     assert!(imeta.iter().any(|field| field == "filename diagram.png"));
     assert!(
         imeta
             .iter()
-            .any(|field| field == "n 242424242424242424242424")
+            .any(|field| field == "nonce 242424242424242424242424")
     );
-    assert!(imeta.iter().any(|field| field == "v mip04-v2"));
+    assert!(imeta.iter().any(|field| field == "v encrypted-media-v1"));
+    assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
+    assert!(imeta.iter().all(|field| !field.starts_with("blurhash ")));
+    assert!(
+        imeta_tags[1]
+            .iter()
+            .any(|field| field == "filename audio.ogg")
+    );
 
     let bad_media = bob
-        .send_media_reference(
+        .send_media_attachments(
             &group_id,
-            MediaReference {
-                url: "https://media.example/diagram.png".to_owned(),
-                file_hash_hex: "not-hex".to_owned(),
+            vec![MediaAttachmentReference {
+                locators: vec![MediaLocator {
+                    kind: "blossom-v1".to_owned(),
+                    value: "https://media.example/diagram.png".to_owned(),
+                }],
+                ciphertext_sha256: hex::encode([0x11_u8; 32]),
+                plaintext_sha256: "not-hex".to_owned(),
                 nonce_hex: hex::encode([0x24_u8; 12]),
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
-                version: "mip04-v2".to_owned(),
-            },
+                version: "encrypted-media-v1".to_owned(),
+                source_epoch: 0,
+                dim: None,
+                thumbhash: None,
+            }],
             None,
         )
         .await
         .unwrap_err();
-    assert!(bad_media.to_string().contains("media hash"));
+    assert!(bad_media.to_string().contains("media plaintext_sha256"));
 }
 
 #[tokio::test]
@@ -2325,18 +2369,32 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     bob.sync().await.unwrap();
     let group_state = alice.group_mls_state(&group_id).unwrap();
     assert!(
-        !group_state.required_app_components.contains(&0x8007),
-        "MIP-04 media uses the raw encrypted-media exporter label, not a SafeExportSecret app component"
+        group_state.required_app_components.contains(&0x8008),
+        "encrypted media v1 is a required SafeExportSecret app component"
     );
 
     let plaintext = b"marmot encrypted media tracer bullet".to_vec();
+    let second_plaintext = b"second attachment in the same message".to_vec();
     let upload = alice
         .upload_media(
             &group_id,
             MediaUploadRequest {
-                file_name: "note.txt".to_owned(),
-                media_type: "Text/Plain; charset=utf-8".to_owned(),
-                plaintext: plaintext.clone(),
+                attachments: vec![
+                    MediaUploadAttachmentRequest {
+                        file_name: "note.txt".to_owned(),
+                        media_type: "Text/Plain; charset=utf-8".to_owned(),
+                        plaintext: plaintext.clone(),
+                        dim: None,
+                        thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
+                    },
+                    MediaUploadAttachmentRequest {
+                        file_name: "clip.mp4".to_owned(),
+                        media_type: "video/mp4".to_owned(),
+                        plaintext: second_plaintext.clone(),
+                        dim: Some("640x360".to_owned()),
+                        thumbhash: None,
+                    },
+                ],
                 caption: Some("secret note".to_owned()),
                 send: true,
                 blossom_server: Some(blossom.url.clone()),
@@ -2345,58 +2403,106 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .await
         .unwrap();
 
-    assert_eq!(upload.reference.file_name, "note.txt");
-    assert_eq!(upload.reference.media_type, "text/plain");
-    assert_eq!(upload.reference.version, "mip04-v2");
+    assert_eq!(upload.attachments.len(), 2);
+    let reference = upload.attachments[0].reference.clone();
+    let second_reference = upload.attachments[1].reference.clone();
+    assert_eq!(reference.file_name, "note.txt");
+    assert_eq!(reference.media_type, "text/plain");
+    assert_eq!(reference.version, "encrypted-media-v1");
     assert_eq!(
-        upload.reference.file_hash_hex,
+        reference.plaintext_sha256,
         hex::encode(Sha256::digest(&plaintext))
     );
-    assert_eq!(upload.reference.nonce_hex.len(), 24);
+    assert_eq!(reference.nonce_hex.len(), 24);
+    assert!(reference.thumbhash.is_some());
+    assert_eq!(second_reference.file_name, "clip.mp4");
+    assert_eq!(second_reference.media_type, "video/mp4");
+    assert_eq!(
+        second_reference.plaintext_sha256,
+        hex::encode(Sha256::digest(&second_plaintext))
+    );
     assert!(upload.sent.as_ref().is_some_and(|sent| sent.published > 0));
 
     let stored = blossom
-        .blob(&upload.encrypted_hash_hex)
+        .blob(&reference.ciphertext_sha256)
         .await
         .expect("encrypted blob was uploaded");
     assert_ne!(stored, plaintext);
     assert_eq!(
         hex::encode(Sha256::digest(&stored)),
-        upload.encrypted_hash_hex
+        reference.ciphertext_sha256
     );
+    let second_stored = blossom
+        .blob(&second_reference.ciphertext_sha256)
+        .await
+        .expect("second encrypted blob was uploaded");
+    assert_ne!(second_stored, second_plaintext);
 
     let sync = bob.sync().await.unwrap();
     assert_eq!(sync.messages[0].plaintext, "secret note");
-    let imeta = sync.messages[0]
+    let imeta_tags: Vec<_> = sync.messages[0]
         .tags
         .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .expect("media message carries imeta");
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .collect();
+    assert_eq!(imeta_tags.len(), 2);
+    let imeta = imeta_tags[0];
+    let second_imeta = imeta_tags[1];
     assert!(
         imeta
             .iter()
-            .any(|field| field == &format!("url {}", upload.reference.url))
+            .any(|field| field == &format!("locator blossom-v1 {}", reference.locators[0].value))
     );
     assert!(imeta.iter().any(|field| field == "m text/plain"));
     assert!(imeta.iter().any(|field| field == "filename note.txt"));
-    assert!(imeta.iter().any(|field| field == "v mip04-v2"));
+    assert!(imeta.iter().any(|field| field == "v encrypted-media-v1"));
+    assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
+    assert!(imeta.iter().all(|field| !field.starts_with("blurhash ")));
+    assert!(second_imeta.iter().any(
+        |field| field == &format!("locator blossom-v1 {}", second_reference.locators[0].value)
+    ));
+    assert!(second_imeta.iter().any(|field| field == "m video/mp4"));
+    assert!(
+        second_imeta
+            .iter()
+            .any(|field| field == "filename clip.mp4")
+    );
 
     let download = bob
-        .download_media(&group_id, upload.reference.clone())
+        .download_media(&group_id, reference.clone())
         .await
         .unwrap();
     assert_eq!(download.plaintext, plaintext);
     assert_eq!(download.file_name, "note.txt");
     assert_eq!(download.media_type, "text/plain");
+    let second_download = bob
+        .download_media(&group_id, second_reference.clone())
+        .await
+        .unwrap();
+    assert_eq!(second_download.plaintext, second_plaintext);
+    assert_eq!(second_download.file_name, "clip.mp4");
+    assert_eq!(second_download.media_type, "video/mp4");
 
-    let second_plaintext = b"second media in the same epoch".to_vec();
-    let second_upload = alice
+    alice.update_message_retention(&group_id, 60).await.unwrap();
+    bob.sync().await.unwrap();
+    let later_epoch_download = bob
+        .download_media(&group_id, reference.clone())
+        .await
+        .unwrap();
+    assert_eq!(later_epoch_download.plaintext, plaintext);
+
+    let third_plaintext = b"third media after the epoch update".to_vec();
+    let third_upload = alice
         .upload_media(
             &group_id,
             MediaUploadRequest {
-                file_name: "second.txt".to_owned(),
-                media_type: "text/plain".to_owned(),
-                plaintext: second_plaintext.clone(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "third.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: third_plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
                 caption: None,
                 send: false,
                 blossom_server: Some(blossom.url.clone()),
@@ -2404,11 +2510,67 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         )
         .await
         .unwrap();
-    let second_download = bob
-        .download_media(&group_id, second_upload.reference)
+    let third_reference = third_upload.attachments[0].reference.clone();
+    let third_download = bob
+        .download_media(&group_id, third_reference)
         .await
         .unwrap();
-    assert_eq!(second_download.plaintext, second_plaintext);
+    assert_eq!(third_download.plaintext, third_plaintext);
+}
+
+#[tokio::test]
+async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("media endpoints", &["bob"])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    bob.sync().await.unwrap();
+
+    let bob_error = bob
+        .replace_encrypted_media_blob_endpoints(
+            &group_id,
+            vec![marmot_app::AppBlobEndpoint {
+                locator_kind: "blossom-v1".to_owned(),
+                base_url: "https://bob.example".to_owned(),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(bob_error.to_string().contains("admin"));
+
+    alice
+        .replace_encrypted_media_blob_endpoints(
+            &group_id,
+            vec![marmot_app::AppBlobEndpoint {
+                locator_kind: "blossom-v1".to_owned(),
+                base_url: "https://media.example".to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+
+    let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
+    assert_eq!(
+        bob_group.encrypted_media.allowed_locator_kinds,
+        vec!["blossom-v1".to_owned()]
+    );
+    assert_eq!(bob_group.encrypted_media.default_blob_endpoints.len(), 1);
+    assert_eq!(
+        bob_group.encrypted_media.default_blob_endpoints[0].base_url,
+        "https://media.example"
+    );
 }
 
 #[tokio::test]

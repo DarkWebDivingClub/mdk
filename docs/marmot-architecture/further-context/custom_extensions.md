@@ -651,7 +651,7 @@ unnecessary; if a second Marmot subsystem ever needs authenticated_data, SafeAAD
 ### 6.5 MIP-04 — Encrypted Media
 
 **Current approach:** Marmot-custom ChaCha20-Poly1305 with key derived from
-`MLS-Exporter("marmot", "encrypted-media", 32)` → HKDF with version label `"mip04-v2"` and per-file metadata. Random
+`MLS-Exporter("marmot", "encrypted-media", 32)` → HKDF with the legacy media version label and per-file metadata. Random
 nonce stored in `imeta` tag.
 
 **Inherit vs Custom check:**
@@ -661,8 +661,9 @@ nonce stored in `imeta` tag.
   with a Marmot-assigned ComponentID (e.g., `0x8006 = marmot_encrypted_media`). Same benefit as MIP-03: per-component
   forward-secure derivation, proper consumption, domain separation from other Marmot subsystems.
 - The `imeta` tag format is Nostr-layer metadata; appropriately Marmot-custom.
-- The HKDF with `mip04-v2` label is providing version-based domain separation. The Safe framework would fold this into
-  ComponentID-based domain separation: bumping to `mip04-v3` could be a new ComponentID rather than a label change.
+- The HKDF with the legacy media version label is providing version-based domain separation. The Safe framework would
+  fold this into ComponentID-based domain separation: a future breaking media version could be a new ComponentID rather
+  than a label change.
 
 **Verdict:** current approach works but doesn't take advantage of Safe framework. **Candidate for Safe-framework
 adoption in a future MIP-04 revision.**
@@ -766,7 +767,7 @@ case, `ProposalType::Custom(_)` may never be needed. But if future MIPs want fea
 **C. Three places where Marmot rolls its own crypto** with pattern discipline but no formal domain separation:
 
 - MIP-01 image encryption (HKDF labels `"mip01-image-encryption-v2"`, `"mip01-blossom-upload-v2"`)
-- MIP-04 media encryption (HKDF label `"mip04-v2"` + file metadata)
+- MIP-04 media encryption (HKDF legacy media version label + file metadata)
 - MIP-05 token encryption (HKDF labels `"mip05-v1"`, `"mip05-token-encryption"`)
 
 The MIP-04 case could migrate to the Safe framework. The MIP-01 case is a deliberate design trade-off and should stay

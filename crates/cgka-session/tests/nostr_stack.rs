@@ -57,6 +57,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
         }]
@@ -159,6 +160,7 @@ async fn group_delivery_requires_synced_group_subscription() {
         after_sync.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"sync gated"),
         }]

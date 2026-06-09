@@ -31,7 +31,7 @@ into spec text.
 - **MIP-01** — Group Construction
 - **MIP-02** — Welcomes
 - **MIP-03** — Group Messages and SelfRemove
-- **MIP-04** — Encrypted Media
+- **Encrypted Media V1** — `marmot.group.encrypted-media.v1`
 - **MIP-05** — Push Notifications
 
 **In PR / design:**

@@ -23,6 +23,7 @@ pub const NOSTR_ROUTING_COMPONENT_ID: AppComponentId = 0x8004;
 pub const GROUP_MESSAGE_RETENTION_COMPONENT_ID: AppComponentId = 0x8005;
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT_ID: AppComponentId = 0x8006;
 pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
+pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId = 0x8008;
 
 pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
@@ -31,11 +32,25 @@ pub const NOSTR_ROUTING_COMPONENT: &str = "marmot.transport.nostr.routing.v1";
 pub const GROUP_MESSAGE_RETENTION_COMPONENT: &str = "marmot.group.message-retention.v1";
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT: &str = "marmot.group.agent-text-stream.quic.v1";
 pub const GROUP_AVATAR_URL_COMPONENT: &str = "marmot.group.avatar-url.v1";
+pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = "marmot.group.encrypted-media.v1";
+pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
+pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";
 
 /// Maximum encoded length of a group avatar URL, in bytes.
 pub const GROUP_AVATAR_URL_MAX_LEN: usize = 2048;
 /// Maximum encoded length of the optional `dim` / `thumbhash` render hints.
 pub const GROUP_AVATAR_HINT_MAX_LEN: usize = 256;
+pub const ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN: usize = 64;
+pub const ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN: usize = 2048;
+pub const ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS: usize = 16;
+pub const ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS: usize = 16;
+// Upper bounds for nested var-bytes vectors before decoding them into owned buffers.
+const ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN: usize =
+    ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS * (ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + 2);
+const ENCRYPTED_MEDIA_ENDPOINT_ENTRY_MAX_LEN: usize =
+    (ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + 2) + (ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN + 2);
+const ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN: usize =
+    ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS * (ENCRYPTED_MEDIA_ENDPOINT_ENTRY_MAX_LEN + 2);
 
 /// Initial app-component state supplied by the app layer at group creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +75,100 @@ impl NostrRoutingV1 {
         };
         validate_nostr_routing(&value)?;
         Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobStoreEndpointV1 {
+    pub locator_kind: String,
+    pub base_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedMediaPolicyV1 {
+    pub media_format: String,
+    pub allowed_locator_kinds: Vec<String>,
+    pub default_blob_endpoints: Vec<BlobStoreEndpointV1>,
+}
+
+impl EncryptedMediaPolicyV1 {
+    pub fn blossom_default(
+        endpoints: impl IntoIterator<Item = String>,
+        allow_loopback_http: bool,
+    ) -> Result<Self, String> {
+        Self::new(
+            ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
+            vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()],
+            endpoints.into_iter().map(|base_url| BlobStoreEndpointV1 {
+                locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                base_url,
+            }),
+            allow_loopback_http,
+        )
+    }
+
+    pub fn new(
+        media_format: String,
+        allowed_locator_kinds: Vec<String>,
+        endpoints: impl IntoIterator<Item = BlobStoreEndpointV1>,
+        allow_loopback_http: bool,
+    ) -> Result<Self, String> {
+        let media_format = media_format.trim().to_owned();
+        if media_format != ENCRYPTED_MEDIA_FORMAT_V1 {
+            return Err(format!(
+                "encrypted media format must be {ENCRYPTED_MEDIA_FORMAT_V1}"
+            ));
+        }
+        let allowed_locator_kinds =
+            normalize_locator_kinds(allowed_locator_kinds, "allowed locator kind")?;
+        if allowed_locator_kinds.is_empty() {
+            return Err("encrypted media policy must allow at least one locator kind".into());
+        }
+        if allowed_locator_kinds.len() > ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS {
+            return Err(format!(
+                "encrypted media policy allows more than {ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS} locator kinds"
+            ));
+        }
+
+        let mut normalized_endpoints = Vec::new();
+        for endpoint in endpoints {
+            let locator_kind =
+                normalize_locator_kind(&endpoint.locator_kind, "endpoint locator kind")?;
+            if !allowed_locator_kinds
+                .iter()
+                .any(|kind| kind == &locator_kind)
+            {
+                return Err("encrypted media endpoint locator kind is not allowed".into());
+            }
+            let base_url =
+                validate_and_normalize_blob_endpoint_url(&endpoint.base_url, allow_loopback_http)?;
+            let endpoint = BlobStoreEndpointV1 {
+                locator_kind,
+                base_url,
+            };
+            if !normalized_endpoints
+                .iter()
+                .any(|existing| existing == &endpoint)
+            {
+                normalized_endpoints.push(endpoint);
+            }
+        }
+        if normalized_endpoints.is_empty() {
+            return Err(
+                "encrypted media policy must include at least one default blob endpoint".into(),
+            );
+        }
+        if normalized_endpoints.len() > ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS {
+            return Err(format!(
+                "encrypted media policy includes more than {ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS} default blob endpoints"
+            ));
+        }
+
+        Ok(Self {
+            media_format,
+            allowed_locator_kinds,
+            default_blob_endpoints: normalized_endpoints,
+        })
     }
 }
 
@@ -210,6 +319,104 @@ pub fn decode_nostr_routing_v1(bytes: &[u8]) -> Result<NostrRoutingV1, String> {
     Ok(routing)
 }
 
+pub fn encode_encrypted_media_policy_v1(
+    policy: &EncryptedMediaPolicyV1,
+) -> Result<Vec<u8>, String> {
+    let policy = EncryptedMediaPolicyV1::new(
+        policy.media_format.clone(),
+        policy.allowed_locator_kinds.clone(),
+        policy.default_blob_endpoints.clone(),
+        true,
+    )?;
+    let mut allowed = Vec::new();
+    for kind in &policy.allowed_locator_kinds {
+        encode_var_bytes(kind.as_bytes(), &mut allowed);
+    }
+    let mut endpoints = Vec::new();
+    for endpoint in &policy.default_blob_endpoints {
+        let mut encoded_endpoint = Vec::new();
+        encode_var_bytes(endpoint.locator_kind.as_bytes(), &mut encoded_endpoint);
+        encode_var_bytes(endpoint.base_url.as_bytes(), &mut encoded_endpoint);
+        encode_var_bytes(&encoded_endpoint, &mut endpoints);
+    }
+    Ok(encode_component_vectors(&[
+        policy.media_format.as_bytes(),
+        allowed.as_slice(),
+        endpoints.as_slice(),
+    ]))
+}
+
+pub fn decode_encrypted_media_policy_v1(bytes: &[u8]) -> Result<EncryptedMediaPolicyV1, String> {
+    let mut cursor = bytes;
+    let media_format = decode_var_bytes(&mut cursor, 64, "encrypted media format")?;
+    let allowed_bytes = decode_var_bytes(
+        &mut cursor,
+        ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN,
+        "encrypted media locator kinds",
+    )?;
+    let endpoints_bytes = decode_var_bytes(
+        &mut cursor,
+        ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN,
+        "encrypted media default blob endpoints",
+    )?;
+    if !cursor.is_empty() {
+        return Err("encrypted media policy has trailing bytes".into());
+    }
+    let media_format = String::from_utf8(media_format)
+        .map_err(|e| format!("encrypted media format is not UTF-8: {e}"))?;
+
+    let mut allowed_cursor = allowed_bytes.as_slice();
+    let mut allowed_locator_kinds = Vec::new();
+    while !allowed_cursor.is_empty() {
+        let kind = decode_var_bytes(
+            &mut allowed_cursor,
+            ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN,
+            "encrypted media locator kind",
+        )?;
+        allowed_locator_kinds.push(
+            String::from_utf8(kind)
+                .map_err(|e| format!("encrypted media locator kind is not UTF-8: {e}"))?,
+        );
+    }
+
+    let mut endpoints_cursor = endpoints_bytes.as_slice();
+    let mut default_blob_endpoints = Vec::new();
+    while !endpoints_cursor.is_empty() {
+        let endpoint_bytes = decode_var_bytes(
+            &mut endpoints_cursor,
+            ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN + 8,
+            "encrypted media endpoint",
+        )?;
+        let mut endpoint_cursor = endpoint_bytes.as_slice();
+        let locator_kind = decode_var_bytes(
+            &mut endpoint_cursor,
+            ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN,
+            "encrypted media endpoint locator kind",
+        )?;
+        let base_url = decode_var_bytes(
+            &mut endpoint_cursor,
+            ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN,
+            "encrypted media endpoint base URL",
+        )?;
+        if !endpoint_cursor.is_empty() {
+            return Err("encrypted media endpoint has trailing bytes".into());
+        }
+        default_blob_endpoints.push(BlobStoreEndpointV1 {
+            locator_kind: String::from_utf8(locator_kind)
+                .map_err(|e| format!("encrypted media endpoint locator kind is not UTF-8: {e}"))?,
+            base_url: String::from_utf8(base_url)
+                .map_err(|e| format!("encrypted media endpoint base URL is not UTF-8: {e}"))?,
+        });
+    }
+
+    EncryptedMediaPolicyV1::new(
+        media_format,
+        allowed_locator_kinds,
+        default_blob_endpoints,
+        true,
+    )
+}
+
 /// Decoded `marmot.group.avatar-url.v1` state. An absent avatar is an empty `url`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupAvatarUrlV1 {
@@ -321,6 +528,113 @@ pub fn validate_and_normalize_group_avatar_url(raw: &str) -> Result<String, Stri
         ));
     }
     Ok(normalized.to_owned())
+}
+
+pub fn validate_and_normalize_blob_endpoint_url(
+    raw: &str,
+    allow_loopback_http: bool,
+) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("encrypted media endpoint URL must not be empty".into());
+    }
+    if raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(format!(
+            "encrypted media endpoint URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        ));
+    }
+    let mut url =
+        Url::parse(raw).map_err(|e| format!("encrypted media endpoint URL is invalid: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("encrypted media endpoint URL must not include credentials".into());
+    }
+    if url.fragment().is_some() {
+        return Err("encrypted media endpoint URL must not include a fragment".into());
+    }
+    if url.query().is_some() {
+        return Err("encrypted media endpoint URL must not include a query".into());
+    }
+    let host = url
+        .host()
+        .ok_or("encrypted media endpoint URL must include a host")?;
+    match url.scheme() {
+        "https" => match host {
+            Host::Domain(domain) => {
+                let lowered = domain.to_ascii_lowercase();
+                if lowered == "localhost" || lowered.ends_with(".localhost") {
+                    return Err("encrypted media https endpoint must not point at localhost".into());
+                }
+            }
+            Host::Ipv4(addr) => reject_non_routable_ipv4(addr).map_err(|_| {
+                "encrypted media endpoint URL must not point at a non-routable address".to_owned()
+            })?,
+            Host::Ipv6(addr) => reject_non_routable_ipv6(addr).map_err(|_| {
+                "encrypted media endpoint URL must not point at a non-routable address".to_owned()
+            })?,
+        },
+        "http" if allow_loopback_http && is_loopback_host(host) => {}
+        "http" => {
+            return Err(
+                "encrypted media endpoint URL scheme must be https unless loopback http is explicitly allowed"
+                    .into(),
+            );
+        }
+        _ => return Err("encrypted media endpoint URL scheme must be https".into()),
+    }
+    url.set_fragment(None);
+    let mut normalized = url.as_str().trim_end_matches('/').to_owned();
+    if normalized.is_empty() {
+        normalized = url.as_str().to_owned();
+    }
+    if normalized.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(format!(
+            "encrypted media endpoint URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_locator_kinds(kinds: Vec<String>, label: &'static str) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for kind in kinds {
+        let kind = normalize_locator_kind(&kind, label)?;
+        if !normalized.iter().any(|existing| existing == &kind) {
+            normalized.push(kind);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_locator_kind(value: &str, label: &'static str) -> Result<String, String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN {
+        return Err(format!(
+            "{label} exceeds {ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN} bytes"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!(
+            "{label} must contain only lowercase ASCII letters, digits, and '-'"
+        ));
+    }
+    Ok(value)
+}
+
+fn is_loopback_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            lowered == "localhost" || lowered.ends_with(".localhost")
+        }
+        Host::Ipv4(addr) => addr.is_loopback(),
+        Host::Ipv6(addr) => addr.is_loopback(),
+    }
 }
 
 fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {
@@ -515,6 +829,97 @@ mod tests {
             vec!["wss://relay-a.example", "wss://relay-b.example"]
         );
         assert_eq!(decoded.nostr_group_id, [0x42; 32]);
+    }
+
+    #[test]
+    fn encrypted_media_policy_round_trips_ordered_endpoints() {
+        let policy = EncryptedMediaPolicyV1::blossom_default(
+            vec![
+                "https://blossom-a.example/upload-root/".to_owned(),
+                "https://blossom-b.example".to_owned(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        let encoded = encode_encrypted_media_policy_v1(&policy).unwrap();
+        let decoded = decode_encrypted_media_policy_v1(&encoded).unwrap();
+
+        assert_eq!(decoded.media_format, ENCRYPTED_MEDIA_FORMAT_V1);
+        assert_eq!(decoded.allowed_locator_kinds, vec![BLOSSOM_LOCATOR_KIND_V1]);
+        assert_eq!(
+            decoded.default_blob_endpoints,
+            vec![
+                BlobStoreEndpointV1 {
+                    locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                    base_url: "https://blossom-a.example/upload-root".to_owned(),
+                },
+                BlobStoreEndpointV1 {
+                    locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                    base_url: "https://blossom-b.example".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn encrypted_media_policy_decode_rejects_oversized_top_level_vectors() {
+        let mut oversized_allowed = Vec::new();
+        encode_var_bytes(ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(), &mut oversized_allowed);
+        encode_quic_varint(
+            (ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN + 1) as u64,
+            &mut oversized_allowed,
+        );
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&oversized_allowed),
+            Err("encrypted media locator kinds exceeds maximum length".into())
+        );
+
+        let mut oversized_endpoints = Vec::new();
+        encode_var_bytes(
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            &mut oversized_endpoints,
+        );
+        encode_var_bytes(&[], &mut oversized_endpoints);
+        encode_quic_varint(
+            (ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN + 1) as u64,
+            &mut oversized_endpoints,
+        );
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&oversized_endpoints),
+            Err("encrypted media default blob endpoints exceeds maximum length".into())
+        );
+    }
+
+    #[test]
+    fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
+        assert!(
+            EncryptedMediaPolicyV1::blossom_default(
+                vec!["http://media.example".to_owned()],
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            EncryptedMediaPolicyV1::blossom_default(
+                vec!["http://127.0.0.1:3000".to_owned()],
+                false,
+            )
+            .is_err()
+        );
+        let local = EncryptedMediaPolicyV1::blossom_default(
+            vec!["http://127.0.0.1:3000/".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            local.default_blob_endpoints[0].base_url,
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
+            Err("encrypted media endpoint URL must not point at a non-routable address".into())
+        );
     }
 
     #[test]

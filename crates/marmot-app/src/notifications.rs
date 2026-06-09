@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn push_gossip_with_wrong_version_is_rejected_as_advisory() {
         let group_id_hex = "ab".repeat(32);
-        let stale_payload = r#"{"v":"mip04-legacy","tokens":[]}"#;
+        let stale_payload = r#"{"v":"stale-legacy","tokens":[]}"#;
         let err = parse_push_gossip(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
             &group_id_hex,

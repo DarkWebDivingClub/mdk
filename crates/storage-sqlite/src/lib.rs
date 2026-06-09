@@ -9,6 +9,7 @@ mod account_projection;
 mod chat_list;
 mod codec;
 mod connection;
+mod encrypted_media_secrets;
 mod migrations;
 mod openmls_storage;
 mod shared;

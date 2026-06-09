@@ -7,6 +7,8 @@ const COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT: Option<&str> =
     option_env!("MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT");
 const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
+const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
+    option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
@@ -26,6 +28,7 @@ pub struct MarmotAppConfig {
 pub struct MarmotServiceEndpoints {
     pub relay_telemetry_otlp_endpoint: Option<String>,
     pub audit_log_tracker_endpoint: Option<String>,
+    pub encrypted_media_blob_endpoints: Vec<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -55,6 +58,9 @@ impl MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
                 .map(str::to_owned),
             audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
+            encrypted_media_blob_endpoints: COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
+                .map(split_endpoint_list)
+                .unwrap_or_default(),
         }
         .normalize()
     }
@@ -62,6 +68,8 @@ impl MarmotServiceEndpoints {
     pub fn normalize(mut self) -> Self {
         self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
         self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
+        self.encrypted_media_blob_endpoints =
+            normalize_endpoint_list(self.encrypted_media_blob_endpoints);
         self
     }
 }
@@ -214,6 +222,26 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         let value = value.trim().to_owned();
         (!value.is_empty()).then_some(value)
     })
+}
+
+fn split_endpoint_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_endpoint_list(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().to_owned();
+        if !value.is_empty() && !normalized.iter().any(|existing| existing == &value) {
+            normalized.push(value);
+        }
+    }
+    normalized
 }
 
 fn trim_required(name: &str, value: String) -> Result<String, String> {
