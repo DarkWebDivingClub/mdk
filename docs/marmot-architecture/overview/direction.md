@@ -3,7 +3,7 @@ title: "Direction — Where We're Going"
 created: 2026-04-19
 tags: [marmot, overview, direction, conclusions]
 status: overview
-updated: 2026-05-11
+updated: 2026-06-09
 ---
 
 # Direction — Where We're Going
@@ -55,7 +55,8 @@ remaining non-target identity. Full design in
 ### 7. MIP-01 group image encryption stays Marmot-custom as-is.
 
 Epoch-independent image key is a deliberate operational trade-off, not a flaw. Encrypted media V1 is different and uses
-`SafeExportSecret(0x8008)` through `marmot.group.encrypted-media.v1`.
+the reusable `MLS-Exporter("marmot", "encrypted-media", 32)` media secret for each message source epoch, with
+`marmot.group.encrypted-media.v1` owning the group media policy.
 
 ---
 

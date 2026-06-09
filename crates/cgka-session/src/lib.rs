@@ -255,6 +255,20 @@ impl AccountDeviceSession {
             .ok_or_else(|| EngineError::Other(format!("missing exporter secret for label {label}")))
     }
 
+    pub fn exporter_secret_with_epoch(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> Result<(EpochId, SecretBytes), EngineError> {
+        let context = self.engine.group_context(group_id)?;
+        let epoch = context.epoch();
+        let secret = context.exporter_secret(label, length).ok_or_else(|| {
+            EngineError::Other(format!("missing exporter secret for label {label}"))
+        })?;
+        Ok((epoch, secret))
+    }
+
     pub fn safe_export_secret_with_epoch(
         &mut self,
         group_id: &GroupId,

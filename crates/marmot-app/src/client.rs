@@ -7,8 +7,8 @@ use cgka_traits::agent_text_stream::{
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
     ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -55,7 +55,9 @@ impl AppClient {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
+        self.cache_current_encrypted_media_epoch_secrets();
         self.runtime.sync_transport_groups(rebuild_since).await?;
+        self.cache_current_encrypted_media_epoch_secrets();
         Ok(())
     }
 
@@ -1372,16 +1374,15 @@ impl AppClient {
                 }
                 if message.kind == MARMOT_APP_EVENT_KIND_CHAT
                     && media_imeta_tags_are_valid(&message.tags)
-                    && let Err(err) = self.remember_encrypted_media_secret_if_current(
-                        &message.group_id,
-                        message.source_epoch,
-                    )
+                    && self
+                        .remember_current_encrypted_media_secret(&message.group_id)
+                        .is_err()
                 {
                     tracing::warn!(
                         target: "marmot_app::media",
                         method = "ingest_delivery",
                         error_code = "encrypted_media_secret_cache_skipped",
-                        "failed to cache encrypted media source epoch secret: {err}",
+                        "failed to cache encrypted media source epoch secret",
                     );
                 }
                 self.app.remember_directory_message_sender(&message)?;
@@ -1578,9 +1579,11 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(u64, SecretBytes), AppError> {
-        let (epoch, secret) = self
-            .runtime
-            .safe_export_secret_with_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
         Ok((epoch.0, secret))
     }
@@ -1593,30 +1596,56 @@ impl AppClient {
         if let Some(secret) = self.cached_encrypted_media_epoch_secret(group_id, source_epoch)? {
             return Ok(SecretBytes::new(secret));
         }
-        let current_epoch = self
-            .runtime
-            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
-        if current_epoch.0 != source_epoch {
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
+        if epoch.0 != source_epoch {
             return Err(AppError::InvalidEncryptedMedia(format!(
                 "missing encrypted media secret for epoch {source_epoch}"
             )));
         }
-        self.encrypted_media_secret(group_id)
-            .map(|(_, secret)| secret)
+        Ok(secret)
     }
 
-    fn remember_encrypted_media_secret_if_current(
-        &mut self,
-        group_id: &GroupId,
-        source_epoch: u64,
-    ) -> Result<(), AppError> {
-        let current_epoch = self
-            .runtime
-            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
-        if current_epoch.0 == source_epoch {
-            let _ = self.encrypted_media_secret(group_id)?;
+    fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    fn cache_current_encrypted_media_epoch_secrets(&self) {
+        for group in &self.state.groups {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "cache_current_encrypted_media_epoch_secrets",
+                    error_code = "encrypted_media_group_record_skipped",
+                    "skipping malformed encrypted media group record",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            if !self.encrypted_media_for_group(&group_id).required {
+                continue;
+            }
+            if self
+                .remember_current_encrypted_media_secret(&group_id)
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "cache_current_encrypted_media_epoch_secrets",
+                    error_code = "encrypted_media_secret_cache_skipped",
+                    "failed to cache encrypted media epoch secret for one group",
+                );
+            }
         }
-        Ok(())
     }
 
     fn remember_encrypted_media_epoch_secret(

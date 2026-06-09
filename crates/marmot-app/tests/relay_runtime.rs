@@ -2370,7 +2370,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     let group_state = alice.group_mls_state(&group_id).unwrap();
     assert!(
         group_state.required_app_components.contains(&0x8008),
-        "encrypted media v1 is a required SafeExportSecret app component"
+        "encrypted media v1 is a required app component"
     );
 
     let plaintext = b"marmot encrypted media tracer bullet".to_vec();
@@ -2483,6 +2483,55 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     assert_eq!(second_download.file_name, "clip.mp4");
     assert_eq!(second_download.media_type, "video/mp4");
 
+    let repeat_plaintext = b"another alice upload in the same epoch".to_vec();
+    let repeat_upload = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "repeat.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: repeat_plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let repeat_reference = repeat_upload.attachments[0].reference.clone();
+    assert_eq!(repeat_reference.source_epoch, reference.source_epoch);
+    let repeat_download = bob
+        .download_media(&group_id, repeat_reference)
+        .await
+        .unwrap();
+    assert_eq!(repeat_download.plaintext, repeat_plaintext);
+
+    let bob_plaintext = b"bob upload after caching alice media secret".to_vec();
+    let bob_upload = bob
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "bob.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: bob_plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let bob_reference = bob_upload.attachments[0].reference.clone();
+    assert_eq!(bob_reference.source_epoch, reference.source_epoch);
+
     alice.update_message_retention(&group_id, 60).await.unwrap();
     bob.sync().await.unwrap();
     let later_epoch_download = bob
@@ -2490,6 +2539,11 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .await
         .unwrap();
     assert_eq!(later_epoch_download.plaintext, plaintext);
+    let bob_download = alice
+        .download_media(&group_id, bob_reference)
+        .await
+        .unwrap();
+    assert_eq!(bob_download.plaintext, bob_plaintext);
 
     let third_plaintext = b"third media after the epoch update".to_vec();
     let third_upload = alice

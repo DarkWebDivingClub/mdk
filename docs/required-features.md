@@ -84,8 +84,8 @@ implementations:
 ### 2.5 Exported secrets and their derivation labels
 
 - How any Marmot subsystem derives cryptographic material from the MLS group state (currently:
-  `MLS-Exporter("marmot", "group-event", 32)` for kind-445 outer wrap, `SafeExportSecret(0x8008)` for encrypted
-  media, and similar labels for MIP-06)
+  `MLS-Exporter("marmot", "group-event", 32)` for kind-445 outer wrap,
+  `MLS-Exporter("marmot", "encrypted-media", 32)` for encrypted media, and similar labels for MIP-06)
 - Whether that derivation is via raw MLS-Exporter or via the MLS Extensions Safe Framework's
   `SafeExportSecret(ComponentID)` (direction: Safe framework for one-shot component secrets; reusable per-epoch secrets
   must keep a registered raw exporter label until the protocol defines another shape)

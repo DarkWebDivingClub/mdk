@@ -45,7 +45,8 @@ pub(crate) const AGENT_TEXT_STREAM_EXPORTER_CONTEXT: &[u8] = b"agent-text-stream
 /// can request the registered group-event exporter without separately carrying
 /// the MLS label/context pair.
 pub(crate) const EXPORTER_SNAPSHOT_KEY: &str = "marmot/group-event";
-pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str = "marmot/encrypted-media";
+pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
+    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL;
 pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_LABEL;
 

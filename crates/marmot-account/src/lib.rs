@@ -837,6 +837,17 @@ where
         Ok(self.session.exporter_secret(group_id, label, length)?)
     }
 
+    pub fn exporter_secret_with_epoch(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> AccountResult<(EpochId, cgka_traits::SecretBytes)> {
+        Ok(self
+            .session
+            .exporter_secret_with_epoch(group_id, label, length)?)
+    }
+
     pub fn safe_export_secret_with_epoch(
         &mut self,
         group_id: &GroupId,

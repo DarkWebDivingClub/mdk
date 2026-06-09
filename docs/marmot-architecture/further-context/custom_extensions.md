@@ -1,7 +1,7 @@
 ---
 title: "Custom Proposals & Extensions — When to Inherit vs Define"
 created: 2026-04-18
-updated: 2026-06-07
+updated: 2026-06-09
 tags: [marmot, mls, extensions, proposals, capabilities, design]
 status: exploration
 related:
@@ -472,8 +472,8 @@ Concrete mapping of every Marmot custom primitive against the Safe framework:
 
 - **Marmot thing:** MIP-04 media per-file key
   - **Currently:** `MLS-Exporter("marmot", "encrypted-media", 32)` → HKDF
-  - **Safe-framework analog:** `SafeExportSecret(marmot_media_component_id)` → HKDF (or directly via
-    SafeEncryptWithLabel)
+  - **Safe-framework note:** `SafeExportSecret(marmot_media_component_id)` is not a fit for reusable media uploads,
+    because each component secret is one-shot within an epoch.
 
 - **Marmot thing:** MIP-06 `join_psk`
   - **Currently:** `MLS-Exporter("marmot-mip06-join-psk-v1", ...)`
@@ -657,9 +657,9 @@ nonce stored in `imeta` tag.
 **Inherit vs Custom check:**
 
 - The idea of using MLS-exporter-derived per-file keys is architecturally sound.
-- The raw `MLS-Exporter()` call with the label `"marmot" / "encrypted-media"` is **a candidate for `SafeExportSecret`**
-  with a Marmot-assigned ComponentID (e.g., `0x8006 = marmot_encrypted_media`). Same benefit as MIP-03: per-component
-  forward-secure derivation, proper consumption, domain separation from other Marmot subsystems.
+- The raw `MLS-Exporter()` call with the label `"marmot" / "encrypted-media"` should stay a registered reusable exporter
+  for media. `SafeExportSecret` is one-shot per component and epoch, so it cannot support multiple media sends or delayed
+  decrypts in the same epoch.
 - The `imeta` tag format is Nostr-layer metadata; appropriately Marmot-custom.
 - The HKDF with the legacy media version label is providing version-based domain separation. The Safe framework would
   fold this into ComponentID-based domain separation: a future breaking media version could be a new ComponentID rather

@@ -218,11 +218,11 @@ dm --account <npub-or-hex> media upload <group-hex> <file-path> --server https:/
 dm --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
 
-`media upload` encrypts the file with the group's `marmot.group.encrypted-media.v1` SafeExportSecret, uploads the
-ciphertext to Blossom (`https://blossom.primal.net` by default), and optionally sends a kind-9 media message. Upload JSON
-returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators. `media
-download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it, decrypts it,
-and writes the plaintext file.
+`media upload` encrypts the file with the group's current `MLS-Exporter("marmot", "encrypted-media", 32)` media secret,
+uploads the ciphertext to Blossom (`https://blossom.primal.net` by default), and optionally sends a kind-9 media message.
+Upload JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
+`media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
+decrypts it, and writes the plaintext file.
 
 Other Whitenoise-shaped commands:
 
