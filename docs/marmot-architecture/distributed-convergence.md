@@ -158,9 +158,13 @@ convergence_policy = {
   max_rewind_commits: 5,
   witness_quorum_senders_per_epoch: <group policy>,
   witness_quorum_epochs: <group policy>,
-  max_witness_override_depth: <group policy>,
+  max_witness_override_depth: <group policy>,   // MUST be <= max_rewind_commits
 }
 ```
+
+`max_witness_override_depth` MUST NOT exceed `max_rewind_commits` (the worked example below uses `2` against the default
+`5`). The engine enforces this bound — `ConvergencePolicy::validate` rejects an out-of-bound policy when it is set or
+decoded — so the witness-quorum boost can never push a branch past the rollback horizon.
 
 `max_rewind_commits` also bounds snapshot retention, so the forward-secrecy cost is explicit. The engine persists the
 per-group policy and uses that stored value after restart. Once MLS app components are available, the policy should live

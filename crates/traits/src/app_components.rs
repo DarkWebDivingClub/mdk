@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use url::Url;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use url::{Host, Url};
 
 /// MLS ComponentID.
 pub type AppComponentId = u16;
@@ -21,6 +22,7 @@ pub const GROUP_ADMIN_POLICY_COMPONENT_ID: AppComponentId = 0x8003;
 pub const NOSTR_ROUTING_COMPONENT_ID: AppComponentId = 0x8004;
 pub const GROUP_MESSAGE_RETENTION_COMPONENT_ID: AppComponentId = 0x8005;
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT_ID: AppComponentId = 0x8006;
+pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
 
 pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
@@ -28,6 +30,12 @@ pub const GROUP_ADMIN_POLICY_COMPONENT: &str = "marmot.group.admin-policy.v1";
 pub const NOSTR_ROUTING_COMPONENT: &str = "marmot.transport.nostr.routing.v1";
 pub const GROUP_MESSAGE_RETENTION_COMPONENT: &str = "marmot.group.message-retention.v1";
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT: &str = "marmot.group.agent-text-stream.quic.v1";
+pub const GROUP_AVATAR_URL_COMPONENT: &str = "marmot.group.avatar-url.v1";
+
+/// Maximum encoded length of a group avatar URL, in bytes.
+pub const GROUP_AVATAR_URL_MAX_LEN: usize = 2048;
+/// Maximum encoded length of the optional `dim` / `thumbhash` render hints.
+pub const GROUP_AVATAR_HINT_MAX_LEN: usize = 256;
 
 /// Initial app-component state supplied by the app layer at group creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +208,154 @@ pub fn decode_nostr_routing_v1(bytes: &[u8]) -> Result<NostrRoutingV1, String> {
     };
     validate_nostr_routing(&routing)?;
     Ok(routing)
+}
+
+/// Decoded `marmot.group.avatar-url.v1` state. An absent avatar is an empty `url`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupAvatarUrlV1 {
+    pub url: String,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+/// Encode `marmot.group.avatar-url.v1` state. The URL is validated and normalized;
+/// an empty `url` encodes the absent/cleared avatar (all fields empty).
+pub fn encode_group_avatar_url_v1(avatar: &GroupAvatarUrlV1) -> Result<Vec<u8>, String> {
+    if avatar.url.is_empty() && (avatar.dim.is_some() || avatar.thumbhash.is_some()) {
+        return Err("group avatar absent state must not include hints".into());
+    }
+    let url = if avatar.url.is_empty() {
+        String::new()
+    } else {
+        validate_and_normalize_group_avatar_url(&avatar.url)?
+    };
+    let dim = avatar.dim.as_deref().unwrap_or("");
+    let thumbhash = avatar.thumbhash.as_deref().unwrap_or("");
+    if dim.len() > GROUP_AVATAR_HINT_MAX_LEN {
+        return Err(format!(
+            "group avatar dim exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
+        ));
+    }
+    if thumbhash.len() > GROUP_AVATAR_HINT_MAX_LEN {
+        return Err(format!(
+            "group avatar thumbhash exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
+        ));
+    }
+    let mut out = Vec::with_capacity(url.len() + dim.len() + thumbhash.len() + 6);
+    encode_var_bytes(url.as_bytes(), &mut out);
+    encode_var_bytes(dim.as_bytes(), &mut out);
+    encode_var_bytes(thumbhash.as_bytes(), &mut out);
+    Ok(out)
+}
+
+/// Decode `marmot.group.avatar-url.v1` state, re-validating a present URL.
+pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, String> {
+    let mut cursor = bytes;
+    let url = decode_var_bytes(&mut cursor, GROUP_AVATAR_URL_MAX_LEN, "group avatar URL")?;
+    let dim = decode_var_bytes(&mut cursor, GROUP_AVATAR_HINT_MAX_LEN, "group avatar dim")?;
+    let thumbhash = decode_var_bytes(
+        &mut cursor,
+        GROUP_AVATAR_HINT_MAX_LEN,
+        "group avatar thumbhash",
+    )?;
+    if !cursor.is_empty() {
+        return Err("group avatar component has trailing bytes".into());
+    }
+    let url = String::from_utf8(url).map_err(|e| format!("group avatar URL is not UTF-8: {e}"))?;
+    let dim = String::from_utf8(dim).map_err(|e| format!("group avatar dim is not UTF-8: {e}"))?;
+    let thumbhash = String::from_utf8(thumbhash)
+        .map_err(|e| format!("group avatar thumbhash is not UTF-8: {e}"))?;
+    if url.is_empty() && (!dim.is_empty() || !thumbhash.is_empty()) {
+        return Err("group avatar absent state must not include hints".into());
+    }
+    if !url.is_empty() {
+        // Compare against normalized bytes so a non-normalized stored URL is rejected.
+        let normalized = validate_and_normalize_group_avatar_url(&url)?;
+        if normalized != url {
+            return Err("group avatar URL is not normalized".into());
+        }
+    }
+    Ok(GroupAvatarUrlV1 {
+        url,
+        dim: (!dim.is_empty()).then_some(dim),
+        thumbhash: (!thumbhash.is_empty()).then_some(thumbhash),
+    })
+}
+
+/// Validate and normalize a group avatar URL: `https` only, length-bounded, no
+/// credentials or fragment, and not pointing at localhost or a non-routable IP.
+/// Returns the normalized URL string.
+pub fn validate_and_normalize_group_avatar_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("group avatar URL must not be empty".into());
+    }
+    if raw.len() > GROUP_AVATAR_URL_MAX_LEN {
+        return Err(format!(
+            "group avatar URL exceeds {GROUP_AVATAR_URL_MAX_LEN} bytes"
+        ));
+    }
+    let url = Url::parse(raw).map_err(|e| format!("group avatar URL is invalid: {e}"))?;
+    if url.scheme() != "https" {
+        return Err("group avatar URL scheme must be https".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("group avatar URL must not include credentials".into());
+    }
+    if url.fragment().is_some() {
+        return Err("group avatar URL must not include a fragment".into());
+    }
+    match url.host().ok_or("group avatar URL must include a host")? {
+        Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            if lowered == "localhost" || lowered.ends_with(".localhost") {
+                return Err("group avatar URL must not point at localhost".into());
+            }
+        }
+        Host::Ipv4(addr) => reject_non_routable_ipv4(addr)?,
+        Host::Ipv6(addr) => reject_non_routable_ipv6(addr)?,
+    }
+    let normalized = url.as_str();
+    if normalized.len() > GROUP_AVATAR_URL_MAX_LEN {
+        return Err(format!(
+            "group avatar URL exceeds {GROUP_AVATAR_URL_MAX_LEN} bytes"
+        ));
+    }
+    Ok(normalized.to_owned())
+}
+
+fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {
+    if addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+        || addr.is_documentation()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+    {
+        return Err("group avatar URL must not point at a non-routable address".into());
+    }
+    Ok(())
+}
+
+fn reject_non_routable_ipv6(addr: Ipv6Addr) -> Result<(), String> {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return reject_non_routable_ipv4(mapped);
+    }
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
+        return Err("group avatar URL must not point at a non-routable address".into());
+    }
+    // Reject unique-local (fc00::/7) and link-local (fe80::/10) addresses, which
+    // the stable std API does not yet classify.
+    let first = addr.segments()[0];
+    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
+        return Err("group avatar URL must not point at a non-routable address".into());
+    }
+    Ok(())
+}
+
+fn encode_var_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    encode_quic_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
 }
 
 pub fn encode_quic_varint(value: u64, out: &mut Vec<u8>) {
@@ -394,5 +550,150 @@ mod tests {
                 "{relay} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn group_avatar_url_round_trips_all_fields() {
+        let avatar = GroupAvatarUrlV1 {
+            url: "https://cdn.example.com/avatar.png".to_owned(),
+            dim: Some("512x512".to_owned()),
+            thumbhash: Some("abc123".to_owned()),
+        };
+        let bytes = encode_group_avatar_url_v1(&avatar).unwrap();
+        assert_eq!(decode_group_avatar_url_v1(&bytes).unwrap(), avatar);
+    }
+
+    #[test]
+    fn group_avatar_url_round_trips_url_only() {
+        let avatar = GroupAvatarUrlV1 {
+            url: "https://cdn.example.com/avatar.png".to_owned(),
+            dim: None,
+            thumbhash: None,
+        };
+        let bytes = encode_group_avatar_url_v1(&avatar).unwrap();
+        assert_eq!(decode_group_avatar_url_v1(&bytes).unwrap(), avatar);
+    }
+
+    #[test]
+    fn group_avatar_url_empty_state_round_trips_as_absent() {
+        let absent = GroupAvatarUrlV1::default();
+        let bytes = encode_group_avatar_url_v1(&absent).unwrap();
+        assert_eq!(decode_group_avatar_url_v1(&bytes).unwrap(), absent);
+    }
+
+    #[test]
+    fn group_avatar_url_absent_state_rejects_hints() {
+        let absent_with_hint = GroupAvatarUrlV1 {
+            url: String::new(),
+            dim: Some("512x512".to_owned()),
+            thumbhash: None,
+        };
+
+        assert!(encode_group_avatar_url_v1(&absent_with_hint).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_requires_https() {
+        for raw in [
+            "http://cdn.example.com/a.png",
+            "ftp://cdn.example.com/a.png",
+            "ws://cdn.example.com/a.png",
+        ] {
+            assert!(
+                validate_and_normalize_group_avatar_url(raw).is_err(),
+                "{raw} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn group_avatar_url_rejects_localhost_and_non_routable_hosts() {
+        for raw in [
+            "https://localhost/a.png",
+            "https://app.localhost/a.png",
+            "https://127.0.0.1/a.png",
+            "https://10.0.0.5/a.png",
+            "https://192.168.1.2/a.png",
+            "https://172.16.0.1/a.png",
+            "https://169.254.1.1/a.png",
+            "https://[::1]/a.png",
+            "https://[::ffff:127.0.0.1]/a.png",
+            "https://[::ffff:10.0.0.1]/a.png",
+            "https://[fc00::1]/a.png",
+            "https://[fe80::1]/a.png",
+        ] {
+            assert!(
+                validate_and_normalize_group_avatar_url(raw).is_err(),
+                "{raw} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn group_avatar_url_rejects_credentials_and_fragment() {
+        assert!(
+            validate_and_normalize_group_avatar_url("https://user:pass@cdn.example.com/a").is_err()
+        );
+        assert!(validate_and_normalize_group_avatar_url("https://cdn.example.com/a#frag").is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_enforces_max_length() {
+        let long = format!(
+            "https://cdn.example.com/{}",
+            "a".repeat(GROUP_AVATAR_URL_MAX_LEN)
+        );
+        assert!(validate_and_normalize_group_avatar_url(&long).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_normalizes_on_ingest() {
+        let normalized =
+            validate_and_normalize_group_avatar_url("https://CDN.Example.COM:443/a.png").unwrap();
+        // Host lowercased and default https port dropped.
+        assert_eq!(normalized, "https://cdn.example.com/a.png");
+    }
+
+    #[test]
+    fn group_avatar_url_decode_rejects_non_normalized_url() {
+        // Hand-build bytes carrying a non-normalized (uppercase host) URL.
+        let mut bytes = Vec::new();
+        let raw = "https://CDN.EXAMPLE.COM/a.png";
+        encode_var_bytes(raw.as_bytes(), &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+        assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_decode_rejects_absent_state_with_hints() {
+        let mut bytes = Vec::new();
+        encode_var_bytes(b"", &mut bytes);
+        encode_var_bytes(b"512x512", &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+
+        assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_decode_rejects_trailing_bytes() {
+        let avatar = GroupAvatarUrlV1 {
+            url: "https://cdn.example.com/a.png".to_owned(),
+            dim: None,
+            thumbhash: None,
+        };
+        let mut bytes = encode_group_avatar_url_v1(&avatar).unwrap();
+        bytes.push(0);
+        assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_hint_length_is_bounded() {
+        let avatar = GroupAvatarUrlV1 {
+            url: "https://cdn.example.com/a.png".to_owned(),
+            dim: Some("a".repeat(GROUP_AVATAR_HINT_MAX_LEN + 1)),
+            thumbhash: None,
+        };
+        assert!(encode_group_avatar_url_v1(&avatar).is_err());
     }
 }

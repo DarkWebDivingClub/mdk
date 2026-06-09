@@ -433,6 +433,7 @@ mod tests {
             },
             deleted: false,
             deleted_by_message_id_hex: None,
+            invalidation_status: None,
         }
     }
 }

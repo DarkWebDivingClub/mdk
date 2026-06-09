@@ -1,0 +1,22 @@
+# nextest configuration.
+#
+# The `darkmatter-cli::cli` integration tests behave like mini end-to-end
+# systems: each one spawns `dm` subprocesses, a `dmd` daemon, local relays, QUIC
+# brokers, and account/runtime workers, then drives polling loops. nextest runs
+# every test in its own process at per-CPU parallelism, so under load the heavy
+# per-test setup is multiplied across the box and worker/daemon startup is
+# starved, surfacing as `account worker startup timed out` flakes (issue #103).
+#
+# Cap the concurrency of just that binary so it is not scheduled like cheap unit
+# tests. The rest of the workspace keeps full parallelism, so the fast unit-test
+# path is unaffected. The serial `marmot-app::relay_runtime` suite stays on its
+# own `cargo test --test-threads=1` job (PR #100) and is unaffected by this.
+
+[test-groups]
+# Reduced concurrency for the subprocess-heavy CLI end-to-end tests. Tunable: 1
+# fully serializes them, higher trades isolation for wall-clock.
+cli-e2e = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'package(darkmatter-cli) & binary(cli)'
+test-group = 'cli-e2e'

@@ -5,8 +5,8 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_LABEL, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -29,12 +29,13 @@ use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, t
 use crate::notifications;
 use crate::{
     AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppError,
-    AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
-    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection,
-    AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaDownloadResult, MediaReference,
-    MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary,
-    SyncSummary, refresh_seen_lookup_if_needed, remember_seen_event, unix_now_seconds,
+    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupMemberRecord,
+    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppRuntime, AppTransportRouting,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
+    remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
     pub(crate) app: MarmotApp,
@@ -359,6 +360,39 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    /// Set (or clear) the group's URL-based avatar (`marmot.group.avatar-url.v1`).
+    /// Passing `url = None` clears the avatar to the absent state. The URL is
+    /// validated and normalized before it is committed.
+    pub async fn update_group_avatar_url(
+        &mut self,
+        group_id: &GroupId,
+        url: Option<String>,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let component = match url {
+            Some(url) if !url.is_empty() => {
+                AppGroupAvatarUrlComponent::new(url, dim, thumbhash)?.to_app_component_data()?
+            }
+            _ => AppGroupAvatarUrlComponent::absent().to_app_component_data()?,
+        };
+
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![component],
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
     }
@@ -990,6 +1024,7 @@ impl AppClient {
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
+            avatar_url: self.avatar_url_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1133,6 +1168,7 @@ impl AppClient {
                             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
                         message_retention: self.message_retention_for_group(group_id),
                         agent_text_stream: self.agent_text_stream_for_group(group_id),
+                        avatar_url: self.avatar_url_for_group(group_id),
                     })
                 })
                 .transpose()?;
@@ -1252,6 +1288,7 @@ impl AppClient {
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
+            avatar_url: self.avatar_url_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1271,6 +1308,7 @@ impl AppClient {
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
+            avatar_url: self.avatar_url_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1319,6 +1357,15 @@ impl AppClient {
             .flatten()
             .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
             .unwrap_or_else(AppAgentTextStreamComponent::disabled)
+    }
+
+    fn avatar_url_for_group(&self, group_id: &GroupId) -> AppGroupAvatarUrlComponent {
+        self.runtime
+            .app_component(group_id, GROUP_AVATAR_URL_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
     }
 
     fn refresh_group_routes(&mut self) -> Result<(), AppError> {
@@ -1404,6 +1451,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidDirectorySearch(_) => "read_marker_failed:invalid_directory_search",
         AppError::InvalidGroupProfile(_) => "read_marker_failed:invalid_group_profile",
         AppError::InvalidNostrRouting(_) => "read_marker_failed:invalid_nostr_routing",
+        AppError::InvalidGroupAvatarUrl(_) => "read_marker_failed:invalid_group_avatar_url",
         AppError::InvalidAgentTextStreamPolicy(_) => {
             "read_marker_failed:invalid_agent_text_stream_policy"
         }

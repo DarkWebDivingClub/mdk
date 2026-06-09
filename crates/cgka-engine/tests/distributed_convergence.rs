@@ -5,9 +5,9 @@ use cgka_engine::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DroppedMessageReason,
     InvalidatedAppMessageReason, MessageKind,
 };
-use cgka_engine::convergence::ConvergencePolicy;
+use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_engine::openmls_projection::project_mls_message;
+use cgka_engine::openmls_projection::{OpenMlsProjectionError, project_mls_message};
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -2589,4 +2589,59 @@ fn assert_message_state(
         .get_message(&msg.id)
         .expect("message remains stored");
     assert_eq!(record.state, expected);
+}
+
+// --- #113: witness-override policy bound -----------------------------------
+
+#[test]
+fn convergence_policy_default_satisfies_witness_override_bound() {
+    assert!(ConvergencePolicy::default().validate().is_ok());
+}
+
+#[test]
+fn convergence_policy_allows_witness_override_equal_to_rewind_horizon() {
+    let policy = ConvergencePolicy {
+        max_rewind_commits: 5,
+        max_witness_override_depth: 5,
+        ..ConvergencePolicy::default()
+    };
+    assert!(policy.validate().is_ok());
+}
+
+#[test]
+fn convergence_policy_rejects_witness_override_exceeding_rewind_horizon() {
+    let policy = ConvergencePolicy {
+        max_rewind_commits: 5,
+        max_witness_override_depth: 1000,
+        ..ConvergencePolicy::default()
+    };
+    assert_eq!(
+        policy.validate(),
+        Err(ConvergencePolicyError::WitnessOverrideExceedsRewind {
+            max_witness_override_depth: 1000,
+            max_rewind_commits: 5,
+        })
+    );
+}
+
+#[test]
+fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
+    let (mut alice, _storage) = build_client(b"alice");
+    let group_id = GroupId::new(vec![0u8; 32]);
+    let bad_policy = CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 5,
+            max_witness_override_depth: 1000,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    };
+
+    let err = alice
+        .set_group_convergence_policy(&group_id, bad_policy)
+        .expect_err("policy violating the witness-override bound must be rejected");
+    assert!(
+        matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
+        "expected InvalidPolicy, got {err:?}"
+    );
 }

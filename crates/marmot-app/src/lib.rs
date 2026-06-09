@@ -29,10 +29,11 @@ use cgka_traits::agent_text_stream::{
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
-    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
+    NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
@@ -114,9 +115,9 @@ pub use config::{
 };
 pub use error::AppError;
 pub use groups::{
-    AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
+    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
 pub use ids::{account_id_hex_from_ref, npub_for_account_id};
 pub use media::{
@@ -715,6 +716,13 @@ fn stored_components_from_app_group(group: &AppGroupRecord) -> Vec<StoredAccount
             component_data_hex: group.agent_text_stream.data_hex.clone(),
         });
     }
+    if group.avatar_url.present {
+        components.push(StoredAccountGroupComponent {
+            component_id: group.avatar_url.component_id,
+            component_name: group.avatar_url.component.clone(),
+            component_data_hex: group.avatar_url.data_hex.clone(),
+        });
+    }
     components
 }
 
@@ -751,6 +759,13 @@ fn app_group_from_stored_group(stored: StoredAccountGroup) -> Result<AppGroupRec
     {
         let agent_bytes = hex::decode(agent_hex)?;
         group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&agent_bytes);
+    }
+    if let Some(avatar_hex) =
+        account_component_data_hex(&stored.components, GROUP_AVATAR_URL_COMPONENT_ID)
+        && !avatar_hex.is_empty()
+    {
+        let avatar_bytes = hex::decode(avatar_hex)?;
+        group.avatar_url = AppGroupAvatarUrlComponent::from_bytes(&avatar_bytes);
     }
     group.archived = stored.archived;
     group.pending_confirmation = stored.pending_confirmation;
@@ -5821,6 +5836,41 @@ mod tests {
                 .get::<_, String>(0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn avatar_url_round_trips_through_account_projection() {
+        let mut group = AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        group.avatar_url = AppGroupAvatarUrlComponent::new(
+            "https://cdn.example.com/a.png".to_owned(),
+            Some("512x512".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        let stored = stored_group_from_app_group(&group);
+        let restored = app_group_from_stored_group(stored).unwrap();
+        assert_eq!(restored.avatar_url, group.avatar_url);
+        assert!(restored.avatar_url.present);
+        assert_eq!(restored.avatar_url.url, "https://cdn.example.com/a.png");
+
+        // An absent avatar restores as absent.
+        let mut plain = group.clone();
+        plain.avatar_url = AppGroupAvatarUrlComponent::absent();
+        let restored_plain =
+            app_group_from_stored_group(stored_group_from_app_group(&plain)).unwrap();
+        assert!(!restored_plain.avatar_url.present);
     }
 
     #[test]

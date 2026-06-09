@@ -434,9 +434,29 @@ impl TransportAdapter for NostrTransportAdapter {
         for group in &activation.group_subscriptions {
             issued.push(group_subscription(&account_id, group, activation.since));
         }
-        for subscription in &issued {
-            self.relay_client.subscribe(subscription.clone()).await?;
+        // #121 instrumentation: subscriptions are issued sequentially and the first
+        // failure aborts the whole activation (behavior unchanged). Record which
+        // position in the sequence aborted so we can confirm the all-or-nothing
+        // hypothesis against missing wake-delivery. Temporary; remove when #121 is
+        // resolved.
+        for (sub_index, subscription) in issued.iter().enumerate() {
+            if let Err(err) = self.relay_client.subscribe(subscription.clone()).await {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "activate_account",
+                    sub_index,
+                    issued_count = issued.len(),
+                    "transport subscription failed; aborting activation"
+                );
+                return Err(err);
+            }
         }
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "activate_account",
+            issued_count = issued.len(),
+            "all transport subscriptions issued"
+        );
 
         let now_ms = self.now_ms();
         let mut state = self.state.write().await;
@@ -479,8 +499,20 @@ impl TransportAdapter for NostrTransportAdapter {
             )
         };
 
-        for subscription in &to_add {
-            self.relay_client.subscribe(subscription.clone()).await?;
+        // #121 instrumentation: same all-or-nothing sequential issue path as
+        // activate_account — a single failed add aborts the sync. Temporary; remove
+        // when #121 is resolved.
+        for (sub_index, subscription) in to_add.iter().enumerate() {
+            if let Err(err) = self.relay_client.subscribe(subscription.clone()).await {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "sync_account_groups",
+                    sub_index,
+                    add_count = to_add.len(),
+                    "transport subscription failed; aborting group sync"
+                );
+                return Err(err);
+            }
         }
         for subscription in &to_remove {
             self.relay_client.unsubscribe(subscription.clone()).await?;

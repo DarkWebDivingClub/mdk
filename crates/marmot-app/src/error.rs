@@ -55,6 +55,8 @@ pub enum AppError {
     InvalidGroupProfile(String),
     #[error("invalid Nostr routing component: {0}")]
     InvalidNostrRouting(String),
+    #[error("invalid group avatar URL: {0}")]
+    InvalidGroupAvatarUrl(String),
     #[error("invalid agent text stream policy: {0}")]
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]

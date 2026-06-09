@@ -1011,6 +1011,11 @@ pub struct TimelineMessageRecordFfi {
     pub reactions: TimelineReactionSummaryFfi,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
+    /// Set when convergence invalidated this message (it landed on a losing
+    /// branch). The message is kept as a "did not reach the group" tombstone
+    /// instead of disappearing; the value is the engine invalidation reason
+    /// (e.g. `LosingBranch`). `None` for delivered messages.
+    pub invalidation_status: Option<String>,
 }
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
@@ -1033,6 +1038,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reactions: value.reactions.into(),
             deleted: value.deleted,
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
+            invalidation_status: value.invalidation_status,
         }
     }
 }
@@ -1256,6 +1262,11 @@ pub struct AppGroupRecordFfi {
     pub admins: Vec<String>,
     pub relays: Vec<String>,
     pub nostr_group_id_hex: String,
+    /// URL-based group avatar (`marmot.group.avatar-url.v1`), `None` when absent.
+    /// When set it takes precedence over a Blossom image avatar.
+    pub avatar_url: Option<String>,
+    pub avatar_dim: Option<String>,
+    pub avatar_thumbhash: Option<String>,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
@@ -1273,6 +1284,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             relays,
             ..
         } = value.nostr_routing;
+        let avatar = value.avatar_url;
         Self {
             group_id_hex: value.group_id_hex,
             endpoint: value.endpoint,
@@ -1281,6 +1293,9 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             admins,
             relays,
             nostr_group_id_hex,
+            avatar_url: avatar.present.then_some(avatar.url),
+            avatar_dim: avatar.dim,
+            avatar_thumbhash: avatar.thumbhash,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
@@ -1798,6 +1813,9 @@ mod tests {
             admins: admins.into_iter().map(ToOwned::to_owned).collect(),
             relays: vec![],
             nostr_group_id_hex: "02".repeat(32),
+            avatar_url: None,
+            avatar_dim: None,
+            avatar_thumbhash: None,
             archived: false,
             pending_confirmation: false,
             welcomer_account_id_hex: None,
@@ -1891,6 +1909,7 @@ mod tests {
             },
             deleted: true,
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
+            invalidation_status: None,
         };
 
         let page = TimelinePageFfi::from(TimelinePage {

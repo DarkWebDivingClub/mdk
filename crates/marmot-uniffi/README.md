@@ -52,5 +52,30 @@ ANDROID_ABIS="arm64-v8a x86_64" ./crates/marmot-uniffi/kotlin-bindings.sh
 Generated Kotlin uses package `dev.ipf.marmotkit`, loads `libmarmot_uniffi.so`, and requires the normal
 UniFFI Kotlin runtime dependencies used by the generated file: JNA, Kotlin coroutines, and AndroidX annotations.
 
+### Android initialization (required before the first `Marmot(...)`)
+
+`Marmot(...)` constructs the Android-native keyring store, which talks to the Android Keystore over JNI and needs the
+`ndk-context` initialized with the application `Context` first. The build copies two hand-written helpers
+(`kotlin-support/`) next to the generated binding:
+
+- `dev.ipf.marmotkit.MarmotAndroid` — the call consumers use.
+- `io.crates.keyring.Keyring` — the JNI shim the `android-native-keyring-store` crate requires (statically linked into
+  `libmarmot_uniffi.so`, so its symbol is exported from that library).
+
+Android consumers MUST call `MarmotAndroid.initialize(this)` from `Application.onCreate` before constructing `Marmot`,
+otherwise the first constructor crashes with `android context was not initialized`:
+
+```kotlin
+class MarmotApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        MarmotAndroid.initialize(this)
+    }
+}
+```
+
+iOS does not need this — `apple-native-keyring-store` uses Keychain APIs that do not require a `JavaVM`. If the host
+framework already initialized `ndk-context`, do not call `initialize` again.
+
 The output directories are ignored because generated bindings and packaged native libraries are derived artifacts.
 Regenerate them from this crate before vendoring into an app repository.

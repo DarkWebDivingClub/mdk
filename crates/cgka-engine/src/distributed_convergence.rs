@@ -28,6 +28,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         policy: CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Fail fast: never persist a policy that violates the witness-override bound.
+        policy
+            .validate()
+            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
@@ -43,7 +47,14 @@ impl<S: StorageProvider> Engine<S> {
             .convergence_policy(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         else {
-            return Ok(self.convergence_policy.clone());
+            // Validate the in-memory default too, so a bad policy set via
+            // `set_convergence_policy` fails closed at read rather than driving
+            // branch selection.
+            let policy = self.convergence_policy.clone();
+            policy
+                .validate()
+                .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+            return Ok(policy);
         };
         decode_convergence_policy(&policy_bytes)
     }
@@ -407,5 +418,12 @@ fn encode_convergence_policy(
 fn decode_convergence_policy(
     bytes: &[u8],
 ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
-    serde_json::from_slice(bytes).map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))
+    let policy: CanonicalizationPolicy = serde_json::from_slice(bytes)
+        .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+    // A stored policy that violates the witness-override bound must not drive branch
+    // selection; reject it at read time.
+    policy
+        .validate()
+        .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+    Ok(policy)
 }

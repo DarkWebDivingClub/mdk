@@ -6,11 +6,13 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_nostr_routing_v1,
-    encode_component_vectors, encode_nostr_routing_v1, encode_quic_varint,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_avatar_url_v1,
+    decode_nostr_routing_v1, encode_component_vectors, encode_group_avatar_url_v1,
+    encode_nostr_routing_v1, encode_quic_varint,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
 use cgka_traits::engine::GroupEvent;
@@ -27,6 +29,10 @@ pub struct AppGroupRecord {
     pub nostr_routing: AppGroupNostrRoutingComponent,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
+    /// URL-based group avatar. When `present`, it takes precedence over `image`
+    /// for rendering (spec: `marmot.group.avatar-url.v1`).
+    #[serde(default)]
+    pub avatar_url: AppGroupAvatarUrlComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
     #[serde(default)]
     pub message_retention: AppGroupMessageRetentionComponent,
@@ -77,6 +83,23 @@ pub struct AppGroupImageComponent {
     pub image_upload_key_hex: String,
     pub media_type: Option<String>,
     pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupAvatarUrlComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub present: bool,
+    pub url: String,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+    pub data_hex: String,
+}
+
+impl Default for AppGroupAvatarUrlComponent {
+    fn default() -> Self {
+        Self::absent()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,6 +169,7 @@ impl AppGroupRecord {
             nostr_routing,
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
+            avatar_url: AppGroupAvatarUrlComponent::absent(),
             admin_policy,
             message_retention,
             agent_text_stream: AppAgentTextStreamComponent::disabled(),
@@ -156,6 +180,7 @@ impl AppGroupRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_group(
         group_id: &GroupId,
         nostr_routing: AppGroupNostrRoutingComponent,
@@ -163,6 +188,7 @@ impl AppGroupRecord {
         admin_policy: AppGroupAdminPolicyComponent,
         message_retention: AppGroupMessageRetentionComponent,
         agent_text_stream: AppAgentTextStreamComponent,
+        avatar_url: AppGroupAvatarUrlComponent,
     ) -> Self {
         let (profile_name, profile_description) = group
             .map(|group| (group.name.clone(), group.description.clone()))
@@ -177,6 +203,7 @@ impl AppGroupRecord {
             message_retention,
         );
         record.agent_text_stream = agent_text_stream;
+        record.avatar_url = avatar_url;
         record
     }
 
@@ -187,12 +214,14 @@ impl AppGroupRecord {
         admin_policy: AppGroupAdminPolicyComponent,
         message_retention: AppGroupMessageRetentionComponent,
         agent_text_stream: AppAgentTextStreamComponent,
+        avatar_url: AppGroupAvatarUrlComponent,
     ) {
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
         self.admin_policy = admin_policy;
         self.message_retention = message_retention;
         self.agent_text_stream = agent_text_stream;
+        self.avatar_url = avatar_url;
         if let Some(group) = group {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
@@ -265,6 +294,68 @@ impl AppGroupImageComponent {
             media_type: input.media_type,
             data_hex: hex::encode(data),
         }
+    }
+}
+
+impl AppGroupAvatarUrlComponent {
+    /// Build a present avatar from validated parts (used on the send path).
+    pub(crate) fn new(
+        url: String,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<Self, AppError> {
+        let avatar = GroupAvatarUrlV1 {
+            url,
+            dim,
+            thumbhash,
+        };
+        let data = encode_group_avatar_url_v1(&avatar).map_err(AppError::InvalidGroupAvatarUrl)?;
+        // Decode the encoded bytes back so the struct fields carry the normalized
+        // URL, matching `from_bytes(to_app_component_data(..))` for any input.
+        let normalized =
+            decode_group_avatar_url_v1(&data).map_err(AppError::InvalidGroupAvatarUrl)?;
+        Ok(Self::from_decoded(normalized, data))
+    }
+
+    pub(crate) fn absent() -> Self {
+        // Encode the canonical empty state (three zero-length fields) so a
+        // "clear avatar" update is engine-valid, not raw-empty bytes.
+        let data = encode_group_avatar_url_v1(&GroupAvatarUrlV1::default()).unwrap_or_default();
+        Self {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            component: GROUP_AVATAR_URL_COMPONENT.to_owned(),
+            present: false,
+            url: String::new(),
+            dim: None,
+            thumbhash: None,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match decode_group_avatar_url_v1(bytes) {
+            Ok(avatar) if !avatar.url.is_empty() => Self::from_decoded(avatar, bytes.to_vec()),
+            _ => Self::absent(),
+        }
+    }
+
+    fn from_decoded(avatar: GroupAvatarUrlV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            component: GROUP_AVATAR_URL_COMPONENT.to_owned(),
+            present: !avatar.url.is_empty(),
+            url: avatar.url,
+            dim: avatar.dim,
+            thumbhash: avatar.thumbhash,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
     }
 }
 
@@ -422,6 +513,7 @@ pub(crate) struct EventGroupProjection<'a> {
     pub(crate) admin_policy: AppGroupAdminPolicyComponent,
     pub(crate) message_retention: AppGroupMessageRetentionComponent,
     pub(crate) agent_text_stream: AppAgentTextStreamComponent,
+    pub(crate) avatar_url: AppGroupAvatarUrlComponent,
 }
 
 #[derive(Clone, Debug)]
@@ -642,6 +734,7 @@ pub(crate) fn add_group(
             projection.admin_policy.clone(),
             projection.message_retention.clone(),
             projection.agent_text_stream.clone(),
+            projection.avatar_url.clone(),
         );
         existing.apply_confirmation_state(confirmation);
         return;
@@ -653,6 +746,7 @@ pub(crate) fn add_group(
         projection.admin_policy.clone(),
         projection.message_retention.clone(),
         projection.agent_text_stream.clone(),
+        projection.avatar_url.clone(),
     );
     group.apply_confirmation_state(confirmation);
     state.groups.push(group);
@@ -713,4 +807,45 @@ fn role_names(mask: u8) -> Vec<String> {
         roles.push("fanout".to_owned());
     }
     roles
+}
+
+#[cfg(test)]
+mod avatar_url_tests {
+    use super::*;
+
+    #[test]
+    fn avatar_url_component_round_trips_through_bytes() {
+        let component = AppGroupAvatarUrlComponent::new(
+            "https://cdn.example.com/a.png".to_owned(),
+            Some("512x512".to_owned()),
+            Some("thumbhash-bytes".to_owned()),
+        )
+        .unwrap();
+        assert!(component.present);
+
+        let data = component.to_app_component_data().unwrap();
+        let decoded = AppGroupAvatarUrlComponent::from_bytes(&data.data);
+        assert_eq!(decoded, component);
+        assert_eq!(decoded.url, "https://cdn.example.com/a.png");
+        assert_eq!(decoded.dim.as_deref(), Some("512x512"));
+        assert_eq!(decoded.thumbhash.as_deref(), Some("thumbhash-bytes"));
+    }
+
+    #[test]
+    fn absent_avatar_round_trips_and_is_engine_valid_bytes() {
+        let absent = AppGroupAvatarUrlComponent::absent();
+        assert!(!absent.present);
+        // Clearing the avatar must produce non-empty, decodable bytes.
+        let data = absent.to_app_component_data().unwrap();
+        assert!(!data.data.is_empty());
+        assert!(!AppGroupAvatarUrlComponent::from_bytes(&data.data).present);
+    }
+
+    #[test]
+    fn non_https_avatar_url_is_rejected() {
+        let err =
+            AppGroupAvatarUrlComponent::new("http://cdn.example.com/a.png".to_owned(), None, None)
+                .unwrap_err();
+        assert!(matches!(err, AppError::InvalidGroupAvatarUrl(_)));
+    }
 }

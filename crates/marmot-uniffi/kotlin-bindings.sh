@@ -3,10 +3,15 @@
 #
 # Outputs:
 #   <crate>/output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt
+#   <crate>/output/android/kotlin/dev/ipf/marmotkit/MarmotAndroid.kt
+#   <crate>/output/android/kotlin/io/crates/keyring/Keyring.kt
 #   <crate>/output/android/jniLibs/<abi>/libmarmot_uniffi.so
 #
 # The Kotlin file is generated from the same UniFFI metadata as the Swift
 # bindings, so the exported Marmot surface stays in lockstep across platforms.
+# The two hand-written helpers under kotlin-support/ are copied alongside it to
+# give Android consumers the ndk-context init bridge the keyring store needs
+# (see kotlin-support/dev/ipf/marmotkit/MarmotAndroid.kt).
 
 set -euo pipefail
 
@@ -194,6 +199,12 @@ cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi
   --no-format \
   --out-dir "$KOTLIN_OUT_DIR"
 
+echo "==> Copying hand-written Android Kotlin support (ndk-context init bridge)"
+# kotlin-support/ mirrors the Kotlin package layout, so copying its contents into
+# the generated output lands MarmotAndroid.kt next to marmot_uniffi.kt and the
+# io.crates.keyring.Keyring JNI shim under its required package.
+cp -R "$CRATE_DIR/kotlin-support/." "$KOTLIN_OUT_DIR/"
+
 for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
@@ -206,4 +217,6 @@ done
 echo ""
 echo "Done."
 echo "  Kotlin binding: $KOTLIN_OUT_DIR/dev/ipf/marmotkit/${LIB_BASENAME}.kt"
+echo "  Android init:   $KOTLIN_OUT_DIR/dev/ipf/marmotkit/MarmotAndroid.kt"
+echo "  Keyring shim:   $KOTLIN_OUT_DIR/io/crates/keyring/Keyring.kt"
 echo "  JNI libraries:  $JNI_OUT_DIR"

@@ -63,6 +63,11 @@ pub struct TimelineMessageRecord {
     pub reactions: TimelineReactionSummary,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
+    /// Set when convergence invalidated this message (e.g. it landed on a losing
+    /// branch). The message is kept in the timeline as a "did not reach the group"
+    /// tombstone instead of silently disappearing. Carries the engine invalidation
+    /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
+    pub invalidation_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +157,8 @@ struct RawAppEvent {
     tags: Vec<Vec<String>>,
     recorded_at: u64,
     received_at: u64,
+    invalidated: bool,
+    invalidation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +179,7 @@ struct TimelineRow {
     reactions: TimelineReactionSummary,
     deleted: bool,
     deleted_by_message_id_hex: Option<String>,
+    invalidation_status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -414,9 +422,9 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
                 group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                deleted, deleted_by_message_id_hex
+                deleted, deleted_by_message_id_hex, invalidation_status
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 &row.group_id_hex,
                 &row.message_id_hex,
@@ -434,6 +442,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
                 reaction_summary_json(&row.reactions)?,
                 if row.deleted { 1_i64 } else { 0_i64 },
                 &row.deleted_by_message_id_hex,
+                &row.invalidation_status,
             ],
         )
         .storage()?;
@@ -465,13 +474,17 @@ fn app_events_for_rebuild_tx(
     tx: &Transaction<'_>,
     group_id_hex: &str,
 ) -> StorageResult<Vec<RawAppEvent>> {
+    // Invalidated events are intentionally NOT filtered out here: convergence-
+    // invalidated message-creating events are projected as tombstones (issue #111).
+    // `project_group_events` skips applying invalidated modifier events (reactions,
+    // deletes) so a losing-branch event never mutates canonical content.
     let mut stmt = tx
         .prepare(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
-                    plaintext, kind, tags_json, recorded_at, received_at
+                    plaintext, kind, tags_json, recorded_at, received_at,
+                    invalidated, invalidation_reason
              FROM app_events
              WHERE group_id_hex = ?1
-               AND invalidated = 0
              ORDER BY recorded_at, message_id_hex, insert_order",
         )
         .storage()?;
@@ -760,7 +773,7 @@ fn timeline_records_by_ids_tx(
         "SELECT message_id_hex, source_message_id_hex, direction, group_id_hex, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                deleted, deleted_by_message_id_hex
+                deleted, deleted_by_message_id_hex, invalidation_status
          FROM message_timeline
          WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
          ORDER BY timeline_at ASC, message_id_hex ASC"
@@ -879,7 +892,7 @@ fn timeline_query_sql(
             "SELECT message_id_hex, source_message_id_hex, direction, group_id_hex, sender,
                     plaintext, kind, tags_json, timeline_at, received_at,
                     reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                    deleted, deleted_by_message_id_hex
+                    deleted, deleted_by_message_id_hex, invalidation_status
              FROM message_timeline
              {where_sql}
              {order_sql}
@@ -898,28 +911,39 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
     for event in &events {
         match event.kind {
             MARMOT_APP_EVENT_KIND_CHAT => {
-                timeline.insert(event.message_id_hex.clone(), timeline_row_from_chat(event));
+                let mut row = timeline_row_from_chat(event);
+                if event.invalidated {
+                    row.invalidation_status = Some(invalidation_status(event));
+                }
+                timeline.insert(event.message_id_hex.clone(), row);
             }
             MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
                 if let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) {
-                    timeline.insert(
-                        event.message_id_hex.clone(),
-                        timeline_row_from_stream_start(event),
-                    );
-                    stream_starts.push(StreamStartRow {
-                        group_id_hex: event.group_id_hex.clone(),
-                        message_id_hex: event.message_id_hex.clone(),
-                        source_message_id_hex: event.source_message_id_hex.clone(),
-                        sender: event.sender.clone(),
-                        stream_id_hex: stream_id_hex.to_owned(),
-                        tags: event.tags.clone(),
-                        started_at: event.recorded_at,
-                        received_at: event.received_at,
-                    });
+                    let mut row = timeline_row_from_stream_start(event);
+                    if event.invalidated {
+                        row.invalidation_status = Some(invalidation_status(event));
+                    }
+                    timeline.insert(event.message_id_hex.clone(), row);
+                    // An invalidated stream start is a tombstone, not a live stream,
+                    // so it does not register an active stream-start row.
+                    if !event.invalidated {
+                        stream_starts.push(StreamStartRow {
+                            group_id_hex: event.group_id_hex.clone(),
+                            message_id_hex: event.message_id_hex.clone(),
+                            source_message_id_hex: event.source_message_id_hex.clone(),
+                            sender: event.sender.clone(),
+                            stream_id_hex: stream_id_hex.to_owned(),
+                            tags: event.tags.clone(),
+                            started_at: event.recorded_at,
+                            received_at: event.received_at,
+                        });
+                    }
                 }
             }
-            MARMOT_APP_EVENT_KIND_REACTION => reactions.push(event.clone()),
-            MARMOT_APP_EVENT_KIND_DELETE => deletes.push(event.clone()),
+            // Invalidated modifier events landed on a losing branch and MUST NOT
+            // mutate canonical content, so they are skipped entirely.
+            MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
+            MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
             _ => {}
         }
     }
@@ -1029,6 +1053,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         reactions: TimelineReactionSummary::default(),
         deleted: false,
         deleted_by_message_id_hex: None,
+        invalidation_status: None,
     }
 }
 
@@ -1050,7 +1075,19 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
         reactions: TimelineReactionSummary::default(),
         deleted: false,
         deleted_by_message_id_hex: None,
+        invalidation_status: None,
     }
+}
+
+/// The projected invalidation status for an invalidated event: the engine
+/// invalidation reason (e.g. `LosingBranch`) when present, falling back to a
+/// generic marker so the tombstone is always distinguishable from a delivered row.
+fn invalidation_status(event: &RawAppEvent) -> String {
+    event
+        .invalidation_reason
+        .clone()
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or_else(|| "Invalidated".to_owned())
 }
 
 fn media_metadata(tags: &[Vec<String>]) -> Option<Value> {
@@ -1113,6 +1150,8 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         })?,
         recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        invalidated: row.get::<_, i64>(10)? != 0,
+        invalidation_reason: row.get(11)?,
     })
 }
 
@@ -1157,6 +1196,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         })?,
         deleted: row.get::<_, i64>(14)? != 0,
         deleted_by_message_id_hex: row.get(15)?,
+        invalidation_status: row.get(16)?,
     })
 }
 
@@ -1747,55 +1787,96 @@ mod tests {
     }
 
     #[test]
-    fn source_invalidation_retracts_projected_effects() {
+    fn sender_own_invalidated_message_stays_as_tombstone() {
+        // Issue #111: a sender's own message invalidated by convergence (losing
+        // branch) must not silently disappear; it stays with a status instead.
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .record_app_event(&chat("target", "alice", 1, "hello"))
-            .unwrap();
+        let mut own = chat("target", "alice", 1, "my message");
+        own.direction = "sent".to_owned();
+        store.record_app_event(&own).unwrap();
 
         let update = store
-            .invalidate_app_event_by_source("source-target", "losing_branch")
-            .unwrap();
-        assert!(update.is_some());
-
-        assert!(update.unwrap().changes.iter().any(|change| {
-            matches!(
-                change,
-                TimelineMessageChange::Remove {
-                    message_id_hex,
-                    reason: TimelineRemoveReason::Invalidated,
-                } if message_id_hex == "target"
-            )
-        }));
-        assert!(list(&store).is_empty());
-    }
-
-    #[test]
-    fn message_id_invalidation_retracts_projected_effects() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .record_app_event(&chat("target", "alice", 1, "hello"))
-            .unwrap();
-
-        let update = store
-            .invalidate_app_event_by_message_id("target", "local_publish_failed")
+            .invalidate_app_event_by_source("source-target", "LosingBranch")
             .unwrap()
             .expect("projection update");
 
-        assert!(update.changes.iter().any(|change| {
-            matches!(
+        assert!(
+            update.changes.iter().any(|change| matches!(
                 change,
-                TimelineMessageChange::Remove {
-                    message_id_hex,
-                    reason: TimelineRemoveReason::Invalidated,
-                } if message_id_hex == "target"
-            )
-        }));
-        assert!(list(&store).is_empty());
+                TimelineMessageChange::Upsert { message, .. }
+                    if message.message_id_hex == "target"
+                        && message.invalidation_status.as_deref() == Some("LosingBranch")
+            )),
+            "invalidation should upsert a tombstone, not remove the row"
+        );
+        assert!(
+            !update
+                .changes
+                .iter()
+                .any(|change| matches!(change, TimelineMessageChange::Remove { .. })),
+            "the sender's own message must not be removed"
+        );
+
+        let rows = list(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id_hex, "target");
+        assert_eq!(rows[0].direction, "sent");
+        assert_eq!(rows[0].invalidation_status.as_deref(), Some("LosingBranch"));
+        assert_eq!(rows[0].plaintext, "my message", "content is preserved");
     }
 
     #[test]
-    fn parent_invalidation_removes_parent_and_updates_reply_preview_delta() {
+    fn source_invalidation_keeps_received_message_as_tombstone() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_source("source-target", "BeyondAnchor")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.changes.iter().any(|change| matches!(
+            change,
+            TimelineMessageChange::Upsert { message, .. }
+                if message.message_id_hex == "target"
+                    && message.invalidation_status.as_deref() == Some("BeyondAnchor")
+        )));
+        let rows = list(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].invalidation_status.as_deref(), Some("BeyondAnchor"));
+    }
+
+    #[test]
+    fn message_id_invalidation_keeps_message_as_tombstone() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_message_id("target", "UndecryptableInCanonicalState")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.changes.iter().any(|change| matches!(
+            change,
+            TimelineMessageChange::Upsert { message, .. }
+                if message.message_id_hex == "target"
+                    && message.invalidation_status.as_deref()
+                        == Some("UndecryptableInCanonicalState")
+        )));
+        let rows = list(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].invalidation_status.as_deref(),
+            Some("UndecryptableInCanonicalState")
+        );
+    }
+
+    #[test]
+    fn parent_invalidation_keeps_parent_as_tombstone_and_reply_preview() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .record_app_event(&chat("parent", "alice", 1, "the original"))
@@ -1805,33 +1886,37 @@ mod tests {
             .unwrap();
 
         let update = store
-            .invalidate_app_event_by_source("source-parent", "losing_branch")
+            .invalidate_app_event_by_source("source-parent", "LosingBranch")
             .unwrap()
             .expect("projection update");
 
-        assert!(update.changes.iter().any(|change| {
-            matches!(
-                change,
-                TimelineMessageChange::Remove {
-                    message_id_hex,
-                    reason: TimelineRemoveReason::Invalidated,
-                } if message_id_hex == "parent"
-            )
-        }));
-        let reply_change = update
-            .changes
+        // The parent is kept as a tombstone (content preserved), not removed.
+        assert!(update.changes.iter().any(|change| matches!(
+            change,
+            TimelineMessageChange::Upsert { message, .. }
+                if message.message_id_hex == "parent"
+                    && message.invalidation_status.as_deref() == Some("LosingBranch")
+        )));
+        assert!(
+            !update
+                .changes
+                .iter()
+                .any(|change| matches!(change, TimelineMessageChange::Remove { .. }))
+        );
+
+        let rows = list(&store);
+        let parent = rows
             .iter()
-            .find_map(|change| match change {
-                TimelineMessageChange::Upsert { trigger, message }
-                    if message.message_id_hex == "reply" =>
-                {
-                    Some((trigger, message))
-                }
-                _ => None,
-            })
-            .expect("reply preview change");
-        assert_eq!(reply_change.0, &TimelineUpdateTrigger::ReplyPreviewChanged);
-        assert!(reply_change.1.reply_preview.is_none());
+            .find(|m| m.message_id_hex == "parent")
+            .expect("parent kept as tombstone");
+        assert_eq!(parent.invalidation_status.as_deref(), Some("LosingBranch"));
+        assert_eq!(parent.plaintext, "the original");
+        // The reply still resolves its preview against the retained parent.
+        let reply = rows
+            .iter()
+            .find(|m| m.message_id_hex == "reply")
+            .expect("reply kept");
+        assert!(reply.reply_preview.is_some());
     }
 
     #[test]

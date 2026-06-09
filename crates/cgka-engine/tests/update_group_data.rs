@@ -16,7 +16,10 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
-use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GroupAvatarUrlV1, encode_group_avatar_url_v1,
+};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -791,4 +794,68 @@ async fn update_group_data_during_pending_publish_is_rejected() {
         .err()
         .unwrap();
     assert!(matches!(err, EngineError::InvalidTransition(_)));
+}
+
+// ── #105 group avatar-url component ──────────────────────────────────────────
+
+#[tokio::test]
+async fn valid_group_avatar_url_component_is_accepted_and_stored() {
+    let (mut alice, _bob, gid) = create_pair().await;
+    let data = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
+        url: "https://cdn.example.com/avatar.png".to_owned(),
+        dim: Some("512x512".to_owned()),
+        thumbhash: None,
+    })
+    .unwrap();
+
+    let res = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+                data: data.clone(),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match res {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    let stored = alice
+        .app_component(&gid, GROUP_AVATAR_URL_COMPONENT_ID)
+        .unwrap()
+        .expect("avatar-url component is stored");
+    assert_eq!(stored, data);
+}
+
+#[tokio::test]
+async fn invalid_group_avatar_url_component_is_rejected() {
+    let (mut alice, _bob, gid) = create_pair().await;
+    // http:// (not https) is rejected by the component validator.
+    let mut bad = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(
+        "http://cdn.example.com/a.png".len() as u64,
+        &mut bad,
+    );
+    bad.extend_from_slice(b"http://cdn.example.com/a.png");
+    cgka_traits::app_components::encode_quic_varint(0, &mut bad); // empty dim
+    cgka_traits::app_components::encode_quic_varint(0, &mut bad); // empty thumbhash
+
+    let err = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+                data: bad,
+            }],
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::Serialize(_)), "got {err:?}");
 }

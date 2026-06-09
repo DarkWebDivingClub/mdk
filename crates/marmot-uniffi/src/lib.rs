@@ -714,6 +714,25 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Set (or clear, with `url = None`) the group's URL-based avatar
+    /// (`marmot.group.avatar-url.v1`). The URL is validated (https-only, no
+    /// localhost/private hosts) and normalized before it is committed.
+    pub async fn update_group_avatar_url(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        url: Option<String>,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_group_avatar_url(&account_ref, &group_id, url, dim, thumbhash)
+            .await?;
+        Ok(summary.into())
+    }
+
     /// Grant admin rights to `member_ref` (npub or hex). Requires the caller
     /// to be an admin; publishes a group state update.
     pub async fn promote_admin(

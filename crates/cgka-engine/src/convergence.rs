@@ -28,6 +28,39 @@ impl Default for ConvergencePolicy {
     }
 }
 
+/// Validation errors for a [`ConvergencePolicy`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConvergencePolicyError {
+    /// `max_witness_override_depth` exceeds `max_rewind_commits`. The witness-quorum
+    /// boost is capped by group policy; if it could exceed the rollback horizon, app
+    /// payload traffic could push a branch past an arbitrarily longer valid commit
+    /// branch — the invariant at `spec/protocol-core/convergence.md` lines 119-120.
+    #[error(
+        "max_witness_override_depth ({max_witness_override_depth}) must not exceed \
+         max_rewind_commits ({max_rewind_commits})"
+    )]
+    WitnessOverrideExceedsRewind {
+        max_witness_override_depth: u64,
+        max_rewind_commits: u64,
+    },
+}
+
+impl ConvergencePolicy {
+    /// Enforce the witness-override invariant as a hard policy bound: a witness-quorum
+    /// boost must never be able to push a branch past the rollback horizon. This is
+    /// checked when a stored policy is decoded and when a group policy is set, so an
+    /// out-of-bound policy can never drive branch selection.
+    pub fn validate(&self) -> Result<(), ConvergencePolicyError> {
+        if self.max_witness_override_depth > self.max_rewind_commits {
+            return Err(ConvergencePolicyError::WitnessOverrideExceedsRewind {
+                max_witness_override_depth: self.max_witness_override_depth,
+                max_rewind_commits: self.max_rewind_commits,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchCandidate {
     pub id: String,

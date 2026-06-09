@@ -269,17 +269,18 @@ fn selector_candidate_shape() -> impl Strategy<Value = SelectorCandidateShape> {
 }
 
 fn convergence_policy_strategy() -> impl Strategy<Value = ConvergencePolicy> {
-    (0u64..=10, 1usize..=4, 1usize..=3, 0u64..=3).prop_map(
-        |(
-            max_rewind_commits,
-            witness_quorum_senders_per_epoch,
-            witness_quorum_epochs,
-            max_witness_override_depth,
-        )| ConvergencePolicy {
-            max_rewind_commits,
-            witness_quorum_senders_per_epoch,
-            witness_quorum_epochs,
-            max_witness_override_depth,
+    // `max_witness_override_depth` is bounded by `max_rewind_commits` so generated
+    // policies satisfy `ConvergencePolicy::validate` (the witness-override invariant).
+    (0u64..=10, 1usize..=4, 1usize..=3).prop_flat_map(
+        |(max_rewind_commits, witness_quorum_senders_per_epoch, witness_quorum_epochs)| {
+            (0u64..=max_rewind_commits.min(3)).prop_map(move |max_witness_override_depth| {
+                ConvergencePolicy {
+                    max_rewind_commits,
+                    witness_quorum_senders_per_epoch,
+                    witness_quorum_epochs,
+                    max_witness_override_depth,
+                }
+            })
         },
     )
 }

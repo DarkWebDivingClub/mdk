@@ -26,6 +26,14 @@ impl Default for CanonicalizationPolicy {
     }
 }
 
+impl CanonicalizationPolicy {
+    /// Validate the nested convergence policy bounds. See
+    /// [`ConvergencePolicy::validate`](crate::convergence::ConvergencePolicy::validate).
+    pub fn validate(&self) -> Result<(), crate::convergence::ConvergencePolicyError> {
+        self.convergence.validate()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalizationState {
     pub current_tip_epoch: u64,

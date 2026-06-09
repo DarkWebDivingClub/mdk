@@ -197,6 +197,7 @@ pub enum OpenMlsProjectionError {
     UnauthorizedCommit { message_id: String },
     Serialize(String),
     Storage(String),
+    InvalidPolicy(String),
 }
 
 impl std::fmt::Display for OpenMlsProjectionError {
@@ -220,6 +221,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
+            OpenMlsProjectionError::InvalidPolicy(e) => {
+                write!(f, "invalid convergence policy: {e}")
+            }
         }
     }
 }
