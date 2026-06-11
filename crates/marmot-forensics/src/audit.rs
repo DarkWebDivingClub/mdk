@@ -504,6 +504,38 @@ fn generate_recorder_session_id() -> String {
     format!("{now:032x}{:08x}{counter:016x}", std::process::id())
 }
 
+/// Stamp lifecycle and diagnostic rows with a `system`-origin `human_action`.
+///
+/// `recorder_started`, `engine_context`, and `recorder_health` are emitted at
+/// startup, outside any human-initiated operation, so they arrive with no
+/// `human_action`. Audit consumers that require a human action on every row
+/// reject them otherwise. Rows that already carry a `human_action` (including
+/// every operation row) are returned unchanged.
+fn stamp_system_lifecycle_action(
+    context: Option<AuditEventContext>,
+    kind: &AuditEventKind,
+) -> Option<AuditEventContext> {
+    if context
+        .as_ref()
+        .is_some_and(|ctx| ctx.human_action.is_some())
+    {
+        return context;
+    }
+    let action = match kind {
+        AuditEventKind::RecorderStarted { .. } => "recorder_started",
+        AuditEventKind::EngineContext { .. } => "engine_context",
+        AuditEventKind::RecorderHealth { .. } => "recorder_health",
+        _ => return context,
+    };
+    let mut context = context.unwrap_or_default();
+    context.human_action = Some(AuditHumanActionContext {
+        action: action.to_string(),
+        origin: "system".to_string(),
+        ..Default::default()
+    });
+    Some(context)
+}
+
 impl ForensicRecorder for JsonlRecorder {
     fn record(&self, record: AuditRecord) {
         // Poisoning means a prior `record()` panicked while holding the lock.
@@ -519,6 +551,7 @@ impl ForensicRecorder for JsonlRecorder {
         };
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
+        let context = stamp_system_lifecycle_action(record.context, &record.kind);
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
             seq,
@@ -530,7 +563,7 @@ impl ForensicRecorder for JsonlRecorder {
             account_ref: inner.account_ref.clone(),
             engine_id: inner.engine_id.clone(),
             group_ref: record.group_ref,
-            context: record.context,
+            context,
             kind: record.kind,
         };
         if let Ok(line) = serde_json::to_string(&event) {
@@ -624,6 +657,81 @@ mod tests {
         assert_eq!(third.group_ref.as_deref(), Some("group-1"));
         assert_eq!(first.schema_version, AUDIT_LOG_SCHEMA_VERSION);
         assert!(first.recorder_session_id.is_some());
+    }
+
+    #[test]
+    fn jsonl_recorder_stamps_lifecycle_rows_with_system_human_action() {
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-abc");
+        let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+        // `recorder_started` is emitted by `open`. Add the other two lifecycle
+        // kinds plus an operation row that already carries a human action.
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::EngineContext {
+                context: AuditEngineContext::default(),
+            },
+        ));
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::RecorderHealth {
+                serialization_failures: 0,
+                write_failures: 0,
+                flush_failures: 0,
+            },
+        ));
+        recorder.record(
+            AuditRecord::new(
+                Some("group-1".into()),
+                AuditEventKind::SendEntry {
+                    intent_kind: "app_message".into(),
+                },
+            )
+            .with_context(AuditEventContext {
+                human_action: Some(AuditHumanActionContext {
+                    action: "send_message".into(),
+                    origin: "local_user".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        drop(recorder);
+
+        let events: Vec<AuditEvent> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let human_action = |kind_name: &str| -> AuditHumanActionContext {
+            events
+                .iter()
+                .find(|event| audit_kind_type(&event.kind) == kind_name)
+                .and_then(|event| event.context.as_ref())
+                .and_then(|ctx| ctx.human_action.clone())
+                .unwrap_or_else(|| panic!("{kind_name} row should carry a human_action"))
+        };
+
+        for kind_name in ["recorder_started", "engine_context", "recorder_health"] {
+            let action = human_action(kind_name);
+            assert_eq!(action.origin, "system");
+            assert_eq!(action.action, kind_name);
+        }
+        // A row that already carries a human action keeps it untouched.
+        let send = human_action("send_entry");
+        assert_eq!(send.origin, "local_user");
+        assert_eq!(send.action, "send_message");
+    }
+
+    fn audit_kind_type(kind: &AuditEventKind) -> &'static str {
+        match kind {
+            AuditEventKind::RecorderStarted { .. } => "recorder_started",
+            AuditEventKind::EngineContext { .. } => "engine_context",
+            AuditEventKind::RecorderHealth { .. } => "recorder_health",
+            AuditEventKind::SendEntry { .. } => "send_entry",
+            _ => "other",
+        }
     }
 
     #[test]
