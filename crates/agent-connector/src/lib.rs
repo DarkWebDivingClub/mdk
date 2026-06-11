@@ -18,7 +18,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::{
     AgentControlAccount, AgentControlDebugFinalSend, AgentControlEnvelope, AgentControlError,
@@ -46,6 +46,12 @@ const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
 const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
+/// Maximum time a stream compose session may sit without an append/status/progress
+/// command before the sweeper aborts it. Bounds the lifetime of sessions abandoned by
+/// a crashed or restarted gateway (fresh ids on restart leave no cleanup path).
+const STREAM_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often the background sweeper scans for idle stream compose sessions.
+const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PROFILE_NAME_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
@@ -207,6 +213,7 @@ impl AgentConnector {
     pub async fn start(&self) -> Result<(), ConnectorError> {
         self.runtime.start().await?;
         self.spawn_invite_policy_worker();
+        self.spawn_stream_session_sweeper();
         self.ensure_agent_accounts_ready().await?;
         Ok(())
     }
@@ -808,6 +815,7 @@ impl AgentConnector {
                 start_message_id_hex: start_message_id_hex.clone(),
                 tx,
                 abort: handle.abort_handle(),
+                last_activity: Instant::now(),
             },
         );
         Ok(AgentControlResponse::StreamBegun {
@@ -1133,6 +1141,26 @@ impl AgentConnector {
         let connector = self.clone();
         tokio::spawn(async move {
             connector.run_invite_policy_worker().await;
+        });
+    }
+
+    fn spawn_stream_session_sweeper(&self) {
+        let streams = self.streams.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(STREAM_SESSION_SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let swept = streams.sweep_idle(STREAM_SESSION_IDLE_TIMEOUT);
+                if swept > 0 {
+                    tracing::warn!(
+                        target: "agent_connector",
+                        method = "spawn_stream_session_sweeper",
+                        swept,
+                        "aborted idle stream compose sessions"
+                    );
+                }
+            }
         });
     }
 
@@ -1606,6 +1634,7 @@ struct ActiveStreamSession {
     start_message_id_hex: String,
     tx: mpsc::Sender<StreamComposeCommand>,
     abort: tokio::task::AbortHandle,
+    last_activity: Instant,
 }
 
 impl StreamSessionStore {
@@ -1619,14 +1648,13 @@ impl StreamSessionStore {
 
     fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        self.sessions
-            .lock()
-            .expect("stream session lock poisoned")
-            .get(&stream_id_hex)
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
-            })
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let session = sessions.get_mut(&stream_id_hex).ok_or_else(|| {
+            ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
+        })?;
+        // Touching the session on any command keeps it alive against the idle sweep.
+        session.last_activity = Instant::now();
+        Ok(session.clone())
     }
 
     fn remove(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
@@ -1638,6 +1666,30 @@ impl StreamSessionStore {
             .ok_or_else(|| {
                 ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
             })
+    }
+
+    /// Abort and drop every session whose last activity is older than `max_idle`.
+    ///
+    /// Returns the number of sessions swept. This is what bounds the lifetime of
+    /// sessions abandoned when the gateway crashes or restarts mid-stream: each such
+    /// session otherwise keeps the compose task, its `mpsc::Sender`, the accumulated
+    /// transcript, and (when broker connect succeeded) a dedicated quinn `Endpoint`
+    /// UDP socket plus a live keep-alive'd QUIC connection alive forever.
+    fn sweep_idle(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let stale: Vec<String> = sessions
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_activity) >= max_idle)
+            .map(|(stream_id_hex, _)| stream_id_hex.clone())
+            .collect();
+        for stream_id_hex in &stale {
+            if let Some(session) = sessions.remove(stream_id_hex) {
+                let _ = session.tx.try_send(StreamComposeCommand::Cancel);
+                session.abort.abort();
+            }
+        }
+        stale.len()
     }
 }
 
@@ -1981,6 +2033,66 @@ mod tests {
         config.allow_any = allow_any;
         config.debug_controls = debug_controls;
         config
+    }
+
+    #[tokio::test]
+    async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
+        use crate::{ActiveStreamSession, StreamSessionStore};
+        use agent_stream_compose::StreamComposeCommand;
+        use cgka_traits::GroupId;
+        use std::time::{Duration, Instant};
+
+        let store = StreamSessionStore::default();
+
+        // An idle session: last activity well beyond the timeout. Its compose task
+        // is a stand-in that blocks on rx, exactly like run_stream_compose_session.
+        let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+        let idle_handle = tokio::spawn(async move { while idle_rx.recv().await.is_some() {} });
+        store.insert(
+            "aa".to_owned(),
+            ActiveStreamSession {
+                account_label: "agent".to_owned(),
+                group_id: GroupId::new(vec![1]),
+                stream_id: vec![0xaa],
+                start_message_id_hex: "00".to_owned(),
+                tx: idle_tx,
+                abort: idle_handle.abort_handle(),
+                last_activity: Instant::now() - Duration::from_secs(3600),
+            },
+        );
+
+        // A fresh session that must survive the sweep.
+        let (active_tx, mut active_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+        let active_handle = tokio::spawn(async move { while active_rx.recv().await.is_some() {} });
+        store.insert(
+            "bb".to_owned(),
+            ActiveStreamSession {
+                account_label: "agent".to_owned(),
+                group_id: GroupId::new(vec![2]),
+                stream_id: vec![0xbb],
+                start_message_id_hex: "00".to_owned(),
+                tx: active_tx,
+                abort: active_handle.abort_handle(),
+                last_activity: Instant::now(),
+            },
+        );
+
+        let swept = store.sweep_idle(Duration::from_secs(300));
+        assert_eq!(swept, 1, "exactly the idle session should be swept");
+
+        // Idle session is gone and its compose task was aborted, dropping the
+        // mpsc Sender / transcript / quinn endpoint it was holding open.
+        assert!(
+            store.remove("aa").is_err(),
+            "idle session should be removed"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), idle_handle)
+            .await
+            .expect("aborted compose task should finish promptly");
+
+        // Active session is untouched and still usable.
+        assert!(store.get("bb").is_ok(), "active session should remain");
+        active_handle.abort();
     }
 
     #[tokio::test]
