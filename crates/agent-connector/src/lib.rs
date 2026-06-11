@@ -9,7 +9,7 @@ pub use bootstrap::{
     resolve_bootstrap_socket, run_bootstrap,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
@@ -25,7 +25,7 @@ use agent_control::{
     AgentControlEvent, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
-use cgka_traits::{GroupId, MessageId, engine::GroupEvent};
+use cgka_traits::{GroupId, MemberId, MessageId, engine::GroupEvent};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{
     AccountRelayListBootstrap, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppError,
@@ -43,6 +43,9 @@ const ALLOWLIST_DIR: &str = "agent-allowlist";
 const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
+const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
+const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
 const MAX_PROFILE_NAME_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
@@ -84,9 +87,88 @@ pub struct AgentConnector {
     debug_events: broadcast::Sender<AgentControlEvent>,
     debug_final_sends: DebugFinalSendStore,
     streams: StreamSessionStore,
+    app: MarmotApp,
     runtime: MarmotAppRuntime,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct InvitePolicyKey {
+    account_id_hex: String,
+    group_id_hex: String,
+}
+
+impl InvitePolicyKey {
+    fn new(account_id_hex: &str, group_id_hex: &str) -> Self {
+        Self {
+            account_id_hex: account_id_hex.to_owned(),
+            group_id_hex: group_id_hex.to_owned(),
+        }
+    }
+}
+
+struct PendingInvitePolicyCandidate {
+    key: InvitePolicyKey,
+    group_id: GroupId,
+    welcomer: Option<MemberId>,
+}
+
+#[derive(Default)]
+struct InvitePolicyRetryState {
+    failures: HashMap<InvitePolicyKey, InvitePolicyRetry>,
+}
+
+struct InvitePolicyRetry {
+    attempts: u32,
+    next_retry_at: tokio::time::Instant,
+}
+
+impl InvitePolicyRetryState {
+    fn is_due(&self, key: &InvitePolicyKey, now: tokio::time::Instant) -> bool {
+        match self.failures.get(key) {
+            Some(retry) => now >= retry.next_retry_at,
+            None => true,
+        }
+    }
+
+    fn clear(&mut self, key: &InvitePolicyKey) {
+        self.failures.remove(key);
+    }
+
+    fn retain_pending(&mut self, pending: &HashSet<InvitePolicyKey>) {
+        self.failures.retain(|key, _| pending.contains(key));
+    }
+
+    fn record_failure(
+        &mut self,
+        key: InvitePolicyKey,
+        now: tokio::time::Instant,
+    ) -> (u32, Duration) {
+        let attempts = self
+            .failures
+            .get(&key)
+            .map(|retry| retry.attempts.saturating_add(1))
+            .unwrap_or(1);
+        let delay = invite_policy_retry_delay(attempts);
+        self.failures.insert(
+            key,
+            InvitePolicyRetry {
+                attempts,
+                next_retry_at: now + delay,
+            },
+        );
+        (attempts, delay)
+    }
+}
+
+fn invite_policy_retry_delay(attempts: u32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(10);
+    let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let delay = INVITE_POLICY_RETRY_BASE
+        .checked_mul(factor)
+        .unwrap_or(INVITE_POLICY_RETRY_MAX);
+    std::cmp::min(delay, INVITE_POLICY_RETRY_MAX)
 }
 
 impl AgentConnector {
@@ -98,7 +180,7 @@ impl AgentConnector {
             relays.clone(),
             account_home.clone(),
         );
-        let runtime = MarmotAppRuntime::new(app);
+        let runtime = MarmotAppRuntime::new(app.clone());
         let allowlists = AllowlistStore::new(&config.home);
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
@@ -110,6 +192,7 @@ impl AgentConnector {
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
             streams: StreamSessionStore::default(),
+            app,
             runtime,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
@@ -1055,24 +1138,140 @@ impl AgentConnector {
 
     async fn run_invite_policy_worker(self) {
         let mut events = self.runtime.subscribe();
+        let mut retry_state = InvitePolicyRetryState::default();
+        let mut reconcile_interval = tokio::time::interval_at(
+            tokio::time::Instant::now(),
+            INVITE_POLICY_RECONCILE_INTERVAL,
+        );
+        reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let event = match events.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            };
-            let MarmotAppEvent::GroupEvent(group_event) = event else {
-                continue;
-            };
-            let GroupEvent::GroupJoined {
-                group_id, welcomer, ..
-            } = group_event.event
-            else {
-                continue;
-            };
-            let _ = self
-                .apply_invite_policy(&group_event.account_id_hex, &group_id, welcomer)
-                .await;
+            tokio::select! {
+                _ = reconcile_interval.tick() => {
+                    self.reconcile_pending_invite_policies(&mut retry_state).await;
+                }
+                event = events.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(lagged)) => {
+                            tracing::warn!(
+                                target: "agent_connector",
+                                method = "run_invite_policy_worker",
+                                lagged,
+                                "invite policy event stream lagged; reconciling pending invites"
+                            );
+                            self.reconcile_pending_invite_policies(&mut retry_state).await;
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    };
+                    let MarmotAppEvent::GroupEvent(group_event) = event else {
+                        continue;
+                    };
+                    let GroupEvent::GroupJoined {
+                        group_id, welcomer, ..
+                    } = group_event.event
+                    else {
+                        continue;
+                    };
+                    let group_id_hex = hex::encode(group_id.as_slice());
+                    let candidate = PendingInvitePolicyCandidate {
+                        key: InvitePolicyKey::new(&group_event.account_id_hex, &group_id_hex),
+                        group_id,
+                        welcomer,
+                    };
+                    let now = tokio::time::Instant::now();
+                    if retry_state.is_due(&candidate.key, now) {
+                        self.apply_invite_policy_candidate(candidate, &mut retry_state, now)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reconcile_pending_invite_policies(&self, retry_state: &mut InvitePolicyRetryState) {
+        let candidates = match self.pending_invite_policy_candidates() {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "reconcile_pending_invite_policies",
+                    error_code = err.privacy_safe_code(),
+                    "pending invite policy reconciliation failed"
+                );
+                return;
+            }
+        };
+        let pending = candidates
+            .iter()
+            .map(|candidate| candidate.key.clone())
+            .collect::<HashSet<_>>();
+        retry_state.retain_pending(&pending);
+        let now = tokio::time::Instant::now();
+        for candidate in candidates {
+            if retry_state.is_due(&candidate.key, now) {
+                self.apply_invite_policy_candidate(candidate, retry_state, now)
+                    .await;
+            }
+        }
+    }
+
+    fn pending_invite_policy_candidates(
+        &self,
+    ) -> Result<Vec<PendingInvitePolicyCandidate>, ConnectorError> {
+        let mut candidates = Vec::new();
+        for account in self
+            .account_home
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.local_signing)
+        {
+            for group in self.app.groups(&account.label)? {
+                if !group.pending_confirmation || group.archived {
+                    continue;
+                }
+                let group_id_hex = normalize_hex(&group.group_id_hex)?;
+                let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+                let welcomer = match group.welcomer_account_id_hex.as_deref() {
+                    Some(welcomer) => Some(MemberId::new(hex::decode(normalize_hex(welcomer)?)?)),
+                    None => None,
+                };
+                candidates.push(PendingInvitePolicyCandidate {
+                    key: InvitePolicyKey::new(&account.account_id_hex, &group_id_hex),
+                    group_id,
+                    welcomer,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn apply_invite_policy_candidate(
+        &self,
+        candidate: PendingInvitePolicyCandidate,
+        retry_state: &mut InvitePolicyRetryState,
+        now: tokio::time::Instant,
+    ) {
+        match self
+            .apply_invite_policy(
+                &candidate.key.account_id_hex,
+                &candidate.group_id,
+                candidate.welcomer,
+            )
+            .await
+        {
+            Ok(()) => retry_state.clear(&candidate.key),
+            Err(err) => {
+                let (attempts, retry_delay) = retry_state.record_failure(candidate.key, now);
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "apply_invite_policy_candidate",
+                    error_code = err.privacy_safe_code(),
+                    attempts,
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "invite policy application failed; will retry"
+                );
+            }
         }
     }
 
@@ -1080,7 +1279,7 @@ impl AgentConnector {
         &self,
         account_id_hex: &str,
         group_id: &GroupId,
-        welcomer: Option<cgka_traits::MemberId>,
+        welcomer: Option<MemberId>,
     ) -> Result<(), ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let allowed = self.allow_any
@@ -1755,6 +1954,7 @@ mod tests {
     use marmot_account::AccountHome;
     use marmot_app::{AccountSetupRequest, MarmotApp, MarmotAppRuntime};
     use nostr_relay_builder::MockRelay;
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tokio::io::BufReader;
@@ -2002,6 +2202,10 @@ mod tests {
                 std::slice::from_ref(&human.account.account_id_hex),
                 None,
             )
+            .await
+            .unwrap();
+        setup_runtime
+            .accept_group_invite(&human.account.account_id_hex, &group_id)
             .await
             .unwrap();
         setup_runtime.shutdown().await;
@@ -2541,6 +2745,97 @@ mod tests {
         human_runtime.shutdown().await;
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connector_start_reconciles_existing_allowed_pending_invite() {
+        let setup = setup_existing_pending_invite("existing pending invite").await;
+        let connector = AgentConnector::open(test_config(
+            setup.dir.path(),
+            setup.dir.path().join("dev").join("dm-agent.sock"),
+            vec![setup.relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+        connector
+            .allowlist_add_response(&setup.agent_account_id_hex, &setup.human_account_id_hex)
+            .unwrap();
+
+        connector.start().await.unwrap();
+
+        wait_for_group_state(
+            &setup.app,
+            &setup.agent_label,
+            &setup.group_id_hex,
+            |group| !group.pending_confirmation && !group.archived,
+        )
+        .await;
+
+        connector.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connector_start_reconciles_existing_unlisted_pending_invite_by_declining() {
+        let setup = setup_existing_pending_invite("existing unlisted pending invite").await;
+        let connector = AgentConnector::open(test_config(
+            setup.dir.path(),
+            setup.dir.path().join("dev").join("dm-agent.sock"),
+            vec![setup.relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+
+        connector.start().await.unwrap();
+
+        wait_for_group_state(
+            &setup.app,
+            &setup.agent_label,
+            &setup.group_id_hex,
+            |group| !group.pending_confirmation && group.archived,
+        )
+        .await;
+
+        connector.runtime.shutdown().await;
+    }
+
+    #[test]
+    fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
+        let mut retry_state = crate::InvitePolicyRetryState::default();
+        let key = crate::InvitePolicyKey::new("aa", "bb");
+        let other_key = crate::InvitePolicyKey::new("cc", "dd");
+        let now = tokio::time::Instant::now();
+
+        assert!(retry_state.is_due(&key, now));
+        let (attempts, delay) = retry_state.record_failure(key.clone(), now);
+        assert_eq!(attempts, 1);
+        assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE);
+        assert!(!retry_state.is_due(&key, now + delay - Duration::from_millis(1)));
+        assert!(retry_state.is_due(&key, now + delay));
+
+        let (attempts, delay) = retry_state.record_failure(key.clone(), now + delay);
+        assert_eq!(attempts, 2);
+        assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE * 2);
+
+        let mut current = now;
+        let mut capped_delay = delay;
+        for expected_attempt in 3..=20 {
+            current += capped_delay;
+            let (attempts, delay) = retry_state.record_failure(key.clone(), current);
+            assert_eq!(attempts, expected_attempt);
+            assert!(delay <= crate::INVITE_POLICY_RETRY_MAX);
+            capped_delay = delay;
+        }
+        assert_eq!(capped_delay, crate::INVITE_POLICY_RETRY_MAX);
+
+        retry_state.record_failure(other_key.clone(), now);
+        retry_state.retain_pending(&HashSet::from([key.clone()]));
+        assert!(retry_state.failures.contains_key(&key));
+        assert!(!retry_state.failures.contains_key(&other_key));
+
+        retry_state.clear(&key);
+        assert!(retry_state.is_due(&key, now));
     }
 
     #[tokio::test]
@@ -3135,6 +3430,60 @@ mod tests {
             transcript.append(seq, *record_type, text.as_bytes());
         }
         hex::encode(transcript.hash())
+    }
+
+    struct ExistingPendingInviteSetup {
+        dir: tempfile::TempDir,
+        _relay: MockRelay,
+        relay_url: String,
+        app: MarmotApp,
+        agent_label: String,
+        agent_account_id_hex: String,
+        human_account_id_hex: String,
+        group_id_hex: String,
+    }
+
+    async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInviteSetup {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+        let setup_runtime = MarmotAppRuntime::new(app.clone());
+        let setup = AccountSetupRequest {
+            default_relays: vec![crate::endpoint(&relay_url)],
+            bootstrap_relays: vec![crate::endpoint(&relay_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        };
+        let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+        let human = setup_runtime.create_identity(setup).await.unwrap();
+
+        let group_id = setup_runtime
+            .create_group(
+                &human.account.account_id_hex,
+                group_name,
+                std::slice::from_ref(&agent.account.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        wait_for_group_state(&app, &agent.account.label, &group_id_hex, |group| {
+            group.pending_confirmation && !group.archived
+        })
+        .await;
+        setup_runtime.shutdown().await;
+
+        ExistingPendingInviteSetup {
+            dir,
+            _relay: relay,
+            relay_url,
+            app,
+            agent_label: agent.account.label,
+            agent_account_id_hex: agent.account.account_id_hex,
+            human_account_id_hex: human.account.account_id_hex,
+            group_id_hex,
+        }
     }
 
     async fn wait_for_group_state<F>(
