@@ -1160,6 +1160,7 @@ struct OpenAppAccount {
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
+    signing_keys: nostr::Keys,
 }
 
 impl MarmotApp {
@@ -1475,6 +1476,13 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
+        // Before any subscription goes out: auth-gated relays (NIP-42)
+        // withhold gift-wrapped welcomes from unauthenticated subscribers,
+        // and the catch-up REQ gets no error back — the events are simply
+        // absent.
+        relay_plane
+            .set_transport_signer(open.signing_keys.clone())
+            .await;
         let rebuild_since =
             relay_plane_for_rebuild.subscription_rebuild_since(open.state.last_transport_timestamp);
         open.runtime.activate_transport(rebuild_since).await?;
@@ -2606,6 +2614,7 @@ impl MarmotApp {
             adapter,
             routing,
             state,
+            signing_keys: keys,
         })
     }
 

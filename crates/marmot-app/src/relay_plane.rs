@@ -457,6 +457,21 @@ impl MarmotRelayPlane {
         ))
     }
 
+    /// Attach an account's signing keys to the shared transport client so it
+    /// can answer NIP-42 AUTH challenges. Auth-gated relays withhold
+    /// gift-wrapped welcomes from unauthenticated subscribers without
+    /// surfacing an error — the events are simply absent — so an inbox
+    /// subscription issued before a signer is set never sees the invites
+    /// those relays hold. The SDK client (and the directory fetcher sharing
+    /// it) is one per plane: with multiple accounts the most recently opened
+    /// account's keys win, which matches the one-account-per-process apps.
+    /// No-op for planes built on a custom relay client.
+    pub async fn set_transport_signer(&self, keys: nostr::Keys) {
+        if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
+            sdk_relay_client.client().set_signer(keys).await;
+        }
+    }
+
     pub async fn relay_health(&self) -> RelayPlaneHealth {
         let directory = self.inner.directory.stats().await;
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
@@ -1353,6 +1368,28 @@ mod tests {
                 device_model_identifier: None,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
+        let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+        let sdk = plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .expect("sdk-backed plane has a relay client");
+        assert!(
+            sdk.client().signer().await.is_err(),
+            "a fresh plane must not have a signer"
+        );
+
+        plane.set_transport_signer(nostr::Keys::generate()).await;
+
+        assert!(
+            sdk.client().signer().await.is_ok(),
+            "the transport client must hold a signer to answer NIP-42 AUTH"
+        );
     }
 
     #[test]
