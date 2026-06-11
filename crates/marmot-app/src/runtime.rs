@@ -3213,7 +3213,12 @@ impl AccountManager {
         }
         // Hold the worker map lock until storage is updated so reconcile()
         // cannot recreate this account's worker mid-removal.
-        self.app.drop_directory_cache_for_account(&account.label);
+        //
+        // Evict every in-memory handle and warm flag for this label BEFORE the
+        // account directory is deleted. Otherwise the cached account-storage
+        // connection (and directory cache) keeps pointing at the unlinked inode
+        // and a later re-import silently splits writes across a stale handle.
+        self.app.drop_account_caches(&account.label);
         self.app.account_home().remove_account(&account.label)?;
         Ok(())
     }
@@ -4352,6 +4357,11 @@ impl AccountManager {
         account: &str,
         source: AppError,
     ) -> Result<T, AppError> {
+        // Setup probes (e.g. `status()`) may have already cached this account's
+        // storage/directory handles. Evict them before the directory is deleted
+        // so a later re-import does not reuse a handle bound to the now-unlinked
+        // inode. See `drop_account_caches` and darkmatter#220.
+        self.app.drop_account_caches(account);
         match self.app.account_home().remove_account(account) {
             Ok(()) => Err(source),
             Err(rollback) => Err(AppError::RelayDirectory(format!(

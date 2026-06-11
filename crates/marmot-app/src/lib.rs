@@ -1440,6 +1440,22 @@ impl MarmotApp {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    fn account_storage_cached_for_test(&self, label: &str) -> bool {
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(label)
+    }
+
+    #[cfg(test)]
+    fn directory_cache_cached_for_test(&self, label: &str) -> bool {
+        self.directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(label)
+    }
+
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
         self.client_with_relay_plane(label, &MarmotRelayPlane::full_history(), None)
             .await
@@ -3799,8 +3815,34 @@ impl MarmotApp {
         self.account_dir(label).join(APP_CACHE_DB_FILE)
     }
 
-    fn drop_directory_cache_for_account(&self, label: &str) {
+    /// Evict every in-memory handle and warm flag bound to `label`.
+    ///
+    /// Must be called before the account directory is deleted on removal or
+    /// setup-failure rollback. Without this, the cached `SqliteAccountStorage`
+    /// connection in `account_storages` (and the `directory_caches` handle)
+    /// keeps pointing at the now-unlinked inode: after the user re-imports the
+    /// same account, the session DB is rebuilt fresh while projection paths
+    /// keep writing through the stale handle, silently losing data. Clearing
+    /// the warm/stale/ready flags forces the rebuilt account to re-warm its
+    /// projections from the fresh database.
+    fn drop_account_caches(&self, label: &str) {
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
         self.directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.account_state_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
@@ -5739,6 +5781,65 @@ mod tests {
         assert_eq!(
             app.directory_cache_open_count_for_test(),
             open_count_after_warm
+        );
+    }
+
+    #[test]
+    fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
+        // Regression for darkmatter#220: removing an account (or rolling back a
+        // failed setup) must evict the cached account-storage connection and
+        // directory-cache handle before the account directory is deleted.
+        // Otherwise the stale handle keeps pointing at the unlinked inode and a
+        // later re-import silently splits writes across a deleted DB.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        // Warm the account-storage connection, directory cache, and the
+        // account-state / chat-list warm flags.
+        app.ensure_account_state(&alice.label).unwrap();
+        let account_summary = app.account_home().account(&alice.label).unwrap();
+        app.ensure_chat_list_projection(&account_summary).unwrap();
+        app.display_name_for_account_id(&alice.account_id_hex)
+            .unwrap();
+
+        assert!(app.account_storage_cached_for_test(&alice.label));
+        assert!(app.directory_cache_cached_for_test(&alice.label));
+        assert!(
+            app.account_state_ready
+                .lock()
+                .unwrap()
+                .contains(&alice.label)
+        );
+        assert!(
+            app.chat_list_projection_warmed
+                .lock()
+                .unwrap()
+                .contains(&alice.label)
+        );
+
+        app.drop_account_caches(&alice.label);
+
+        assert!(!app.account_storage_cached_for_test(&alice.label));
+        assert!(!app.directory_cache_cached_for_test(&alice.label));
+        assert!(
+            !app.account_state_ready
+                .lock()
+                .unwrap()
+                .contains(&alice.label)
+        );
+        assert!(
+            !app.chat_list_projection_warmed
+                .lock()
+                .unwrap()
+                .contains(&alice.label)
+        );
+        assert!(
+            !app.chat_list_projection_stale
+                .lock()
+                .unwrap()
+                .contains(&alice.label)
         );
     }
 
