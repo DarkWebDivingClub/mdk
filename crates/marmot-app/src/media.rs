@@ -371,7 +371,19 @@ pub(crate) fn media_attachment_from_imeta_tag(
             continue;
         };
         match key {
-            "v" => version = Some(value.to_owned()),
+            "v" => {
+                if value != ENCRYPTED_MEDIA_VERSION {
+                    return Err(AppError::InvalidAppMessagePayload(format!(
+                        "media version must be {ENCRYPTED_MEDIA_VERSION}"
+                    )));
+                }
+                if version.is_some() {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "media tag must contain exactly one version".into(),
+                    ));
+                }
+                version = Some(value.to_owned());
+            }
             "ciphertext_sha256" => ciphertext_sha256 = Some(value.to_owned()),
             "plaintext_sha256" => plaintext_sha256 = Some(value.to_owned()),
             "nonce" => nonce_hex = Some(value.to_owned()),
@@ -783,5 +795,41 @@ fn reqwest_blob_error(err: reqwest::Error) -> AppError {
         AppError::BlobStore("invalid response body".into())
     } else {
         AppError::BlobStore("request failed".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_imeta_tag() -> Vec<String> {
+        vec![
+            "imeta".to_owned(),
+            "v encrypted-media-v1".to_owned(),
+            "locator blossom-v1 https://media.example/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.bin".to_owned(),
+            format!("ciphertext_sha256 {}", "11".repeat(32)),
+            format!("plaintext_sha256 {}", "22".repeat(32)),
+            "nonce 333333333333333333333333".to_owned(),
+            "m image/png".to_owned(),
+            "filename diagram.png".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn imeta_parser_rejects_legacy_version_even_when_later_current_version_present() {
+        let mut tag = valid_imeta_tag();
+        tag.insert(1, "v legacy-media-v0".to_owned());
+
+        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn imeta_parser_rejects_duplicate_current_version_fields() {
+        let mut tag = valid_imeta_tag();
+        tag.insert(1, "v encrypted-media-v1".to_owned());
+
+        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag]));
     }
 }
