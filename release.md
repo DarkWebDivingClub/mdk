@@ -231,6 +231,32 @@ If the workflow succeeds but an uploaded asset is wrong, rerun the workflow from
 is correct and the failure was packaging-only. The release job uploads assets with `--clobber`, so a rerun can replace
 assets on the same GitHub Release.
 
+## dm-agent Beta Release
+
+Use this for Hermes/Marmot connector beta testers who need prebuilt `dm-agent` binaries and the Hermes plugin bundle.
+
+The workflow lives at:
+
+```text
+.github/workflows/dm-agent-binaries.yml
+```
+
+It runs on pushes to `master` that touch the connector, plugin, or installer paths. Each successful run updates the
+rolling GitHub pre-release tag `dm-agent-beta` with:
+
+- `dm-agent-linux-x86_64-latest.tar.gz` and a matching `<sha>` bundle
+- `dm-agent-darwin-aarch64-latest.tar.gz` and a matching `<sha>` bundle
+- `hermes-marmot-plugin-latest.tar.gz` and a matching `<sha>` bundle
+- `install-hermes-marmot.sh`
+
+Beta install entry point:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash
+```
+
+See `integrations/hermes/marmot/README.md` for bootstrap and Hermes setup steps after install.
+
 ## Current Limits
 
 - The workspace is not published to crates.io.

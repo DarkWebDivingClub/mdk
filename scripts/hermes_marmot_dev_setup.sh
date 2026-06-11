@@ -385,11 +385,11 @@ SCRIPT
 set -euo pipefail
 dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$dev_root/env.sh"
-bootstrap_args=(--socket "$MARMOT_AGENT_SOCKET")
+bootstrap_args=(bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
 if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
     bootstrap_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
 fi
-exec "$DARKMATTER_REPO/scripts/hermes_marmot_bootstrap_agent.py" "${bootstrap_args[@]}" "$@"
+exec cargo run -p agent-connector --bin dm-agent -- "${bootstrap_args[@]}" "$@"
 SCRIPT
 
     cat >"$dev_root/start-dm-agent.sh" <<'SCRIPT'

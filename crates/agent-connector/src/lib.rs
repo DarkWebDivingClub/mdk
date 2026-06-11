@@ -1,5 +1,14 @@
 //! Local Marmot agent connector daemon.
 
+mod bootstrap;
+
+pub use bootstrap::{
+    BootstrapError, BootstrapOptions, BootstrapResult, DEFAULT_BOOTSTRAP_LABEL,
+    DEFAULT_QUIC_CANDIDATE, DEFAULT_RELAYS, default_bootstrap_home, read_bootstrap_auth_token,
+    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
+    resolve_bootstrap_socket, run_bootstrap,
+};
+
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};

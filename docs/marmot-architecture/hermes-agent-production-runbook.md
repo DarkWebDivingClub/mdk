@@ -1,7 +1,7 @@
 ---
 title: "Hermes Agent Production Runbook"
 created: 2026-06-08
-updated: 2026-06-08
+updated: 2026-06-11
 tags: [marmot, architecture, agents, hermes, runbook, deployment]
 status: draft-runbook
 ---
@@ -39,7 +39,7 @@ Do not run this as an unattended production service until the manual phone test 
 Current pilot values:
 
 ```sh
-MARMOT_RELAYS=wss://relay.eu.whiteniose.chat,wss://relay.us.whitenoise.chat
+MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
 MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450
 ```
 
@@ -53,7 +53,7 @@ dm-agent \
   --socket /run/marmot-agent/dm-agent.sock \
   --socket-dir-mode 0700 \
   --socket-mode 0600 \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
 
@@ -74,7 +74,7 @@ dm-agent \
   --auth-token-file /etc/marmot-agent/control.token \
   --socket-dir-mode 0770 \
   --socket-mode 0660 \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
 export MARMOT_AGENT_AUTH_TOKEN_FILE=/etc/marmot-agent/control.token
@@ -144,7 +144,7 @@ This is the shortest useful manual test for the real user shape: Hermes runs on 
 it through normal Marmot traffic on public Nostr relays. Docker is optional isolation for the computer-side setup. It must
 not change the relay model.
 
-Use `wss://relay.eu.whiteniose.chat` and `wss://relay.us.whitenoise.chat` for this pilot so the phone and the agent
+Use `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` for this pilot so the phone and the agent
 computer exercise the same public relay set. Use `quic://quic-broker.ipf.dev:4450` for live previews. If preview
 debugging gets in the way, omit `--quic-candidate`; final encrypted replies still exercise the durable production path.
 
@@ -163,7 +163,7 @@ Compose service passes through common provider variables when they are set in yo
 `just hermes-phone-test-bootstrap` runs this inside the container:
 
 ```sh
-docker compose exec hermes-marmot-phone-test marmot-agent-bootstrap --qr
+docker compose exec hermes-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
 ```
 
 The command creates or reuses the `hermes-agent` account, publishes or repairs its KeyPackage, then prints the agent

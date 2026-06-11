@@ -76,4 +76,7 @@ source "$default_root/env.sh"
 "$repo_root/scripts/hermes_marmot_dev_teardown.sh" --root "$default_root" --force
 [ ! -e "$default_root" ]
 
+[ -x "$repo_root/scripts/install-hermes-marmot.sh" ]
+"$repo_root/scripts/install-hermes-marmot.sh" --dry-run >/dev/null
+
 echo "dev script test passed"

@@ -76,7 +76,7 @@ hermes-phone-test-up:
     docker compose --profile hermes-phone-test up -d --build hermes-marmot-phone-test
 
 hermes-phone-test-bootstrap:
-    docker compose exec hermes-marmot-phone-test marmot-agent-bootstrap --qr
+    docker compose exec hermes-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
 
 hermes-phone-test-logs:
     docker compose logs -f hermes-marmot-phone-test

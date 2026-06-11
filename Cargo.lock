@@ -50,6 +50,7 @@ dependencies = [
  "marmot-account",
  "marmot-app",
  "nostr-relay-builder",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",

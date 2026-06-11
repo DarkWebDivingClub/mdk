@@ -6,6 +6,8 @@ Local Marmot agent connector daemon; ships the `dm-agent` binary.
 
 - Own `serve_socket`/`AgentConnector` and the `dm-agent` Unix-socket daemon that bridges the `agent-control` protocol
   and `agent-stream-compose` previews to `MarmotApp`/`MarmotAppRuntime`.
+- Own `dm-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
+  phone invite details (`npub`, `nprofile`, optional terminal QR).
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
 - Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
   process glue, not the protocol or composition owner.
