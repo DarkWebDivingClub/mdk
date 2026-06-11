@@ -147,6 +147,38 @@ impl AppClient {
         }
     }
 
+    /// Map a user-authored message intent to its audit `human_action` context.
+    /// Machine, agent, and system intents return `None` so they stay untagged —
+    /// the audit log marks human actions, not stream, gossip, or push-token
+    /// traffic. Resolve this from the original intent *before* the
+    /// `Unreact` → `Delete` rewrite so a retracted reaction stays `unreact`.
+    fn message_human_action_context(intent: &AppMessageIntent) -> Option<AuditEventContext> {
+        let (action, target_count): (&'static str, Option<u64>) = match intent {
+            AppMessageIntent::Chat { .. } => ("send_message", None),
+            AppMessageIntent::Reply { .. } => ("reply_message", None),
+            AppMessageIntent::Edit { .. } => ("edit_message", None),
+            AppMessageIntent::Reaction { .. } => ("react", None),
+            AppMessageIntent::Unreact { .. } => ("unreact", None),
+            AppMessageIntent::Delete { .. } => ("delete_message", None),
+            AppMessageIntent::Media { attachments, .. } => {
+                ("send_media", Some(attachments.len() as u64))
+            }
+            AppMessageIntent::StreamStart { .. }
+            | AppMessageIntent::StreamFinal { .. }
+            | AppMessageIntent::AgentActivity { .. }
+            | AppMessageIntent::AgentOperation { .. }
+            | AppMessageIntent::GroupSystem { .. }
+            | AppMessageIntent::PushTokenUpdate { .. }
+            | AppMessageIntent::PushTokenRemoval { .. } => return None,
+        };
+        Some(Self::local_human_action_context(
+            action,
+            Vec::new(),
+            Vec::new(),
+            target_count,
+        ))
+    }
+
     fn record_human_action(
         &self,
         group_id: &GroupId,
@@ -759,6 +791,9 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group(group_id)?;
+        // Capture the human-action descriptor before `Unreact` is rewritten to
+        // `Delete` below, so the audit log records the user's actual intent.
+        let audit_context = Self::message_human_action_context(&intent);
         let sender = self
             .app
             .account_home()
@@ -802,13 +837,20 @@ impl AppClient {
 
         let effects = match async {
             self.sync_runtime_groups().await?;
-            let effects = self
-                .runtime
-                .send(SendIntent::AppMessage {
-                    group_id: group_id.clone(),
-                    payload,
-                })
-                .await?;
+            let send_intent = SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            };
+            // Thread the human-action context through the engine so the send's
+            // audit rows carry `human_action`, matching create_group/invite/etc.
+            let effects = match &audit_context {
+                Some(context) => {
+                    self.runtime
+                        .send_with_audit_context(send_intent, context.clone())
+                        .await?
+                }
+                None => self.runtime.send(send_intent).await?,
+            };
             fail_if_publish_failed(&effects.failures)?;
             Ok::<_, AppError>(effects)
         }
@@ -837,6 +879,9 @@ impl AppClient {
                 return Err(err);
             }
         };
+        if let Some(context) = &audit_context {
+            self.record_human_action_succeeded(group_id, context, &effects);
+        }
         self.remember_published_reports(&effects);
         let source_message_id_hex = effects
             .reports

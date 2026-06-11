@@ -536,3 +536,55 @@ async fn local_group_action_writes_human_action_context() {
         "local_user"
     );
 }
+
+#[tokio::test]
+async fn local_message_send_tags_engine_rows_with_human_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+
+    let mut client = app.client(&account.label).await.unwrap();
+    let group_id = client.create_group("audit actions", &[]).await.unwrap();
+    // The fake relay never acks, so the publish step may fail — but the engine
+    // emits the send's audit rows locally before that, which is what we assert.
+    let _ = client.send(&group_id, b"hello marmots").await;
+
+    let files = app.audit_log_files().unwrap();
+    let body = std::fs::read_to_string(&files[0].path).unwrap();
+    let events = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    // The app threads the human action through `send_with_audit_context`, so the
+    // engine's `send_entry` row carries it (previously context-free for sends).
+    let send_entry = events
+        .iter()
+        .find(|event| event["kind"]["type"] == "send_entry")
+        .expect("send should write a send_entry audit row");
+    assert_eq!(
+        send_entry["context"]["human_action"]["action"],
+        "send_message"
+    );
+    assert_eq!(
+        send_entry["context"]["human_action"]["origin"],
+        "local_user"
+    );
+
+    // The engine's ambient operation context backfills the secondary
+    // `message_state_changed` row, which the engine emits context-free.
+    let state_changed = events
+        .iter()
+        .find(|event| {
+            event["kind"]["type"] == "message_state_changed"
+                && event["context"]["human_action"]["action"] == "send_message"
+        })
+        .expect("send's message_state_changed row should inherit the human action");
+    assert_eq!(
+        state_changed["context"]["human_action"]["origin"],
+        "local_user"
+    );
+}

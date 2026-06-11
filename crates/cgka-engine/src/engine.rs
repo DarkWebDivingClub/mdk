@@ -88,6 +88,12 @@ pub struct Engine<S: StorageProvider> {
     /// reconstruct what each device saw and decided.
     pub(crate) recorder: Box<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,
+    /// Audit context for the in-flight local operation. The
+    /// `*_with_audit_context` entry points set this around their `do_*` call so
+    /// the secondary rows those emit (e.g. `message_state_changed`,
+    /// `group_context`) inherit the operation's `human_action` instead of
+    /// landing context-free. `None` outside a human-initiated operation.
+    pub(crate) current_audit_context: Option<AuditEventContext>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -219,6 +225,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
             audit_operation_counter: 0,
+            current_audit_context: None,
         })
     }
 }
@@ -286,7 +293,9 @@ impl<S: StorageProvider> Engine<S> {
                 intent_kind: intent_kind.clone(),
             },
         });
+        self.current_audit_context = Some(context.clone());
         let result = self.do_send(intent).await;
+        self.current_audit_context = None;
         match &result {
             Ok(send_result) => {
                 self.recorder.record(AuditRecord {
@@ -329,6 +338,7 @@ impl<S: StorageProvider> Engine<S> {
                 initial_admin_count: req.initial_admins.len() as u64,
             },
         );
+        self.current_audit_context = Some(context.clone());
         let result = self.do_create_group(req).await;
         match &result {
             Ok((group_id, send_result)) => {
@@ -352,6 +362,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
+        self.current_audit_context = None;
         result
     }
 
@@ -435,6 +446,10 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
         kind: AuditEventKind,
     ) {
+        // Fall back to the in-flight operation's context so secondary rows
+        // emitted via the context-less `audit`/`audit_group` helpers still
+        // carry the operation's `human_action`. An explicit context always wins.
+        let context = context.or_else(|| self.current_audit_context.clone());
         let mut record = AuditRecord::new(
             group_id.map(|group_id| hex::encode(group_id.as_slice())),
             kind,
