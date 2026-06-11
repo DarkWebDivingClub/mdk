@@ -41,10 +41,37 @@ const ACCOUNT_SECRET_FILE: &str = "secret.json";
 const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
 
+/// Persistent home for local Nostr account records and their signing
+/// credentials.
+///
+/// `AccountHome` is **not safe for arbitrary concurrent mutation**.
+/// Methods such as [`AccountHome::create_account`] and
+/// [`AccountHome::import_account`] perform check-then-act sequences over
+/// the filesystem and the secret store (e.g. checking
+/// [`AccountSecretStore::has_secret_for_label`] /
+/// [`AccountSecretStore::has_secret_for_account_id`] before writing a
+/// credential). Two callers racing those methods can both observe the
+/// pre-state and both proceed, which can produce duplicate writes. The
+/// duplicate-key guard in `write_signing_account_for_label` is advisory,
+/// not atomic; callers needing concurrent imports must serialize
+/// mutations externally.
+///
+/// [`AccountHome::remove_account`] is the exception: it holds an internal
+/// mutation lock across its shared-credential check and the matching
+/// `remove_secret` call, so concurrent `remove_account` calls on twin
+/// records sharing a credential cannot both skip deletion and orphan it.
 #[derive(Clone)]
 pub struct AccountHome {
     root: PathBuf,
     secret_store: Arc<dyn AccountSecretStore>,
+    /// Serializes mutating operations whose check-then-act sequences would
+    /// otherwise race against concurrent callers. Currently held by
+    /// [`AccountHome::remove_account`] to make the
+    /// `secret_shared_with_other_record` check and the matching
+    /// `remove_secret` call atomic, so two concurrent removals on twin
+    /// records cannot both observe the other as still present and skip
+    /// deleting the shared credential.
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +91,8 @@ pub enum AccountHomeError {
     Hex(#[from] hex::FromHexError),
     #[error("account already exists: {0}")]
     AccountExists(String),
+    #[error("account id is already in use: {0}")]
+    AccountIdInUse(String),
     #[error("unknown account: {0}")]
     UnknownAccount(String),
     #[error("invalid nsec or secret key")]
@@ -99,6 +128,12 @@ struct StoredAccountSecret {
 
 pub trait AccountSecretStore: Send + Sync {
     fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool>;
+    /// Whether the store already holds a credential keyed by account id.
+    /// Stores that key one credential per label never share entries across
+    /// records, so the default reports `false`.
+    fn has_secret_for_account_id(&self, _account_id_hex: &str) -> AccountHomeResult<bool> {
+        Ok(false)
+    }
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()>;
     fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys>;
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()>;
@@ -187,6 +222,14 @@ impl AccountSecretStore for KeychainSecretStore {
         Ok(false)
     }
 
+    fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
+        match self.entry_for_account(account_id_hex)?.get_password() {
+            Ok(_) => Ok(true),
+            Err(keyring_core::Error::NoEntry) => Ok(false),
+            Err(err) => Err(map_keyring_error(err)),
+        }
+    }
+
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
         self.entry_for_account(&account.account_id_hex)?
             .set_password(&keys.secret_key().to_secret_hex())
@@ -233,6 +276,7 @@ impl AccountHome {
         Self {
             secret_store: Arc::new(LocalFileSecretStore::new(&root)),
             root,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -255,6 +299,7 @@ impl AccountHome {
         Self {
             root: root.as_ref().to_path_buf(),
             secret_store,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -353,13 +398,46 @@ impl AccountHome {
     }
 
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
+        // Hold the mutation lock across the shared-credential check and
+        // the matching `remove_secret` call so two concurrent removals on
+        // twin records cannot both observe the other as still present,
+        // both skip deletion, and orphan the shared credential.
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = self.account(account_ref)?;
-        self.secret_store.remove_secret(&account)?;
+        if !self.secret_shared_with_other_record(&account)? {
+            self.secret_store.remove_secret(&account)?;
+        }
         match fs::remove_dir_all(self.account_dir(&account.label)) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Account-id-keyed stores hold one credential per account id, so records
+    /// with the same account id share a single credential. The shared
+    /// credential must outlive this record while another signing record still
+    /// depends on it.
+    ///
+    /// This helper is only safe when the caller already holds
+    /// `AccountHome::mutation_lock`, which serializes the check against
+    /// concurrent removals on twin records. See
+    /// [`AccountHome::remove_account`].
+    fn secret_shared_with_other_record(&self, account: &AccountSummary) -> AccountHomeResult<bool> {
+        if !self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?
+        {
+            return Ok(false);
+        }
+        Ok(self.accounts()?.iter().any(|other| {
+            other.local_signing
+                && other.label != account.label
+                && other.account_id_hex == account.account_id_hex
+        }))
     }
 
     pub fn load_signing_keys(&self, account_ref: &str) -> AccountHomeResult<nostr::Keys> {
@@ -391,9 +469,20 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountExists(label));
         }
+        let account_id_hex = keys.public_key().to_hex();
+        // NOTE: this check-then-write is advisory. Concurrent callers can
+        // both observe an empty store and both proceed. See the `AccountHome`
+        // type-level docs; callers needing concurrent imports must serialize
+        // externally.
+        if self
+            .secret_store
+            .has_secret_for_account_id(&account_id_hex)?
+        {
+            return Err(AccountHomeError::AccountIdInUse(account_id_hex));
+        }
         let account = AccountSummary {
             label,
-            account_id_hex: keys.public_key().to_hex(),
+            account_id_hex,
             local_signing: true,
         };
         self.secret_store.write_secret(&account, keys)?;

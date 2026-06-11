@@ -5757,6 +5757,11 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
             "message": err.to_string(),
             "account_ref": account,
         }),
+        AccountHomeError::AccountIdInUse(account_id) => json!({
+            "code": "account_id_in_use",
+            "message": err.to_string(),
+            "account_id_hex": account_id,
+        }),
         AccountHomeError::UnknownAccount(account) => json!({
             "code": "unknown_account",
             "message": err.to_string(),
