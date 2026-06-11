@@ -15,7 +15,7 @@ use nostr_sdk::prelude::{
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
 use crate::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
@@ -248,6 +248,21 @@ impl NostrSdkRelayClient {
             return event
                 .to_verified_nostr_event()
                 .map_err(|e| TransportAdapterError::Publish(format!("invalid signed event: {e}")));
+        }
+
+        // spec/transports/nostr.md:64-66 — a kind-445 group event's pubkey MUST
+        // be a fresh per-event ephemeral key and MUST NOT be the sender's
+        // account identity. The peeler signs every outbound 445 ephemerally at
+        // wrap time, so a 445 that reaches publish without a sig is a caller
+        // error. Fail closed rather than fall through to the account signer
+        // below, which would stamp the account pubkey into the routing-visible
+        // envelope (metadata/correlation leak).
+        if event.kind == KIND_MARMOT_GROUP_MESSAGE {
+            return Err(TransportAdapterError::Publish(
+                "refusing to sign unsigned kind-445 group event with the account identity: \
+                 kind-445 events must arrive pre-signed by the peeler's per-event ephemeral key"
+                    .to_owned(),
+            ));
         }
 
         let kind = u16::try_from(event.kind).map(Kind::from).map_err(|_| {
@@ -649,6 +664,22 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
+    /// Build a kind-445 group event DTO pre-signed by a fresh ephemeral key,
+    /// matching the production peeler wrap path (spec/transports/nostr.md:64-66).
+    /// The publish path rejects unsigned 445s, so publish tests must pre-sign.
+    fn signed_group_event_dto() -> NostrTransportEvent {
+        let ephemeral = Keys::generate();
+        let signed = EventBuilder::new(Kind::MlsGroupMessage, "outer encrypted body")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["cc".repeat(32)],
+            )])
+            .custom_created_at(NostrTimestamp::from_secs(1_700_000_010))
+            .sign_with_keys(&ephemeral)
+            .expect("sign ephemeral 445");
+        NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
+    }
+
     #[test]
     fn group_subscription_plan_uses_mls_group_kind_h_tag_and_since() {
         let account_id = MemberId::new(vec![0xA1; 32]);
@@ -761,7 +792,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsigned_group_event_is_signed_before_publish() {
+    async fn unsigned_group_event_is_rejected_not_account_signed() {
+        // spec/transports/nostr.md:64-66 — a kind-445 group event's pubkey MUST
+        // be a fresh ephemeral key and MUST NOT be the sender's account
+        // identity. event_for_publish must fail closed on an unsigned 445
+        // rather than stamp the account signer onto the routing-visible
+        // envelope.
         let keys = Keys::generate();
         let client = Client::builder().signer(keys.clone()).build();
         let sdk = NostrSdkRelayClient::new(client);
@@ -775,12 +811,13 @@ mod tests {
             sig: None,
         };
 
-        let event = sdk.event_for_publish(&dto).await.expect("event");
+        let err = sdk
+            .event_for_publish(&dto)
+            .await
+            .expect_err("unsigned kind-445 must be rejected");
 
-        event.verify().expect("signed event verifies");
-        assert_eq!(event.pubkey, keys.public_key());
-        assert_eq!(event.kind, Kind::MlsGroupMessage);
-        assert_eq!(event.content, dto.content);
+        assert!(matches!(err, TransportAdapterError::Publish(_)));
+        assert!(err.to_string().contains("kind-445"));
     }
 
     #[tokio::test]
@@ -836,15 +873,9 @@ mod tests {
         let keys = Keys::generate();
         let client = Client::builder().signer(keys).build();
         let sdk = NostrSdkRelayClient::new(client);
-        let dto = NostrTransportEvent {
-            id: "11".repeat(32),
-            pubkey: "22".repeat(32),
-            created_at: 1_700_000_010,
-            kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "cc".repeat(32)]],
-            content: "outer encrypted body".into(),
-            sig: None,
-        };
+        // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
+        // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
+        let dto = signed_group_event_dto();
 
         let outcome = timeout(
             Duration::from_secs(2),
@@ -865,15 +896,9 @@ mod tests {
         let keys = Keys::generate();
         let client = Client::builder().signer(keys).build();
         let sdk = NostrSdkRelayClient::new(client);
-        let dto = NostrTransportEvent {
-            id: "11".repeat(32),
-            pubkey: "22".repeat(32),
-            created_at: 1_700_000_010,
-            kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "cc".repeat(32)]],
-            content: "outer encrypted body".into(),
-            sig: None,
-        };
+        // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
+        // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
+        let dto = signed_group_event_dto();
 
         let err = sdk
             .publish_event(&[endpoint.clone(), endpoint], &dto, 2)
