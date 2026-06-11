@@ -1,6 +1,7 @@
 //! Reusable live-preview stream composition for Marmot agent integrations.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
@@ -11,6 +12,8 @@ use cgka_traits::agent_text_stream::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
+
+const DEFAULT_LIVE_BROKER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamComposeReport {
@@ -45,16 +48,80 @@ pub enum StreamComposeCommand {
     Cancel,
 }
 
+trait LiveBrokerPublisher: Sized + Send + 'static {
+    async fn append_record_text(
+        &mut self,
+        record_type: u8,
+        text: &str,
+        chunk_bytes: usize,
+    ) -> Result<(), String>;
+
+    async fn finish(self) -> Result<(), String>;
+}
+
+impl LiveBrokerPublisher for BrokerTextPublisher {
+    async fn append_record_text(
+        &mut self,
+        record_type: u8,
+        text: &str,
+        chunk_bytes: usize,
+    ) -> Result<(), String> {
+        BrokerTextPublisher::append_record_text(
+            self,
+            record_type,
+            text,
+            chunk_bytes,
+            Duration::ZERO,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
+    async fn finish(self) -> Result<(), String> {
+        BrokerTextPublisher::finish(self)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
 pub async fn run_stream_compose_session(
     open: OpenBrokerTextPublisher,
     chunk_bytes: usize,
+    rx: mpsc::Receiver<StreamComposeCommand>,
+    report: StreamComposeReport,
+) {
+    let connect = BrokerTextPublisher::connect(open.clone());
+    run_stream_compose_session_with_connector(
+        open,
+        connect,
+        chunk_bytes,
+        rx,
+        report,
+        DEFAULT_LIVE_BROKER_WRITE_TIMEOUT,
+    )
+    .await;
+}
+
+async fn run_stream_compose_session_with_connector<P, C, E>(
+    open: OpenBrokerTextPublisher,
+    connect: C,
+    chunk_bytes: usize,
     mut rx: mpsc::Receiver<StreamComposeCommand>,
     mut report: StreamComposeReport,
-) {
+    live_write_timeout: Duration,
+) where
+    P: LiveBrokerPublisher,
+    C: Future<Output = Result<P, E>> + Send + 'static,
+    E: ToString + Send + 'static,
+{
     let mut transcript = LocalComposeTranscript::new(&open);
     let mut pending_live_records = VecDeque::new();
     let mut publisher = None;
-    let mut connect_task = Some(tokio::spawn(BrokerTextPublisher::connect(open)));
+    let mut connect_task = Some(tokio::spawn(async move {
+        connect.await.map_err(|err| err.to_string())
+    }));
     let mut live_error = None;
 
     loop {
@@ -64,20 +131,24 @@ pub async fn run_stream_compose_session(
                     connect_task = None;
                     match connect_result {
                         Ok(Ok(mut connected)) => {
-                            if let Err(err) = flush_pending_live_records(
-                                &mut connected,
-                                &mut pending_live_records,
-                                chunk_bytes,
+                            if let Err(err) = live_broker_deadline(
+                                live_write_timeout,
+                                flush_pending_live_records(
+                                    &mut connected,
+                                    &mut pending_live_records,
+                                    chunk_bytes,
+                                ),
                             )
                             .await
                             {
                                 live_error = Some(err);
+                                pending_live_records.clear();
                             } else {
                                 publisher = Some(connected);
                             }
                         }
                         Ok(Err(err)) => {
-                            live_error = Some(err.to_string());
+                            live_error = Some(err);
                             pending_live_records.clear();
                         }
                         Err(err) => {
@@ -104,9 +175,12 @@ pub async fn run_stream_compose_session(
                 let result = append_stream_compose_text(
                     &mut report,
                     &mut transcript,
-                    &mut publisher,
-                    &mut pending_live_records,
-                    &mut live_error,
+                    ComposeLiveSink {
+                        publisher: &mut publisher,
+                        pending_live_records: &mut pending_live_records,
+                        live_error: &mut live_error,
+                        live_write_timeout,
+                    },
                     text,
                     chunk_bytes,
                 )
@@ -117,9 +191,12 @@ pub async fn run_stream_compose_session(
                 let result = append_stream_compose_status(
                     &mut report,
                     &mut transcript,
-                    &mut publisher,
-                    &mut pending_live_records,
-                    &mut live_error,
+                    ComposeLiveSink {
+                        publisher: &mut publisher,
+                        pending_live_records: &mut pending_live_records,
+                        live_error: &mut live_error,
+                        live_write_timeout,
+                    },
                     status,
                     chunk_bytes,
                 )
@@ -130,9 +207,12 @@ pub async fn run_stream_compose_session(
                 let result = append_stream_compose_progress(
                     &mut report,
                     &mut transcript,
-                    &mut publisher,
-                    &mut pending_live_records,
-                    &mut live_error,
+                    ComposeLiveSink {
+                        publisher: &mut publisher,
+                        pending_live_records: &mut pending_live_records,
+                        live_error: &mut live_error,
+                        live_write_timeout,
+                    },
                     text,
                     chunk_bytes,
                 )
@@ -146,9 +226,12 @@ pub async fn run_stream_compose_session(
                 let result = finish_stream_compose_report(
                     &mut report,
                     &transcript,
-                    &mut publisher,
-                    &mut pending_live_records,
-                    &mut live_error,
+                    ComposeLiveSink {
+                        publisher: &mut publisher,
+                        pending_live_records: &mut pending_live_records,
+                        live_error: &mut live_error,
+                        live_write_timeout,
+                    },
                     chunk_bytes,
                 )
                 .await;
@@ -227,12 +310,10 @@ fn validate_stream_chunk_bytes(chunk_bytes: usize) -> Result<(), String> {
     Ok(())
 }
 
-async fn append_stream_compose_text(
+async fn append_stream_compose_text<P: LiveBrokerPublisher>(
     report: &mut StreamComposeReport,
     transcript: &mut LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
-    live_error: &mut Option<String>,
+    mut live: ComposeLiveSink<'_, P>,
     text: String,
     chunk_bytes: usize,
 ) -> Result<StreamComposeReport, String> {
@@ -242,93 +323,8 @@ async fn append_stream_compose_text(
     report.transcript_hash = Some(transcript.transcript_hash());
 
     append_live_record(
-        publisher,
-        pending_live_records,
-        live_error,
+        &mut live,
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-        text,
-        chunk_bytes,
-    )
-    .await;
-    if let Some(err) = live_error {
-        report.error = Some(format!("live stream failed: {err}"));
-    }
-
-    Ok(report.clone())
-}
-
-async fn append_stream_compose_status(
-    report: &mut StreamComposeReport,
-    transcript: &mut LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
-    live_error: &mut Option<String>,
-    status: String,
-    chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
-    report.status.clone_from(&status);
-    append_stream_compose_non_text_record(
-        report,
-        transcript,
-        ComposeLiveSink {
-            publisher,
-            pending_live_records,
-            live_error,
-        },
-        AGENT_TEXT_STREAM_RECORD_STATUS,
-        status,
-        chunk_bytes,
-    )
-    .await
-}
-
-async fn append_stream_compose_progress(
-    report: &mut StreamComposeReport,
-    transcript: &mut LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
-    live_error: &mut Option<String>,
-    text: String,
-    chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
-    append_stream_compose_non_text_record(
-        report,
-        transcript,
-        ComposeLiveSink {
-            publisher,
-            pending_live_records,
-            live_error,
-        },
-        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
-        text,
-        chunk_bytes,
-    )
-    .await
-}
-
-struct ComposeLiveSink<'a> {
-    publisher: &'a mut Option<BrokerTextPublisher>,
-    pending_live_records: &'a mut VecDeque<PendingComposeRecord>,
-    live_error: &'a mut Option<String>,
-}
-
-async fn append_stream_compose_non_text_record(
-    report: &mut StreamComposeReport,
-    transcript: &mut LocalComposeTranscript,
-    live: ComposeLiveSink<'_>,
-    record_type: u8,
-    text: String,
-    chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
-    transcript.append_record_text(record_type, &text, chunk_bytes)?;
-    report.chunk_count = transcript.chunk_count();
-    report.transcript_hash = Some(transcript.transcript_hash());
-
-    append_live_record(
-        live.publisher,
-        live.pending_live_records,
-        live.live_error,
-        record_type,
         text,
         chunk_bytes,
     )
@@ -340,76 +336,147 @@ async fn append_stream_compose_non_text_record(
     Ok(report.clone())
 }
 
-async fn append_live_record(
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
-    live_error: &mut Option<String>,
+async fn append_stream_compose_status<P: LiveBrokerPublisher>(
+    report: &mut StreamComposeReport,
+    transcript: &mut LocalComposeTranscript,
+    live: ComposeLiveSink<'_, P>,
+    status: String,
+    chunk_bytes: usize,
+) -> Result<StreamComposeReport, String> {
+    report.status.clone_from(&status);
+    append_stream_compose_non_text_record(
+        report,
+        transcript,
+        live,
+        AGENT_TEXT_STREAM_RECORD_STATUS,
+        status,
+        chunk_bytes,
+    )
+    .await
+}
+
+async fn append_stream_compose_progress<P: LiveBrokerPublisher>(
+    report: &mut StreamComposeReport,
+    transcript: &mut LocalComposeTranscript,
+    live: ComposeLiveSink<'_, P>,
+    text: String,
+    chunk_bytes: usize,
+) -> Result<StreamComposeReport, String> {
+    append_stream_compose_non_text_record(
+        report,
+        transcript,
+        live,
+        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+        text,
+        chunk_bytes,
+    )
+    .await
+}
+
+struct ComposeLiveSink<'a, P> {
+    publisher: &'a mut Option<P>,
+    pending_live_records: &'a mut VecDeque<PendingComposeRecord>,
+    live_error: &'a mut Option<String>,
+    live_write_timeout: Duration,
+}
+
+async fn append_stream_compose_non_text_record<P: LiveBrokerPublisher>(
+    report: &mut StreamComposeReport,
+    transcript: &mut LocalComposeTranscript,
+    mut live: ComposeLiveSink<'_, P>,
+    record_type: u8,
+    text: String,
+    chunk_bytes: usize,
+) -> Result<StreamComposeReport, String> {
+    transcript.append_record_text(record_type, &text, chunk_bytes)?;
+    report.chunk_count = transcript.chunk_count();
+    report.transcript_hash = Some(transcript.transcript_hash());
+
+    append_live_record(&mut live, record_type, text, chunk_bytes).await;
+    if let Some(err) = live.live_error.as_deref() {
+        report.error = Some(format!("live stream failed: {err}"));
+    }
+
+    Ok(report.clone())
+}
+
+async fn append_live_record<P: LiveBrokerPublisher>(
+    live: &mut ComposeLiveSink<'_, P>,
     record_type: u8,
     text: String,
     chunk_bytes: usize,
 ) {
-    if live_error.is_none() {
-        if let Some(publisher) = publisher.as_mut() {
-            if let Err(err) = publisher
-                .append_record_text(record_type, &text, chunk_bytes, Duration::ZERO)
-                .await
-                .map_err(|err| err.to_string())
+    if live.live_error.is_none() {
+        if let Some(connected) = live.publisher.as_mut() {
+            if let Err(err) = live_broker_deadline(
+                live.live_write_timeout,
+                connected.append_record_text(record_type, &text, chunk_bytes),
+            )
+            .await
             {
-                *live_error = Some(err);
+                *live.live_error = Some(err);
+                *live.publisher = None;
+                live.pending_live_records.clear();
             }
         } else {
-            pending_live_records.push_back(PendingComposeRecord { record_type, text });
+            live.pending_live_records
+                .push_back(PendingComposeRecord { record_type, text });
         }
     }
 }
 
-async fn finish_stream_compose_report(
+async fn finish_stream_compose_report<P: LiveBrokerPublisher>(
     report: &mut StreamComposeReport,
     transcript: &LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
-    live_error: &mut Option<String>,
+    live: ComposeLiveSink<'_, P>,
     chunk_bytes: usize,
 ) -> Result<StreamComposeReport, String> {
-    if live_error.is_none()
-        && let Some(publisher) = publisher.as_mut()
-        && let Err(err) =
-            flush_pending_live_records(publisher, pending_live_records, chunk_bytes).await
-    {
-        *live_error = Some(err);
+    let flush_result = if live.live_error.is_none() {
+        if let Some(connected) = live.publisher.as_mut() {
+            Some(
+                live_broker_deadline(
+                    live.live_write_timeout,
+                    flush_pending_live_records(connected, live.pending_live_records, chunk_bytes),
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(Err(err)) = flush_result {
+        *live.live_error = Some(err);
+        *live.publisher = None;
+        live.pending_live_records.clear();
     }
 
-    if live_error.is_none()
-        && let Some(publisher) = publisher.take()
-        && let Err(err) = publisher.finish().await.map_err(|err| err.to_string())
+    if live.live_error.is_none()
+        && let Some(connected) = live.publisher.take()
+        && let Err(err) = live_broker_deadline(live.live_write_timeout, connected.finish()).await
     {
-        *live_error = Some(err);
+        *live.live_error = Some(err);
     }
 
     report.status = "finished".to_owned();
     report.transcript_hash = Some(transcript.transcript_hash());
     report.chunk_count = transcript.chunk_count();
-    if let Some(err) = live_error {
+    if let Some(err) = live.live_error.as_deref() {
         report.error = Some(format!("live stream failed: {err}"));
     }
     Ok(report.clone())
 }
 
-async fn flush_pending_live_records(
-    publisher: &mut BrokerTextPublisher,
+async fn flush_pending_live_records<P: LiveBrokerPublisher>(
+    publisher: &mut P,
     pending_live_records: &mut VecDeque<PendingComposeRecord>,
     chunk_bytes: usize,
 ) -> Result<(), String> {
     while let Some(record) = pending_live_records.pop_front() {
         if let Err(err) = publisher
-            .append_record_text(
-                record.record_type,
-                &record.text,
-                chunk_bytes,
-                Duration::ZERO,
-            )
+            .append_record_text(record.record_type, &record.text, chunk_bytes)
             .await
-            .map_err(|err| err.to_string())
         {
             pending_live_records.clear();
             return Err(err);
@@ -418,8 +485,23 @@ async fn flush_pending_live_records(
     Ok(())
 }
 
+async fn live_broker_deadline<T>(
+    live_write_timeout: Duration,
+    operation: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if live_write_timeout.is_zero() {
+        return operation.await;
+    }
+    // Dropping the timed-out operation cancels the in-flight QUIC write; callers
+    // then drop the publisher so future live records fall back to the local transcript.
+    tokio::time::timeout(live_write_timeout, operation)
+        .await
+        .map_err(|_| format!("live broker write timed out after {live_write_timeout:?}"))?
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
@@ -747,6 +829,199 @@ mod tests {
         assert_eq!(
             finished.transcript_hash.as_deref(),
             Some(expected_hash.as_str())
+        );
+
+        session.await.unwrap();
+    }
+
+    struct StalledPublisher {
+        append_started: Option<oneshot::Sender<()>>,
+    }
+
+    impl super::LiveBrokerPublisher for StalledPublisher {
+        async fn append_record_text(
+            &mut self,
+            _record_type: u8,
+            _text: &str,
+            _chunk_bytes: usize,
+        ) -> Result<(), String> {
+            if let Some(append_started) = self.append_started.take() {
+                let _ = append_started.send(());
+            }
+            future::pending().await
+        }
+
+        async fn finish(self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn append_live_record_times_out_stalled_publisher_and_drops_it() {
+        let mut publisher = Some(StalledPublisher {
+            append_started: None,
+        });
+        let mut pending_live_records = std::collections::VecDeque::new();
+        let mut live_error = None;
+
+        super::append_live_record(
+            &mut super::ComposeLiveSink {
+                publisher: &mut publisher,
+                pending_live_records: &mut pending_live_records,
+                live_error: &mut live_error,
+                live_write_timeout: Duration::from_millis(10),
+            },
+            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+            "hello".to_owned(),
+            8,
+        )
+        .await;
+
+        assert!(publisher.is_none(), "stalled publisher should be dropped");
+        assert!(pending_live_records.is_empty());
+        assert!(
+            live_error
+                .as_deref()
+                .is_some_and(|err| err.contains("timed out")),
+            "append should record live timeout: {live_error:?}"
+        );
+    }
+
+    struct StalledFinishPublisher;
+
+    impl super::LiveBrokerPublisher for StalledFinishPublisher {
+        async fn append_record_text(
+            &mut self,
+            _record_type: u8,
+            _text: &str,
+            _chunk_bytes: usize,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn finish(self) -> Result<(), String> {
+            future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_report_times_out_stalled_live_finish_and_uses_local_transcript() {
+        let stream_id = vec![0x5a; 32];
+        let start_event_id = MessageId::new(vec![0x5b; 32]);
+        let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+        let mut report = test_stream_compose_report(&stream_id);
+        let transcript = super::LocalComposeTranscript::new(&open);
+        let mut publisher = Some(StalledFinishPublisher);
+        let mut pending_live_records = std::collections::VecDeque::new();
+        let mut live_error = None;
+
+        let finished = super::finish_stream_compose_report(
+            &mut report,
+            &transcript,
+            super::ComposeLiveSink {
+                publisher: &mut publisher,
+                pending_live_records: &mut pending_live_records,
+                live_error: &mut live_error,
+                live_write_timeout: Duration::from_millis(10),
+            },
+            8,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            publisher.is_none(),
+            "publisher should be consumed on finish"
+        );
+        assert_eq!(finished.status, "finished");
+        assert_eq!(finished.chunk_count, 0);
+        assert!(
+            finished
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("timed out")),
+            "finish should report live timeout: {:?}",
+            finished.error
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_session_times_out_stalled_live_flush_and_still_finishes() {
+        let stream_id = vec![0x4a; 32];
+        let start_event_id = MessageId::new(vec![0x4b; 32]);
+        let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let (connect_tx, connect_rx) = oneshot::channel();
+        let (append_started_tx, append_started_rx) = oneshot::channel();
+        let session = tokio::spawn(super::run_stream_compose_session_with_connector(
+            open,
+            async move {
+                connect_rx.await.map_err(|err| err.to_string())?;
+                Ok::<_, String>(StalledPublisher {
+                    append_started: Some(append_started_tx),
+                })
+            },
+            8,
+            rx,
+            report,
+            Duration::from_millis(10),
+        ));
+
+        let (append_tx, append_rx) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "hello".to_owned(),
+            respond: append_tx,
+        })
+        .await
+        .unwrap();
+        let appended = tokio::time::timeout(Duration::from_millis(250), append_rx)
+            .await
+            .expect("append should use local transcript while broker connect is pending")
+            .unwrap()
+            .unwrap();
+        assert_eq!(appended.text, "hello");
+        assert_eq!(appended.chunk_count, 1);
+        assert_eq!(appended.error, None);
+
+        connect_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), append_started_rx)
+            .await
+            .expect("pending live flush should start")
+            .unwrap();
+
+        let (finish_tx, finish_rx) = oneshot::channel();
+        tx.send(StreamComposeCommand::Finish { respond: finish_tx })
+            .await
+            .unwrap();
+        let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+            .await
+            .expect("finish should not wait indefinitely behind the stalled live flush")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finished.status, "finished");
+        assert_eq!(finished.text, "hello");
+        assert_eq!(finished.chunk_count, 1);
+        assert!(
+            finished
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("timed out")),
+            "finish should report live timeout: {:?}",
+            finished.error
+        );
+        assert_eq!(
+            finished.transcript_hash.as_deref(),
+            Some(
+                expected_stream_transcript_hash_for_appends(
+                    &stream_id,
+                    &start_event_id,
+                    &["hello"],
+                    8,
+                )
+                .as_str()
+            )
         );
 
         session.await.unwrap();
