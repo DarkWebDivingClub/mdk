@@ -6,6 +6,7 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::EngineError;
+use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
@@ -18,7 +19,9 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
@@ -92,6 +95,25 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+/// Encode a `marmot.group.admin-policy.v1` state from raw 32-byte account keys,
+/// sorted + deduped per the component rules. Mirrors the same-named helper in
+/// `tests/update_group_data.rs`; kept file-local so this test file stays
+/// self-contained like the others.
+fn encode_admin_policy_for_test(admins: &[Vec<u8>]) -> Vec<u8> {
+    let mut admins = admins.to_vec();
+    admins.sort();
+    admins.dedup();
+    let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+    for admin in admins {
+        assert_eq!(admin.len(), 32);
+        admin_bytes.extend_from_slice(&admin);
+    }
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    out
 }
 
 #[async_trait]
@@ -242,6 +264,89 @@ fn welcome_from_existing_non_admin(
         source: TransportSource("malicious-openmls".into()),
         envelope: TransportEnvelope::Welcome {
             recipient: MemberId::new(recipient.identity().to_vec()),
+        },
+    }
+}
+
+/// Like [`welcome_from_existing_non_admin`], but the malicious non-admin's
+/// forked commit *also* rewrites the admin policy in the same commit so the
+/// forger lands in `admins`. The one-shot `add_members` the sibling helper uses
+/// cannot carry an extra proposal, so this builds `Add` + `AppDataUpdate` in a
+/// single commit through the OpenMLS commit builder (same mechanics as
+/// `tests/update_group_data.rs`). The Welcome it produces embeds the fork's
+/// self-authored admin set, so the join-time `require_admin` check validates the
+/// author against an admin set the author controls.
+fn welcome_from_fork_with_self_promoted_admin(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    invitee_key_package: &KeyPackage,
+    forged_admin_policy: Vec<u8>,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load attacker's MLS group")
+        .expect("attacker joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+    let invitee = clone_key_package_for_invite(invitee_key_package);
+    // Capture the recipient identity before `propose_adds` consumes the KP.
+    let recipient = BasicCredential::try_from(invitee.leaf_node().credential().clone())
+        .expect("invitee uses BasicCredential");
+    let recipient_id = MemberId::new(recipient.identity().to_vec());
+
+    // One commit: Add(invitee) + AppDataUpdate(admin-policy -> includes forger).
+    let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        forged_admin_policy,
+    )));
+    let mut builder = mls_group
+        .commit_builder()
+        .propose_adds(std::iter::once(invitee))
+        .add_proposal(admin_update)
+        .load_psks(provider.storage())
+        .expect("load PSKs");
+    let mut app_data = builder.app_data_dictionary_updater();
+    for proposal in builder.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            app_data.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    builder.with_app_data_dictionary_updates(app_data.changes());
+    let commit_bundle = builder
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("non-admin can build Add+AppDataUpdate fork")
+        .stage_commit(&provider)
+        .expect("stage malicious Add+AppDataUpdate fork");
+    let welcome_msg = commit_bundle
+        .into_welcome_msg()
+        .expect("an Add commit produces a Welcome");
+    let welcome_bytes = welcome_msg
+        .tls_serialize_detached()
+        .expect("serialize malicious Welcome");
+
+    TransportMessage {
+        id: hash_id(&welcome_bytes),
+        payload: welcome_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient_id,
         },
     }
 }
@@ -623,6 +728,86 @@ async fn join_rejects_welcome_authored_by_existing_non_admin() {
     assert!(
         matches!(err, EngineError::NotGroupAdmin { .. }),
         "expected NotGroupAdmin for non-admin Welcome signer, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn join_accepts_welcome_from_fork_with_self_promoted_admin() {
+    // Boundary pinned: the join-time admin-authored-Welcome check (`require_admin`
+    // on the welcome path) validates the Welcome author against the admin set of
+    // the *joined* group state, and in a fork that admin set is author-controlled.
+    // A non-admin member who forks with a single commit that BOTH adds the invitee
+    // AND rewrites the admin policy to list itself defeats the check: the join
+    // SUCCEEDS, because the author is an admin of the fork it just authored. This
+    // is the sibling of `join_rejects_welcome_authored_by_existing_non_admin`,
+    // which forks with a plain Add (no self-promotion) and is correctly rejected.
+    //
+    // This is the documented limit of Welcome-bootstrap trust, not a defect the
+    // engine fixes here: see spec/protocol-core/joining.md ("Welcome-bootstrap
+    // trust") and issue #275. The corroboration mitigation (treat a freshly
+    // joined group as unverified until an application message from another member
+    // account authenticates on the branch) is an application-layer concern, not an
+    // engine-side join check.
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let mut carol = build_client(b"carol");
+    let mut david = build_client(b"david");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome-fork-self-promote".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    // Alice is the sole (implicit) admin. Bob (non-admin) forks: in ONE commit he
+    // adds david AND rewrites the admin policy from {alice} to {alice, bob},
+    // sorted/valid per marmot.group.admin-policy.v1, promoting himself.
+    let forged_admins = encode_admin_policy_for_test(&[
+        alice.self_id().as_slice().to_vec(),
+        bob.self_id().as_slice().to_vec(),
+    ]);
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let malicious_welcome = welcome_from_fork_with_self_promoted_admin(
+        &bob_storage,
+        &bob.self_id(),
+        &group_id,
+        &david_kp,
+        forged_admins,
+    );
+
+    // The join SUCCEEDS: `require_admin` checks the Welcome author (bob) against
+    // the fork's admin set, which bob just authored to include himself.
+    let joined_group_id = david
+        .join_welcome(malicious_welcome)
+        .await
+        .expect("fork that self-promotes its author into admins currently passes the join check");
+    assert_eq!(
+        joined_group_id, group_id,
+        "david joins the forked group (same group id)"
+    );
+    assert!(
+        david.members(&group_id).is_ok(),
+        "david should hold the joined (forked) group state"
     );
 }
 
