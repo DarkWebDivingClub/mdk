@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 
 pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentControlError {

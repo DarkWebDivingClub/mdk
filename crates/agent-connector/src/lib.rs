@@ -21,14 +21,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::{
-    AgentControlAccount, AgentControlDebugFinalSend, AgentControlEnvelope, AgentControlError,
-    AgentControlEvent, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccount, AgentControlDebugFinalSend,
+    AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
+    AgentControlResponse, read_envelope, write_frame,
 };
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
-use cgka_traits::{
-    GroupId, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, MemberId,
-    MessageId, engine::GroupEvent,
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, STREAM_TAG,
 };
+use cgka_traits::{GroupId, MemberId, MessageId, engine::GroupEvent};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{
     AccountRelayListBootstrap, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppError,
@@ -1647,22 +1648,50 @@ fn control_event_from_runtime_event(
 ) -> Option<AgentControlEvent> {
     match event {
         MarmotAppEvent::MessageReceived(update) => {
-            let group_id_hex = hex::encode(update.message.group_id.as_slice());
-            if !inbound_filter_matches(
+            // Only kind-9 chat/media is conversational input. Edits, reactions,
+            // deletes, and telemetry need explicit control semantics before they
+            // can safely influence an agent prompt.
+            if update.message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+                return None;
+            }
+            let group_id_hex = inbound_event_group_id_hex(
                 account_filter,
                 &update.account_id_hex,
                 group_filter,
-                &group_id_hex,
-            ) || update.message.sender == update.account_id_hex
-            {
-                return None;
-            }
+                &update.message.group_id,
+                &update.message.sender,
+            )?;
             Some(AgentControlEvent::InboundMessage {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
                 message_id_hex: update.message.message_id_hex,
                 sender_account_id_hex: update.message.sender,
                 text: update.message.plaintext,
+            })
+        }
+        MarmotAppEvent::AgentStreamStarted(update) => {
+            if update.message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+                return None;
+            }
+            let group_id_hex = inbound_event_group_id_hex(
+                account_filter,
+                &update.account_id_hex,
+                group_filter,
+                &update.message.group_id,
+                &update.message.sender,
+            )?;
+            let stream_id_hex = update
+                .message
+                .tags
+                .iter()
+                .find(|tag| tag.first().is_some_and(|name| name == STREAM_TAG))
+                .and_then(|tag| tag.get(1))
+                .and_then(|stream_id_hex| normalize_hex(stream_id_hex).ok())?;
+            Some(AgentControlEvent::StreamUpdate {
+                account_id_hex: update.account_id_hex,
+                group_id_hex,
+                stream_id_hex,
+                status: AGENT_CONTROL_STREAM_STATUS_STARTED.to_owned(),
             })
         }
         MarmotAppEvent::GroupEvent(group_event) => match group_event.event {
@@ -1734,6 +1763,23 @@ fn control_event_from_debug_event(
     };
     inbound_filter_matches(account_filter, account_id_hex, group_filter, group_id_hex)
         .then_some(event)
+}
+
+fn inbound_event_group_id_hex(
+    account_filter: Option<&str>,
+    account_id_hex: &str,
+    group_filter: Option<&str>,
+    group_id: &GroupId,
+    sender_account_id_hex: &str,
+) -> Option<String> {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    if inbound_filter_matches(account_filter, account_id_hex, group_filter, &group_id_hex)
+        && sender_account_id_hex != account_id_hex
+    {
+        Some(group_id_hex)
+    } else {
+        None
+    }
 }
 
 fn inbound_filter_matches(
@@ -2418,16 +2464,25 @@ fn validate_profile_name(value: String) -> Result<String, ConnectorError> {
 #[cfg(test)]
 mod tests {
     use agent_control::{
-        AgentControlEnvelope, AgentControlEvent, AgentControlRequest, AgentControlResponse,
-        read_envelope, write_frame,
+        AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
+        AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
     };
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
         AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
         AgentTextStreamTranscriptV1,
     };
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
+    };
     use marmot_account::AccountHome;
-    use marmot_app::{AccountSetupRequest, MarmotApp, MarmotAppRuntime};
+    use marmot_app::{
+        AccountSetupRequest, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
+        RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    };
     use nostr_relay_builder::MockRelay;
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
@@ -2462,6 +2517,102 @@ mod tests {
         config.allow_any = allow_any;
         config.debug_controls = debug_controls;
         config
+    }
+
+    fn received_message(
+        kind: u64,
+        plaintext: impl Into<String>,
+        tags: Vec<Vec<String>>,
+    ) -> ReceivedMessage {
+        ReceivedMessage {
+            message_id_hex: "33".repeat(32),
+            source_message_id_hex: "44".repeat(32),
+            sender: "bb".repeat(32),
+            sender_display_name: None,
+            group_id: cgka_traits::GroupId::new(vec![0x22; 32]),
+            source_epoch: 7,
+            plaintext: plaintext.into(),
+            kind,
+            tags,
+            recorded_at: 42,
+        }
+    }
+
+    #[test]
+    fn control_event_forwards_only_chat_inner_events_as_inbound_messages() {
+        let agent_account_id_hex = "aa".repeat(32);
+        let non_conversational = [
+            (MARMOT_APP_EVENT_KIND_DELETE, ""),
+            (MARMOT_APP_EVENT_KIND_REACTION, "+"),
+            (MARMOT_APP_EVENT_KIND_EDIT, "edited text"),
+            (MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, "thinking"),
+            (MARMOT_APP_EVENT_KIND_AGENT_OPERATION, "tool running"),
+            (MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, "member added"),
+        ];
+
+        for (kind, plaintext) in non_conversational {
+            let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                account_id_hex: agent_account_id_hex.clone(),
+                account_label: "agent".to_owned(),
+                message: received_message(kind, plaintext, Vec::new()),
+            });
+
+            assert_eq!(
+                super::control_event_from_runtime_event(event, None, None),
+                None,
+                "kind {kind} must not be forwarded to Hermes as a prompt"
+            );
+        }
+
+        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: agent_account_id_hex,
+            account_label: "agent".to_owned(),
+            message: received_message(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                "hello agent",
+                vec![vec![
+                    "imeta".to_owned(),
+                    "url https://example.invalid/a.png".to_owned(),
+                ]],
+            ),
+        });
+
+        let Some(AgentControlEvent::InboundMessage { text, .. }) =
+            super::control_event_from_runtime_event(event, None, None)
+        else {
+            panic!("expected kind-9 chat event to become an inbound message");
+        };
+        assert_eq!(text, "hello agent");
+    }
+
+    #[test]
+    fn control_event_emits_stream_update_for_agent_stream_started() {
+        let agent_account_id_hex = "aa".repeat(32);
+        let stream_id_hex = "55".repeat(32);
+        let event = MarmotAppEvent::AgentStreamStarted(RuntimeAgentStreamMessage {
+            account_id_hex: agent_account_id_hex.clone(),
+            account_label: "agent".to_owned(),
+            message: received_message(
+                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                "",
+                vec![vec![STREAM_TAG.to_owned(), stream_id_hex.clone()]],
+            ),
+        });
+
+        let Some(AgentControlEvent::StreamUpdate {
+            account_id_hex,
+            group_id_hex,
+            stream_id_hex: event_stream_id_hex,
+            status,
+        }) = super::control_event_from_runtime_event(event, None, None)
+        else {
+            panic!("expected agent stream start to become a stream update");
+        };
+
+        assert_eq!(account_id_hex, agent_account_id_hex);
+        assert_eq!(group_id_hex, "22".repeat(32));
+        assert_eq!(event_stream_id_hex, stream_id_hex);
+        assert_eq!(status, AGENT_CONTROL_STREAM_STATUS_STARTED);
     }
 
     #[tokio::test]
