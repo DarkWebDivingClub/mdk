@@ -2914,7 +2914,9 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
     assert_eq!(bob_group.encrypted_media.default_blob_endpoints.len(), 1);
     assert_eq!(
         bob_group.encrypted_media.default_blob_endpoints[0].base_url,
-        "https://media.example"
+        // WHATWG normalization (group-encrypted-media-v1.md) serializes an empty
+        // path as `/`, so the stored canonical endpoint URL carries the slash.
+        "https://media.example/"
     );
 }
 

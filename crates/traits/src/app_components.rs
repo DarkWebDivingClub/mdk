@@ -340,10 +340,11 @@ pub fn encode_encrypted_media_policy_v1(
     }
     let mut endpoints = Vec::new();
     for endpoint in &policy.default_blob_endpoints {
-        let mut encoded_endpoint = Vec::new();
-        encode_var_bytes(endpoint.locator_kind.as_bytes(), &mut encoded_endpoint);
-        encode_var_bytes(endpoint.base_url.as_bytes(), &mut encoded_endpoint);
-        encode_var_bytes(&encoded_endpoint, &mut endpoints);
+        // Per group-encrypted-media-v1.md, `default_blob_endpoints` is `Type
+        // items<V>`: one outer length (added by `encode_component_vectors`) then
+        // the concatenated `BlobStoreEndpointV1` structs with NO per-item wrapper.
+        encode_var_bytes(endpoint.locator_kind.as_bytes(), &mut endpoints);
+        encode_var_bytes(endpoint.base_url.as_bytes(), &mut endpoints);
     }
     Ok(encode_component_vectors(&[
         policy.media_format.as_bytes(),
@@ -352,6 +353,14 @@ pub fn encode_encrypted_media_policy_v1(
     ]))
 }
 
+/// Decode `marmot.group.encrypted-media.v1` state strictly.
+///
+/// Per [`../foundation/canonical-encoding.md`] ("Canonical decoding"), this is a
+/// decoder of signed, state-selecting Marmot bytes: it MUST reject input that is
+/// not already canonical and MUST NOT trim, case-fold, normalize, deduplicate, or
+/// reorder anything. Unlike the producer-side [`EncryptedMediaPolicyV1::new`],
+/// nothing here repairs non-canonical state — every check is a validation, and a
+/// failure is an `Err`.
 pub fn decode_encrypted_media_policy_v1(bytes: &[u8]) -> Result<EncryptedMediaPolicyV1, String> {
     let mut cursor = bytes;
     let media_format = decode_var_bytes(&mut cursor, 64, "encrypted media format")?;
@@ -370,6 +379,11 @@ pub fn decode_encrypted_media_policy_v1(bytes: &[u8]) -> Result<EncryptedMediaPo
     }
     let media_format = String::from_utf8(media_format)
         .map_err(|e| format!("encrypted media format is not UTF-8: {e}"))?;
+    if media_format != ENCRYPTED_MEDIA_FORMAT_V1 {
+        return Err(format!(
+            "encrypted media format must be {ENCRYPTED_MEDIA_FORMAT_V1}"
+        ));
+    }
 
     let mut allowed_cursor = allowed_bytes.as_slice();
     let mut allowed_locator_kinds = Vec::new();
@@ -379,48 +393,73 @@ pub fn decode_encrypted_media_policy_v1(bytes: &[u8]) -> Result<EncryptedMediaPo
             ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN,
             "encrypted media locator kind",
         )?;
-        allowed_locator_kinds.push(
-            String::from_utf8(kind)
-                .map_err(|e| format!("encrypted media locator kind is not UTF-8: {e}"))?,
-        );
+        let kind = String::from_utf8(kind)
+            .map_err(|e| format!("encrypted media locator kind is not UTF-8: {e}"))?;
+        validate_locator_kind(&kind, "allowed locator kind")?;
+        if allowed_locator_kinds.contains(&kind) {
+            return Err("encrypted media policy has a duplicate allowed locator kind".into());
+        }
+        allowed_locator_kinds.push(kind);
+    }
+    if allowed_locator_kinds.is_empty() {
+        return Err("encrypted media policy must allow at least one locator kind".into());
+    }
+    if allowed_locator_kinds.len() > ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS {
+        return Err(format!(
+            "encrypted media policy allows more than {ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS} locator kinds"
+        ));
     }
 
     let mut endpoints_cursor = endpoints_bytes.as_slice();
-    let mut default_blob_endpoints = Vec::new();
+    let mut default_blob_endpoints: Vec<BlobStoreEndpointV1> = Vec::new();
     while !endpoints_cursor.is_empty() {
-        let endpoint_bytes = decode_var_bytes(
-            &mut endpoints_cursor,
-            ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN + 8,
-            "encrypted media endpoint",
-        )?;
-        let mut endpoint_cursor = endpoint_bytes.as_slice();
         let locator_kind = decode_var_bytes(
-            &mut endpoint_cursor,
+            &mut endpoints_cursor,
             ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN,
             "encrypted media endpoint locator kind",
         )?;
         let base_url = decode_var_bytes(
-            &mut endpoint_cursor,
+            &mut endpoints_cursor,
             ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN,
             "encrypted media endpoint base URL",
         )?;
-        if !endpoint_cursor.is_empty() {
-            return Err("encrypted media endpoint has trailing bytes".into());
+        let locator_kind = String::from_utf8(locator_kind)
+            .map_err(|e| format!("encrypted media endpoint locator kind is not UTF-8: {e}"))?;
+        let base_url = String::from_utf8(base_url)
+            .map_err(|e| format!("encrypted media endpoint base URL is not UTF-8: {e}"))?;
+        validate_locator_kind(&locator_kind, "endpoint locator kind")?;
+        if !allowed_locator_kinds.contains(&locator_kind) {
+            return Err("encrypted media endpoint locator kind is not allowed".into());
         }
-        default_blob_endpoints.push(BlobStoreEndpointV1 {
-            locator_kind: String::from_utf8(locator_kind)
-                .map_err(|e| format!("encrypted media endpoint locator kind is not UTF-8: {e}"))?,
-            base_url: String::from_utf8(base_url)
-                .map_err(|e| format!("encrypted media endpoint base URL is not UTF-8: {e}"))?,
-        });
+        // Loopback http is valid component state for every member, so the decoder
+        // accepts it (acting on it is a separate local rule). The URL must already
+        // be in WHATWG-normalized form: reject, never repair.
+        validate_blob_endpoint_url_is_canonical(&base_url)?;
+        let endpoint = BlobStoreEndpointV1 {
+            locator_kind,
+            base_url,
+        };
+        if default_blob_endpoints.contains(&endpoint) {
+            return Err("encrypted media policy has a duplicate default blob endpoint".into());
+        }
+        default_blob_endpoints.push(endpoint);
+    }
+    if default_blob_endpoints.is_empty() {
+        return Err(
+            "encrypted media policy must include at least one default blob endpoint".into(),
+        );
+    }
+    if default_blob_endpoints.len() > ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS {
+        return Err(format!(
+            "encrypted media policy includes more than {ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS} default blob endpoints"
+        ));
     }
 
-    EncryptedMediaPolicyV1::new(
+    Ok(EncryptedMediaPolicyV1 {
         media_format,
         allowed_locator_kinds,
         default_blob_endpoints,
-        true,
-    )
+    })
 }
 
 /// Decoded `marmot.group.avatar-url.v1` state. An absent avatar is an empty `url`.
@@ -549,7 +588,7 @@ pub fn validate_and_normalize_blob_endpoint_url(
             "encrypted media endpoint URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
         ));
     }
-    let mut url =
+    let url =
         Url::parse(raw).map_err(|e| format!("encrypted media endpoint URL is invalid: {e}"))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err("encrypted media endpoint URL must not include credentials".into());
@@ -587,17 +626,16 @@ pub fn validate_and_normalize_blob_endpoint_url(
         }
         _ => return Err("encrypted media endpoint URL scheme must be https".into()),
     }
-    url.set_fragment(None);
-    let mut normalized = url.as_str().trim_end_matches('/').to_owned();
-    if normalized.is_empty() {
-        normalized = url.as_str().to_owned();
-    }
+    // Normalization is WHATWG parse-and-serialize, matching group-avatar-url-v1.md
+    // and group-encrypted-media-v1.md. The serializer's output is the stored form:
+    // it serializes an empty path as `/`, so do NOT strip a trailing slash here.
+    let normalized = url.as_str();
     if normalized.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
         return Err(format!(
             "encrypted media endpoint URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
         ));
     }
-    Ok(normalized)
+    Ok(normalized.to_owned())
 }
 
 fn normalize_locator_kinds(kinds: Vec<String>, label: &'static str) -> Result<Vec<String>, String> {
@@ -611,8 +649,19 @@ fn normalize_locator_kinds(kinds: Vec<String>, label: &'static str) -> Result<Ve
     Ok(normalized)
 }
 
+/// Producer-side locator-kind normalization: trims and lowercases, then enforces
+/// the same canonical rule a decoder validates with [`validate_locator_kind`].
 fn normalize_locator_kind(value: &str, label: &'static str) -> Result<String, String> {
     let value = value.trim().to_ascii_lowercase();
+    validate_locator_kind(&value, label)?;
+    Ok(value)
+}
+
+/// Canonical locator-kind rule per group-encrypted-media-v1.md: 1..64 bytes,
+/// lowercase ASCII letters (`a-z`), digits (`0-9`), and `-`. This is a pure
+/// validation (no trimming, case-folding, or rewriting) so it can run on the
+/// strict decode path.
+fn validate_locator_kind(value: &str, label: &'static str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
     }
@@ -629,7 +678,20 @@ fn normalize_locator_kind(value: &str, label: &'static str) -> Result<String, St
             "{label} must contain only lowercase ASCII letters, digits, and '-'"
         ));
     }
-    Ok(value)
+    Ok(())
+}
+
+/// Strict decode-side check that a stored endpoint base URL is already canonical:
+/// it validates as an encrypted-media endpoint URL AND is byte-equal to its own
+/// producer-side normalization. A non-normalized URL is rejected, never repaired.
+/// Loopback http is accepted as valid component state (per the spec, acting on it
+/// is a separate local rule), so `allow_loopback_http` is `true` here.
+fn validate_blob_endpoint_url_is_canonical(base_url: &str) -> Result<(), String> {
+    let normalized = validate_and_normalize_blob_endpoint_url(base_url, true)?;
+    if normalized != base_url {
+        return Err("encrypted media endpoint base URL is not normalized".into());
+    }
+    Ok(())
 }
 
 fn is_loopback_host(host: Host<&str>) -> bool {
@@ -664,10 +726,18 @@ fn reject_non_routable_ipv6(addr: Ipv6Addr) -> Result<(), String> {
     if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
-    // Reject unique-local (fc00::/7) and link-local (fe80::/10) addresses, which
-    // the stable std API does not yet classify.
-    let first = addr.segments()[0];
-    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
+    // Reject ranges the stable std API does not yet classify, mirroring the IPv4
+    // branch's `is_documentation()` and the spec's "documentation" MUST-reject:
+    //   - unique-local      fc00::/7   (first & 0xfe00 == 0xfc00)
+    //   - link-local        fe80::/10  (first & 0xffc0 == 0xfe80)
+    //   - documentation     2001:db8::/32 (segments[0] == 0x2001 && [1] == 0x0db8)
+    //   - documentation     3fff::/20  (first & 0xfff0 == 0x3ff0), per RFC 9637
+    let [first, second, ..] = addr.segments();
+    if (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (first == 0x2001 && second == 0x0db8)
+        || (first & 0xfff0) == 0x3ff0
+    {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
     Ok(())
@@ -853,16 +923,18 @@ mod tests {
 
         assert_eq!(decoded.media_format, ENCRYPTED_MEDIA_FORMAT_V1);
         assert_eq!(decoded.allowed_locator_kinds, vec![BLOSSOM_LOCATOR_KIND_V1]);
+        // WHATWG serialization preserves a non-empty path's trailing slash and
+        // serializes an empty path as `/`, so both stored URLs end in `/`.
         assert_eq!(
             decoded.default_blob_endpoints,
             vec![
                 BlobStoreEndpointV1 {
                     locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
-                    base_url: "https://blossom-a.example/upload-root".to_owned(),
+                    base_url: "https://blossom-a.example/upload-root/".to_owned(),
                 },
                 BlobStoreEndpointV1 {
                     locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
-                    base_url: "https://blossom-b.example".to_owned(),
+                    base_url: "https://blossom-b.example/".to_owned(),
                 },
             ]
         );
@@ -918,14 +990,193 @@ mod tests {
             true,
         )
         .unwrap();
+        // WHATWG keeps the path's `/`; the dev loopback http URL is stored as-is.
         assert_eq!(
             local.default_blob_endpoints[0].base_url,
-            "http://127.0.0.1:3000"
+            "http://127.0.0.1:3000/"
         );
         assert_eq!(
             validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
             Err("encrypted media endpoint URL must not point at a non-routable address".into())
         );
+    }
+
+    /// Fixed encode→bytes vector pinning the corrected #171 layout: each
+    /// `BlobStoreEndpointV1` is the concatenation `{locator_kind, base_url}` with
+    /// NO per-item length wrapper, matching `allowed_locator_kinds` and the spec's
+    /// `Type items<V>` (one outer length, then concatenated items).
+    ///
+    /// Policy:
+    ///   media_format           = "encrypted-media-v1"
+    ///   allowed_locator_kinds  = ["blossom-v1"]
+    ///   default_blob_endpoints = [{ "blossom-v1", "https://blossom.primal.net/" }]
+    #[test]
+    fn encrypted_media_policy_encodes_endpoints_without_per_item_wrapper() {
+        const EXPECTED: &[u8] = &[
+            0x12, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x65, 0x64, 0x2d, 0x6d, 0x65, 0x64,
+            0x69, 0x61, 0x2d, 0x76, 0x31, // <media_format len=0x12>"encrypted-media-v1"
+            0x0b, // allowed_locator_kinds outer length = 11
+            0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76,
+            0x31, // <kind len=0x0a>"blossom-v1"
+            0x27, // default_blob_endpoints outer length = 39 (= 11 kind + 28 url, no wrapper)
+            0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76,
+            0x31, // <kind len=0x0a>"blossom-v1"
+            0x1b, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x62, 0x6c, 0x6f, 0x73, 0x73,
+            0x6f, 0x6d, 0x2e, 0x70, 0x72, 0x69, 0x6d, 0x61, 0x6c, 0x2e, 0x6e, 0x65, 0x74,
+            0x2f, // <url len=0x1b>"https://blossom.primal.net/"
+        ];
+
+        let policy = EncryptedMediaPolicyV1::blossom_default(
+            vec!["https://blossom.primal.net".to_owned()],
+            false,
+        )
+        .unwrap();
+        let encoded = encode_encrypted_media_policy_v1(&policy).unwrap();
+        assert_eq!(encoded, EXPECTED);
+        // The fixed bytes round-trip back to the same policy.
+        assert_eq!(decode_encrypted_media_policy_v1(EXPECTED).unwrap(), policy);
+    }
+
+    /// Decode is strict: a body carrying the OLD per-item-wrapped endpoint layout
+    /// (an extra QUIC length prefix around each `{locator_kind, base_url}`) is not
+    /// canonical and MUST be rejected, not silently re-parsed.
+    #[test]
+    fn encrypted_media_policy_decode_rejects_extra_per_item_endpoint_prefix() {
+        // Same policy as the fixed vector above, but with the legacy wrapper byte
+        // (0x28 outer endpoints length, 0x27 per-item wrapper) before the item.
+        const OLD_WRAPPED: &[u8] = &[
+            0x12, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x65, 0x64, 0x2d, 0x6d, 0x65, 0x64,
+            0x69, 0x61, 0x2d, 0x76, 0x31, 0x0b, 0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d,
+            0x2d, 0x76, 0x31, 0x28, // endpoints outer length = 40 (1 wrapper byte + 39 item)
+            0x27, // legacy per-item wrapper length = 39
+            0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76, 0x31, 0x1b, 0x68, 0x74,
+            0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2e,
+            0x70, 0x72, 0x69, 0x6d, 0x61, 0x6c, 0x2e, 0x6e, 0x65, 0x74, 0x2f,
+        ];
+        assert!(decode_encrypted_media_policy_v1(OLD_WRAPPED).is_err());
+    }
+
+    /// Decode rejects a duplicate entry in `allowed_locator_kinds` rather than
+    /// deduplicating it (canonical-encoding.md "Canonical decoding").
+    #[test]
+    fn encrypted_media_policy_decode_rejects_duplicate_allowed_locator_kind() {
+        let mut allowed = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+        let mut endpoints = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+        encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+        let bytes = encode_component_vectors(&[
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&bytes),
+            Err("encrypted media policy has a duplicate allowed locator kind".into())
+        );
+    }
+
+    /// Decode rejects a duplicate `default_blob_endpoints` entry rather than
+    /// deduplicating it.
+    #[test]
+    fn encrypted_media_policy_decode_rejects_duplicate_endpoint() {
+        let mut allowed = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+        let mut endpoints = Vec::new();
+        for _ in 0..2 {
+            encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+            encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+        }
+        let bytes = encode_component_vectors(&[
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&bytes),
+            Err("encrypted media policy has a duplicate default blob endpoint".into())
+        );
+    }
+
+    /// Decode rejects a non-normalized endpoint base URL (missing the WHATWG
+    /// empty-path `/`) rather than repairing it.
+    #[test]
+    fn encrypted_media_policy_decode_rejects_non_normalized_endpoint_url() {
+        let mut allowed = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+        let mut endpoints = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+        // WHATWG-normalized form is "https://blossom.primal.net/"; the trailing
+        // slash is missing here, so the stored bytes are not canonical.
+        encode_var_bytes(b"https://blossom.primal.net", &mut endpoints);
+        let bytes = encode_component_vectors(&[
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&bytes),
+            Err("encrypted media endpoint base URL is not normalized".into())
+        );
+    }
+
+    /// Decode rejects a non-canonical locator kind (uppercase) rather than
+    /// lowercasing it.
+    #[test]
+    fn encrypted_media_policy_decode_rejects_non_canonical_locator_kind() {
+        let mut allowed = Vec::new();
+        encode_var_bytes(b"Blossom-V1", &mut allowed);
+        let mut endpoints = Vec::new();
+        encode_var_bytes(b"Blossom-V1", &mut endpoints);
+        encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+        let bytes = encode_component_vectors(&[
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert!(decode_encrypted_media_policy_v1(&bytes).is_err());
+    }
+
+    /// Decode rejects a non-canonical `media_format` (e.g. with surrounding
+    /// whitespace) rather than trimming it.
+    #[test]
+    fn encrypted_media_policy_decode_rejects_non_canonical_media_format() {
+        let mut allowed = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+        let mut endpoints = Vec::new();
+        encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+        encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+        let bytes = encode_component_vectors(&[
+            b" encrypted-media-v1 ",
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&bytes),
+            Err(format!(
+                "encrypted media format must be {ENCRYPTED_MEDIA_FORMAT_V1}"
+            ))
+        );
+    }
+
+    #[test]
+    fn group_avatar_url_rejects_documentation_ipv6_ranges() {
+        // 2001:db8::/32 is the spec-required documentation range; 3fff::/20 is the
+        // newer RFC 9637 documentation range.
+        for raw in [
+            "https://[2001:db8::1]/a.png",
+            "https://[2001:db8:abcd:12::1]/a.png",
+            "https://[3fff::1]/a.png",
+            "https://[3fff:ffff::1]/a.png",
+        ] {
+            assert!(
+                validate_and_normalize_group_avatar_url(raw).is_err(),
+                "{raw} should be rejected"
+            );
+        }
+        // A globally-routable IPv6 address is still accepted.
+        assert!(validate_and_normalize_group_avatar_url("https://[2606:4700::1]/a.png").is_ok());
     }
 
     #[test]
