@@ -485,6 +485,19 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         cgka_traits::ingest::IngestOutcome::Buffered { .. }
     ));
 
+    // Pin a long settlement-quiescence window before the queued send. The
+    // outbound intent is only queued while convergence reports `Syncing`,
+    // which holds only while `now_ms - last_input_ms < settlement_quiescence_ms`.
+    // With the default 1s window this test silently depended on under ~1s of
+    // wall-clock elapsing between buffering the commit and sending; under a
+    // loaded nextest shard that window blew past 1s, convergence settled
+    // early, and the message published instead of queuing (issue #296).
+    // A large explicit window makes the queue path deterministic regardless of
+    // scheduling jitter; the reset to 0 below deterministically releases it.
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 3_600_000,
+        ..CanonicalizationPolicy::default()
+    });
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
