@@ -25,9 +25,9 @@ use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use transport_quic_broker::{
-    BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_updates,
+    BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_limits,
 };
-use transport_quic_stream::AgentTextStreamCrypto;
+use transport_quic_stream::{AgentTextStreamCrypto, AgentTextStreamReceiveLimits};
 
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;
 
@@ -1832,6 +1832,18 @@ impl MarmotAppRuntime {
                 &start_message_id_hex,
             )
             .await?;
+        // Decode the group's agent-text-stream policy so receive validation
+        // applies the group `max_plaintext_frame_len` (plus the spec-pinned
+        // 1024-byte frame allowance) instead of only the app-profile ceiling.
+        let app_for_policy = self.accounts.app.clone();
+        let account_ref_for_policy = account_ref.to_owned();
+        let group_id_hex_for_policy = group_id_hex.clone();
+        let policy_max_plaintext_frame_len = blocking_app_task(move || {
+            app_for_policy.group(&account_ref_for_policy, &group_id_hex_for_policy)
+        })
+        .await?
+        .map(|group| group.agent_text_stream.max_plaintext_frame_len)
+        .filter(|max_plaintext_frame_len| *max_plaintext_frame_len > 0);
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
         let (terminal_tx, terminal_rx) = oneshot::channel();
@@ -1840,12 +1852,15 @@ impl MarmotAppRuntime {
             let final_update = tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut stopping) => return,
                 update = watch_broker_candidates(
-                    candidates,
-                    server_cert_der,
-                    insecure_local,
-                    crypto_context.stream_id,
-                    crypto_context.start_event_id,
-                    Some(crypto_context.crypto),
+                    BrokerWatch {
+                        candidates,
+                        server_cert_der,
+                        insecure_local,
+                        stream_id: crypto_context.stream_id,
+                        start_event_id: crypto_context.start_event_id,
+                        crypto: Some(crypto_context.crypto),
+                        policy_max_plaintext_frame_len,
+                    },
                     updates_tx.clone(),
                 ) => update,
             };
@@ -5536,17 +5551,31 @@ fn candidate_server_name(authority: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
 }
 
-async fn watch_broker_candidates(
+/// One broker-watch attempt: every reachable candidate for one preview
+/// stream, the trust inputs, the record crypto, and the group policy cap.
+struct BrokerWatch {
     candidates: Vec<ParsedQuicCandidate>,
     server_cert_der: Option<Vec<u8>>,
     insecure_local: bool,
     stream_id: Vec<u8>,
     start_event_id: MessageId,
     crypto: Option<AgentTextStreamCrypto>,
+    policy_max_plaintext_frame_len: Option<u32>,
+}
+
+async fn watch_broker_candidates(
+    watch: BrokerWatch,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
 ) -> RuntimeAgentStreamUpdate {
+    // Receive validation uses the group policy frame cap when the component
+    // is present; the app-profile constant stays the ceiling and fallback.
+    let mut limits = AgentTextStreamReceiveLimits::default();
+    if let Some(max_plaintext_frame_len) = watch.policy_max_plaintext_frame_len {
+        limits.max_plaintext_frame_len =
+            max_plaintext_frame_len.min(limits.max_plaintext_frame_len);
+    }
     let mut last_error = None;
-    for candidate in candidates {
+    for candidate in watch.candidates {
         match resolve_broker_addr(&candidate.authority).await {
             Ok(broker_addr) => {
                 let resolved = ResolvedQuicCandidate {
@@ -5555,19 +5584,19 @@ async fn watch_broker_candidates(
                 };
                 let trust = broker_trust_for_addr(
                     resolved.broker_addr,
-                    server_cert_der.clone(),
-                    insecure_local,
+                    watch.server_cert_der.clone(),
+                    watch.insecure_local,
                 );
                 let config = SubscribeTextFromBroker {
                     broker_addr: resolved.broker_addr,
                     server_name: resolved.server_name,
                     trust,
-                    stream_id: stream_id.clone(),
-                    start_event_id: start_event_id.clone(),
-                    crypto: crypto.clone(),
+                    stream_id: watch.stream_id.clone(),
+                    start_event_id: watch.start_event_id.clone(),
+                    crypto: watch.crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
-                match subscribe_text_from_broker_with_updates(config, |chunk| {
+                match subscribe_text_from_broker_with_limits(config, limits, |chunk| {
                     let update = match chunk.record_type {
                         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
                             seq: chunk.seq,

@@ -3731,6 +3731,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                     max_chunk_bytes: chunk_bytes,
                     chunk_delay: Duration::from_millis(chunk_delay_ms),
                     crypto: None,
+                    max_plaintext_frame_len: None,
                 })
                 .await?;
                 return Ok(CommandOutput {
@@ -3763,6 +3764,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                 max_chunk_bytes: chunk_bytes,
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
                 crypto: None,
+                max_plaintext_frame_len: None,
             })
             .await?;
             Ok(CommandOutput {
@@ -3926,6 +3928,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     max_chunk_bytes: chunk_bytes,
                     chunk_delay: Duration::from_millis(chunk_delay_ms),
                     crypto: Some(crypto),
+                    max_plaintext_frame_len: None,
                 })
                 .await?;
                 return Ok(CommandOutput {
@@ -3958,6 +3961,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 max_chunk_bytes: chunk_bytes,
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
                 crypto: Some(crypto),
+                max_plaintext_frame_len: None,
             })
             .await?;
             Ok(CommandOutput {

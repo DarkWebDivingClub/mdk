@@ -81,6 +81,7 @@ async fn round_trip_public_broker_addr(broker_addr: SocketAddr) -> Result<(), St
         max_chunk_bytes: 1024,
         chunk_delay: Duration::ZERO,
         crypto: None,
+        max_plaintext_frame_len: None,
     })
     .await
     .map_err(|err| format!("publish to {broker_addr} failed: {err}"))?;

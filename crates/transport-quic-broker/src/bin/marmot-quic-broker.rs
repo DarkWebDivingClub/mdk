@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use transport_quic_broker::{QuicBrokerConfig, QuicBrokerServer, QuicBrokerTlsConfig};
@@ -16,6 +17,10 @@ struct Args {
     per_subscriber_queue: usize,
     #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_BACKLOG_DEPTH)]
     max_backlog: usize,
+    /// Replay window (seconds) for serving retained backlog to late
+    /// subscribers. 0 retains no replay; the hard cap is 300.
+    #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_REPLAY_TTL.as_secs())]
+    replay_ttl_secs: u64,
     #[arg(long, value_name = "PATH", requires = "key_pem")]
     cert_pem: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires = "cert_pem")]
@@ -45,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr: args.bind,
         per_subscriber_queue: args.per_subscriber_queue,
         max_backlog: args.max_backlog,
+        replay_ttl: Duration::from_secs(args.replay_ttl_secs),
         tls,
         ..QuicBrokerConfig::default()
     })?;
@@ -63,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "persistence": "none",
                     "per_subscriber_queue": args.per_subscriber_queue,
                     "max_backlog": args.max_backlog,
+                    "replay_ttl_secs": args.replay_ttl_secs,
                 }
             }))?
         );
@@ -72,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("tls={tls_mode}");
         eprintln!("persistence=none");
         eprintln!("max_backlog={}", args.max_backlog);
+        eprintln!("replay_ttl_secs={}", args.replay_ttl_secs);
     }
 
     server

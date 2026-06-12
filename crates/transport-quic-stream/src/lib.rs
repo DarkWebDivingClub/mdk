@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES, AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
-    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_CHECKPOINT,
-    AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_VERSION,
-    AGENT_TEXT_STREAM_START_EVENT_ID_LEN, AgentTextStreamKeyContextV1, AgentTextStreamRecordError,
-    AgentTextStreamRecordV1, AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_AEAD_TAG_LEN, AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES,
+    AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
+    AGENT_TEXT_STREAM_RECORD_CHECKPOINT, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+    AGENT_TEXT_STREAM_RECORD_VERSION, AGENT_TEXT_STREAM_START_EVENT_ID_LEN,
+    AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
+    AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_components::encode_quic_varint;
 use cgka_traits::{
@@ -27,10 +28,33 @@ use tokio::time::{sleep, timeout};
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
+/// Spec-pinned reader allowance on top of the plaintext frame policy cap: a
+/// reader rejects a frame whose `frame_len` exceeds the group's
+/// `max_plaintext_frame_len` policy value plus exactly 1024 bytes of header
+/// and AEAD-tag allowance.
+pub const AGENT_TEXT_STREAM_FRAME_ALLOWANCE: usize = 1024;
+const MAX_FRAME_SIZE: usize =
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + AGENT_TEXT_STREAM_FRAME_ALLOWANCE;
 const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
-const AEAD_TAG_LEN: usize = 16;
+const AEAD_TAG_LEN: usize = AGENT_TEXT_STREAM_AEAD_TAG_LEN;
 const AGENT_TEXT_STREAM_SECRET_LEN: usize = 32;
+
+/// Effective plaintext cap for a stream given an optional group policy value:
+/// the policy bound when present, with the app-profile constant as the
+/// ceiling and fallback.
+pub fn effective_plaintext_cap(policy_max_plaintext_frame_len: Option<u32>) -> usize {
+    policy_max_plaintext_frame_len
+        .filter(|len| *len > 0)
+        .map_or(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, |len| {
+            len.min(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN)
+        }) as usize
+}
+
+/// Maximum accepted wire `frame_len` for a stream: the effective plaintext cap
+/// plus the spec-pinned 1024-byte header/AEAD-tag allowance.
+pub fn frame_len_cap(policy_max_plaintext_frame_len: Option<u32>) -> usize {
+    effective_plaintext_cap(policy_max_plaintext_frame_len) + AGENT_TEXT_STREAM_FRAME_ALLOWANCE
+}
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -82,26 +106,34 @@ impl QuicTextStreamReceiver {
         let connection = incoming.await?;
         let mut recv = connection.accept_uni().await?;
         let mut stream_id = None;
-        let mut expected_seq = 1_u64;
+        // Last-accepted seq high-water mark per the QUIC transport binding:
+        // records at or below it (duplicates, transport-level replay) are
+        // discarded silently and are never stream-fatal; the next accepted
+        // record is high_water + 1; a record further ahead is a gap.
+        let mut high_water = 0_u64;
         let mut chunks = Vec::new();
         let mut text = String::new();
         let mut transcript = None;
         let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
+        let max_frame_len = frame_len_cap(Some(limits.max_plaintext_frame_len));
 
-        while let Some(record) = read_record(&mut recv).await? {
+        while let Some(record) = read_record(&mut recv, max_frame_len).await? {
+            if record.seq <= high_water {
+                continue;
+            }
+            if record.seq != high_water + 1 {
+                return Err(QuicTextStreamError::UnexpectedSequence {
+                    expected: high_water + 1,
+                    actual: record.seq,
+                });
+            }
             let record = if let Some(crypto) = &crypto {
                 decrypt_record(crypto, &record)?
             } else {
                 record
             };
             limit_state.observe(&record)?;
-            if record.seq != expected_seq {
-                return Err(QuicTextStreamError::UnexpectedSequence {
-                    expected: expected_seq,
-                    actual: record.seq,
-                });
-            }
-            expected_seq += 1;
+            high_water = record.seq;
 
             if let Some(existing) = &stream_id {
                 if existing != &record.stream_id {
@@ -181,6 +213,10 @@ pub struct SendTextStream {
     pub max_chunk_bytes: usize,
     pub chunk_delay: Duration,
     pub crypto: Option<AgentTextStreamCrypto>,
+    /// Group policy `max_plaintext_frame_len` when the caller has the decoded
+    /// `AgentTextStreamQuicPolicyV1` available. Chunk size is clamped to it;
+    /// the app-profile constant is the ceiling and the fallback when `None`.
+    pub max_plaintext_frame_len: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +278,10 @@ impl std::fmt::Debug for AgentTextStreamCrypto {
 pub struct AgentTextStreamReceiveLimits {
     pub max_records: u64,
     pub max_plaintext_bytes: usize,
+    /// Group policy `max_plaintext_frame_len` when available. Receive paths
+    /// reject wire frames above this value plus the spec-pinned 1024-byte
+    /// allowance; the app-profile constant is the ceiling and default.
+    pub max_plaintext_frame_len: u32,
 }
 
 impl Default for AgentTextStreamReceiveLimits {
@@ -249,6 +289,7 @@ impl Default for AgentTextStreamReceiveLimits {
         Self {
             max_records: AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
             max_plaintext_bytes: AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES,
+            max_plaintext_frame_len: AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN,
         }
     }
 }
@@ -343,14 +384,12 @@ pub async fn send_text_stream(
             config.max_chunk_bytes,
         ));
     }
-    if config.crypto.is_some()
-        && config.max_chunk_bytes + AEAD_TAG_LEN
-            > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
-    {
-        return Err(QuicTextStreamError::ChunkSizeTooLarge(
-            config.max_chunk_bytes,
-        ));
-    }
+    // Clamp the chunk size to the group policy cap when the caller supplied
+    // one. A plaintext within the cap always encrypts to a ciphertext within
+    // the record's `ciphertext<0..2^16-1>` field bound (cap + 16 <= 65535).
+    let max_chunk_bytes = config
+        .max_chunk_bytes
+        .min(effective_plaintext_cap(config.max_plaintext_frame_len));
 
     let endpoint = client_endpoint(config.trust, config.server_addr)?;
     let connection = endpoint
@@ -360,7 +399,7 @@ pub async fn send_text_stream(
     let mut transcript =
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
 
-    for (index, chunk) in split_text_deltas(&config.text, config.max_chunk_bytes)
+    for (index, chunk) in split_text_deltas(&config.text, max_chunk_bytes)
         .into_iter()
         .enumerate()
     {
@@ -425,9 +464,10 @@ pub fn encrypt_record(
     record: &AgentTextStreamRecordV1,
 ) -> Result<AgentTextStreamRecordV1, QuicTextStreamError> {
     validate_crypto_record_context(crypto, record)?;
-    if record.plaintext_frame.len() + AEAD_TAG_LEN
-        > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
-    {
+    // Plaintext within the app-profile cap (65519) keeps the ciphertext
+    // (plaintext + 16-byte AEAD tag) within the record's
+    // `ciphertext<0..2^16-1>` wire field bound.
+    if record.plaintext_frame.len() > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
         return Err(QuicTextStreamError::EncryptedFrameTooLarge(
             record.plaintext_frame.len(),
         ));
@@ -507,11 +547,20 @@ fn validate_crypto_record_context(
     Ok(())
 }
 
-fn derive_record_key(crypto: &AgentTextStreamCrypto) -> Result<[u8; 32], QuicTextStreamError> {
+/// Derive the per-stream AEAD record key:
+/// `HKDF-Expand(stream_secret, len("record key") || "record key" || key_context, 32)`.
+///
+/// Public so conformance vectors can pin the derivation bytes.
+pub fn derive_record_key(crypto: &AgentTextStreamCrypto) -> Result<[u8; 32], QuicTextStreamError> {
     derive_bytes(crypto, b"record key")
 }
 
-fn derive_record_nonce(
+/// Derive the per-record AEAD nonce: `nonce_base XOR uint96_be(seq)`, where
+/// `nonce_base = HKDF-Expand(stream_secret, len("record nonce") || "record nonce" || key_context, 12)`.
+/// Calling this with `seq = 0` yields `nonce_base` itself.
+///
+/// Public so conformance vectors can pin the derivation bytes.
+pub fn derive_record_nonce(
     crypto: &AgentTextStreamCrypto,
     seq: u64,
 ) -> Result<[u8; 12], QuicTextStreamError> {
@@ -540,7 +589,13 @@ fn derive_bytes<const N: usize>(
     Ok(out)
 }
 
-fn record_aad(crypto: &AgentTextStreamCrypto, record: &AgentTextStreamRecordV1) -> Vec<u8> {
+/// Build the record AEAD AAD:
+/// `version || SHA-256(group_id) || len(stream_id) || stream_id || mls_epoch ||
+/// len(sender_id) || sender_id || seq || record_type || flags`, with every
+/// `len(...)` a QUIC variable-length integer.
+///
+/// Public so conformance vectors can pin the AAD bytes.
+pub fn record_aad(crypto: &AgentTextStreamCrypto, record: &AgentTextStreamRecordV1) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(AGENT_TEXT_STREAM_RECORD_VERSION);
     let group_hash = Sha256::digest(crypto.context.group_id.as_slice());
@@ -620,6 +675,7 @@ async fn write_record(
 
 async fn read_record(
     recv: &mut quinn::RecvStream,
+    max_frame_len: usize,
 ) -> Result<Option<AgentTextStreamRecordV1>, QuicTextStreamError> {
     let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
     let mut read = 0;
@@ -633,17 +689,17 @@ async fn read_record(
     }
 
     let len = u32::from_be_bytes(len_bytes) as usize;
-    validate_frame_len(len)?;
+    validate_frame_len(len, max_frame_len)?;
     let mut bytes = vec![0_u8; len];
     recv.read_exact(&mut bytes).await?;
     Ok(Some(AgentTextStreamRecordV1::decode(&bytes)?))
 }
 
-fn validate_frame_len(len: usize) -> Result<(), QuicTextStreamError> {
+fn validate_frame_len(len: usize, max_frame_len: usize) -> Result<(), QuicTextStreamError> {
     if len == 0 {
         return Err(QuicTextStreamError::EmptyFrame);
     }
-    if len > MAX_FRAME_SIZE {
+    if len > max_frame_len.min(MAX_FRAME_SIZE) {
         return Err(QuicTextStreamError::FrameTooLarge(len));
     }
     Ok(())
@@ -755,7 +811,11 @@ pub enum QuicTextStreamError {
     EncryptedFrameTooLarge(usize),
     #[error("agent text stream mixed stream ids in one QUIC stream")]
     MixedStreamIds,
-    #[error("agent text stream sequence mismatch: expected {expected}, got {actual}")]
+    /// A record arrived ahead of the high-water mark (`actual > expected`),
+    /// signalling a gap the receiver cannot fill without a replay source.
+    /// Records at or below the high-water mark are discarded silently and
+    /// never raise this error.
+    #[error("agent text stream sequence gap: expected {expected}, got {actual}")]
     UnexpectedSequence { expected: u64, actual: u64 },
     #[error("agent text stream crypto failed: {0}")]
     Crypto(String),
@@ -792,9 +852,37 @@ mod tests {
     #[test]
     fn oversized_frames_are_rejected_before_allocation() {
         assert!(matches!(
-            validate_frame_len(MAX_FRAME_SIZE + 1),
+            validate_frame_len(MAX_FRAME_SIZE + 1, MAX_FRAME_SIZE),
             Err(QuicTextStreamError::FrameTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn policy_frame_cap_is_policy_plus_fixed_allowance_with_app_ceiling() {
+        assert_eq!(AGENT_TEXT_STREAM_FRAME_ALLOWANCE, 1024);
+        assert_eq!(frame_len_cap(None), MAX_FRAME_SIZE);
+        assert_eq!(
+            frame_len_cap(Some(4096)),
+            4096 + AGENT_TEXT_STREAM_FRAME_ALLOWANCE
+        );
+        // A policy above the app-profile ceiling is clamped to the ceiling, and
+        // a zero policy falls back to the ceiling.
+        assert_eq!(frame_len_cap(Some(u32::MAX)), MAX_FRAME_SIZE);
+        assert_eq!(frame_len_cap(Some(0)), MAX_FRAME_SIZE);
+        assert!(matches!(
+            validate_frame_len(
+                4096 + AGENT_TEXT_STREAM_FRAME_ALLOWANCE + 1,
+                frame_len_cap(Some(4096))
+            ),
+            Err(QuicTextStreamError::FrameTooLarge(_))
+        ));
+        assert!(
+            validate_frame_len(
+                4096 + AGENT_TEXT_STREAM_FRAME_ALLOWANCE,
+                frame_len_cap(Some(4096))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -842,6 +930,7 @@ mod tests {
             AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
                 max_records: 1,
                 max_plaintext_bytes: 1024,
+                ..AgentTextStreamReceiveLimits::default()
             });
         record_limited.observe(&record).unwrap();
         assert!(matches!(
@@ -856,6 +945,7 @@ mod tests {
             AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
                 max_records: 10,
                 max_plaintext_bytes: 4,
+                ..AgentTextStreamReceiveLimits::default()
             });
         assert!(matches!(
             byte_limited.observe(&record),
@@ -947,6 +1037,7 @@ mod tests {
             max_chunk_bytes: 5,
             chunk_delay: Duration::ZERO,
             crypto: None,
+            max_plaintext_frame_len: None,
         })
         .await
         .unwrap_err();
@@ -976,6 +1067,7 @@ mod tests {
             max_chunk_bytes: 5,
             chunk_delay: Duration::ZERO,
             crypto: None,
+            max_plaintext_frame_len: None,
         })
         .await
         .unwrap();
@@ -995,5 +1087,141 @@ mod tests {
         assert_eq!(sent.stream_id, stream_id);
         assert_eq!(sent.chunk_count, 3);
         assert_eq!(sent.transcript_hash, received.transcript_hash);
+    }
+
+    #[tokio::test]
+    async fn send_clamps_chunk_size_to_group_policy_cap() {
+        let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+        let server_addr = receiver.local_addr().unwrap();
+        let server_cert = receiver.server_cert_der().to_vec();
+        let stream_id = vec![0x42; 32];
+        let start_event_id = MessageId::new(vec![0x24; 32]);
+        let receive = tokio::spawn(receiver.receive_once(start_event_id.clone(), None));
+
+        let sent = send_text_stream(SendTextStream {
+            server_addr,
+            server_name: "localhost".to_owned(),
+            trust: ServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            text: "hello over quic".to_owned(),
+            max_chunk_bytes: 1024,
+            chunk_delay: Duration::ZERO,
+            crypto: None,
+            max_plaintext_frame_len: Some(5),
+        })
+        .await
+        .unwrap();
+
+        let received = receive.await.unwrap().unwrap();
+        assert_eq!(received.text, "hello over quic");
+        assert_eq!(
+            received
+                .chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello", " over", " quic"]
+        );
+        assert_eq!(sent.chunk_count, 3);
+    }
+
+    async fn raw_record_sender(
+        server_addr: SocketAddr,
+        server_cert: Vec<u8>,
+        records: Vec<AgentTextStreamRecordV1>,
+    ) {
+        let endpoint =
+            client_endpoint(ServerTrust::CertificateDer(server_cert), server_addr).unwrap();
+        let connection = endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let mut send = connection.open_uni().await.unwrap();
+        for record in &records {
+            write_record(&mut send, record).await.unwrap();
+        }
+        send.finish().unwrap();
+        if timeout(SEND_CLOSE_WAIT, connection.closed()).await.is_err() {
+            connection.close(0_u32.into(), b"done");
+        }
+        endpoint.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn receiver_silently_discards_replayed_records_at_or_below_high_water() {
+        let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+        let server_addr = receiver.local_addr().unwrap();
+        let server_cert = receiver.server_cert_der().to_vec();
+        let stream_id = vec![0x42; 32];
+        let start_event_id = MessageId::new(vec![0x24; 32]);
+        let receive = tokio::spawn(receiver.receive_once(start_event_id.clone(), None));
+
+        let first = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"hel".to_vec());
+        let second = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 2, b"lo".to_vec());
+        let third = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 3, b" world".to_vec());
+        // A broker replaying its retained backlog re-sends records the receiver
+        // already accepted; those must be discarded silently, never
+        // stream-fatal, and the next accepted record is high-water + 1.
+        raw_record_sender(
+            server_addr,
+            server_cert,
+            vec![
+                first.clone(),
+                second.clone(),
+                first.clone(),
+                second.clone(),
+                third.clone(),
+            ],
+        )
+        .await;
+
+        let received = receive.await.unwrap().unwrap();
+        assert_eq!(received.text, "hello world");
+        assert_eq!(received.chunk_count, 3);
+        assert_eq!(
+            received
+                .chunks
+                .iter()
+                .map(|chunk| chunk.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let mut transcript = AgentTextStreamTranscriptV1::new(stream_id, start_event_id);
+        transcript.append(1, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"hel");
+        transcript.append(2, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"lo");
+        transcript.append(3, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b" world");
+        assert_eq!(received.transcript_hash, transcript.hash());
+    }
+
+    #[tokio::test]
+    async fn receiver_reports_gap_when_record_is_ahead_of_high_water() {
+        let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+        let server_addr = receiver.local_addr().unwrap();
+        let server_cert = receiver.server_cert_der().to_vec();
+        let stream_id = vec![0x42; 32];
+        let start_event_id = MessageId::new(vec![0x24; 32]);
+        let receive = tokio::spawn(receiver.receive_once(start_event_id, None));
+
+        raw_record_sender(
+            server_addr,
+            server_cert,
+            vec![
+                AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"hel".to_vec()),
+                AgentTextStreamRecordV1::text_delta(stream_id, 3, b"lo".to_vec()),
+            ],
+        )
+        .await;
+
+        let err = receive.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            QuicTextStreamError::UnexpectedSequence {
+                expected: 2,
+                actual: 3
+            }
+        ));
     }
 }

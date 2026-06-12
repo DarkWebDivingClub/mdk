@@ -2323,6 +2323,9 @@ async fn open_stream_compose(
                 stream_id: stream_id_bytes,
                 start_event_id,
                 crypto,
+                // Group policy max_plaintext_frame_len is not plumbed to the
+                // daemon compose path yet; the app-profile cap applies.
+                max_plaintext_frame_len: None,
             },
             chunk_bytes,
             rx,
@@ -4124,6 +4127,7 @@ mod tests {
             stream_id,
             start_event_id,
             crypto: None,
+            max_plaintext_frame_len: None,
         }
     }
 

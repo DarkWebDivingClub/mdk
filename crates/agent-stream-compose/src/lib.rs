@@ -615,6 +615,7 @@ mod tests {
             stream_id,
             start_event_id,
             crypto: None,
+            max_plaintext_frame_len: None,
         }
     }
 
@@ -1165,6 +1166,7 @@ mod tests {
             stream_id: stream_id.clone(),
             start_event_id,
             crypto: None,
+            max_plaintext_frame_len: None,
         };
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
@@ -1301,6 +1303,7 @@ mod tests {
             stream_id: stream_id.clone(),
             start_event_id,
             crypto: None,
+            max_plaintext_frame_len: None,
         };
         let report = test_stream_compose_report(&stream_id);
         // Capacity-1 command channel keeps the queue trivially saturable.

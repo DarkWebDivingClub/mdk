@@ -49,7 +49,19 @@ pub const AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN: usize = 64;
 pub const AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN: usize = 32;
 pub const AGENT_TEXT_STREAM_START_EVENT_ID_LEN: usize = 32;
 
-pub const AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN: u32 = 64 * 1024;
+/// App-profile cap on the plaintext bytes in one stream frame before record
+/// encryption. 65519 keeps a maximum-length frame's ciphertext
+/// (`plaintext_len + 16` AEAD tag bytes) within the record's
+/// `ciphertext<0..2^16-1>` field bound.
+pub const AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN: u32 = 65519;
+/// Wire bound of the record's `ciphertext<0..2^16-1>` field. The
+/// `AgentTextStreamRecordV1` frame field carries ciphertext on the wire, so
+/// the struct-level validator enforces this bound; the plaintext policy cap is
+/// [`AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN`].
+pub const AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN: u32 = u16::MAX as u32;
+/// AEAD tag bytes appended to every encrypted record frame
+/// (ChaCha20-Poly1305).
+pub const AGENT_TEXT_STREAM_AEAD_TAG_LEN: usize = 16;
 pub const AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS: u64 = 4096;
 pub const AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
 pub const AGENT_TEXT_STREAM_MAX_REPLAY_TTL_SECS: u32 = 5 * 60;
@@ -287,7 +299,11 @@ impl AgentTextStreamRecordV1 {
                 self.record_type,
             ));
         }
-        if self.plaintext_frame.len() > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
+        // The frame field carries ciphertext on the wire, so the struct bound
+        // is the `ciphertext<0..2^16-1>` field bound. The tighter plaintext
+        // policy cap (`max_plaintext_frame_len`, app-profile max 65519) is
+        // enforced on the send chunking and encrypt paths.
+        if self.plaintext_frame.len() > AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN as usize {
             return Err(AgentTextStreamRecordError::PlaintextFrameTooLarge(
                 self.plaintext_frame.len(),
             ));
@@ -409,8 +425,14 @@ fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// Hash `len(bytes) || bytes` where `len(...)` is the Marmot binary profile's
+/// QUIC variable-length integer — the same length encoding the QUIC record and
+/// key-context use, per the transcript-hash construction in the spec (a
+/// 32-byte id's length prefix is the single byte `0x20`).
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_be_bytes());
+    let mut prefix = Vec::with_capacity(8);
+    encode_quic_varint(bytes.len() as u64, &mut prefix);
+    hasher.update(&prefix);
     hasher.update(bytes);
 }
 
@@ -557,6 +579,67 @@ mod tests {
                 .windows(8)
                 .any(|window| window == 9_u64.to_be_bytes())
         );
+    }
+
+    #[test]
+    fn plaintext_cap_keeps_max_ciphertext_within_wire_field_bound() {
+        // Spec: max_plaintext_frame_len <= 65519 so a maximum-length frame's
+        // ciphertext (plaintext + 16-byte AEAD tag) fits ciphertext<0..2^16-1>.
+        assert_eq!(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, 65519);
+        assert_eq!(
+            AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + AGENT_TEXT_STREAM_AEAD_TAG_LEN,
+            AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN as usize,
+        );
+        assert_eq!(
+            AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN,
+            u32::from(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn record_frame_field_accepts_max_length_ciphertext() {
+        // A 65519-byte plaintext encrypts to a 65535-byte ciphertext, which the
+        // record struct must round-trip because the wire field bound is
+        // ciphertext<0..2^16-1>, not the plaintext policy cap.
+        let max_ciphertext = AgentTextStreamRecordV1::text_delta(
+            vec![0x11; 32],
+            1,
+            vec![0x55; AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN as usize],
+        );
+        let decoded = AgentTextStreamRecordV1::decode(&max_ciphertext.encode().unwrap()).unwrap();
+        assert_eq!(decoded, max_ciphertext);
+
+        let oversized = AgentTextStreamRecordV1::text_delta(
+            vec![0x11; 32],
+            1,
+            vec![0x55; AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN as usize + 1],
+        );
+        assert_eq!(
+            oversized.encode(),
+            Err(AgentTextStreamRecordError::PlaintextFrameTooLarge(
+                AGENT_TEXT_STREAM_MAX_RECORD_CIPHERTEXT_LEN as usize + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn transcript_hash_uses_quic_varint_length_prefixes() {
+        // Spec: every len(...) in the transcript construction is the QUIC
+        // variable-length integer; a 32-byte id's prefix is the single byte
+        // 0x20, never an 8-byte fixed-width length.
+        let stream_id = vec![0x11; 32];
+        let start = MessageId::new(vec![0x22; 32]);
+        let transcript = AgentTextStreamTranscriptV1::new(stream_id.clone(), start.clone());
+
+        let mut hasher = Sha256::new();
+        hasher.update(AGENT_TEXT_STREAM_TRANSCRIPT_HASH_CONTEXT);
+        hasher.update([0x20]);
+        hasher.update(&stream_id);
+        hasher.update([0x20]);
+        hasher.update(start.as_slice());
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(transcript.hash(), expected);
     }
 
     #[test]

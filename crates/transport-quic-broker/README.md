@@ -8,13 +8,17 @@ final MLS app-message payload remains authoritative.
 
 ## Protocol Shape
 
-- Publishers open a QUIC unidirectional stream, send one broker control frame, then send agent text stream record
-  frames.
-- Subscribers open a QUIC bidirectional stream, send one broker control frame, then receive matching record frames from
-  the broker.
-- Rooms are keyed by `stream_id + start_event_id`.
+- Broker connections negotiate ALPN `marmot.quic_broker.v1`.
+- Publishers open a QUIC unidirectional stream, send one binary broker control envelope frame, then send agent text
+  stream record frames.
+- Subscribers open a QUIC bidirectional stream, send one binary broker control envelope frame, then receive matching
+  record frames from the broker. The broker rejects a publish envelope on a bidirectional stream and a subscribe
+  envelope on a unidirectional stream.
+- Rooms are keyed by `stream_id + start_event_id` (raw bytes in the control envelope).
 - Subscriber queues are bounded and live-only.
-- Finished rooms retain bounded backlog for 60 seconds so late subscribers can still replay the completed preview.
+- Replay backlog is gated by `--replay-ttl-secs` (default `0`: no retained replay, matching the first-profile
+  `replay_ttl_secs` default; hard cap 300s). With a nonzero replay window, backlog entries are timestamped on append
+  and purged once they age out; finished rooms keep their remaining backlog for at most 60 seconds.
 
 ## Run
 

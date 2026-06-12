@@ -68,6 +68,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Aligned the experimental `dm stream` QUIC preview transport with the merged spec (pre-interop breaking change):
+  broker connections now negotiate ALPN `marmot.quic_broker.v1` and send a binary broker control envelope instead of
+  JSON, the plaintext frame cap is 65519 bytes, transcript hashes use QUIC varint length prefixes, receivers silently
+  discard replayed records at or below their seq high-water mark, and brokers serve replay backlog only within a
+  configurable `--replay-ttl-secs` window (default 0, cap 300). Old and new `dm`/broker builds do not interoperate.
+
 - Removed the kind `10051` KeyPackage relay list. KeyPackage kind `30443` events now publish to, and are fetched from,
   the account's kind `10002` NIP-65 relays. The `key_package` relay type is no longer accepted by `dm relays`, account
   relay-list status no longer reports a `key_package` list, and account bootstrap only requires the NIP-65 and inbox

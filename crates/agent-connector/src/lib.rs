@@ -823,6 +823,10 @@ impl AgentConnector {
                 stream_id: stream_id.clone(),
                 start_event_id: MessageId::new(hex::decode(&start_message_id_hex)?),
                 crypto: Some(crypto.crypto),
+                // Group policy max_plaintext_frame_len is not plumbed to the
+                // connector publish path yet; the app-profile cap applies and
+                // STREAM_COMPOSE_CHUNK_BYTES stays well below any sane policy.
+                max_plaintext_frame_len: None,
             },
             STREAM_COMPOSE_CHUNK_BYTES,
             rx,
