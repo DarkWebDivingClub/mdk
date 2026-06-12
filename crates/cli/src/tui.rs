@@ -1624,12 +1624,14 @@ impl TuiApp {
             && let Some(index) = selected_account_index(&self.accounts, Some(selector))
         {
             self.selected_account = index;
-            if local_signing {
-                self.refresh_chats()?;
-            } else {
-                self.chats.clear();
-                self.messages.clear();
-            }
+            // refresh_chats() dispatches on the selected account's local_signing
+            // flag: for a local signing account it reloads chats/messages, and for
+            // a public-only account it fully clears chats, messages, the
+            // messages_account_id/messages_group_id targets, and the prior
+            // account's subscriptions. Calling it unconditionally avoids the
+            // partial-clear drift where a public-only login left stale send
+            // targets pointing at the previous account/chat (issue #196).
+            self.refresh_chats()?;
         }
 
         let signing = if local_signing {
@@ -5060,6 +5062,48 @@ mod tests {
             Some(account_id)
         );
         assert!(app.group_diagnostics.is_some());
+    }
+
+    #[test]
+    fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
+        // Regression for issue #196: logging in a public-only identity must not
+        // leave messages_account_id/messages_group_id (and the prior account's
+        // subscriptions) pointing at the previous local account/chat, or Enter
+        // would silently send from the old account into the old chat.
+        let previous_account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let previous_group = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let public_only = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
+        let mut app = test_tui_app(client, previous_account);
+        // Stand in for the prior refresh against local signing account A.
+        app.accounts.push(AccountRow {
+            account_id: public_only.to_owned(),
+            npub: "npub1public".to_owned(),
+            display_name: Some("Public".to_owned()),
+            local_signing: false,
+        });
+        app.selected_account = 1;
+        app.chats = vec![ChatRow {
+            group_id: previous_group.to_owned(),
+            name: "general".to_owned(),
+            archived: false,
+        }];
+        app.messages_account_id = Some(previous_account.to_owned());
+        app.messages_group_id = Some(previous_group.to_owned());
+        app.chat_subscription = Some(test_chat_subscription(previous_account, false));
+        app.message_subscription = Some(test_message_subscription(previous_account));
+        app.group_diagnostics = Some(GroupDiagnostics::unavailable(previous_group, "old"));
+
+        app.refresh_chats().expect("refresh chats");
+
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.messages_account_id.is_none());
+        assert!(app.messages_group_id.is_none());
+        assert!(app.chat_subscription.is_none());
+        assert!(app.message_subscription.is_none());
+        assert!(app.group_state_subscription.is_none());
+        assert!(app.group_diagnostics.is_none());
     }
 
     #[test]
