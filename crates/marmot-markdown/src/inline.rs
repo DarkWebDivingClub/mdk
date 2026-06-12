@@ -35,6 +35,60 @@ const INLINE_SPECIAL: [bool; 128] = {
     t
 };
 
+/// Maximum inline emphasis / strong / strikethrough (and link/image) nesting
+/// depth the tokenizer will build. The analogue of [`crate::MAX_CONTAINER_DEPTH`]
+/// for inline content. Delimiter runs that would nest past this depth are left
+/// as literal text.
+///
+/// This bounds the recursion depth of every consumer that walks the inline
+/// tree — the derived `serde` (de)serialization, the `marmot-uniffi` `From`
+/// conversions, and `coalesce_text_runs` — so that hostile input cannot drive
+/// any of them into a stack-overflow abort (a fatal, uncatchable crash). See
+/// darkmatter#208.
+pub(crate) const MAX_INLINE_NESTING_DEPTH: usize = 96;
+
+/// Returns `true` if any inline in `items` is nested at least `cap` levels
+/// deep, counting the items in `items` themselves as level 1.
+///
+/// Iterative, explicit-stack walk that prunes as soon as the cap is reached,
+/// so it is cheap (`O(cap)`) on the hostile single-chain input and — unlike a
+/// recursive walk — cannot itself overflow the stack.
+fn nesting_depth_at_least(items: &[Inline], cap: usize) -> bool {
+    if cap == 0 {
+        return true;
+    }
+    if cap == 1 {
+        return !items.is_empty();
+    }
+    // Each frame: (slice, next index into slice, depth of this slice's items).
+    let mut stack: Vec<(&[Inline], usize, usize)> = vec![(items, 0, 1)];
+    while let Some(&mut (slice, ref mut idx, depth)) = stack.last_mut() {
+        if *idx >= slice.len() {
+            stack.pop();
+            continue;
+        }
+        let item = &slice[*idx];
+        *idx += 1;
+        let children = inline_children(item);
+        if let Some(children) = children {
+            if depth + 1 >= cap {
+                return true;
+            }
+            stack.push((children, 0, depth + 1));
+        }
+    }
+    false
+}
+
+fn inline_children(item: &Inline) -> Option<&[Inline]> {
+    match item {
+        Inline::Emph(c) | Inline::Strong(c) | Inline::Strikethrough(c) => Some(c.as_slice()),
+        Inline::Link { children, .. } => Some(children.as_slice()),
+        Inline::Image { alt, .. } => Some(alt.as_slice()),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_inlines(blocks: Vec<Block>, refs: &HashMap<String, LinkRef>) -> Document {
     Document {
         blocks: walk_blocks(blocks, refs),
@@ -596,8 +650,11 @@ fn try_close_bracket(
     if bytes.get(i + 1) == Some(&b'(')
         && let Some((dest, title, end)) = parse_inline_link_suffix(bytes, i + 1)
     {
-        absorb_link(out, delims, opener_idx, dest, title);
-        return Some(end);
+        if absorb_link(out, delims, opener_idx, dest, title) {
+            return Some(end);
+        }
+        // Wrapping refused (depth cap): treat `]` as literal text.
+        return None;
     }
 
     // 2. Full reference link: `][label]`
@@ -608,8 +665,10 @@ fn try_close_bracket(
             && let Some(def) = refs.get(&crate::block::normalize_label(&label_raw))
         {
             let (dest, title) = (def.dest.clone(), def.title.clone());
-            absorb_link(out, delims, opener_idx, dest, title);
-            return Some(end);
+            if absorb_link(out, delims, opener_idx, dest, title) {
+                return Some(end);
+            }
+            return None;
         }
         // Empty `[]` after `]` — collapsed reference: use the link text as
         // the label.
@@ -617,8 +676,10 @@ fn try_close_bracket(
             let label = label_text(bytes, opener.input_pos + 1, i);
             if let Some(def) = refs.get(&crate::block::normalize_label(&label)) {
                 let (dest, title) = (def.dest.clone(), def.title.clone());
-                absorb_link(out, delims, opener_idx, dest, title);
-                return Some(end);
+                if absorb_link(out, delims, opener_idx, dest, title) {
+                    return Some(end);
+                }
+                return None;
             }
         }
     }
@@ -629,8 +690,10 @@ fn try_close_bracket(
         && let Some(def) = refs.get(&crate::block::normalize_label(&label))
     {
         let (dest, title) = (def.dest.clone(), def.title.clone());
-        absorb_link(out, delims, opener_idx, dest, title);
-        return Some(i + 1);
+        if absorb_link(out, delims, opener_idx, dest, title) {
+            return Some(i + 1);
+        }
+        return None;
     }
 
     // No match — drop the opener and emit literal `]`.
@@ -709,17 +772,37 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 
 /// Replace the placeholder + intermediate inlines with a single Link/Image
 /// inline; deactivate earlier `[` openers (no nested links).
+///
+/// Returns `true` if the link/image was wrapped, `false` if wrapping was
+/// refused because it would push the inline tree past
+/// [`MAX_INLINE_NESTING_DEPTH`] (darkmatter#208). On refusal `out`/`delims`
+/// are left untouched so the caller can fall back to literal-text handling
+/// of the closing `]`.
 fn absorb_link(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     opener_idx: usize,
     dest: String,
     title: Option<String>,
-) {
+) -> bool {
     // First, pair any emphasis runs strictly inside the link before
     // wrapping — emphasis inside link text DOES get processed (per spec).
     process_emphasis(out, delims, opener_idx + 1);
     let opener = delims[opener_idx];
+
+    // Depth guard (darkmatter#208). Wrapping the children in a Link/Image node
+    // produces a node one level deeper than its deepest child, exactly like
+    // emphasis pairing. Without this bound, input shaped as
+    // `"![" * N + "a" + "](x)" * N` builds image nesting of depth ~N and later
+    // overflows the stack in coalesce_text_runs, serde, and the uniffi
+    // conversions — a fatal, uncatchable abort. If wrapping would exceed the
+    // cap, refuse it and leave the delimiters as literal text. The probe is the
+    // same iterative, early-pruning O(cap) walk used by process_emphasis, so it
+    // neither overflows nor costs anything on ordinary input.
+    if nesting_depth_at_least(&out[opener.out_pos + 1..], MAX_INLINE_NESTING_DEPTH) {
+        return false;
+    }
+
     let kind_is_image = opener.kind == b'!';
     // Children = items after the placeholder.
     let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
@@ -749,6 +832,7 @@ fn absorb_link(
             }
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1259,30 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
             let strong = opener.len >= 2 && closer.len >= 2;
             let n = if closer.kind == b'~' || strong { 2 } else { 1 };
 
+            // Depth guard (darkmatter#208). Wrapping these children produces a
+            // node one level deeper than the deepest child. If that would push
+            // the inline tree past MAX_INLINE_NESTING_DEPTH, refuse the pairing
+            // and leave the closer's delimiter run as literal text — exactly
+            // the "no opener found" fallback below. This bounds the recursion
+            // depth of every consumer that later walks the tree (serde,
+            // marmot-uniffi conversions, coalesce_text_runs), none of which can
+            // then be driven into a stack-overflow abort. The probe is an
+            // iterative, early-pruning O(cap) walk, so it neither overflows nor
+            // costs anything on ordinary input.
+            if arena.nesting_depth_at_least_between(
+                opener.out_pos,
+                closer.out_pos,
+                MAX_INLINE_NESTING_DEPTH,
+            ) {
+                openers_bottom.insert(key, closer_idx);
+                let after_closer = next[closer_idx];
+                if !closer.can_open {
+                    unlink_delim(delims, &mut prev, &mut next, closer_idx);
+                }
+                closer_cursor = after_closer;
+                continue;
+            }
+
             let children = arena.detach_between(opener.out_pos, closer.out_pos);
             let opener_empty = arena.trim_run_text(opener.out_pos, n, /*from_right*/ true);
             let closer_empty = arena.trim_run_text(closer.out_pos, n, /*from_right*/ false);
@@ -1311,6 +1419,33 @@ impl InlineArena {
         }
     }
 
+    fn nesting_depth_at_least_between(&self, before: usize, after: usize, cap: usize) -> bool {
+        if cap == 0 {
+            return true;
+        }
+        let mut cursor = self.nodes[before].next;
+        while let Some(idx) = cursor {
+            if idx == after {
+                break;
+            }
+            let node = &self.nodes[idx];
+            cursor = node.next;
+            if !node.alive {
+                continue;
+            }
+            if cap == 1 {
+                return true;
+            }
+            let Some(children) = inline_children(&node.item) else {
+                continue;
+            };
+            if depth_from_children_at_least(children, 2, cap) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn unlink(&mut self, idx: usize) {
         if !self.nodes[idx].alive {
             return;
@@ -1370,6 +1505,32 @@ impl InlineArena {
         }
         (items, node_positions)
     }
+}
+
+fn depth_from_children_at_least(items: &[Inline], depth: usize, cap: usize) -> bool {
+    if depth >= cap {
+        return !items.is_empty();
+    }
+
+    let mut stack: Vec<(&[Inline], usize, usize)> = vec![(items, 0, depth)];
+    while let Some(&mut (slice, ref mut idx, depth)) = stack.last_mut() {
+        if *idx >= slice.len() {
+            stack.pop();
+            continue;
+        }
+        let item = &slice[*idx];
+        *idx += 1;
+        if depth >= cap {
+            return true;
+        }
+        if let Some(children) = inline_children(item) {
+            if depth + 1 >= cap {
+                return true;
+            }
+            stack.push((children, 0, depth + 1));
+        }
+    }
+    false
 }
 
 fn unlink_delims_between(
