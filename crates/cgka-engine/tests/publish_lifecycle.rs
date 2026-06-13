@@ -22,6 +22,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -220,6 +221,20 @@ fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEn
         .unwrap()
 }
 
+fn build_with_peeler_and_storage(
+    id: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+    storage: SqliteAccountStorage,
+) -> impl CgkaEngine {
+    EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(peeler)
+        .build()
+        .unwrap()
+}
+
 // ── 1. Invite + publish_failed → projected member rolls back ───────────────
 
 #[tokio::test]
@@ -344,6 +359,90 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
         })
         .await
         .expect("retry after wrap failure must not hit orphaned OpenMLS PendingCommit");
+    let retry_pending = match retry {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => panic!("expected GroupEvolution"),
+    };
+    alice.confirm_published(retry_pending).await.unwrap();
+    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_eq!(alice.members(&gid).unwrap().len(), 3);
+}
+
+// ── Regression #332: guard releases the pre-commit fork-recovery snapshot ──
+//
+// The orphan-window cleanup guard (#331 / #149) clears the staged OpenMLS
+// pending commit on a failed send, but the invite / auto-commit / upgrade /
+// group-data-update paths also create a `fork-{epoch}-{n}-{hash}` recovery
+// snapshot *before* the send can fail. The normal `publish_failed` path
+// releases that snapshot via `forget_pending_commit_for_recovery`; the guard
+// must mirror that so a send that fails inside the armed window does not leak
+// a snapshot row. These pre-commit snapshots are not in the retained-anchor
+// set, so epoch advancement never GCs them.
+#[tokio::test]
+async fn invite_wrap_failure_releases_pre_commit_recovery_snapshot() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_with_peeler_and_storage(
+        b"alice",
+        Box::new(FailFirstGroupWrapPeeler::new()),
+        storage.clone(),
+    );
+    let mut bob = build(b"bob");
+    let mut carol = build(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+
+    // Baseline snapshot rows after a clean group is established. The invite
+    // that fails below must not grow this set once the guard fires.
+    let baseline = storage.list_group_snapshots(&gid).unwrap().len();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let err = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .expect_err("first invite should fail at transport wrapping");
+    assert!(
+        matches!(err, EngineError::Peeler(PeelerError::WrapFailed(_))),
+        "unexpected error: {err:?}"
+    );
+
+    // The pre-commit fork-recovery snapshot created in the armed window must
+    // have been released by the guard's Drop — no orphaned snapshot row.
+    let after_failure = storage.list_group_snapshots(&gid).unwrap().len();
+    assert_eq!(
+        after_failure, baseline,
+        "failed invite leaked a pre-commit fork-recovery snapshot: \
+         baseline={baseline}, after_failure={after_failure}"
+    );
+
+    // And the group is still usable: a retry succeeds and converges.
+    let carol_kp2 = carol.fresh_key_package().await.unwrap();
+    let retry = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp2],
+        })
+        .await
+        .expect("retry after wrap failure must succeed");
     let retry_pending = match retry {
         SendResult::GroupEvolution { pending, .. } => pending,
         _ => panic!("expected GroupEvolution"),

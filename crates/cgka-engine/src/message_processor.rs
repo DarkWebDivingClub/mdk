@@ -854,11 +854,20 @@ impl<S: StorageProvider> Engine<S> {
                         // Fork-detection bookkeeping — we're committing FROM
                         // the current pre-commit epoch.
                         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+                        // Arm the cleanup guard before creating the snapshot so
+                        // the snapshot is released on early return /
+                        // cancellation even before a pending commit is staged.
+                        let mut pending_commit_guard = PendingCommitCleanupGuard::arm(
+                            &self.storage,
+                            &provider,
+                            group_id.clone(),
+                        );
                         let recovery_snapshot = self.fork_recovery.create_snapshot(
                             &self.storage,
                             &group_id,
                             pre_commit_epoch,
                         )?;
+                        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
                         self.audit_snapshot_created(
                             &group_id,
                             &recovery_snapshot,
@@ -870,8 +879,6 @@ impl<S: StorageProvider> Engine<S> {
                         let (commit_out, _welcome_opt, _gi) = mls_group
                             .commit_to_pending_proposals(&provider, &self.identity.signer)
                             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
-                        let pending_commit_guard =
-                            PendingCommitCleanupGuard::arm(&provider, group_id.clone());
                         let commit_bytes = commit_out
                             .tls_serialize_detached()
                             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1375,9 +1382,15 @@ impl<S: StorageProvider> Engine<S> {
         // Record the pre-commit epoch so a later same-epoch commit can be
         // compared against this locally produced branch.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        // Arm the cleanup guard before creating the snapshot so the snapshot is
+        // released on early return / cancellation even before a pending commit
+        // is staged.
+        let mut pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
         self.audit_snapshot_created(
             &group_id,
             &recovery_snapshot,
@@ -1398,7 +1411,6 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out, _gi) = mls_group
             .add_members(&provider, &self.identity.signer, &parsed_kps)
             .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -1613,9 +1625,15 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        // Arm the cleanup guard before creating the snapshot so the snapshot is
+        // released on early return / cancellation even before a pending commit
+        // is staged.
+        let mut pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
         self.audit_snapshot_created(
             &group_id,
             &recovery_snapshot,
@@ -1630,7 +1648,6 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, _welcome_opt, _gi) = mls_group
             .remove_members(&provider, &self.identity.signer, &leaf_indices)
             .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
-        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()

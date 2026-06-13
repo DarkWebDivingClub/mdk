@@ -143,9 +143,15 @@ impl<S: StorageProvider> Engine<S> {
 
         // Fork-detection bookkeeping.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        // Arm the cleanup guard before creating the snapshot so the snapshot is
+        // released on early return / cancellation even before a pending commit
+        // is staged.
+        let mut pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, group_id, pre_commit_epoch)?;
+        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
         self.audit_snapshot_created(
             group_id,
             &recovery_snapshot,
@@ -199,7 +205,6 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("upgrade build: {e:?}")))?
             .stage_commit(&provider)
             .map_err(|e| EngineError::Backend(format!("upgrade stage: {e:?}")))?;
-        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
         let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
         let commit_bytes = commit_out
             .tls_serialize_detached()

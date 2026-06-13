@@ -190,8 +190,11 @@ impl<S: StorageProvider> Engine<S> {
             let (_commit_out, welcome_out, _group_info) = mls_group
                 .add_members(&provider, &self.identity.signer, &parsed_kps)
                 .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-            pending_commit_guard =
-                Some(PendingCommitCleanupGuard::arm(&provider, group_id.clone()));
+            pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
+                &self.storage,
+                &provider,
+                group_id.clone(),
+            ));
             let bytes = welcome_out
                 .tls_serialize_detached()
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
