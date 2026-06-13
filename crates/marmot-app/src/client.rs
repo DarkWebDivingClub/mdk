@@ -1329,7 +1329,10 @@ impl AppClient {
             .encrypted_media_policy_for_group(group_id)?
             .allowed_locator_kinds;
         for attachment in &attachments {
-            attachment.validate_outbound(&allowed_locator_kinds)?;
+            attachment.validate_outbound(
+                &allowed_locator_kinds,
+                self.app.allow_loopback_blob_endpoints(),
+            )?;
         }
         let (_event, summary) = self
             .send_app_event(
@@ -1392,6 +1395,7 @@ impl AppClient {
             &keys,
             default_endpoint,
             &policy.allowed_locator_kinds,
+            allow_loopback,
         )
         .await?;
         if should_send {
@@ -1884,6 +1888,7 @@ impl AppClient {
                 group_projection.as_ref(),
                 &source_message_id_hex,
                 source_recorded_at,
+                self.app.allow_loopback_blob_endpoints(),
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
                     if let Err(err) = self
@@ -1902,7 +1907,10 @@ impl AppClient {
                     continue;
                 }
                 if message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                    && media_imeta_tags_are_valid(&message.tags)
+                    && media_imeta_tags_are_valid(
+                        &message.tags,
+                        self.app.allow_loopback_blob_endpoints(),
+                    )
                     && self
                         .remember_current_encrypted_media_secret(&message.group_id)
                         .is_err()

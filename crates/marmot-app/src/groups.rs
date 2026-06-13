@@ -693,6 +693,7 @@ pub(crate) enum GroupConfirmationProjection {
 /// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
 /// canonical id does not match or the inner `pubkey` is not the authenticated
 /// sender — both are integrity failures that must not reach the timeline.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_received_event(
     payload: &[u8],
     sender_hex: &str,
@@ -701,6 +702,7 @@ pub(crate) fn decode_received_event(
     source_epoch: u64,
     source_message_id_hex: &str,
     source_recorded_at: u64,
+    allow_loopback_http: bool,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -726,7 +728,7 @@ pub(crate) fn decode_received_event(
             .tags
             .iter()
             .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        && !media_imeta_tags_are_valid(&event.tags)
+        && !media_imeta_tags_are_valid(&event.tags, allow_loopback_http)
     {
         // Ingest is purely STRUCTURAL: a media reference drops the message only
         // when a locator is structurally malformed (empty kind/value, unparseable
@@ -756,6 +758,7 @@ pub(crate) fn decode_received_event(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_event(
     state: &mut AccountState,
     display_names: &HashMap<String, String>,
@@ -764,6 +767,7 @@ pub(crate) fn observe_event(
     group_projection: Option<&EventGroupProjection<'_>>,
     source_message_id_hex: &str,
     source_recorded_at: u64,
+    allow_loopback_http: bool,
 ) -> Option<ReceivedMessage> {
     match event {
         GroupEvent::GroupJoined { group_id, .. } | GroupEvent::GroupCreated { group_id } => {
@@ -824,6 +828,7 @@ pub(crate) fn observe_event(
                 epoch.0,
                 source_message_id_hex,
                 source_recorded_at,
+                allow_loopback_http,
             ) else {
                 summary.events.push(event.clone());
                 return None;
