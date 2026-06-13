@@ -31,10 +31,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use transport_quic_broker::{
     BrokerServerTrust, PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
-    subscribe_text_from_broker_with_updates,
+    subscribe_text_from_broker_with_limits,
 };
 use transport_quic_stream::{
-    QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
+    AgentTextStreamReceiveLimits, QuicTextStreamReceiver, SendTextStream, ServerTrust,
+    send_text_stream,
 };
 
 pub mod daemon;
@@ -3964,14 +3965,15 @@ pub(crate) async fn stream_command_app_with_runtime(
             let start_event_id_hex = start_event_id.ok_or(DmError::MissingStreamStart)?;
             let expected_stream_id_hex =
                 stream_id.map(|value| normalize_hex(&value)).transpose()?;
-            let (stream_id, crypto) = stream_crypto_for_start_event(
-                runtime,
-                selected_account_id_hex,
-                None,
-                expected_stream_id_hex.as_deref(),
-                &start_event_id_hex,
-            )
-            .await?;
+            let (stream_id, crypto, policy_max_plaintext_frame_len) =
+                stream_crypto_for_start_event(
+                    runtime,
+                    selected_account_id_hex,
+                    None,
+                    expected_stream_id_hex.as_deref(),
+                    &start_event_id_hex,
+                )
+                .await?;
             let start_event_id = MessageId::new(hex::decode(normalize_hex(&start_event_id_hex)?)?);
             if broker {
                 let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
@@ -3985,7 +3987,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     max_chunk_bytes: chunk_bytes,
                     chunk_delay: Duration::from_millis(chunk_delay_ms),
                     crypto: Some(crypto),
-                    max_plaintext_frame_len: None,
+                    max_plaintext_frame_len: policy_max_plaintext_frame_len,
                 })
                 .await?;
                 return Ok(CommandOutput {
@@ -4018,7 +4020,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 max_chunk_bytes: chunk_bytes,
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
                 crypto: Some(crypto),
-                max_plaintext_frame_len: None,
+                max_plaintext_frame_len: policy_max_plaintext_frame_len,
             })
             .await?;
             Ok(CommandOutput {
@@ -4222,7 +4224,7 @@ where
     let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
-    let (stream_id, crypto) = stream_crypto_for_start_event(
+    let (stream_id, crypto, policy_max_plaintext_frame_len) = stream_crypto_for_start_event(
         runtime,
         Some(&account.account_id_hex),
         Some(&group_id_hex),
@@ -4231,10 +4233,15 @@ where
     )
     .await?;
     let crypto = Some(crypto);
+    let mut limits = AgentTextStreamReceiveLimits::default();
+    if let Some(max_plaintext_frame_len) = policy_max_plaintext_frame_len {
+        limits.max_plaintext_frame_len =
+            max_plaintext_frame_len.min(limits.max_plaintext_frame_len);
+    }
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
     let delta_stream_id = stream_id_hex.clone();
-    let received = subscribe_text_from_broker_with_updates(
+    let received = subscribe_text_from_broker_with_limits(
         SubscribeTextFromBroker {
             broker_addr: candidate_addr,
             server_name: candidate.server_name.clone(),
@@ -4243,6 +4250,7 @@ where
             start_event_id,
             crypto,
         },
+        limits,
         |chunk| {
             on_delta(AgentStreamDelta {
                 account: delta_account.clone(),
@@ -4322,7 +4330,14 @@ pub(crate) async fn stream_crypto_for_start_event(
     group_id_hex: Option<&str>,
     stream_id_hex: Option<&str>,
     start_message_id_hex: &str,
-) -> Result<(Vec<u8>, transport_quic_stream::AgentTextStreamCrypto), DmError> {
+) -> Result<
+    (
+        Vec<u8>,
+        transport_quic_stream::AgentTextStreamCrypto,
+        Option<u32>,
+    ),
+    DmError,
+> {
     let context = runtime
         .agent_text_stream_crypto_for_start_event(
             resolved_account_id_hex,
@@ -4332,7 +4347,11 @@ pub(crate) async fn stream_crypto_for_start_event(
         )
         .await
         .map_err(map_agent_stream_crypto_error)?;
-    Ok((context.stream_id, context.crypto))
+    Ok((
+        context.stream_id,
+        context.crypto,
+        context.policy_max_plaintext_frame_len,
+    ))
 }
 
 fn map_agent_stream_crypto_error(err: AppError) -> DmError {

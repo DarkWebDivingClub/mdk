@@ -850,6 +850,7 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     assert_eq!(stream_crypto.account_id_hex, bob.account.account_id_hex);
     assert_eq!(stream_crypto.group_id, group_id);
     assert_eq!(stream_crypto.stream_id, stream_id.to_vec());
+    assert_eq!(stream_crypto.policy_max_plaintext_frame_len, Some(4096));
 
     runtime.shutdown().await;
 }

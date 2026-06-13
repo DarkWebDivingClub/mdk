@@ -4,6 +4,11 @@
 records keyed by `stream_id + start_event_id`; it does not store payloads, maintain accounts, talk to relays, or decide
 final message authority.
 
+Broker replay retention is an operator-side bound. The broker does not read MLS group state and cannot independently
+enforce `agent-text-stream-quic-v1.replay_ttl_secs`; configure broker replay TTLs no greater than the policy for the
+groups served. Clients still treat broker replay as provisional preview data until the final MLS message transcript hash
+verifies the stream.
+
 ## Local Docker Compose
 
 The root `docker-compose.yml` starts the local relay stack and a local QUIC broker:

@@ -1131,6 +1131,7 @@ pub struct AgentTextStreamCryptoContext {
     pub stream_id: Vec<u8>,
     pub start_event_id: MessageId,
     pub crypto: AgentTextStreamCrypto,
+    pub policy_max_plaintext_frame_len: Option<u32>,
 }
 
 /// A live agent-text-stream watch. Drains chunk/finished/failed updates from a
@@ -1832,18 +1833,7 @@ impl MarmotAppRuntime {
                 &start_message_id_hex,
             )
             .await?;
-        // Decode the group's agent-text-stream policy so receive validation
-        // applies the group `max_plaintext_frame_len` (plus the spec-pinned
-        // 1024-byte frame allowance) instead of only the app-profile ceiling.
-        let app_for_policy = self.accounts.app.clone();
-        let account_ref_for_policy = account_ref.to_owned();
-        let group_id_hex_for_policy = group_id_hex.clone();
-        let policy_max_plaintext_frame_len = blocking_app_task(move || {
-            app_for_policy.group(&account_ref_for_policy, &group_id_hex_for_policy)
-        })
-        .await?
-        .map(|group| group.agent_text_stream.max_plaintext_frame_len)
-        .filter(|max_plaintext_frame_len| *max_plaintext_frame_len > 0);
+        let policy_max_plaintext_frame_len = crypto_context.policy_max_plaintext_frame_len;
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
         let (terminal_tx, terminal_rx) = oneshot::channel();
@@ -1951,6 +1941,18 @@ impl MarmotAppRuntime {
                         start_event_id.clone(),
                     ),
                 );
+                // Carry the group policy alongside the start-event-bound crypto
+                // so send/watch/compose paths enforce the durable MLS component
+                // instead of silently falling back to the app-profile ceiling.
+                let app_for_policy = self.accounts.app.clone();
+                let account_label_for_policy = account.label.clone();
+                let group_id_hex_for_policy = message.group_id_hex.clone();
+                let policy_max_plaintext_frame_len = blocking_app_task(move || {
+                    app_for_policy.group(&account_label_for_policy, &group_id_hex_for_policy)
+                })
+                .await?
+                .map(|group| group.agent_text_stream.max_plaintext_frame_len)
+                .filter(|max_plaintext_frame_len| *max_plaintext_frame_len > 0);
                 return Ok(AgentTextStreamCryptoContext {
                     account_id_hex: account.account_id_hex,
                     account_label: account.label,
@@ -1958,6 +1960,7 @@ impl MarmotAppRuntime {
                     stream_id,
                     start_event_id,
                     crypto,
+                    policy_max_plaintext_frame_len,
                 });
             }
         }

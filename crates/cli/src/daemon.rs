@@ -2273,7 +2273,7 @@ async fn open_stream_compose(
         Ok(bytes) => bytes,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
-    let crypto = {
+    let (crypto, policy_max_plaintext_frame_len) = {
         let Some(runtime) = runtime_host.runtime.as_ref() else {
             return daemon_error(
                 cli.json,
@@ -2290,7 +2290,9 @@ async fn open_stream_compose(
         )
         .await
         {
-            Ok((_, crypto)) => Some(crypto),
+            Ok((_, crypto, policy_max_plaintext_frame_len)) => {
+                (Some(crypto), policy_max_plaintext_frame_len)
+            }
             Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
         }
     };
@@ -2323,9 +2325,7 @@ async fn open_stream_compose(
                 stream_id: stream_id_bytes,
                 start_event_id,
                 crypto,
-                // Group policy max_plaintext_frame_len is not plumbed to the
-                // daemon compose path yet; the app-profile cap applies.
-                max_plaintext_frame_len: None,
+                max_plaintext_frame_len: policy_max_plaintext_frame_len,
             },
             chunk_bytes,
             rx,

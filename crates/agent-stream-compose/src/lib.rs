@@ -12,6 +12,7 @@ use cgka_traits::agent_text_stream::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
+use transport_quic_stream::effective_plaintext_cap;
 
 /// Bounded grace period to let an in-flight broker connect land during cancel
 /// so a live `Abort` record can be published before the session shuts down.
@@ -132,6 +133,8 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
     C: Future<Output = Result<P, E>> + Send + 'static,
     E: ToString + Send + 'static,
 {
+    let chunk_bytes =
+        effective_stream_compose_chunk_bytes(chunk_bytes, open.max_plaintext_frame_len);
     let mut transcript = LocalComposeTranscript::new(&open);
     let mut pending_live_records = VecDeque::new();
     let mut publisher = None;
@@ -334,6 +337,19 @@ impl LocalComposeTranscript {
 
     fn chunk_count(&self) -> u64 {
         self.transcript.chunk_count()
+    }
+}
+
+fn effective_stream_compose_chunk_bytes(
+    requested_chunk_bytes: usize,
+    policy_max_plaintext_frame_len: Option<u32>,
+) -> usize {
+    if requested_chunk_bytes == 0
+        || requested_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
+    {
+        requested_chunk_bytes
+    } else {
+        requested_chunk_bytes.min(effective_plaintext_cap(policy_max_plaintext_frame_len))
     }
 }
 
@@ -720,6 +736,59 @@ mod tests {
                 .as_str()
             )
         );
+
+        session.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_session_clamps_local_transcript_to_group_policy_cap() {
+        let stream_id = vec![0xab; 32];
+        let start_event_id = MessageId::new(vec![0xbc; 32]);
+        let mut open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+        open.max_plaintext_frame_len = Some(5);
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(
+            open, 1024, rx, cancel_rx, report,
+        ));
+
+        let (append_tx, append_rx) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "hello over quic".to_owned(),
+            respond: append_tx,
+        })
+        .await
+        .unwrap();
+        let appended = tokio::time::timeout(Duration::from_millis(250), append_rx)
+            .await
+            .expect("append should not wait for broker connect")
+            .unwrap()
+            .unwrap();
+        assert_eq!(appended.chunk_count, 3);
+        assert_eq!(
+            appended.transcript_hash.as_deref(),
+            Some(
+                expected_stream_transcript_hash_for_appends(
+                    &stream_id,
+                    &start_event_id,
+                    &["hello over quic"],
+                    5,
+                )
+                .as_str()
+            )
+        );
+
+        let (finish_tx, finish_rx) = oneshot::channel();
+        tx.send(StreamComposeCommand::Finish { respond: finish_tx })
+            .await
+            .unwrap();
+        let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+            .await
+            .expect("finish should use policy-clamped local transcript")
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.chunk_count, 3);
 
         session.await.unwrap();
     }
