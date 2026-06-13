@@ -1678,7 +1678,7 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(
         result.invalidated_app_messages.iter().any(|invalidated| {
-            invalidated.message_id == hex::encode(app_msg.id.as_slice())
+            invalidated.message_id == content_hex(&app_msg)
                 && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
         }),
         "future-epoch app message should be UndecryptableInCanonicalState, got {:?}",
@@ -1693,7 +1693,7 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == app_msg.id
+            GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == content_id(&app_msg)
         )),
         "retryable future-epoch app message must not emit AppMessageInvalidated, got {events:?}"
     );
@@ -1711,7 +1711,7 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_app_messages,
-        vec![hex::encode(app_msg.id.as_slice())]
+        vec![content_hex(&app_msg)]
     );
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
 
