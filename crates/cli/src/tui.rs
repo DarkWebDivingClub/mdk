@@ -5547,6 +5547,7 @@ mod tests {
         let mut app = test_tui_app(client, account_id);
         app.streaming = Some(StreamComposer {
             stream_id: "stream-194".to_owned(),
+            group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             pending_text: String::new(),
             last_flush: Instant::now(),
         });
@@ -5590,6 +5591,7 @@ mod tests {
         let mut app = test_tui_app(client, account_id);
         app.streaming = Some(StreamComposer {
             stream_id: "stream-194".to_owned(),
+            group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             pending_text: "queued".to_owned(),
             last_flush: Instant::now(),
         });
