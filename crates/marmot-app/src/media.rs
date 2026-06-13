@@ -714,6 +714,12 @@ fn is_public_ipv6(addr: Ipv6Addr) -> bool {
     if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
         return false;
     }
+    // Reject IPv6 transition mechanisms that can route to an embedded IPv4
+    // endpoint through host-local tunnel configuration, bypassing the IPv4
+    // non-public-address checks above.
+    if first == 0x2002 || (first == 0x2001 && second == 0x0000) {
+        return false;
+    }
     if first == 0x2001 && second == 0x0db8 {
         return false;
     }
@@ -1101,6 +1107,33 @@ mod tests {
 
         assert!(err.to_string().contains("non-public"));
         assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn imeta_parser_rejects_ipv6_transition_prefix_media_locators() {
+        for locator in [
+            // 6to4 wraps 10.0.0.5 in the two segments after 2002::/16.
+            format!("https://[2002:a00:5::]/{}.bin", valid_hash()),
+            // Teredo carries the obfuscated client IPv4 in the low 32 bits: !10.0.0.5.
+            format!(
+                "https://[2001:0:4136:e378:8000:63bf:f5ff:fffa]/{}.bin",
+                valid_hash()
+            ),
+        ] {
+            let tag = tag_with_locator(locator);
+            let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+            assert!(err.to_string().contains("non-public"));
+            assert!(!media_imeta_tags_are_valid(&[tag]));
+        }
+    }
+
+    #[test]
+    fn imeta_parser_accepts_public_ipv6_media_locator() {
+        let tag = tag_with_locator(format!("https://[2606:4700::]/{}.bin", valid_hash()));
+
+        assert!(media_attachment_from_imeta_tag(&tag, None).is_ok());
+        assert!(media_imeta_tags_are_valid(&[tag]));
     }
 
     #[test]
