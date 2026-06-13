@@ -20,7 +20,7 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, DurationHistogramSnapshot, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, RelayDeliverySpread, RelayDeliveryStats,
     RelayLatencyStats, RelaySyncSnapshot, RelayTelemetrySnapshot, StreamStartView, SyncSummary,
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
@@ -4357,12 +4357,21 @@ struct ParsedQuicCandidate {
     server_name: String,
 }
 
+/// Extract the `host:port` (or `[ipv6]:port`) authority from a `quic://` URL
+/// remainder, ignoring any path, query, or fragment after it. Per
+/// `transports/quic.md` the authority ends at the first `/`, `?`, or `#`. Shared
+/// by both quic-candidate parsers below (and mirrors `marmot_app`'s
+/// `parse_quic_candidate`) so the rule cannot drift.
+fn quic_authority(rest: &str) -> &str {
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
 fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError> {
     let trimmed = candidate.trim();
     let Some(rest) = trimmed.strip_prefix("quic://") else {
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = quic_authority(rest);
     if authority.is_empty() {
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
     }
@@ -4412,7 +4421,7 @@ pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
 
 fn quic_candidate_host(candidate: &str) -> Option<String> {
     let rest = candidate.trim().strip_prefix("quic://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = quic_authority(rest);
     if let Some(rest) = authority.strip_prefix('[') {
         return rest.split_once(']').map(|(host, _)| host.to_owned());
     }
@@ -5502,7 +5511,25 @@ fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 }
 
 fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
-    MarmotApp::with_relays_and_account_home(home, relay.into_iter().collect(), account_home)
+    // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
+    // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
+    // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
+    // installs leave it unset.
+    let config = MarmotAppConfig::default()
+        .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
+    MarmotApp::with_relays_and_account_home_and_config(
+        home,
+        relay.into_iter().collect(),
+        account_home,
+        config,
+    )
+}
+
+fn dm_allow_loopback_blob_endpoints() -> bool {
+    matches!(
+        std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn open_account_home(
@@ -6012,7 +6039,8 @@ mod tests {
     use super::{
         AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
         apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
-        relay_endpoints, relay_stats_output, relay_stats_plain, resolve_relay,
+        parse_quic_candidate, quic_candidate_host, relay_endpoints, relay_stats_output,
+        relay_stats_plain, resolve_relay,
     };
     use marmot_app::{
         DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -6212,6 +6240,37 @@ mod tests {
         assert!(!first_quic_candidate_is_loopback(&[
             "quic://quic-broker.ipf.dev:4450".to_owned()
         ]));
+    }
+
+    #[test]
+    fn parse_quic_candidate_ignores_path_query_and_fragment() {
+        // The authority ends at the first `/`, `?`, or `#` (transports/quic.md);
+        // a path/query/fragment after it MUST be ignored, not folded into the
+        // host:port (which would break server_name + host resolution). Mirrors
+        // the marmot-app `parse_quic_candidate` fix (#230).
+        for candidate in [
+            "quic://broker.example:4450/path",
+            "quic://broker.example:4450?x=1",
+            "quic://broker.example:4450#frag",
+            "quic://broker.example:4450/p?x=1#frag",
+        ] {
+            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
+            assert_eq!(
+                parsed.authority, "broker.example:4450",
+                "authority must stop at the first /?#: {candidate}"
+            );
+            assert_eq!(
+                quic_candidate_host(candidate),
+                Some("broker.example".to_owned())
+            );
+        }
+        let parsed =
+            parse_quic_candidate("quic://[2001:db8::1]:4450?x=1").expect("ipv6 candidate parses");
+        assert_eq!(parsed.authority, "[2001:db8::1]:4450");
+        assert_eq!(
+            quic_candidate_host("quic://[2001:db8::1]:4450#frag"),
+            Some("2001:db8::1".to_owned())
+        );
     }
 
     #[test]

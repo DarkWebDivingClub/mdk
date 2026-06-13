@@ -822,7 +822,10 @@ pub(crate) fn token_records_by_server(
     let mut grouped: BTreeMap<String, Vec<GroupPushTokenRecord>> = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for token in tokens {
-        if token.member_id_hex == local_account_id_hex || token.relay_hint.is_none() {
+        // Keep records without a relay hint: the trigger publisher falls back to
+        // the server account's published kind-10050 inbox relays, so a missing
+        // hint is not an immediate drop (per features/push-notifications.md).
+        if token.member_id_hex == local_account_id_hex {
             continue;
         }
         let key = (
@@ -838,6 +841,36 @@ pub(crate) fn token_records_by_server(
         }
     }
     grouped
+}
+
+/// Choose the relays to publish a notification trigger to for one server.
+///
+/// Per features/push-notifications.md the relay hints carried in stored token
+/// records are preferred; when none exist the fallback is the notification
+/// server account's published kind-10050 NIP-17 inbox relays. If neither is
+/// available the server is unreachable and the result is empty (the caller
+/// skips it as the genuine last resort). Blank entries are dropped and the
+/// result is de-duplicated with a stable order.
+pub(crate) fn select_notification_trigger_relays(
+    record_relay_hints: &[String],
+    server_inbox_relays: &[String],
+) -> Vec<String> {
+    let hints = dedup_non_empty_relays(record_relay_hints);
+    if !hints.is_empty() {
+        return hints;
+    }
+    dedup_non_empty_relays(server_inbox_relays)
+}
+
+fn dedup_non_empty_relays(relays: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    relays
+        .iter()
+        .map(|relay| relay.trim())
+        .filter(|relay| !relay.is_empty())
+        .filter(|relay| seen.insert(relay.to_owned()))
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(crate) fn unix_now_ms() -> i64 {
@@ -909,6 +942,97 @@ mod tests {
         let public = SecpPublicKey::from_secret_key(&secp, secret);
         let (xonly, _) = public.x_only_public_key();
         hex::encode(xonly.serialize())
+    }
+
+    #[test]
+    fn trigger_relays_prefer_record_hints_over_10050_fallback() {
+        // Hint present -> hint (the 10050 list is not consulted).
+        let selected = select_notification_trigger_relays(
+            &["wss://hint.example".to_owned()],
+            &["wss://inbox.example".to_owned()],
+        );
+        assert_eq!(selected, vec!["wss://hint.example".to_owned()]);
+    }
+
+    #[test]
+    fn trigger_relays_fall_back_to_10050_when_no_hint() {
+        // Hint absent -> the server account's published kind-10050 inbox relays.
+        let selected = select_notification_trigger_relays(
+            &[],
+            &[
+                "wss://inbox-a.example".to_owned(),
+                "wss://inbox-b.example".to_owned(),
+            ],
+        );
+        assert_eq!(
+            selected,
+            vec![
+                "wss://inbox-a.example".to_owned(),
+                "wss://inbox-b.example".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn trigger_relays_empty_when_neither_hint_nor_10050() {
+        // Neither -> unreachable (caller skips as the genuine last resort).
+        assert!(select_notification_trigger_relays(&[], &[]).is_empty());
+        // Blank entries are not relays.
+        assert!(
+            select_notification_trigger_relays(&["   ".to_owned()], &["".to_owned()]).is_empty()
+        );
+    }
+
+    #[test]
+    fn trigger_relays_dedup_with_stable_order() {
+        let selected = select_notification_trigger_relays(
+            &[
+                "wss://a.example".to_owned(),
+                "wss://a.example".to_owned(),
+                "wss://b.example".to_owned(),
+            ],
+            &[],
+        );
+        assert_eq!(
+            selected,
+            vec!["wss://a.example".to_owned(), "wss://b.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
+        // A token record with no relay hint must still be grouped so the trigger
+        // publisher can fall back to the server's kind-10050 inbox relays. Only
+        // the local account's own tokens are dropped here.
+        let server = "aa".repeat(32);
+        let group_id_hex = "ee".repeat(32);
+        let tokens = vec![
+            GroupPushTokenRecord {
+                group_id_hex: group_id_hex.clone(),
+                member_id_hex: "bb".repeat(32),
+                leaf_index: 1,
+                platform: PushPlatform::Apns,
+                token_fingerprint: "fp1".to_owned(),
+                server_pubkey_hex: server.clone(),
+                relay_hint: None,
+                encrypted_token: vec![1, 2, 3],
+                updated_at_ms: 0,
+            },
+            GroupPushTokenRecord {
+                group_id_hex,
+                member_id_hex: "cc".repeat(32),
+                leaf_index: 2,
+                platform: PushPlatform::Fcm,
+                token_fingerprint: "fp2".to_owned(),
+                server_pubkey_hex: server.clone(),
+                relay_hint: Some("wss://hint.example".to_owned()),
+                encrypted_token: vec![4, 5, 6],
+                updated_at_ms: 0,
+            },
+        ];
+        let grouped = token_records_by_server(tokens, "dd".repeat(32).as_str());
+        let records = grouped.get(&server).expect("server group present");
+        assert_eq!(records.len(), 2);
     }
 
     #[test]

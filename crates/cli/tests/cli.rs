@@ -247,6 +247,9 @@ fn dm(home: &std::path::Path) -> Command {
     command.arg("--home").arg(home).arg("--json");
     command.env("DM_SECRET_STORE", "file");
     command.env("DM_RELAY", test_relay_url());
+    // CLI tests exercise encrypted media against a loopback Blossom server,
+    // which is the dev/test scenario the loopback-HTTP gate is for.
+    command.env("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
     command
 }
 

@@ -14,6 +14,14 @@ const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
 pub struct MarmotAppConfig {
     pub directory_max_future_skew: Duration,
     pub service_endpoints: MarmotServiceEndpoints,
+    /// Dev/test gate for loopback-HTTP blob endpoints. A loopback-HTTP endpoint
+    /// (e.g. `http://127.0.0.1:PORT`) is VALID component state for everyone, but
+    /// per group-encrypted-media-v1.md a client MUST NOT upload to or download
+    /// from one unless explicitly configured for dev/test. Defaults to `false`
+    /// so production builds treat such endpoints as unusable rather than issuing
+    /// requests to the local host. This does not affect component validity
+    /// (decode still accepts loopback endpoints).
+    pub allow_loopback_blob_endpoints: bool,
 }
 
 /// Compiled or app-level default service URLs for production telemetry export
@@ -36,6 +44,7 @@ impl Default for MarmotAppConfig {
         Self {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             service_endpoints: MarmotServiceEndpoints::compiled(),
+            allow_loopback_blob_endpoints: false,
         }
     }
 }
@@ -48,6 +57,13 @@ impl MarmotAppConfig {
 
     pub fn with_service_endpoints(mut self, endpoints: MarmotServiceEndpoints) -> Self {
         self.service_endpoints = endpoints.normalize();
+        self
+    }
+
+    /// Enable acting on loopback-HTTP blob endpoints for dev/test. Off by
+    /// default; production builds must leave this unset.
+    pub fn with_allow_loopback_blob_endpoints(mut self, allow: bool) -> Self {
+        self.allow_loopback_blob_endpoints = allow;
         self
     }
 }
@@ -431,6 +447,18 @@ fn host_is_loopback(host: url::Host<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_loopback_blob_endpoints_defaults_off_and_is_opt_in() {
+        // Production builds must not act on loopback-HTTP blob endpoints unless a
+        // host app explicitly opts in for dev/test.
+        assert!(!MarmotAppConfig::default().allow_loopback_blob_endpoints);
+        assert!(
+            MarmotAppConfig::default()
+                .with_allow_loopback_blob_endpoints(true)
+                .allow_loopback_blob_endpoints
+        );
+    }
 
     fn runtime_config() -> RelayTelemetryRuntimeConfig {
         RelayTelemetryRuntimeConfig {

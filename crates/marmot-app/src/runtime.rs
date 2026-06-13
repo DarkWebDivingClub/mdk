@@ -5522,7 +5522,10 @@ fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, AppError
     let Some(rest) = trimmed.strip_prefix("quic://") else {
         return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
+    // Per transports/quic.md a receiver MUST ignore any path, query, or
+    // fragment after the authority; the authority ends at the first of '/',
+    // '?', or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if authority.is_empty() {
         return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
     }
@@ -5938,6 +5941,55 @@ fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_quic_candidate_ignores_path_query_and_fragment_after_authority() {
+        // Per transports/quic.md a receiver MUST ignore any path, query, or
+        // fragment after the authority. A spec-valid start payload from another
+        // implementation that appends one of these must still be watchable: the
+        // authority (and thus the resolvable port) stops at the first '/', '?',
+        // or '#'.
+        for (candidate, authority, server_name) in [
+            (
+                "quic://relay.example:443/path",
+                "relay.example:443",
+                "relay.example",
+            ),
+            (
+                "quic://relay.example:443?x=1",
+                "relay.example:443",
+                "relay.example",
+            ),
+            (
+                "quic://relay.example:443#frag",
+                "relay.example:443",
+                "relay.example",
+            ),
+            (
+                "quic://relay.example:443/p?x=1#frag",
+                "relay.example:443",
+                "relay.example",
+            ),
+            (
+                "quic://[2001:db8::1]:443?x=1",
+                "[2001:db8::1]:443",
+                "2001:db8::1",
+            ),
+            (
+                "quic://[2001:db8::1]:443#frag",
+                "[2001:db8::1]:443",
+                "2001:db8::1",
+            ),
+        ] {
+            let parsed = parse_quic_candidate(candidate)
+                .unwrap_or_else(|_| panic!("candidate should parse: {candidate}"));
+            assert_eq!(parsed.authority, authority, "authority for {candidate}");
+            assert_eq!(
+                parsed.server_name, server_name,
+                "server name for {candidate}"
+            );
+        }
+    }
 
     #[test]
     fn stamp_published_profile_created_at_replaces_zero_with_now() {

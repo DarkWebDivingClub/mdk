@@ -1229,6 +1229,13 @@ impl MarmotApp {
         &self.config.service_endpoints
     }
 
+    /// Whether this build may act on loopback-HTTP blob endpoints (dev/test
+    /// only). Production builds return `false` and skip such endpoints in the
+    /// upload/download act paths.
+    pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
+        self.config.allow_loopback_blob_endpoints
+    }
+
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
         let storage = self.shared_storage()?;
         if let Some(install_id) = storage.telemetry_install_id()? {
@@ -7322,6 +7329,97 @@ mod tests {
         assert_eq!(message.kind, MARMOT_APP_EVENT_KIND_CHAT);
         assert_eq!(message.sender, SENDER_HEX);
         assert_eq!(message.recorded_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
+        // PR #328 review Finding 2 (core regression): a delayed media message
+        // whose locator kind is no longer in the group's current policy MUST
+        // still be delivered. Ingest is purely structural, so `decode_received_event`
+        // keeps a structurally well-formed media reference regardless of locator
+        // policy; fetchability is decided later at download time.
+        let event = build(AppMessageIntent::Media {
+            attachments: vec![MediaAttachmentReference {
+                // A locator kind that is not the default `blossom-v1` and would be
+                // out of a blossom-only policy.
+                locators: vec![MediaLocator {
+                    kind: "ipfs-v1".to_owned(),
+                    value: "ipfs://bafybeigdyrexample".to_owned(),
+                }],
+                ciphertext_sha256: hex::encode([0x33_u8; 32]),
+                plaintext_sha256: hex::encode([0x11_u8; 32]),
+                nonce_hex: hex::encode([0x22_u8; 12]),
+                file_name: "a.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+                source_epoch: 7,
+                dim: None,
+                thumbhash: None,
+            }],
+            caption: Some("delayed media".to_owned()),
+        });
+        let bytes = event.encode().unwrap();
+        let group_id = GroupId::new(vec![0x01]);
+        let message =
+            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0)
+                .expect("an out-of-policy media locator must not drop the message");
+        assert_eq!(message.plaintext, "delayed media");
+        assert!(
+            message
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("imeta")),
+            "the imeta tag is preserved on the delivered message",
+        );
+    }
+
+    #[test]
+    fn received_media_message_with_malformed_reference_is_rejected() {
+        // PR #328 review Finding 2: structural malformation (here a bad
+        // ciphertext hash) still drops the message, unlike out-of-policy locators.
+        let mut event = build(AppMessageIntent::Media {
+            attachments: vec![MediaAttachmentReference {
+                locators: vec![MediaLocator {
+                    kind: "blossom-v1".to_owned(),
+                    value: "https://media.example/a.png".to_owned(),
+                }],
+                ciphertext_sha256: hex::encode([0x33_u8; 32]),
+                plaintext_sha256: hex::encode([0x11_u8; 32]),
+                nonce_hex: hex::encode([0x22_u8; 12]),
+                file_name: "a.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+                source_epoch: 7,
+                dim: None,
+                thumbhash: None,
+            }],
+            caption: None,
+        });
+        // Corrupt the ciphertext hash in the serialized imeta tag, then recompute
+        // the canonical id so the message passes id/sender checks and the only
+        // remaining failure is the structural media-reference check.
+        for tag in &mut event.tags {
+            for field in tag.iter_mut() {
+                if let Some(rest) = field.strip_prefix("ciphertext_sha256 ") {
+                    let _ = rest;
+                    *field = "ciphertext_sha256 not-a-valid-hash".to_owned();
+                }
+            }
+        }
+        event.id = cgka_traits::canonical_event_id(
+            &event.pubkey,
+            event.created_at,
+            event.kind,
+            &event.tags,
+            &event.content,
+        );
+        let bytes = event.encode().unwrap();
+        let group_id = GroupId::new(vec![0x01]);
+        assert!(
+            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0)
+                .is_none(),
+            "a structurally malformed media reference must drop the message",
+        );
     }
 
     #[test]

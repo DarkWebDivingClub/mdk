@@ -57,6 +57,9 @@ Common options can be passed as flags or environment variables:
 - `--keychain-service <name>` or `DM_KEYCHAIN_SERVICE`: keychain service name.
 - `--json`: return a stable JSON envelope for scripts, the TUI, and daemon forwarding.
 
+For local development against a loopback Blossom server, set `DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1`. By default `dm`
+refuses to upload to or download from `http://127.0.0.1`-style blob endpoints; production installs leave this unset.
+
 The default home is `DM_HOME` when set. Without `DM_HOME`, `dm` uses the platform user data directory:
 
 - macOS: `~/Library/Application Support/darkmatter`

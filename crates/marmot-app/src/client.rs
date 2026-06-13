@@ -5,12 +5,12 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
-    ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    encode_nostr_routing_v1,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BLOSSOM_LOCATOR_KIND_V1,
+    BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -29,7 +29,8 @@ use crate::groups::{
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
-    media_imeta_tags_are_valid, upload_encrypted_media, upload_group_image,
+    is_loopback_http_endpoint, media_imeta_tags_are_valid, upload_encrypted_media,
+    upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
@@ -1119,14 +1120,12 @@ impl AppClient {
                 .iter()
                 .map(|record| record.encrypted_token.clone())
                 .collect::<Vec<_>>();
-            let endpoints = records
-                .iter()
-                .filter_map(|record| record.relay_hint.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .map(TransportEndpoint)
-                .collect::<Vec<_>>();
+            let endpoints =
+                self.notification_trigger_target_relays(&server_pubkey_hex, &records)?;
             if endpoints.is_empty() {
+                // No relay hint and no published kind-10050 inbox list for this
+                // server: it is unreachable, so skip it as the genuine last
+                // resort.
                 continue;
             }
             let event =
@@ -1141,8 +1140,52 @@ impl AppClient {
         Ok(())
     }
 
+    /// Relays to publish the gift-wrapped trigger to for `server_pubkey_hex`.
+    /// Prefers the relay hints carried in the stored token records; when none
+    /// exist, falls back to the server account's published kind-10050 NIP-17
+    /// inbox relays (cached in the user directory). Returns empty when neither
+    /// is available, i.e. the server is unreachable.
+    fn notification_trigger_target_relays(
+        &self,
+        server_pubkey_hex: &str,
+        records: &[notifications::GroupPushTokenRecord],
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let record_relay_hints = records
+            .iter()
+            .filter_map(|record| record.relay_hint.clone())
+            .collect::<Vec<_>>();
+        let server_inbox_relays = if record_relay_hints.is_empty() {
+            self.app
+                .directory_entry_for_account_id(server_pubkey_hex)?
+                .map(|entry| entry.relay_lists.inbox.relays)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(notifications::select_notification_trigger_relays(
+            &record_relay_hints,
+            &server_inbox_relays,
+        )
+        .into_iter()
+        .map(TransportEndpoint)
+        .collect())
+    }
+
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {
         let local_account = self.app.account_home().account(&self.state.label)?;
+        // TODO(#305 leaf_index): per features/push-notifications.md the gossip
+        // entry `leaf_index` is the device's MLS leaf index, but this is the
+        // member-roster enumeration position, which only equals the MLS leaf
+        // index while no leaves are blanked. BLOCKED: the MLS leaf index is not
+        // exposed through the public engine/session API to marmot-app. The
+        // engine `CgkaEngine` trait surfaces only `members()` (returning
+        // `cgka_traits::Member`, which by documented invariant omits the leaf
+        // index because it changes as the tree mutates) and `self_id()`; the
+        // own leaf index lives only inside OpenMLS (`own_leaf_index()`), which
+        // is engine-internal. Reaching into engine internals from here is
+        // disallowed. Resolve by adding a leaf-index accessor (e.g. an own
+        // leaf-index method on the engine/session) and threading it here, then
+        // drop the enumeration position.
         self.runtime
             .members(group_id)?
             .into_iter()
@@ -1276,6 +1319,18 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        // Validate every outbound attachment against the group's ACTUAL
+        // `marmot.group.encrypted-media.v1` policy before sending: a reference
+        // whose locator kind the group does not allow would be rejected by
+        // receivers, so fail the send early rather than emit it.
+        let allowed_locator_kinds = self
+            .encrypted_media_policy_for_group(group_id)?
+            .allowed_locator_kinds;
+        for attachment in &attachments {
+            attachment.validate_outbound(&allowed_locator_kinds)?;
+        }
         let (_event, summary) = self
             .send_app_event(
                 group_id,
@@ -1296,9 +1351,33 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
-        let default_endpoint = policy.default_blob_endpoints.first().ok_or_else(|| {
-            AppError::InvalidEncryptedMedia("encrypted media policy has no default endpoint".into())
-        })?;
+        // `upload_encrypted_media` always performs Blossom upload semantics and
+        // emits a `blossom-v1` locator, so the chosen default endpoint MUST be a
+        // Blossom endpoint. A policy whose first endpoint serves a non-Blossom
+        // locator would otherwise receive Blossom bytes at the wrong backend.
+        // Skip loopback-HTTP policy endpoints unless this build is configured for
+        // dev/test: they are valid component state but a production client MUST
+        // NOT upload to the local host (a remote admin could point the policy at
+        // the victim's loopback services). An explicit per-request
+        // `blossom_server` override is an intentional dev escape hatch, so when
+        // one is present any Blossom policy endpoint serves as the (unused)
+        // default.
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let has_explicit_server = request.blossom_server.is_some();
+        let default_endpoint = policy
+            .default_blob_endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1
+                    && (has_explicit_server
+                        || allow_loopback
+                        || !is_loopback_http_endpoint(&endpoint.base_url))
+            })
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia(
+                    "group policy has no usable Blossom endpoint for upload".into(),
+                )
+            })?;
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let keys = self
             .app
@@ -1312,6 +1391,7 @@ impl AppClient {
             media_secret.as_ref(),
             &keys,
             default_endpoint,
+            &policy.allowed_locator_kinds,
         )
         .await?;
         if should_send {
@@ -1342,6 +1422,8 @@ impl AppClient {
             reference,
             media_secret.as_ref(),
             &policy.default_blob_endpoints,
+            &policy.allowed_locator_kinds,
+            self.app.allow_loopback_blob_endpoints(),
         )
         .await
     }

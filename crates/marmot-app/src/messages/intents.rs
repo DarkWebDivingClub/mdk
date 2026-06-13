@@ -189,7 +189,11 @@ pub(crate) fn build_inner_event(
             }
             let source_epoch = attachments[0].source_epoch;
             for attachment in attachments {
-                attachment.validate()?;
+                // Structural + group-policy validation of outbound attachments
+                // happens in `Client::send_media_attachments`, which holds the
+                // group's `allowed_locator_kinds`. Here we only enforce the
+                // cross-attachment invariant that one message shares a single
+                // source epoch.
                 if attachment.source_epoch != source_epoch {
                     return Err(AppError::InvalidAppMessagePayload(
                         "media attachments in one message must share a source epoch".into(),
