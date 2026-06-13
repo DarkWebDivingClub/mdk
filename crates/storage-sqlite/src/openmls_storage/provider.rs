@@ -279,15 +279,32 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         group_id: &GroupId,
     ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::Error> {
         let refs: Vec<ProposalRef> = self.queued_proposal_refs(group_id)?;
-        refs.into_iter()
-            .map(|proposal_ref| {
-                let key = serde_json::to_vec(&(group_id, &proposal_ref))?;
-                let proposal = self
-                    .read_entity(QUEUED_PROPOSAL_LABEL, key)?
-                    .ok_or(SqliteOpenMlsStorageError::MissingQueuedProposal)?;
-                Ok((proposal_ref, proposal))
-            })
-            .collect()
+        let mut proposals = Vec::with_capacity(refs.len());
+        for proposal_ref in refs {
+            let key = serde_json::to_vec(&(group_id, &proposal_ref))?;
+            match self.read_entity(QUEUED_PROPOSAL_LABEL, key)? {
+                Some(proposal) => proposals.push((proposal_ref, proposal)),
+                None => {
+                    // A ref without its entity means the persisted queue is no longer
+                    // authoritative. Recover by clearing the entire queue instead of
+                    // loading a partial subset: commits after recovery start from the
+                    // current MLS group state and require proposals to be re-enqueued.
+                    // This keeps corrupted historical queue state from silently
+                    // influencing a future commit while still allowing group load.
+                    tracing::warn!(
+                        target: "marmot.storage_sqlite.openmls",
+                        method = "queued_proposals",
+                        "clearing corrupted OpenMLS proposal queue after dangling proposal reference"
+                    );
+                    self.delete_group_labels(
+                        group_id,
+                        &[QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL],
+                    )?;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        Ok(proposals)
     }
 
     fn tree<
@@ -623,5 +640,60 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
         self.delete_group_value(APPLICATION_EXPORT_TREE_LABEL, group_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SqliteAccountStorage;
+    use openmls_traits::storage::{Entity, Key};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestGroupId(Vec<u8>);
+
+    impl Key<CURRENT_VERSION> for TestGroupId {}
+    impl traits::GroupId<CURRENT_VERSION> for TestGroupId {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestProposalRef(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestProposalRef {}
+    impl Key<CURRENT_VERSION> for TestProposalRef {}
+    impl traits::ProposalRef<CURRENT_VERSION> for TestProposalRef {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestQueuedProposal(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestQueuedProposal {}
+    impl traits::QueuedProposal<CURRENT_VERSION> for TestQueuedProposal {}
+
+    #[test]
+    fn queued_proposals_recovers_from_dangling_refs_by_clearing_queue() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+        let valid_ref = TestProposalRef(vec![0xAA]);
+        let dangling_ref = TestProposalRef(vec![0xBB]);
+        let valid_proposal = TestQueuedProposal(vec![0xCC]);
+
+        mls.queue_proposal(&group_id, &valid_ref, &valid_proposal)
+            .unwrap();
+        let group_key = SqliteOpenMlsStorage::group_key(&group_id).unwrap();
+        mls.append_entity(
+            PROPOSAL_QUEUE_REFS_LABEL,
+            group_key.clone(),
+            Some(group_key),
+            &dangling_ref,
+        )
+        .unwrap();
+
+        let proposals: Vec<(TestProposalRef, TestQueuedProposal)> =
+            mls.queued_proposals(&group_id).unwrap();
+        assert_eq!(proposals, Vec::new());
+
+        let refs: Vec<TestProposalRef> = mls.queued_proposal_refs(&group_id).unwrap();
+        assert_eq!(refs, Vec::new());
     }
 }

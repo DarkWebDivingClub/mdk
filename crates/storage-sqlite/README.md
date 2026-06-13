@@ -64,6 +64,12 @@ group policy is stored, and the engine persists negotiated policy bytes per grou
 snapshots are pruned after successful stable canonicalization advances the tip. Invalidated message records are kept as
 audit/debug evidence and so applications can decide whether to surface invalidated messages.
 
+OpenMLS proposal queues are also treated as recoverable cached state. If `queued_proposals()` finds a
+`ProposalQueueRefs` entry whose `QueuedProposal` entity is missing, the backend clears the whole proposal queue for that
+group and returns an empty queue. It deliberately does not load a partial subset of still-present proposals: after
+corruption, a later commit must start from the current MLS group state and require proposals to be re-enqueued rather
+than silently committing a queue whose history is known incomplete.
+
 Run:
 
 ```sh
