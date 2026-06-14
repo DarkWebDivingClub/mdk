@@ -510,6 +510,7 @@ fn client_observation<'a>(
     observed
         .observations
         .iter()
+        .rev()
         .find(|observation| observation.client == client)
 }
 
@@ -719,5 +720,97 @@ fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
         priority: key.priority,
         committer: hex::encode(key.committer.as_slice()),
         commit_digest: hex::encode(key.commit_digest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(client: &str, epoch: u64, member_count: usize) -> ClientObservation {
+        ClientObservation {
+            client: client.into(),
+            epoch,
+            member_count,
+            event_counts: ClientEventCounts::default(),
+            received_payloads: Vec::new(),
+            added_members: Vec::new(),
+            removed_members: Vec::new(),
+            epoch_changes: Vec::new(),
+            app_invalidations: Vec::new(),
+            recoveries: Vec::new(),
+        }
+    }
+
+    fn trace(observations: Vec<ClientObservation>) -> ScenarioTrace {
+        ScenarioTrace {
+            name: "duplicate-observations".into(),
+            pending_resolutions: Vec::new(),
+            errors: Vec::new(),
+            admin_policies: Vec::new(),
+            observations,
+        }
+    }
+
+    #[test]
+    fn client_state_expectation_uses_latest_observation() {
+        let mut latest = observation("alice", 2, 3);
+        latest.received_payloads = vec!["after-fork".into()];
+
+        let observed = trace(vec![observation("alice", 1, 2), latest]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientState {
+                client: "alice".into(),
+                epoch: 2,
+                member_count: 3,
+                received_payloads: Some(vec!["after-fork".into()]),
+                added_members: None,
+                removed_members: None,
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn clients_converged_expectation_rejects_stale_pre_fork_observations() {
+        let observed = trace(vec![
+            observation("alice", 1, 2),
+            observation("bob", 1, 2),
+            observation("alice", 2, 3),
+            observation("bob", 2, 4),
+        ]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsConverged {
+                clients: vec!["alice".into(), "bob".into()],
+                epoch: None,
+                member_count: None,
+            }],
+            &observed,
+        );
+
+        assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
+        assert_eq!(failures[0].kind, "clients_not_converged");
+    }
+
+    #[test]
+    fn client_epoch_changes_expectation_uses_latest_observation() {
+        let mut latest = observation("alice", 3, 3);
+        latest.epoch_changes = vec![EpochChangeObservation { from: 2, to: 3 }];
+
+        let observed = trace(vec![observation("alice", 1, 2), latest]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientEpochChanges {
+                client: "alice".into(),
+                changes: vec![EpochChangeObservation { from: 2, to: 3 }],
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
     }
 }
