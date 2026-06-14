@@ -1181,6 +1181,15 @@ pub(crate) enum DmError {
     },
     #[error("message pagination cannot use before and after cursors together")]
     MessagePaginationConflictingCursors,
+    #[error("profile update requires at least one field flag (e.g. --name, --about, --picture)")]
+    EmptyProfileUpdate,
+    #[error(
+        "cannot safely update profile for {account_id}: no current profile event found on the selected relays"
+    )]
+    ProfileUpdateInconclusive {
+        account_id: String,
+        source_relays: Vec<String>,
+    },
 }
 
 pub async fn run_from<I, T>(args: I) -> CliOutput
@@ -3401,18 +3410,57 @@ pub(crate) async fn profile_command_with_runtime(
             nip05,
             lud16,
         } => {
+            // A flag-per-field update is partial by intent: the user names the
+            // fields they want to change and expects the rest of their kind:0
+            // profile to survive. kind:0 is a *replaceable* event, though, so a
+            // naive publish of just the passed flags overwrites the whole
+            // profile and silently wipes every unset field. Reject the
+            // no-flags call outright (it would publish an empty {} and erase
+            // everything), then fetch the current published profile, overlay
+            // only the provided fields, and publish the merged result. This
+            // mirrors the relays-add replaceable-list flow (fetch current,
+            // merge, refuse to clobber when the relay has no current event).
+            if name.is_none()
+                && display_name.is_none()
+                && about.is_none()
+                && picture.is_none()
+                && nip05.is_none()
+                && lud16.is_none()
+            {
+                return Err(DmError::EmptyProfileUpdate);
+            }
             let relay = relay.ok_or(DmError::MissingRelay)?;
             let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
-            let profile = UserProfileMetadata {
-                name,
-                display_name,
-                about,
-                picture,
-                nip05,
-                lud16,
-                created_at: unix_now_seconds(),
-                source_relays: Vec::new(),
-            };
+            let mut profile = app
+                .fetch_current_user_profile_for_account_id(
+                    &account.account_id_hex,
+                    vec![endpoint.clone()],
+                )
+                .await?
+                .ok_or_else(|| DmError::ProfileUpdateInconclusive {
+                    account_id: account.account_id_hex.clone(),
+                    source_relays: vec![endpoint.0.clone()],
+                })?;
+            if let Some(name) = name {
+                profile.name = Some(name);
+            }
+            if let Some(display_name) = display_name {
+                profile.display_name = Some(display_name);
+            }
+            if let Some(about) = about {
+                profile.about = Some(about);
+            }
+            if let Some(picture) = picture {
+                profile.picture = Some(picture);
+            }
+            if let Some(nip05) = nip05 {
+                profile.nip05 = Some(nip05);
+            }
+            if let Some(lud16) = lud16 {
+                profile.lud16 = Some(lud16);
+            }
+            profile.created_at = unix_now_seconds();
+            profile.source_relays = Vec::new();
             runtime
                 .publish_user_profile(
                     &account.label,
@@ -5765,6 +5813,22 @@ fn dm_error_json(err: &DmError) -> Value {
         DmError::MessagePaginationConflictingCursors => json!({
             "code": "message_pagination_conflicting_cursors",
             "message": err.to_string(),
+        }),
+        DmError::EmptyProfileUpdate => json!({
+            "code": "empty_profile_update",
+            "message": err.to_string(),
+        }),
+        DmError::ProfileUpdateInconclusive {
+            account_id,
+            source_relays,
+        } => json!({
+            "code": "profile_update_inconclusive",
+            "message": err.to_string(),
+            "account_id": account_id,
+            "source_relays": source_relays,
+            "repair": {
+                "retry_with_relay": "--relay <relay-that-has-the-current-profile>",
+            },
         }),
         DmError::AccountHome(err) => account_home_error_json(err),
         DmError::App(err) => app_error_json(err),

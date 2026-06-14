@@ -1882,6 +1882,43 @@ impl MarmotApp {
         Ok(Some(status))
     }
 
+    /// Fetch the account's own current published kind:0 profile metadata from
+    /// the selected relays.
+    ///
+    /// kind:0 is a replaceable event, so a fresh publish overwrites the prior
+    /// one entirely. Callers that perform partial updates (CLI `profile
+    /// update`) must read the current value here and overlay only the fields
+    /// they intend to change, otherwise unset fields are silently wiped. The
+    /// shape mirrors [`Self::fetch_current_account_relay_list_status_for_account_id`]:
+    /// returns `Ok(None)` when the selected relays hold no fresh profile event
+    /// for the account so the caller can refuse to clobber an unconfirmed
+    /// remote state instead of publishing a partial replacement. The fetched
+    /// profile is cached in the local directory on success.
+    pub async fn fetch_current_user_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let source_relays = self.directory_source_relays(&bootstrap_relays);
+        let records = self
+            .fetch_events_for_account_ids(
+                std::slice::from_ref(&account_id_hex),
+                KIND_NOSTR_METADATA,
+                &source_relays,
+            )
+            .await?;
+        let profiles =
+            latest_fresh_profiles_from_records(records, self.directory_freshness()).value;
+        let Some(profile) = profiles.get(&account_id_hex).cloned() else {
+            return Ok(None);
+        };
+        self.remember_directory_profile(&account_id_hex, &profile)?;
+        Ok(Some(profile))
+    }
+
     pub async fn fetch_latest_key_package_for_account_id(
         &self,
         account_id_hex: &str,

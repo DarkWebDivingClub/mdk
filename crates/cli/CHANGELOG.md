@@ -76,6 +76,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+- `dm profile update` no longer wipes the rest of your published Nostr profile. It previously published a fresh kind-0
+  metadata event built only from the flags you passed, so e.g. `dm profile update --picture URL` erased
+  name/display_name/about/nip05/lud16, and `dm profile update` with no flags published an empty profile that wiped
+  everything. It now fetches your current published profile from the selected relay, overlays only the provided
+  fields, and publishes the merged result. A no-flags invocation is rejected with `empty_profile_update`, and when the
+  selected relay holds no current profile event the command refuses with `profile_update_inconclusive` (retry with a
+  `--relay` that has your current profile) instead of clobbering it.
 - `dmd` no longer exits when a single client connection is abrupt, empty, oversized, malformed, or stalled.
   Per-connection read failures (a client that closes before sending, a mid-write interrupt, a request over the 1 MiB
   cap, or invalid JSON) are now reported to that client and skipped like authorization failures, instead of propagating
