@@ -428,7 +428,17 @@ pub(crate) async fn server_status(
     stream_workers: &StreamWatchWorkers,
 ) -> DaemonStatus {
     stream_workers.reap_finished();
-    let state = state.lock().ok();
+    let (pid, started_at, last_runtime_activity) = state
+        .lock()
+        .ok()
+        .map(|state| {
+            (
+                Some(state.pid),
+                Some(state.started_at),
+                state.last_runtime_activity.clone(),
+            )
+        })
+        .unwrap_or((None, None, None));
     let relay_health = if let Some(runtime) = runtime {
         let shared = runtime.shared_services();
         Some(shared.relay_plane().relay_health().await)
@@ -441,15 +451,13 @@ pub(crate) async fn server_status(
     DaemonStatus {
         running: true,
         socket: defaults.socket.clone(),
-        pid: state.as_ref().map(|state| state.pid),
+        pid,
         pid_file: Some(defaults.pid_path.clone()),
         stale_pid: None,
-        started_at: state.as_ref().map(|state| state.started_at),
+        started_at,
         home: Some(defaults.home.clone()),
         log: Some(defaults.log_path.clone()),
-        last_runtime_activity: state
-            .as_ref()
-            .and_then(|state| state.last_runtime_activity.clone()),
+        last_runtime_activity,
         relay_health,
         stream_watches,
     }

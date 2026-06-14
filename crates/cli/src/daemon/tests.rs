@@ -475,6 +475,44 @@ async fn daemon_request_reader_times_out_on_stalled_client() {
 }
 
 #[tokio::test]
+async fn daemon_status_response_does_not_wait_for_busy_workers() {
+    // Execute requests run outside the accept loop but may still own the shared
+    // worker mutex while a long command is in flight. Status must use a
+    // best-effort worker snapshot instead of waiting on that mutex; otherwise a
+    // long Execute still starves daemon status/stop at the next request.
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/dm-daemon-home"),
+        socket: PathBuf::from("/tmp/dm-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
+        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("daemon-keychain".to_owned()),
+    };
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 42,
+        started_at: 7,
+        last_runtime_activity: None,
+    }));
+    let workers = SharedDaemonWorkers::default();
+    let _busy = workers.lock().await;
+
+    let output = tokio::time::timeout(
+        Duration::from_millis(50),
+        daemon_status_output(&defaults, state, workers.clone()),
+    )
+    .await
+    .expect("status should not wait behind a busy Execute worker");
+
+    assert_eq!(output.code, 0);
+    let status: DaemonStatus = serde_json::from_str(output.stdout.trim()).expect("status JSON");
+    assert!(status.running);
+    assert_eq!(status.pid, Some(42));
+}
+
+#[tokio::test]
 async fn daemon_request_reader_within_returns_request_before_timeout() {
     let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
     let writer = tokio::spawn(async move {
