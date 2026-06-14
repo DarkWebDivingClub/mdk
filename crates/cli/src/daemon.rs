@@ -1361,7 +1361,7 @@ async fn handle_timeline_messages_subscription(
     }
 
     let initial = timeline_page_stream_response(
-        runtime_subscription.snapshot.clone(),
+        runtime_subscription.take_snapshot(),
         "InitialTimelinePage",
         &runtime,
     );

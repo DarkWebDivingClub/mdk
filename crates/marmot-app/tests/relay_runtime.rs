@@ -16,7 +16,7 @@ use marmot_app::{
     AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime, MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest,
     MediaUploadRequest, NotificationWakeSource, PushPlatform, RuntimeMessageUpdate,
-    TimelineMessageQuery, UserDirectorySearch, UserProfileMetadata, tag_value,
+    TimelineMessageQuery, TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -2193,7 +2193,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     let mut timeline = runtime
         .subscribe_timeline_messages(&alice_id, query.clone())
         .unwrap();
-    assert!(timeline.snapshot.messages.is_empty());
+    assert!(timeline.take_snapshot().messages.is_empty());
 
     runtime
         .send_message(&alice_id, &group_id, b"persist through reopen".to_vec())
@@ -2218,15 +2218,129 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     let reopened = runtime
         .subscribe_timeline_messages(&alice_id, query)
         .unwrap();
-    assert_eq!(reopened.snapshot.messages.len(), 1);
-    assert_eq!(reopened.snapshot.messages[0].direction, "sent");
-    assert_eq!(reopened.snapshot.messages[0].sender, alice_id);
+    let reopened_snapshot = reopened.take_snapshot();
+    assert_eq!(reopened_snapshot.messages.len(), 1);
+    assert_eq!(reopened_snapshot.messages[0].direction, "sent");
+    assert_eq!(reopened_snapshot.messages[0].sender, alice_id);
     assert_eq!(
-        reopened.snapshot.messages[0].plaintext,
+        reopened_snapshot.messages[0].plaintext,
         "persist through reopen"
     );
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_timeline_subscription_paginates_backwards_through_real_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "runtime pagination",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Five messages, oldest to newest. (Intra-second `timeline_at` ties are
+    // possible, so the test asserts counts/flags/membership, not exact order.)
+    for index in 0..5 {
+        runtime
+            .send_message(&alice_id, &group_id, format!("m{index}").into_bytes())
+            .await
+            .unwrap();
+    }
+
+    let full_query = TimelineMessageQuery {
+        group_id_hex: Some(group_id_hex.clone()),
+        ..TimelineMessageQuery::default()
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let page = runtime
+                .timeline_messages_with_query(&alice_id, full_query.clone())
+                .unwrap();
+            if page.messages.len() == 5 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("five messages materialized in the store");
+
+    // Subscribe with a window of two: the snapshot holds the two newest, with
+    // older history available and no gap to the head.
+    let query = TimelineMessageQuery {
+        group_id_hex: Some(group_id_hex.clone()),
+        pagination: TimelinePagination {
+            limit: Some(2),
+            ..TimelinePagination::default()
+        },
+        ..TimelineMessageQuery::default()
+    };
+    let timeline = runtime
+        .subscribe_timeline_messages(&alice_id, query)
+        .unwrap();
+    let snapshot = timeline.take_snapshot();
+    assert_eq!(snapshot.messages.len(), 2);
+    assert!(snapshot.has_more_before);
+    assert!(!snapshot.has_more_after);
+
+    // Page backward: the window grows to the four newest, still with older
+    // history and no gap to the head.
+    let page = timeline.paginate_backwards(2).await.unwrap();
+    assert_eq!(page.messages.len(), 4);
+    assert!(page.has_more_before);
+    assert!(!page.has_more_after);
+    assert!(timeline_plaintexts_unique(&page));
+
+    // Page backward again: the whole history is loaded; no more older history.
+    let page = timeline.paginate_backwards(2).await.unwrap();
+    assert_eq!(page.messages.len(), 5);
+    assert!(!page.has_more_before);
+    assert!(!page.has_more_after);
+    assert!(timeline_plaintexts_unique(&page));
+    let loaded: std::collections::BTreeSet<String> = page
+        .messages
+        .iter()
+        .map(|message| message.plaintext.clone())
+        .collect();
+    assert_eq!(
+        loaded,
+        ["m0", "m1", "m2", "m3", "m4"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+
+    // A further call past the start is a no-op.
+    let page = timeline.paginate_backwards(2).await.unwrap();
+    assert_eq!(page.messages.len(), 5);
+    assert!(!page.has_more_before);
+
+    runtime.shutdown().await;
+}
+
+fn timeline_plaintexts_unique(page: &marmot_app::TimelinePage) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    page.messages
+        .iter()
+        .all(|message| seen.insert(message.message_id_hex.clone()))
 }
 
 async fn wait_for_chat_update<F>(

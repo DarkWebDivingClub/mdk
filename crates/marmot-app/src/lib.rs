@@ -103,7 +103,7 @@ pub use runtime::{
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
     RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    StreamStartView,
+    StreamStartView, TimelineWindowHandle,
 };
 pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};
 
@@ -156,9 +156,9 @@ pub use relay_telemetry_export::{
     build_export_batch_with_app_performance, metric_names,
 };
 pub use storage_sqlite::{
-    ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineReactionSummary,
-    TimelineReplyPreview, TimelineUserReaction,
+    ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,

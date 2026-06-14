@@ -127,6 +127,7 @@ fn timeline_query_from_ffi(
         pagination: TimelinePagination {
             before: query.before,
             before_message_id: optional_message_id_hex(query.before_message_id)?,
+            before_inclusive: false,
             after: query.after,
             after_message_id: optional_message_id_hex(query.after_message_id)?,
             limit: query.limit.map(|value| value as usize),
@@ -1516,6 +1517,13 @@ impl Marmot {
     /// start, reaction summaries, delete tombstones, and pagination flags. Raw
     /// kind-7/kind-5 events remain available through `messages(...)` for
     /// diagnostics.
+    ///
+    /// This call is **synchronous** and runs the store read on the calling
+    /// thread; clients should not use it for scroll-back. Prefer
+    /// [`subscribe_timeline_messages`](Self::subscribe_timeline_messages) plus
+    /// `TimelineMessagesSubscription::paginate_backwards` /
+    /// `paginate_forwards`, which own a bounded window and run off the caller
+    /// thread. Retained for one-shot diagnostics/tooling only.
     pub fn timeline_messages(
         &self,
         account_ref: String,

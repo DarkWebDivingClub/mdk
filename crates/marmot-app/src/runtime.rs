@@ -47,13 +47,15 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp,
-    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
-    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
-    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS,
+    MAX_TIMELINE_LIMIT, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
+    TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, TimelineUpdateTrigger, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -979,29 +981,439 @@ pub enum RuntimeTimelineMessageUpdate {
     Projection(RuntimeProjectionUpdate),
 }
 
+/// Maximum number of messages a timeline subscription keeps materialized at
+/// once. Pagination grows the window up to this cap; once exceeded, the edge
+/// opposite the one being extended is trimmed (loading older trims the newest,
+/// loading newer trims the oldest). This centralizes the per-conversation
+/// window the clients previously capped by hand.
+///
+/// Bounded by the store's single-query cap so the whole window can always be
+/// re-materialized in one cursor query (e.g. on a broadcast-lag refresh)
+/// without silently dropping rows off the scrolled-back edge.
+const TIMELINE_WINDOW_LIMIT: usize = MAX_TIMELINE_LIMIT;
+
+/// Re-materializes the timeline for a fixed account/group from the store.
+/// Captures the owning [`MarmotApp`] and account label so the subscription can
+/// run cursor queries off the caller thread without threading them through
+/// every call site (and so tests can substitute an in-memory store).
+type TimelineQueryFn = dyn Fn(TimelineMessageQuery) -> Result<TimelinePage, AppError> + Send + Sync;
+
+/// Which side of the window a [`merge_timeline_window`] call extends. The cap
+/// is enforced from the opposite edge.
+#[derive(Clone, Copy)]
+enum TimelineWindowEdge {
+    Older,
+    Newer,
+}
+
+/// Internal signal from a timeline subscription's background task to
+/// [`RuntimeTimelineMessagesSubscription::recv`]. `Projection` carries a
+/// delta-applicable update; `Refresh` asks the subscription to re-materialize
+/// its current window from the store — used on broadcast lag and for queries
+/// whose deltas cannot be applied incrementally (e.g. search-scoped windows).
+enum TimelineSubscriptionSignal {
+    // Boxed so the buffered channel does not reserve the full projection size
+    // for every (mostly `Refresh`) slot. This enum is internal, so boxing
+    // carries none of the public-type cost noted on `RuntimeTimelineMessageUpdate`.
+    Projection(Box<RuntimeProjectionUpdate>),
+    Refresh,
+}
+
+/// The mutable, materialized window plus everything needed to extend it. Lives
+/// behind a `std::sync::Mutex` inside [`TimelineWindowHandle`] so the live
+/// receiver and pagination mutate it through brief, non-overlapping critical
+/// sections instead of serializing on one long-held lock. The mutex is never
+/// held across an `.await`.
+struct TimelineWindow {
+    query: Arc<TimelineQueryFn>,
+    base_query: TimelineMessageQuery,
+    page: TimelinePage,
+    window_limit: usize,
+    /// Bumped on every window mutation (pagination, live apply, refresh install).
+    /// A refresh captures this before its store read and re-checks it before
+    /// installing, so a pagination that completes during the read is never rolled
+    /// back by a stale refresh.
+    generation: u64,
+}
+
+impl TimelineWindow {
+    /// True when the window includes the live head, i.e. no messages exist
+    /// after the newest loaded one. Derived from the page so it can never drift
+    /// from `has_more_after`.
+    fn anchored_to_head(&self) -> bool {
+        !self.page.has_more_after
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Cursor query that re-materializes the current window from the store.
+    /// Anchored windows refresh the head; detached (scrolled-back) windows
+    /// refresh the loaded range ending at the current newest message so the
+    /// scroll position survives a broadcast lag instead of snapping to the head.
+    /// Because the window is capped at the store's single-query limit, one query
+    /// always reconstitutes it.
+    fn refresh_query(&self) -> TimelineMessageQuery {
+        let mut query = self.base_query.clone();
+        let limit = self.page.messages.len().max(1);
+        query.pagination = match self.page.messages.last() {
+            // Detached: re-fetch the loaded range ending exactly at the newest
+            // message using an *inclusive* upper-bound cursor. The store applies
+            // the descending `LIMIT` against `<= (timeline_at, message_id_hex)`,
+            // so newer same-second rows are excluded at the SQL level and can't
+            // starve the window — no post-fetch trimming required.
+            Some(newest) if !self.anchored_to_head() => TimelinePagination {
+                before: Some(newest.timeline_at),
+                before_message_id: Some(newest.message_id_hex.clone()),
+                before_inclusive: true,
+                limit: Some(limit),
+                ..TimelinePagination::default()
+            },
+            // Anchored or empty: refresh the head.
+            _ => TimelinePagination {
+                limit: Some(limit),
+                ..TimelinePagination::default()
+            },
+        };
+        query
+    }
+}
+
+/// A cloneable handle to a subscription's materialized window. Cloning shares
+/// the same underlying window, so a client driving [`recv`] on a background task
+/// can paginate through a separately-held clone of this handle without
+/// contending on the live-update receiver lock. Window mutations take a brief
+/// synchronous lock that is never held across the store read's `.await`.
+#[derive(Clone)]
+pub struct TimelineWindowHandle {
+    inner: Arc<StdMutex<TimelineWindow>>,
+}
+
+impl TimelineWindowHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TimelineWindow> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The current materialized window: sorted ascending, deduplicated, capped,
+    /// with correct `has_more_before` / `has_more_after` flags. Render it
+    /// directly — no client-side merging or windowing is required.
+    pub fn snapshot(&self) -> TimelinePage {
+        self.lock().page.clone()
+    }
+
+    /// Extend the window toward older history by up to `count` messages and
+    /// return the updated window. A no-op (returns the current window) when no
+    /// older messages exist. The store read runs off the caller thread.
+    pub async fn paginate_backwards(&self, count: usize) -> Result<TimelinePage, AppError> {
+        let (query_fn, query) = {
+            let window = self.lock();
+            if !window.page.has_more_before {
+                return Ok(window.page.clone());
+            }
+            let Some(oldest) = window.page.messages.first() else {
+                return Ok(window.page.clone());
+            };
+            let mut query = window.base_query.clone();
+            query.pagination = TimelinePagination {
+                before: Some(oldest.timeline_at),
+                before_message_id: Some(oldest.message_id_hex.clone()),
+                limit: Some(count),
+                ..TimelinePagination::default()
+            };
+            (window.query.clone(), query)
+        };
+        let older = blocking_app_task(move || query_fn(query)).await?;
+        let mut window = self.lock();
+        let limit = window.window_limit;
+        merge_timeline_window(&mut window.page, older, TimelineWindowEdge::Older, limit);
+        window.bump_generation();
+        Ok(window.page.clone())
+    }
+
+    /// Extend the window toward the live head by up to `count` messages and
+    /// return the updated window. A no-op (returns the current window) when the
+    /// window already includes the head. Reaching the head re-anchors the
+    /// window (`has_more_after` becomes false).
+    pub async fn paginate_forwards(&self, count: usize) -> Result<TimelinePage, AppError> {
+        let (query_fn, query) = {
+            let window = self.lock();
+            if !window.page.has_more_after {
+                return Ok(window.page.clone());
+            }
+            let Some(newest) = window.page.messages.last() else {
+                return Ok(window.page.clone());
+            };
+            let mut query = window.base_query.clone();
+            query.pagination = TimelinePagination {
+                after: Some(newest.timeline_at),
+                after_message_id: Some(newest.message_id_hex.clone()),
+                limit: Some(count),
+                ..TimelinePagination::default()
+            };
+            (window.query.clone(), query)
+        };
+        let newer = blocking_app_task(move || query_fn(query)).await?;
+        let mut window = self.lock();
+        let limit = window.window_limit;
+        merge_timeline_window(&mut window.page, newer, TimelineWindowEdge::Newer, limit);
+        window.bump_generation();
+        Ok(window.page.clone())
+    }
+
+    /// Apply a delta-applicable projection to the window in place (honoring
+    /// head-anchoring and the cap).
+    fn apply_projection(&self, update: &AppProjectionUpdate) {
+        let mut window = self.lock();
+        let limit = window.window_limit;
+        apply_projection_to_window(&mut window.page, update, limit);
+        window.bump_generation();
+    }
+
+    /// Read the store handle, the refresh cursor, and the window generation the
+    /// refresh is based on (so a stale install can be detected).
+    fn refresh_request(&self) -> (Arc<TimelineQueryFn>, TimelineMessageQuery, u64) {
+        let window = self.lock();
+        (
+            window.query.clone(),
+            window.refresh_query(),
+            window.generation,
+        )
+    }
+
+    /// Replace the window with a freshly-materialized page and return it —
+    /// unless the window changed while the refresh query ran. Pagination uses a
+    /// different lock and can complete during the refresh's `.await`; installing
+    /// the (now stale) refresh would roll that expansion back, so if the
+    /// generation moved we keep the newer window and drop the refresh.
+    fn install_refresh(&self, page: TimelinePage, generation: u64) -> TimelinePage {
+        let mut window = self.lock();
+        if window.generation != generation {
+            return window.page.clone();
+        }
+        window.page = page;
+        window.bump_generation();
+        window.page.clone()
+    }
+}
+
+/// A live subscription over one conversation's materialized timeline.
+///
+/// Holds the loaded window (via a shared [`TimelineWindowHandle`]) and a live
+/// update stream. The window can be extended in either direction; live updates
+/// and broadcast-lag refreshes mutate the same window through [`recv`](Self::recv).
+/// The store remains the durable source of truth; this is the view.
 pub struct RuntimeTimelineMessagesSubscription {
-    pub snapshot: TimelinePage,
-    updates: mpsc::Receiver<RuntimeTimelineMessageUpdate>,
+    window: TimelineWindowHandle,
+    updates: mpsc::Receiver<TimelineSubscriptionSignal>,
     stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeTimelineMessagesSubscription {
-    pub fn take_snapshot(&mut self) -> TimelinePage {
-        std::mem::replace(
-            &mut self.snapshot,
-            TimelinePage {
-                messages: Vec::new(),
-                has_more_before: false,
-                has_more_after: false,
-            },
-        )
+    /// The current materialized window. See [`TimelineWindowHandle::snapshot`].
+    pub fn take_snapshot(&self) -> TimelinePage {
+        self.window.snapshot()
     }
 
+    /// A clone of this subscription's window handle. A client that drives
+    /// [`recv`](Self::recv) on a background task paginates through this handle
+    /// concurrently, without blocking on the live-update receiver.
+    pub fn window_handle(&self) -> TimelineWindowHandle {
+        self.window.clone()
+    }
+
+    /// Extend the window toward older history. See
+    /// [`TimelineWindowHandle::paginate_backwards`].
+    pub async fn paginate_backwards(&self, count: usize) -> Result<TimelinePage, AppError> {
+        self.window.paginate_backwards(count).await
+    }
+
+    /// Extend the window toward the live head. See
+    /// [`TimelineWindowHandle::paginate_forwards`].
+    pub async fn paginate_forwards(&self, count: usize) -> Result<TimelinePage, AppError> {
+        self.window.paginate_forwards(count).await
+    }
+
+    /// Await the next live update, applying it to the window before returning.
+    /// While parked waiting for an update no window lock is held, so concurrent
+    /// pagination through [`window_handle`](Self::window_handle) is never blocked.
     pub async fn recv(&mut self) -> Option<RuntimeTimelineMessageUpdate> {
-        tokio::select! {
-            update = self.updates.recv() => update,
-            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        loop {
+            let signal = tokio::select! {
+                signal = self.updates.recv() => signal?,
+                _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
+            };
+            match signal {
+                TimelineSubscriptionSignal::Projection(update) => {
+                    self.window.apply_projection(&update.update);
+                    return Some(RuntimeTimelineMessageUpdate::Projection(*update));
+                }
+                TimelineSubscriptionSignal::Refresh => {
+                    let (query_fn, query, generation) = self.window.refresh_request();
+                    match blocking_app_task(move || query_fn(query)).await {
+                        Ok(page) => {
+                            let page = self.window.install_refresh(page, generation);
+                            return Some(RuntimeTimelineMessageUpdate::Page { page });
+                        }
+                        // Transient store error on refresh: keep the existing
+                        // window and wait for the next signal rather than
+                        // surfacing a spurious empty page.
+                        Err(_) => continue,
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Sort a timeline by the canonical `(timeline_at, message_id_hex)` ascending
+/// order the store and clients agree on.
+fn sort_timeline_records(messages: &mut [TimelineMessageRecord]) {
+    messages.sort_by(|left, right| {
+        left.timeline_at
+            .cmp(&right.timeline_at)
+            .then_with(|| left.message_id_hex.cmp(&right.message_id_hex))
+    });
+}
+
+/// Merge a freshly-queried page into `window` on the given edge, then enforce
+/// the cap from the opposite edge. The single piece of windowing logic shared
+/// by both pagination directions.
+fn merge_timeline_window(
+    window: &mut TimelinePage,
+    incoming: TimelinePage,
+    edge: TimelineWindowEdge,
+    limit: usize,
+) {
+    let mut messages = std::mem::take(&mut window.messages);
+    for message in incoming.messages {
+        upsert_window_message(&mut messages, message);
+    }
+    sort_timeline_records(&mut messages);
+    match edge {
+        TimelineWindowEdge::Older => {
+            // The older side now reflects whatever the store reported. The
+            // newer side is unchanged unless the cap forces dropping the newest
+            // rows, in which case a gap to the head opens.
+            window.has_more_before = incoming.has_more_before;
+            if messages.len() > limit {
+                messages.truncate(limit);
+                window.has_more_after = true;
+            }
+        }
+        TimelineWindowEdge::Newer => {
+            window.has_more_after = incoming.has_more_after;
+            if messages.len() > limit {
+                let overflow = messages.len() - limit;
+                messages.drain(0..overflow);
+                window.has_more_before = true;
+            }
+        }
+    }
+    window.messages = messages;
+}
+
+/// Apply a live projection delta to the window, honoring head-anchoring and the
+/// cap. Edits/removes to already-loaded messages always apply; brand-new
+/// messages append only when the window is anchored to the head (or fall at or
+/// below the newest message of a detached window). A new head message arriving
+/// while the window is scrolled back is dropped so the window stays put — the
+/// client re-anchors via [`RuntimeTimelineMessagesSubscription::paginate_forwards`].
+fn apply_projection_to_window(
+    window: &mut TimelinePage,
+    update: &AppProjectionUpdate,
+    limit: usize,
+) {
+    let anchored = !window.has_more_after;
+    // Canonical upper bound of the window is the pair `(timeline_at,
+    // message_id_hex)`, not just the timestamp. A detached window must suppress
+    // anything sorting strictly after this — including same-second messages with
+    // a larger id, which `timeline_at`-only comparison would have admitted.
+    let newest_key = window
+        .messages
+        .last()
+        .map(|message| (message.timeline_at, message.message_id_hex.clone()));
+    if update.timeline_changes.is_empty() {
+        for message in &update.timeline_messages {
+            insert_live_message(
+                &mut window.messages,
+                message.clone(),
+                anchored,
+                newest_key.as_ref(),
+            );
+        }
+    } else {
+        for change in &update.timeline_changes {
+            match change {
+                TimelineMessageChange::Upsert { message, .. } => {
+                    insert_live_message(
+                        &mut window.messages,
+                        (**message).clone(),
+                        anchored,
+                        newest_key.as_ref(),
+                    );
+                }
+                TimelineMessageChange::Remove { message_id_hex, .. } => {
+                    window
+                        .messages
+                        .retain(|message| &message.message_id_hex != message_id_hex);
+                }
+            }
+        }
+    }
+    sort_timeline_records(&mut window.messages);
+    // Live growth only ever adds at or below the head, so trim the oldest rows
+    // on overflow; the head boundary (`has_more_after`) is preserved.
+    if window.messages.len() > limit {
+        let overflow = window.messages.len() - limit;
+        window.messages.drain(0..overflow);
+        window.has_more_before = true;
+    }
+}
+
+/// Apply one live upsert. Existing messages are replaced in place (edits,
+/// reactions, delivery-state changes). A brand-new message is appended only when
+/// the window is anchored to the head, or when it sorts at or below the detached
+/// window's newest message in canonical `(timeline_at, message_id_hex)` order.
+/// `newest_key` is `None` only for an empty window, where a detached window has
+/// nothing in range and therefore suppresses (an anchored empty window still
+/// appends, as the head).
+fn insert_live_message(
+    messages: &mut Vec<TimelineMessageRecord>,
+    message: TimelineMessageRecord,
+    anchored: bool,
+    newest_key: Option<&(u64, String)>,
+) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.message_id_hex == message.message_id_hex)
+    {
+        *existing = message;
+        return;
+    }
+    let within_window = newest_key.is_some_and(|(at, id)| {
+        (message.timeline_at, message.message_id_hex.as_str()) <= (*at, id.as_str())
+    });
+    if anchored || within_window {
+        messages.push(message);
+    }
+}
+
+/// Insert or replace a message by id, preserving any others. Used when merging
+/// store pages, where dedup matters but ordering is fixed up afterwards.
+fn upsert_window_message(
+    messages: &mut Vec<TimelineMessageRecord>,
+    message: TimelineMessageRecord,
+) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.message_id_hex == message.message_id_hex)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
     }
 }
 
@@ -1425,6 +1837,28 @@ impl MarmotAppRuntime {
             .entered();
             app.timeline_messages_with_query(&account_label, query.clone())?
         };
+        // The subscription owns the window, so the re-query base carries only the
+        // durable filter (group + search); pagination is supplied per call.
+        let base_query = TimelineMessageQuery {
+            group_id_hex: query.group_id_hex.clone(),
+            search: query.search.clone(),
+            pagination: TimelinePagination::default(),
+        };
+        // Deltas are applicable iff the base query is an unfiltered, unpaginated
+        // tail. Search-scoped windows cannot be reconstructed from a projection
+        // delta, so they trigger a window refresh instead.
+        let deltas_applicable = timeline_query_can_apply_projection_delta(&base_query);
+        let query_fn: Arc<TimelineQueryFn> =
+            Arc::new(move |query| app.timeline_messages_with_query(&account_label, query));
+        let window = TimelineWindowHandle {
+            inner: Arc::new(StdMutex::new(TimelineWindow {
+                query: query_fn,
+                base_query,
+                page: snapshot,
+                window_limit: TIMELINE_WINDOW_LIMIT,
+                generation: 0,
+            })),
+        };
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -1435,22 +1869,10 @@ impl MarmotAppRuntime {
                 let event = match event {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let app_for_lookup = app.clone();
-                        let account_label_for_lookup = account_label.clone();
-                        let query_for_lookup = query.clone();
-                        let page = match blocking_app_task(move || {
-                            app_for_lookup.timeline_messages_with_query(
-                                &account_label_for_lookup,
-                                query_for_lookup,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(page) => page,
-                            Err(_) => continue,
-                        };
+                        // We may have missed projections; ask the subscription to
+                        // re-materialize its current window (head or scrolled-back).
                         if updates_tx
-                            .send(RuntimeTimelineMessageUpdate::Page { page })
+                            .send(TimelineSubscriptionSignal::Refresh)
                             .await
                             .is_err()
                         {
@@ -1460,50 +1882,28 @@ impl MarmotAppRuntime {
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
-                if let Some(update) = projection_update_from_event(&event)
-                    && projection_update_matches_query(
-                        update,
-                        &account_id_hex,
-                        group_id_hex.as_deref(),
-                    )
-                {
-                    if timeline_query_can_apply_projection_delta(&query) {
-                        if updates_tx
-                            .send(RuntimeTimelineMessageUpdate::Projection(update.clone()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    } else {
-                        let app_for_lookup = app.clone();
-                        let account_label_for_lookup = account_label.clone();
-                        let query_for_lookup = query.clone();
-                        let page = match blocking_app_task(move || {
-                            app_for_lookup.timeline_messages_with_query(
-                                &account_label_for_lookup,
-                                query_for_lookup,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(page) => page,
-                            Err(_) => continue,
-                        };
-                        if updates_tx
-                            .send(RuntimeTimelineMessageUpdate::Page { page })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
+                let Some(update) = projection_update_from_event(&event) else {
                     continue;
+                };
+                if !projection_update_matches_query(
+                    update,
+                    &account_id_hex,
+                    group_id_hex.as_deref(),
+                ) {
+                    continue;
+                }
+                let signal = if deltas_applicable {
+                    TimelineSubscriptionSignal::Projection(Box::new(update.clone()))
+                } else {
+                    TimelineSubscriptionSignal::Refresh
+                };
+                if updates_tx.send(signal).await.is_err() {
+                    return;
                 }
             }
         });
         Ok(RuntimeTimelineMessagesSubscription {
-            snapshot,
+            window,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
@@ -6291,19 +6691,146 @@ mod tests {
         drop(updates_tx);
     }
 
+    fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
+        TimelineMessageRecord {
+            message_id_hex: message_id_hex.to_owned(),
+            source_message_id_hex: None,
+            source_epoch: None,
+            group_id_hex: "group-1".to_owned(),
+            direction: "inbound".to_owned(),
+            sender: "sender-1".to_owned(),
+            plaintext: message_id_hex.to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            timeline_at,
+            received_at: timeline_at,
+            deleted: false,
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media: None,
+            agent_text_stream: None,
+            reactions: Default::default(),
+        }
+    }
+
+    fn timeline_test_page(
+        records: &[(&str, u64)],
+        has_more_before: bool,
+        has_more_after: bool,
+    ) -> TimelinePage {
+        TimelinePage {
+            messages: records
+                .iter()
+                .map(|(id, at)| timeline_test_record(id, *at))
+                .collect(),
+            has_more_before,
+            has_more_after,
+        }
+    }
+
+    fn empty_timeline_page() -> TimelinePage {
+        TimelinePage {
+            messages: Vec::new(),
+            has_more_before: false,
+            has_more_after: false,
+        }
+    }
+
+    fn timeline_ids(page: &TimelinePage) -> Vec<String> {
+        page.messages
+            .iter()
+            .map(|message| message.message_id_hex.clone())
+            .collect()
+    }
+
+    /// A fake store that hands out canned pages in order and records each query
+    /// it received, so tests can assert both the merge result and the cursor a
+    /// pagination/refresh call issued.
+    #[derive(Clone, Default)]
+    struct ScriptedTimelineStore {
+        responses: Arc<StdMutex<std::collections::VecDeque<TimelinePage>>>,
+        queries: Arc<StdMutex<Vec<TimelineMessageQuery>>>,
+    }
+
+    impl ScriptedTimelineStore {
+        fn new(responses: Vec<TimelinePage>) -> Self {
+            Self {
+                responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
+                queries: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn query_fn(&self) -> Arc<TimelineQueryFn> {
+            let responses = self.responses.clone();
+            let queries = self.queries.clone();
+            Arc::new(move |query: TimelineMessageQuery| {
+                queries.lock().expect("queries lock").push(query);
+                let page = responses
+                    .lock()
+                    .expect("responses lock")
+                    .pop_front()
+                    .expect("scripted timeline store exhausted");
+                Ok(page)
+            })
+        }
+
+        fn recorded_queries(&self) -> Vec<TimelineMessageQuery> {
+            self.queries.lock().expect("queries lock").clone()
+        }
+    }
+
+    fn timeline_window(
+        store: &ScriptedTimelineStore,
+        page: TimelinePage,
+        window_limit: usize,
+    ) -> TimelineWindow {
+        TimelineWindow {
+            query: store.query_fn(),
+            base_query: TimelineMessageQuery::default(),
+            page,
+            window_limit,
+            generation: 0,
+        }
+    }
+
+    fn timeline_window_handle(
+        store: &ScriptedTimelineStore,
+        page: TimelinePage,
+        window_limit: usize,
+    ) -> TimelineWindowHandle {
+        TimelineWindowHandle {
+            inner: Arc::new(StdMutex::new(timeline_window(store, page, window_limit))),
+        }
+    }
+
+    fn timeline_subscription_with(
+        store: &ScriptedTimelineStore,
+        window: TimelinePage,
+        window_limit: usize,
+        updates: mpsc::Receiver<TimelineSubscriptionSignal>,
+        stopping: watch::Receiver<bool>,
+    ) -> RuntimeTimelineMessagesSubscription {
+        RuntimeTimelineMessagesSubscription {
+            window: timeline_window_handle(store, window, window_limit),
+            updates,
+            stopping,
+        }
+    }
+
     #[tokio::test]
     async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
         let lifecycle = RuntimeLifecycle::new();
+        let store = ScriptedTimelineStore::default();
         let (updates_tx, updates) = mpsc::channel(1);
-        let mut subscription = RuntimeTimelineMessagesSubscription {
-            snapshot: TimelinePage {
-                messages: Vec::new(),
-                has_more_before: false,
-                has_more_after: false,
-            },
+        let mut subscription = timeline_subscription_with(
+            &store,
+            empty_timeline_page(),
+            TIMELINE_WINDOW_LIMIT,
             updates,
-            stopping: lifecycle.subscribe_shutdown(),
-        };
+            lifecycle.subscribe_shutdown(),
+        );
 
         lifecycle.begin_shutdown();
 
@@ -6344,46 +6871,492 @@ mod tests {
     }
 
     #[test]
-    fn timeline_subscription_take_snapshot_drains_retained_page() {
+    fn timeline_subscription_take_snapshot_retains_window_for_pagination() {
         let lifecycle = RuntimeLifecycle::new();
+        let store = ScriptedTimelineStore::default();
         let (_updates_tx, updates) = mpsc::channel(1);
-        let mut subscription = RuntimeTimelineMessagesSubscription {
-            snapshot: TimelinePage {
-                messages: vec![crate::TimelineMessageRecord {
-                    message_id_hex: "message-1".to_owned(),
-                    source_message_id_hex: None,
-                    source_epoch: None,
-                    group_id_hex: "group-1".to_owned(),
-                    direction: "inbound".to_owned(),
-                    sender: "sender-1".to_owned(),
-                    plaintext: "hello".to_owned(),
-                    kind: 9,
-                    tags: Vec::new(),
-                    timeline_at: 1,
-                    received_at: 1,
-                    deleted: false,
-                    deleted_by_message_id_hex: None,
-                    invalidation_status: None,
-                    reply_to_message_id_hex: None,
-                    reply_preview: None,
-                    media: None,
-                    agent_text_stream: None,
-                    reactions: Default::default(),
-                }],
-                has_more_before: true,
-                has_more_after: false,
-            },
+        let subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("message-1", 1)], true, false),
+            TIMELINE_WINDOW_LIMIT,
             updates,
-            stopping: lifecycle.subscribe_shutdown(),
-        };
+            lifecycle.subscribe_shutdown(),
+        );
 
         let snapshot = subscription.take_snapshot();
 
         assert_eq!(snapshot.messages.len(), 1);
         assert!(snapshot.has_more_before);
-        assert!(subscription.snapshot.messages.is_empty());
-        assert!(!subscription.snapshot.has_more_before);
-        assert!(!subscription.snapshot.has_more_after);
+        // The window is retained (cloned, not drained) so pagination can extend
+        // it; a second read returns the same window.
+        let again = subscription.take_snapshot();
+        assert_eq!(timeline_ids(&again), vec!["message-1".to_owned()]);
+        assert!(again.has_more_before);
+    }
+
+    #[test]
+    fn merge_timeline_window_prepends_older_and_keeps_head_flag() {
+        let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
+        let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
+
+        merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c", "d"]);
+        // The store reported no more history before; the head side is untouched.
+        assert!(!window.has_more_before);
+        assert!(!window.has_more_after);
+    }
+
+    #[test]
+    fn merge_timeline_window_older_caps_by_dropping_newest() {
+        let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
+        let older = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+
+        merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 3);
+
+        // Cap forces dropping the newest row, opening a gap to the head.
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
+        assert!(window.has_more_before);
+        assert!(window.has_more_after);
+    }
+
+    #[test]
+    fn merge_timeline_window_newer_caps_by_dropping_oldest() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+        let newer = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
+
+        merge_timeline_window(&mut window, newer, TimelineWindowEdge::Newer, 3);
+
+        assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
+        assert!(window.has_more_before);
+        // The store reported the head was reached.
+        assert!(!window.has_more_after);
+    }
+
+    #[test]
+    fn merge_timeline_window_dedupes_overlap() {
+        let mut window = timeline_test_page(&[("b", 20), ("c", 30)], true, false);
+        let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
+
+        merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
+    }
+
+    fn projection_for(messages: Vec<TimelineMessageRecord>) -> AppProjectionUpdate {
+        AppProjectionUpdate {
+            group_id_hex: "group-1".to_owned(),
+            timeline_messages: messages,
+            timeline_changes: Vec::new(),
+            chat_list_row: None,
+            chat_list_trigger: Default::default(),
+        }
+    }
+
+    #[test]
+    fn apply_projection_appends_new_message_when_anchored() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
+        let update = projection_for(vec![timeline_test_record("c", 30)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
+        assert!(!window.has_more_after);
+    }
+
+    #[test]
+    fn apply_projection_suppresses_new_head_message_when_detached() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+        let update = projection_for(vec![timeline_test_record("c", 30)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        // Detached window stays put; the new head message is dropped.
+        assert_eq!(timeline_ids(&window), vec!["a", "b"]);
+        assert!(window.has_more_after);
+    }
+
+    #[test]
+    fn apply_projection_applies_in_window_edit_when_detached() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+        let mut edited = timeline_test_record("b", 20);
+        edited.plaintext = "edited".to_owned();
+        let update = projection_for(vec![edited]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b"]);
+        assert_eq!(window.messages[1].plaintext, "edited");
+    }
+
+    #[test]
+    fn apply_projection_suppresses_same_second_head_when_detached() {
+        // Newest is ("b", 20); a brand-new message shares the second but sorts
+        // after it by id. Timestamp-only comparison would admit it; canonical
+        // `(timeline_at, message_id_hex)` comparison correctly suppresses it.
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+        let update = projection_for(vec![timeline_test_record("c", 20)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b"]);
+        assert!(window.has_more_after);
+    }
+
+    #[test]
+    fn apply_projection_applies_same_second_in_range_message_when_detached() {
+        // Newest is ("c", 20); a same-second message that sorts *before* it is
+        // genuinely inside the window and must be applied.
+        let mut window = timeline_test_page(&[("a", 10), ("c", 20)], true, true);
+        let update = projection_for(vec![timeline_test_record("b", 20)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn apply_projection_suppresses_new_message_when_detached_window_empty() {
+        // An emptied detached window (every row removed) has nothing in range, so
+        // a head message must be suppressed rather than absorbed.
+        let mut window = timeline_test_page(&[], true, true);
+        let update = projection_for(vec![timeline_test_record("a", 10)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert!(window.messages.is_empty());
+        assert!(window.has_more_after);
+    }
+
+    #[test]
+    fn apply_projection_removes_message() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
+        let update = AppProjectionUpdate {
+            group_id_hex: "group-1".to_owned(),
+            timeline_messages: Vec::new(),
+            timeline_changes: vec![TimelineMessageChange::Remove {
+                message_id_hex: "a".to_owned(),
+                reason: crate::TimelineRemoveReason::Invalidated,
+            }],
+            chat_list_row: None,
+            chat_list_trigger: Default::default(),
+        };
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["b"]);
+    }
+
+    #[test]
+    fn apply_projection_caps_anchored_window_by_dropping_oldest() {
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20), ("c", 30)], false, false);
+        let update = projection_for(vec![timeline_test_record("d", 40)]);
+
+        apply_projection_to_window(&mut window, &update, 3);
+
+        assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
+        assert!(window.has_more_before);
+        assert!(!window.has_more_after);
+    }
+
+    #[tokio::test]
+    async fn paginate_backwards_extends_window_and_clears_more_before() {
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            false,
+            true,
+        )]);
+        let handle = timeline_window_handle(
+            &store,
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            300,
+        );
+
+        let page = handle.paginate_backwards(2).await.expect("paginate");
+
+        assert_eq!(timeline_ids(&page), vec!["a", "b", "c", "d"]);
+        assert!(!page.has_more_before);
+        assert!(!page.has_more_after);
+        // The cursor was anchored at the previous oldest message.
+        let queries = store.recorded_queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].pagination.before, Some(30));
+        assert_eq!(
+            queries[0].pagination.before_message_id.as_deref(),
+            Some("c")
+        );
+        assert_eq!(queries[0].pagination.limit, Some(2));
+    }
+
+    #[tokio::test]
+    async fn paginate_backwards_is_noop_without_more_before() {
+        // Empty response queue: a store call would panic, proving none is made.
+        let store = ScriptedTimelineStore::new(Vec::new());
+        let handle =
+            timeline_window_handle(&store, timeline_test_page(&[("a", 10)], false, false), 300);
+
+        let page = handle.paginate_backwards(10).await.expect("paginate");
+
+        assert_eq!(timeline_ids(&page), vec!["a"]);
+        assert!(store.recorded_queries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paginate_forwards_reaching_head_reanchors() {
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("c", 30), ("d", 40)],
+            true,
+            false,
+        )]);
+        let handle = timeline_window_handle(
+            &store,
+            timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+            300,
+        );
+
+        let page = handle.paginate_forwards(2).await.expect("paginate");
+
+        assert_eq!(timeline_ids(&page), vec!["a", "b", "c", "d"]);
+        assert!(page.has_more_before);
+        // Head reached: the window is now anchored again.
+        assert!(!page.has_more_after);
+        let queries = store.recorded_queries();
+        assert_eq!(queries[0].pagination.after, Some(20));
+        assert_eq!(queries[0].pagination.after_message_id.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn paginate_backwards_caps_window_and_opens_head_gap() {
+        // A small window cap forces trimming the newest rows when older history
+        // is loaded, opening a gap to the head (has_more_after).
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            true,
+            true,
+        )]);
+        let handle = timeline_window_handle(
+            &store,
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            3,
+        );
+
+        let page = handle.paginate_backwards(2).await.expect("paginate");
+
+        assert_eq!(timeline_ids(&page), vec!["a", "b", "c"]);
+        assert!(page.has_more_before);
+        assert!(page.has_more_after);
+    }
+
+    #[tokio::test]
+    async fn paginate_does_not_block_on_a_parked_receiver() {
+        // Regression for the FFI-equivalent contention: a subscription parked in
+        // recv() (no live updates) must not block pagination through the handle.
+        let lifecycle = RuntimeLifecycle::new();
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            false,
+            true,
+        )]);
+        let (tx, updates) = mpsc::channel(1);
+        let mut subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            300,
+            updates,
+            lifecycle.subscribe_shutdown(),
+        );
+        let handle = subscription.window_handle();
+
+        // recv() parks (no signal queued); pagination through the cloned handle
+        // proceeds without waiting for a live update.
+        let recv = tokio::spawn(async move { subscription.recv().await });
+        let page = tokio::time::timeout(Duration::from_secs(2), handle.paginate_backwards(2))
+            .await
+            .expect("pagination must not block on the parked receiver")
+            .expect("paginate");
+        assert_eq!(timeline_ids(&page), vec!["a", "b", "c", "d"]);
+
+        // Unblock and join the parked receiver.
+        drop(tx);
+        let _ = recv.await;
+    }
+
+    #[tokio::test]
+    async fn recv_projection_applies_to_window() {
+        let lifecycle = RuntimeLifecycle::new();
+        let store = ScriptedTimelineStore::default();
+        let (tx, updates) = mpsc::channel(1);
+        let mut subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("a", 10)], false, false),
+            300,
+            updates,
+            lifecycle.subscribe_shutdown(),
+        );
+        tx.send(TimelineSubscriptionSignal::Projection(Box::new(
+            RuntimeProjectionUpdate {
+                account_id_hex: "account".to_owned(),
+                account_label: "label".to_owned(),
+                update: projection_for(vec![timeline_test_record("b", 20)]),
+            },
+        )))
+        .await
+        .expect("send projection");
+
+        let update = subscription.recv().await.expect("recv");
+
+        assert!(matches!(
+            update,
+            RuntimeTimelineMessageUpdate::Projection(_)
+        ));
+        assert_eq!(timeline_ids(&subscription.take_snapshot()), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn recv_refresh_rematerializes_anchored_head() {
+        let lifecycle = RuntimeLifecycle::new();
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            true,
+            false,
+        )]);
+        let (tx, updates) = mpsc::channel(1);
+        let mut subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("a", 10)], false, false),
+            300,
+            updates,
+            lifecycle.subscribe_shutdown(),
+        );
+        tx.send(TimelineSubscriptionSignal::Refresh)
+            .await
+            .expect("send refresh");
+
+        let update = subscription.recv().await.expect("recv");
+
+        match update {
+            RuntimeTimelineMessageUpdate::Page { page } => {
+                assert_eq!(timeline_ids(&page), vec!["a", "b"]);
+            }
+            other => panic!("expected refreshed page, got {other:?}"),
+        }
+        // Anchored refresh queries the head (no cursor).
+        let queries = store.recorded_queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].pagination.before, None);
+        assert_eq!(queries[0].pagination.after, None);
+    }
+
+    #[tokio::test]
+    async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
+        let lifecycle = RuntimeLifecycle::new();
+        // The store itself excludes newer same-second rows via the inclusive
+        // bound (covered by storage-sqlite's
+        // `before_inclusive_cursor_keeps_window_rows_over_newer_same_second_rows`);
+        // here we assert the runtime issues that inclusive cursor and installs
+        // the returned page verbatim (no post-fetch trimming).
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            true,
+            true,
+        )]);
+        let (tx, updates) = mpsc::channel(1);
+        let mut subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+            300,
+            updates,
+            lifecycle.subscribe_shutdown(),
+        );
+        tx.send(TimelineSubscriptionSignal::Refresh)
+            .await
+            .expect("send refresh");
+
+        let update = subscription.recv().await.expect("recv");
+
+        match update {
+            RuntimeTimelineMessageUpdate::Page { page } => {
+                assert_eq!(timeline_ids(&page), vec!["a", "b"]);
+            }
+            other => panic!("expected refreshed page, got {other:?}"),
+        }
+        let queries = store.recorded_queries();
+        assert_eq!(queries[0].pagination.before, Some(20));
+        assert_eq!(
+            queries[0].pagination.before_message_id.as_deref(),
+            Some("b")
+        );
+        assert!(queries[0].pagination.before_inclusive);
+    }
+
+    #[tokio::test]
+    async fn refresh_install_is_dropped_when_window_paginated_during_query() {
+        // Deterministic model of the P1(b) race: a refresh captures the window
+        // generation before its store read; a pagination completes during that
+        // read (bumping the generation); installing the now-stale refresh must
+        // be a no-op so the paginated expansion is preserved.
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            false,
+            true,
+        )]);
+        let handle = timeline_window_handle(
+            &store,
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            300,
+        );
+
+        // recv() captures the refresh request (a generation snapshot) before
+        // awaiting the store.
+        let (_query_fn, _query, generation) = handle.refresh_request();
+
+        // A concurrent pagination lands while the refresh query is "in flight".
+        let paginated = handle.paginate_backwards(2).await.expect("paginate");
+        assert_eq!(timeline_ids(&paginated), vec!["a", "b", "c", "d"]);
+
+        // Installing the stale refresh is rejected; the paginated window stands.
+        let installed = handle.install_refresh(
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            generation,
+        );
+        assert_eq!(timeline_ids(&installed), vec!["a", "b", "c", "d"]);
+        assert_eq!(timeline_ids(&handle.snapshot()), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn refresh_query_for_detached_window_anchors_at_newest() {
+        let store = ScriptedTimelineStore::default();
+        let window = timeline_window(
+            &store,
+            timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+            300,
+        );
+
+        let query = window.refresh_query();
+
+        // Detached: an inclusive upper-bound cursor at the exact newest message,
+        // so the descending LIMIT can't be starved by newer same-second rows.
+        assert_eq!(query.pagination.before, Some(20));
+        assert_eq!(query.pagination.before_message_id.as_deref(), Some("b"));
+        assert!(query.pagination.before_inclusive);
+        assert_eq!(query.pagination.limit, Some(2));
+    }
+
+    #[test]
+    fn refresh_query_for_anchored_window_targets_head() {
+        let store = ScriptedTimelineStore::default();
+        let window = timeline_window(
+            &store,
+            timeline_test_page(&[("a", 10), ("b", 20)], true, false),
+            300,
+        );
+
+        let query = window.refresh_query();
+
+        // Anchored: cursorless head refresh sized to the current window.
+        assert_eq!(query.pagination.before, None);
+        assert_eq!(query.pagination.after, None);
+        assert_eq!(query.pagination.limit, Some(2));
     }
 
     #[tokio::test]

@@ -19,15 +19,15 @@ use std::sync::Mutex as StdMutex;
 use marmot_app::{
     RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
 };
 use tokio::sync::Mutex;
 
+use crate::MarmotKitError;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi, TimelineMessageRecordFfi,
-    TimelinePageFfi, TimelineProjectionUpdateFfi, TimelineSubscriptionUpdateFfi,
+    TimelinePageFfi, TimelineSubscriptionUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -133,26 +133,35 @@ impl MessagesSubscription {
     }
 }
 
+/// Host-facing handle to one conversation's materialized timeline window.
+///
+/// The runtime owns the authoritative, bounded window; this object exposes it.
+/// The live-update receiver and the paginatable window are held behind separate
+/// locks (`receiver` vs the runtime's internal window mutex, reached through the
+/// cloned `window` handle), so a host can drive `next()`/`next_update()` on one
+/// task while `paginate_backwards`/`paginate_forwards` runs on another without
+/// either blocking the other.
 #[derive(uniffi::Object)]
 pub struct TimelineMessagesSubscription {
     snapshot: StdMutex<Option<TimelinePageFfi>>,
-    current_page: StdMutex<TimelinePageFfi>,
-    inner: Mutex<RuntimeTimelineMessagesSubscription>,
+    window: TimelineWindowHandle,
+    receiver: Mutex<RuntimeTimelineMessagesSubscription>,
 }
 
 impl TimelineMessagesSubscription {
-    pub(crate) fn new(mut inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
+    pub(crate) fn new(inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
         let _span = tracing::debug_span!(
-            target: "marmot_uniffi::conversion",
+            target: "marmot_uniffi::subscriptions",
             "timeline_subscription_snapshot_conversion",
             method = "TimelineMessagesSubscription::new"
         )
         .entered();
+        let window = inner.window_handle();
         let snapshot: TimelinePageFfi = inner.take_snapshot().into();
         Arc::new(Self {
-            snapshot: StdMutex::new(Some(snapshot.clone())),
-            current_page: StdMutex::new(snapshot),
-            inner: Mutex::new(inner),
+            snapshot: StdMutex::new(Some(snapshot)),
+            window,
+            receiver: Mutex::new(inner),
         })
     }
 }
@@ -163,75 +172,41 @@ impl TimelineMessagesSubscription {
         take_snapshot(&self.snapshot)
     }
 
+    /// Await the next live update and return the resulting authoritative window.
+    /// Windowing (ordering, dedup, head-anchoring while scrolled back, and the
+    /// cap) is owned by the runtime, so this returns exactly the bounded window
+    /// pagination operates on — render it directly. Use
+    /// [`next_update`](Self::next_update) instead to receive the raw delta.
     pub async fn next(&self) -> Option<TimelinePageFfi> {
-        let mut inner = self.inner.lock().await;
-        let update = inner.recv().await?;
-        let mut current_page = self
-            .current_page
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match update {
-            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => {
-                *current_page = page.into();
-            }
-            marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => {
-                let update = RuntimeProjectionUpdateFfi::from(update);
-                apply_timeline_projection_update(&mut current_page, update.update);
-            }
-        }
-        Some(current_page.clone())
+        let mut receiver = self.receiver.lock().await;
+        receiver.recv().await?;
+        Some(self.window.snapshot().into())
     }
 
     pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi> {
-        let mut inner = self.inner.lock().await;
-        inner.recv().await.map(Into::into)
+        let mut receiver = self.receiver.lock().await;
+        receiver.recv().await.map(Into::into)
     }
-}
 
-fn apply_timeline_projection_update(
-    page: &mut TimelinePageFfi,
-    update: TimelineProjectionUpdateFfi,
-) {
-    if update.changes.is_empty() {
-        for message in update.messages {
-            upsert_timeline_message(&mut page.messages, message);
-        }
-    } else {
-        for change in update.changes {
-            match change {
-                TimelineMessageChangeFfi::Upsert { message, .. } => {
-                    upsert_timeline_message(&mut page.messages, message);
-                }
-                TimelineMessageChangeFfi::Remove { message_id_hex, .. } => {
-                    page.messages
-                        .retain(|message| message.message_id_hex != message_id_hex);
-                }
-            }
-        }
+    /// Extend the materialized window toward older history by up to `count`
+    /// messages and return the new window. The returned page is already sorted,
+    /// deduplicated, capped, and carries correct `has_more_before` /
+    /// `has_more_after` flags — render it directly; no client-side merging or
+    /// windowing is required. The store read runs off the caller thread and uses
+    /// a different lock than `next()`, so a host driving `next()` on a background
+    /// task can paginate without blocking (and this never blocks the UI thread,
+    /// unlike the synchronous `Marmot::timeline_messages`).
+    pub async fn paginate_backwards(&self, count: u32) -> Result<TimelinePageFfi, MarmotKitError> {
+        Ok(self.window.paginate_backwards(count as usize).await?.into())
     }
-    sort_timeline_messages(&mut page.messages);
-}
 
-fn upsert_timeline_message(
-    messages: &mut Vec<TimelineMessageRecordFfi>,
-    message: TimelineMessageRecordFfi,
-) {
-    if let Some(existing) = messages
-        .iter_mut()
-        .find(|existing| existing.message_id_hex == message.message_id_hex)
-    {
-        *existing = message;
-    } else {
-        messages.push(message);
+    /// Extend the materialized window toward the live head by up to `count`
+    /// messages and return the new window. Reaching the head re-anchors the
+    /// window (`has_more_after` becomes false). Same windowing/threading
+    /// guarantees as [`paginate_backwards`](Self::paginate_backwards).
+    pub async fn paginate_forwards(&self, count: u32) -> Result<TimelinePageFfi, MarmotKitError> {
+        Ok(self.window.paginate_forwards(count as usize).await?.into())
     }
-}
-
-fn sort_timeline_messages(messages: &mut [TimelineMessageRecordFfi]) {
-    messages.sort_by(|left, right| {
-        left.timeline_at
-            .cmp(&right.timeline_at)
-            .then_with(|| left.message_id_hex.cmp(&right.message_id_hex))
-    });
 }
 
 #[derive(uniffi::Object)]
@@ -336,11 +311,6 @@ fn take_snapshot<T>(snapshot: &StdMutex<Option<T>>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversions::{
-        ChatListUpdateTriggerFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-        TimelineUpdateTriggerFfi,
-    };
-    use crate::markdown::parse_markdown_document;
 
     #[test]
     fn take_snapshot_recovers_from_poisoned_lock() {
@@ -354,90 +324,10 @@ mod tests {
         assert_eq!(take_snapshot(&snapshot), None);
     }
 
-    #[test]
-    fn timeline_projection_update_upserts_into_retained_page() {
-        let mut page = TimelinePageFfi {
-            messages: vec![timeline_record("older", 10)],
-            has_more_before: true,
-            has_more_after: false,
-        };
-
-        apply_timeline_projection_update(
-            &mut page,
-            TimelineProjectionUpdateFfi {
-                group_id_hex: "group".to_owned(),
-                messages: Vec::new(),
-                changes: vec![TimelineMessageChangeFfi::Upsert {
-                    trigger: TimelineUpdateTriggerFfi::NewMessage,
-                    message: timeline_record("newer", 20),
-                }],
-                chat_list_row: None,
-                chat_list_trigger: ChatListUpdateTriggerFfi::NewLastMessage,
-            },
-        );
-
-        assert_eq!(
-            page.messages
-                .iter()
-                .map(|message| message.message_id_hex.as_str())
-                .collect::<Vec<_>>(),
-            vec!["older", "newer"]
-        );
-        assert!(page.has_more_before);
-    }
-
-    #[test]
-    fn timeline_projection_update_removes_from_retained_page() {
-        let mut page = TimelinePageFfi {
-            messages: vec![timeline_record("keep", 10), timeline_record("remove", 20)],
-            has_more_before: false,
-            has_more_after: false,
-        };
-
-        apply_timeline_projection_update(
-            &mut page,
-            TimelineProjectionUpdateFfi {
-                group_id_hex: "group".to_owned(),
-                messages: Vec::new(),
-                changes: vec![TimelineMessageChangeFfi::Remove {
-                    message_id_hex: "remove".to_owned(),
-                    reason: TimelineRemoveReasonFfi::Invalidated,
-                }],
-                chat_list_row: None,
-                chat_list_trigger: ChatListUpdateTriggerFfi::LastMessageDeleted,
-            },
-        );
-
-        assert_eq!(page.messages.len(), 1);
-        assert_eq!(page.messages[0].message_id_hex, "keep");
-    }
-
-    fn timeline_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecordFfi {
-        TimelineMessageRecordFfi {
-            message_id_hex: message_id_hex.to_owned(),
-            source_message_id_hex: None,
-            direction: "sent".to_owned(),
-            group_id_hex: "group".to_owned(),
-            sender: "sender".to_owned(),
-            plaintext: message_id_hex.to_owned(),
-            content_tokens: parse_markdown_document(message_id_hex),
-            kind: 9,
-            tags: Vec::new(),
-            timeline_at,
-            received_at: timeline_at,
-            reply_to_message_id_hex: None,
-            reply_preview: None,
-            media_json: None,
-            agent_text_stream_json: None,
-            reactions: TimelineReactionSummaryFfi {
-                by_emoji: Vec::new(),
-                user_reactions: Vec::new(),
-            },
-            deleted: false,
-            deleted_by_message_id_hex: None,
-            invalidation_status: None,
-        }
-    }
+    // The timeline window's projection/cap/anchoring contract now lives and is
+    // tested in `marmot-app` (`apply_projection_to_window`, `merge_timeline_window`,
+    // `paginate_*`); the FFI no longer re-materializes the window, so its former
+    // delta-application tests moved there.
 }
 
 #[uniffi::export(async_runtime = "tokio")]

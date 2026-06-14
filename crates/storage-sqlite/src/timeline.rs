@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
-const MAX_TIMELINE_LIMIT: usize = 200;
+/// Largest number of rows a single timeline cursor query returns. A
+/// materialized window kept above this cannot be re-fetched in one query, so
+/// window owners should not exceed it.
+pub const MAX_TIMELINE_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
@@ -40,6 +43,12 @@ pub struct StoredAppEvent {
 pub struct TimelinePagination {
     pub before: Option<u64>,
     pub before_message_id: Option<String>,
+    /// When true (only meaningful with a `before` cursor), the cursor is an
+    /// inclusive upper bound: rows equal to `(before, before_message_id)` are
+    /// returned, not just rows strictly older. Used to re-materialize a
+    /// scrolled-back window ending exactly at its newest row without the
+    /// descending `LIMIT` spending its budget on newer same-second rows.
+    pub before_inclusive: bool,
     pub after: Option<u64>,
     pub after_message_id: Option<String>,
     pub limit: Option<usize>,
@@ -220,6 +229,9 @@ struct ValidatedPagination {
     direction: CursorDirection,
     cursor_at: Option<u64>,
     cursor_message_id_hex: Option<String>,
+    /// Inclusive upper bound for a `Before` cursor (see
+    /// [`TimelinePagination::before_inclusive`]); ignored for other directions.
+    inclusive: bool,
     limit: usize,
 }
 
@@ -977,6 +989,7 @@ fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<Validat
         direction,
         cursor_at,
         cursor_message_id_hex,
+        inclusive: pagination.before_inclusive,
         limit,
     })
 }
@@ -1002,8 +1015,12 @@ fn timeline_query_sql(
     }
     match pagination.direction {
         CursorDirection::Before => {
-            clauses
-                .push("(timeline_at < ? OR (timeline_at = ? AND message_id_hex < ?))".to_owned());
+            // An inclusive cursor returns the row equal to the bound too, so the
+            // tie-break comparison flips from `<` to `<=`.
+            let id_comparison = if pagination.inclusive { "<=" } else { "<" };
+            clauses.push(format!(
+                "(timeline_at < ? OR (timeline_at = ? AND message_id_hex {id_comparison} ?))"
+            ));
             let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
             params.push(rusqlite::types::Value::Integer(cursor_at));
             params.push(rusqlite::types::Value::Integer(cursor_at));
@@ -1810,12 +1827,63 @@ mod tests {
                         before_message_id: Some("a".to_owned()),
                         after: Some(2),
                         after_message_id: Some("b".to_owned()),
-                        limit: None,
+                        ..TimelinePagination::default()
                     },
                     ..TimelineMessageQuery::default()
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn before_inclusive_cursor_keeps_window_rows_over_newer_same_second_rows() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        // Four rows; b/c/d all share second 20. A scrolled-back window ends at
+        // ("b", 20); c and d are unseen newer same-second rows.
+        store
+            .record_app_event(&chat("a", "alice", 10, "a"))
+            .unwrap();
+        store
+            .record_app_event(&chat("b", "alice", 20, "b"))
+            .unwrap();
+        store
+            .record_app_event(&chat("c", "alice", 20, "c"))
+            .unwrap();
+        store
+            .record_app_event(&chat("d", "alice", 20, "d"))
+            .unwrap();
+
+        let query = |inclusive: bool| TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            search: None,
+            pagination: TimelinePagination {
+                before: Some(20),
+                before_message_id: Some("b".to_owned()),
+                before_inclusive: inclusive,
+                limit: Some(2),
+                ..TimelinePagination::default()
+            },
+        };
+
+        // Inclusive: the tight descending LIMIT must NOT be spent on c/d; the
+        // window's own rows [a, b] come back. (Exclusive over-fetch + a later
+        // trim would have blanked the window here.)
+        let inclusive = store.message_timeline(query(true)).unwrap();
+        assert_eq!(ids(&inclusive), ["a", "b"]);
+        assert!(inclusive.has_more_after);
+        assert!(!inclusive.has_more_before);
+
+        // Exclusive (the normal paginate-backwards bound) returns rows strictly
+        // older than ("b", 20) — here just [a].
+        let exclusive = store.message_timeline(query(false)).unwrap();
+        assert_eq!(ids(&exclusive), ["a"]);
+    }
+
+    fn ids(page: &TimelinePage) -> Vec<&str> {
+        page.messages
+            .iter()
+            .map(|message| message.message_id_hex.as_str())
+            .collect()
     }
 
     #[test]

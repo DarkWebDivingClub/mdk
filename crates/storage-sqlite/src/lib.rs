@@ -34,9 +34,10 @@ pub use shared::{
     StoredRelayTelemetrySettings,
 };
 pub use timeline::{
-    StoredAppEvent, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary,
-    TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
+    MAX_TIMELINE_LIMIT, StoredAppEvent, TimelineMessageChange, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
+    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
+    TimelineUserReaction,
 };
 
 pub(crate) use codec::{
