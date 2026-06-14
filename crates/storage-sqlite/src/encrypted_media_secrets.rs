@@ -1,6 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64, unix_now_seconds_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 
@@ -73,20 +71,6 @@ WHERE group_id_hex = ?1
             .optional()
             .storage()
     }
-}
-
-fn u64_to_i64(value: u64) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        StorageError::Serialization(format!("value does not fit in sqlite INTEGER: {value}"))
-    })
-}
-
-fn unix_now_seconds_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
 }
 
 #[cfg(test)]

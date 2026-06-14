@@ -17,6 +17,21 @@ This crate owns the account/session orchestration layer around:
 It should not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, real
 relay auth, or transport-specific relay discovery.
 
+## Layout
+
+`src/lib.rs` is a thin facade: crate docs, `mod` declarations, and `pub use` re-exports. Every public item keeps its
+`marmot_account::Item` path. Source is split into focused modules:
+
+- `error.rs` — `AccountError`/`AccountHomeError` enums and the `AccountResult`/`AccountHomeResult` aliases.
+- `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
+- `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
+- `keyring.rs` — platform keyring store init (per-OS `#[cfg]` cascade) and keyring-error mapping.
+- `io.rs` — JSON read/write helpers, private-file writes, and account-label validation.
+- `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
+- `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
+- `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
+  `PublishFailure`, `PendingResolution`).
+
 ## Rules
 
 - Keep the crate transport-generic. Nostr-specific publication belongs behind an injected boundary or in a

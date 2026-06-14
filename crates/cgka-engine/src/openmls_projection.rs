@@ -1537,7 +1537,10 @@ fn replay_error(context: &str, error: impl std::fmt::Debug) -> OpenMlsProjection
     OpenMlsProjectionError::Replay(format!("{context}: {error:?}"))
 }
 
-fn process_commit_with_app_data_updates<S: StorageProvider>(
+/// Process a commit, validating and applying any `AppDataUpdate` proposals it
+/// carries before OpenMLS stages the commit. Shared by the replay/canonicalization
+/// path here and the live inbound path in [`crate::message_processor`].
+pub(crate) fn process_commit_with_app_data_updates<S: StorageProvider>(
     mls_group: &mut MlsGroup,
     provider: &EngineOpenMlsProvider<'_, S>,
     proto: ProtocolMessage,

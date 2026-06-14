@@ -623,7 +623,8 @@ fn unix_now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccountRelayListStatus, UserProfileMetadata, npub_for_account_id_lossy};
+    use crate::ids::npub_for_account_id_lossy;
+    use crate::{AccountRelayListStatus, UserProfileMetadata};
 
     fn test_cache() -> (tempfile::TempDir, DirectoryCache) {
         let dir = tempfile::tempdir().unwrap();

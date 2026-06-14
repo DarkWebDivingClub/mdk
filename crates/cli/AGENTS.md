@@ -90,6 +90,38 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - Do not fake image messages in the TUI by sending file paths, plaintext placeholders, or raw bytes through
   `message send`. Add an image command only when it uses the real encrypted-media/blob upload path.
 
+## Key files
+
+- `src/lib.rs`: crate entrypoint and wiring. Owns `run_from`/`run_cli_local`, the `execute`/`execute_inner` command
+  dispatch (which calls `commands::<namespace>::<handler>`), the daemon-socket routing/fallback glue, `CliOutput` /
+  `CommandOutput` / `CliRuntimeInfo` types, and the broadly-shared `pub(crate)` helpers (`resolve_account`,
+  `npub_for_account_id`, `ensure_local_signing`, `normalize_group_id_hex`, `relay_endpoints`, `validate_relay_url`,
+  `group_json`/`group_show_output`, `agent_text_stream_payload_value`, `unsupported_command`, home/secret-store
+  resolution, etc.).
+- `src/commands/`: per-namespace command handlers, each module mirroring a `*Command` enum in `args.rs`. The
+  `foo_command` / `foo_command_with_runtime` pairs plus the output/format helpers used only by that namespace live
+  here. Modules: `account` (create-identity/login/whoami/account(s) + account-setup output), `key_package` (keys),
+  `chats`, `media`, `groups` (group + groups), `messages` (incl. the `timeline` subgroup), `follows`, `profile`,
+  `relays`, `settings`, `users`, `notifications`, `stream` (QUIC agent text stream previews + quic-candidate/trust
+  helpers), `debug`, `sync`, and `relay_stats`. Handlers and helpers reached from the lib dispatch, from the `daemon`
+  module, or across namespaces are `pub(crate)`.
+- `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
+- `src/error.rs`: `DmError` and the `--json` error rendering.
+- `src/daemon/`: `dmd` runtime, socket-backed execution, subscription workers; calls
+  `commands::<namespace>::*_with_runtime` handlers and shared `commands::stream` / `commands::account` helpers.
+  `mod.rs` keeps the accept loop / request dispatch (`run_server`, `handle_connection`) and re-exports the
+  submodules: `protocol` (request/response wire types, framing, `DaemonClient`), `responses` (stream-response
+  construction + subscription matching), `subscriptions` (the streaming `handle_*_subscription` handlers),
+  `stream_workers` (background stream-watch and stream-compose workers), `runtime_host` (app-runtime reconciliation,
+  event bridge, hosted command dispatch), and `lifecycle` (start/stop/status, pid/log/socket files). `tests.rs`
+  holds the daemon unit tests.
+- `src/tui/`: Ratatui shell over the `dm --json` surface. `mod.rs` keeps the `run_tui` entry plus shared constants
+  and re-exports the submodules: `model` (row/view/state types, JSON parsers, pure helpers), `view` (`TuiApp` draw
+  methods + Ratatui line/style helpers), `slash` (slash-command parsing), `client` (`DmClient` subprocess wrapper,
+  subscription readers, and the `dm`/subscription-driving `TuiApp` methods), and `app` (`TuiApp` state plus the
+  event loop, key handling, and selection methods). `tests.rs` holds the TUI unit tests.
+- `tests/cli.rs`: end-to-end CLI/daemon integration tests asserting real `dm`/`dmd` behavior and JSON shapes.
+
 ## Verification
 
 For docs-only changes, run the help commands that cover the documented surface:

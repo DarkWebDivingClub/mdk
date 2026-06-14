@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::SqliteResultExt;
+use crate::{
+    SqliteResultExt, bool_i64, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
+};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 
@@ -437,47 +439,8 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 }
 
-fn bool_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
-}
-
-fn u64_to_i64(value: u64) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        cgka_traits::storage::StorageError::Backend(
-            "u64 value does not fit in sqlite INTEGER".to_owned(),
-        )
-    })
-}
-
-fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
-    value
-        .map(|value| {
-            i64::try_from(value).map_err(|_| {
-                cgka_traits::storage::StorageError::Backend(
-                    "u64 value does not fit in sqlite INTEGER".to_owned(),
-                )
-            })
-        })
-        .transpose()
-}
-
 fn optional_i64_to_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
-}
-
-fn usize_to_i64(value: usize) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        cgka_traits::storage::StorageError::Backend(
-            "usize value does not fit in sqlite INTEGER".to_owned(),
-        )
-    })
-}
-
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

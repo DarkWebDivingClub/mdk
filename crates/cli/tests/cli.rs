@@ -601,7 +601,11 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&daemon_start_help.stdout),
         String::from_utf8_lossy(&daemon_start_help.stderr)
     );
-    for flag in ["--discovery-relays", "--default-account-relays"] {
+    for flag in [
+        "--discovery-relays",
+        "--default-account-relays",
+        "--logs-dir",
+    ] {
         assert!(
             daemon_start_help.contains(flag),
             "dm daemon start --help missing {flag}"
@@ -1826,6 +1830,26 @@ fn create_identity_publishes_key_package_for_direct_invites() {
         &["--account", alice_id, "groups", "create", "general", bob_id],
     );
     assert!(created_group["group_id"].as_str().is_some());
+
+    // Regression: `groups create` must report persisted membership, not the raw
+    // request input. The `members` field is now the same member-record shape as
+    // `groups members` (objects with `member_id`/`npub`/`local`), and reflects
+    // the creator plus the invited member rather than echoing the argv pubkey.
+    assert_eq!(
+        member_accounts(&created_group),
+        sorted_accounts([alice_id, bob_id]),
+        "create output members should come from persisted group state"
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    let members = run_json(
+        home.path(),
+        &["--account", alice_id, "groups", "members", group_id],
+    );
+    assert_eq!(
+        member_accounts(&created_group),
+        member_accounts(&members),
+        "create output members should match the groups members projection"
+    );
 }
 
 #[test]
@@ -2620,6 +2644,41 @@ fn keys_namespace_uses_account_resolution() {
     let published = run_json(home.path(), &["keys", "publish"]);
     assert_eq!(published["account_id"], account_id);
     assert!(published["key_package_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn keys_list_surfaces_fetch_errors_instead_of_reporting_no_key_packages() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    // The account has nip65 relays (so `keys list` takes the fetch branch) but
+    // never publishes a KeyPackage, so the upstream fetch returns
+    // `MissingKeyPackage`. The handler must propagate that error rather than
+    // swallowing it via `.ok()` and printing a false "no key packages" result.
+    let account_id = create_account(home.path());
+
+    let error = run_json_error(home.path(), &["--account", &account_id, "keys", "list"]);
+    assert_eq!(error["code"], "missing_key_package");
+    assert_eq!(error["account_id"], account_id);
+}
+
+#[test]
+fn keys_list_reports_published_key_package() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let account_id = create_account(home.path());
+    run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
+
+    // With a published KeyPackage on the reachable relay, `keys list` must
+    // surface it rather than returning an empty list.
+    let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
+    assert_eq!(listed["account_id"], account_id);
+    let keys = listed["keys"].as_array().expect("keys array");
+    assert_eq!(
+        keys.len(),
+        1,
+        "expected the published key package, got {keys:?}"
+    );
+    assert_eq!(keys[0]["account_id"], account_id);
 }
 
 #[test]

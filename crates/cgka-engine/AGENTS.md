@@ -15,17 +15,19 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
   - **Open...:** `src/epoch_manager.rs` + `cgka_traits::engine_state`
 
 - **You want to...:** Trace an inbound message
-  - **Open...:** `src/message_processor.rs::do_ingest` (dispatched from `CgkaEngine::ingest` in `engine.rs`)
+  - **Open...:** `src/message_processor/mod.rs::do_ingest` (dispatched from `CgkaEngine::ingest` in `engine.rs`), then
+    `src/message_processor/ingest.rs::ingest_group_message` for the peel → classify → apply body
 
 - **You want to...:** Trace an outbound intent
-  - **Open...:** `src/message_processor.rs::do_send` (then the matching `do_*` in `group_lifecycle.rs` / `upgrade.rs`)
+  - **Open...:** `src/message_processor/mod.rs::do_send`, then the matching `do_send_*` in
+    `src/message_processor/send.rs` (or the `do_*` in `group_lifecycle.rs` / `upgrade.rs`)
 
 - **You want to...:** Add a feature capability
   - **Open...:** `src/feature_registry.rs` + tests in `tests/capabilities.rs`
 
 - **You want to...:** Understand fork handling
   - **Open...:** `src/fork_recovery.rs` + `src/epoch_manager.rs::we_committed_from` + the `WrongEpoch` branch in
-    `message_processor.rs`
+    `src/message_processor/ingest.rs`
 
 - **You want to...:** Figure out auto-commit policy
   - **Open...:** `src/auto_committer.rs`
@@ -65,9 +67,13 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 - **Module:** `group_lifecycle.rs`
   - **Owns:** `do_create_group`, `do_join_welcome`
 
-- **Module:** `message_processor.rs`
-  - **Owns:** inbound peel → classify → apply (`do_ingest`); outbound `SendIntent` dispatch including `do_send_invite`
-    and `do_send_leave`; MIP-03 guards
+- **Module:** `message_processor/` (`mod.rs`, `ingest.rs`, `send.rs`, `store.rs`)
+  - **Owns:** inbound peel → classify → apply and outbound `SendIntent` dispatch including `do_send_invite` and
+    `do_send_leave`; MIP-03 guards. `mod.rs` keeps the entry points dispatched from `engine.rs` (`do_ingest`,
+    `do_send`, convergence/queue drains, `replay_buffered_messages`) plus shared helpers and re-exports; `ingest.rs`
+    holds the inbound path (`ingest_group_message`, peel/snapshot recovery, `convergence_ingest_outcome`); `send.rs`
+    holds the `do_send_*` outbound methods; `store.rs` holds durable persistence / dedup classification / stored-message
+    state transitions.
 
 - **Module:** `epoch_manager.rs`
   - **Owns:** only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind),
