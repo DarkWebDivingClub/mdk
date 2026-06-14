@@ -1310,8 +1310,19 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let account_id_hex = account.account_id_hex.clone();
         let group_id_hex = query.group_id_hex.clone();
+        let account_label = account.label.clone();
+        let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        // Lag recovery must NOT inherit the caller's initial-replay `limit`.
+        // That limit caps the *initial* snapshot to the latest N rows; reusing
+        // it here would reload only the latest N stored rows on lag, so a slow
+        // subscriber with e.g. `limit: Some(1)` could still permanently lose
+        // any messages between the last delivered id and that latest row. The
+        // live path delivers every post-subscription message, so recovery must
+        // reload the full group history (keeping the group filter) and rely on
+        // `seen_message_ids` to dedupe what was already delivered. See #180.
+        let recovery_query = messages_recovery_query(&query);
         let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
         let mut seen_message_ids = MessageSubscriptionSeenIds::from_ids(
             snapshot
@@ -1324,11 +1335,45 @@ impl MarmotAppRuntime {
             loop {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                    event = events.recv() => match event {
-                        Ok(event) => event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
+                    event = events.recv() => event,
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    // On lag the receiver permanently lost any messages that
+                    // overflowed the broadcast ring buffer. Re-read the message
+                    // snapshot and re-emit anything we have not delivered yet,
+                    // matching `subscribe_timeline_messages` / `subscribe_chat_list`,
+                    // so a slow consumer cannot silently drop messages.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let account_id_for_lookup = account_id_hex.clone();
+                        let query_for_lookup = recovery_query.clone();
+                        let updates = match blocking_app_task(move || {
+                            messages_recovery_updates(
+                                &app_for_lookup,
+                                &account_id_for_lookup,
+                                &account_label_for_lookup,
+                                query_for_lookup,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(updates) => updates,
+                            Err(_) => continue,
+                        };
+                        for update in updates {
+                            let message_id = update.message().message_id_hex.clone();
+                            if !message_id.is_empty() && !seen_message_ids.insert(message_id) {
+                                continue;
+                            }
+                            if updates_tx.send(update).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 };
                 let Some(update) = runtime_message_update_from_event(event) else {
                     continue;
@@ -5747,6 +5792,95 @@ pub(crate) fn broker_trust_for_addr(
         .unwrap_or(BrokerServerTrust::Platform)
 }
 
+/// Build the lag-recovery query for `subscribe_messages` from the caller's
+/// initial-replay `query`. Recovery keeps the group filter but drops `limit`:
+/// the caller's `limit` is an *initial replay* cap on the latest N rows, while
+/// recovery must reload the full group history so the existing
+/// `seen_message_ids` set can re-emit every message missed during broadcast
+/// lag — not just the latest N. Reusing the limit here would reintroduce #180
+/// for any limited subscriber. See `subscribe_messages`.
+fn messages_recovery_query(query: &AppMessageQuery) -> AppMessageQuery {
+    AppMessageQuery {
+        group_id_hex: query.group_id_hex.clone(),
+        limit: None,
+    }
+}
+
+/// Re-read the message projection on broadcast lag and rebuild the runtime
+/// message updates a subscriber would have received. The caller filters these
+/// through its `seen_message_ids` set so only genuinely-missed messages are
+/// re-emitted. Kind-1200 agent-stream starts are reclassified as
+/// `AgentStreamStarted`, matching the live forwarding path.
+fn messages_recovery_updates(
+    app: &MarmotApp,
+    account_id_hex: &str,
+    account_label: &str,
+    query: AppMessageQuery,
+) -> Result<Vec<RuntimeMessageUpdate>, AppError> {
+    let records = app.messages_with_query(account_label, query)?;
+    let senders = records
+        .iter()
+        .map(|record| record.sender.clone())
+        .collect::<Vec<_>>();
+    let display_names = app
+        .display_names_for_account_ids(&senders)
+        .unwrap_or_default();
+    let updates = records
+        .into_iter()
+        .filter_map(|record| {
+            received_message_update_from_record(
+                account_id_hex,
+                account_label,
+                record,
+                &display_names,
+            )
+        })
+        .collect();
+    Ok(updates)
+}
+
+/// Rebuild a `RuntimeMessageUpdate` from a stored projection row. Returns
+/// `None` when the row carries an undecodable group id (it cannot be routed).
+fn received_message_update_from_record(
+    account_id_hex: &str,
+    account_label: &str,
+    record: AppMessageRecord,
+    display_names: &HashMap<String, String>,
+) -> Option<RuntimeMessageUpdate> {
+    let group_id = GroupId::new(hex::decode(&record.group_id_hex).ok()?);
+    let sender_display_name = display_names.get(&record.sender).cloned();
+    let message = ReceivedMessage {
+        message_id_hex: record.message_id_hex,
+        // The projection does not retain the transport (outer-event) id; the
+        // canonical app-message id above is what subscribers dedupe on.
+        source_message_id_hex: String::new(),
+        sender: record.sender,
+        sender_display_name,
+        group_id,
+        source_epoch: record.source_epoch.unwrap_or(0),
+        plaintext: record.plaintext,
+        kind: record.kind,
+        tags: record.tags,
+        recorded_at: record.recorded_at,
+    };
+    let received = RuntimeMessageReceived {
+        account_id_hex: account_id_hex.to_owned(),
+        account_label: account_label.to_owned(),
+        message,
+    };
+    if received.message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+        Some(RuntimeMessageUpdate::AgentStreamStarted(
+            RuntimeAgentStreamMessage {
+                account_id_hex: received.account_id_hex,
+                account_label: received.account_label,
+                message: received.message,
+            },
+        ))
+    } else {
+        Some(RuntimeMessageUpdate::Message(received))
+    }
+}
+
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {
     match event {
         // Raw message updates keep kind-1200 stream starts distinct from
@@ -6373,6 +6507,131 @@ mod tests {
             last_read_timeline_at: None,
             updated_at: 0,
         }
+    }
+
+    fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMessageRecord {
+        AppMessageRecord {
+            message_id_hex: message_id_hex.to_owned(),
+            direction: "received".to_owned(),
+            group_id_hex: group_id_hex.to_owned(),
+            sender: "ab".repeat(32),
+            plaintext: "hello".to_owned(),
+            kind,
+            tags: Vec::new(),
+            source_epoch: Some(7),
+            recorded_at: 11,
+            received_at: 12,
+        }
+    }
+
+    #[test]
+    fn recovery_record_maps_chat_message_to_message_update() {
+        let group_id_hex = "cd".repeat(32);
+        let record = message_record(&"11".repeat(32), &group_id_hex, 9);
+        let mut display_names = HashMap::new();
+        display_names.insert("ab".repeat(32), "Alice".to_owned());
+
+        let update = received_message_update_from_record(
+            "ac".repeat(32).as_str(),
+            "alice",
+            record,
+            &display_names,
+        )
+        .expect("update");
+
+        match update {
+            RuntimeMessageUpdate::Message(received) => {
+                assert_eq!(received.account_id_hex, "ac".repeat(32));
+                assert_eq!(received.account_label, "alice");
+                assert_eq!(received.message.message_id_hex, "11".repeat(32));
+                assert_eq!(
+                    received.message.sender_display_name.as_deref(),
+                    Some("Alice")
+                );
+                assert_eq!(received.message.source_epoch, 7);
+                assert_eq!(
+                    hex::encode(received.message.group_id.as_slice()),
+                    group_id_hex
+                );
+            }
+            other => panic!("expected Message update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_record_reclassifies_agent_stream_start() {
+        let group_id_hex = "cd".repeat(32);
+        let record = message_record(
+            &"22".repeat(32),
+            &group_id_hex,
+            MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+        );
+
+        let update = received_message_update_from_record(
+            "ac".repeat(32).as_str(),
+            "alice",
+            record,
+            &HashMap::new(),
+        )
+        .expect("update");
+
+        match update {
+            RuntimeMessageUpdate::AgentStreamStarted(received) => {
+                assert_eq!(received.message.message_id_hex, "22".repeat(32));
+                assert_eq!(received.message.sender_display_name, None);
+            }
+            other => panic!("expected AgentStreamStarted update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_record_drops_undecodable_group_id() {
+        let record = message_record(&"33".repeat(32), "not-hex", 9);
+        let update = received_message_update_from_record(
+            "ac".repeat(32).as_str(),
+            "alice",
+            record,
+            &HashMap::new(),
+        );
+        assert!(update.is_none());
+    }
+
+    #[test]
+    fn messages_recovery_query_drops_initial_replay_limit() {
+        // Regression for darkmatter#180 follow-up: the caller's `limit` is an
+        // initial-replay cap (latest N rows). Reusing it on lag recovery would
+        // reload only the latest N stored rows, so a limited subscriber could
+        // still permanently lose messages between the last delivered id and
+        // that latest row after broadcast lag. Recovery must drop the limit and
+        // lean on `seen_message_ids` to dedupe.
+        let group_id_hex = "cd".repeat(32);
+        let query = AppMessageQuery {
+            group_id_hex: Some(group_id_hex.clone()),
+            limit: Some(1),
+        };
+        let recovery = messages_recovery_query(&query);
+        assert_eq!(
+            recovery.limit, None,
+            "lag recovery must not inherit the initial replay limit"
+        );
+        assert_eq!(
+            recovery.group_id_hex,
+            Some(group_id_hex),
+            "lag recovery must keep the caller's group filter"
+        );
+    }
+
+    #[test]
+    fn messages_recovery_query_preserves_absent_group_filter() {
+        // An all-groups subscription (group_id_hex == None) must recover across
+        // all groups, still without a limit.
+        let query = AppMessageQuery {
+            group_id_hex: None,
+            limit: Some(10),
+        };
+        let recovery = messages_recovery_query(&query);
+        assert_eq!(recovery.group_id_hex, None);
+        assert_eq!(recovery.limit, None);
     }
 
     #[test]
