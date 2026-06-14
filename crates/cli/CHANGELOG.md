@@ -76,6 +76,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
+  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
+  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
+  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 - `dm profile update` no longer wipes the rest of your published Nostr profile. It previously published a fresh kind-0
   metadata event built only from the flags you passed, so e.g. `dm profile update --picture URL` erased
   name/display_name/about/nip05/lud16, and `dm profile update` with no flags published an empty profile that wiped
@@ -94,6 +98,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Security
 
+- Redacted TUI `/login` `nsec` composer input when users type leading whitespace, repeated whitespace, or tabs before
+  submitting the import.
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
   peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
 - Encrypted-media uploads and downloads no longer act on loopback-HTTP blob endpoints (e.g. `http://127.0.0.1:PORT`)
@@ -166,13 +172,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   product flows require relay-backed setup.
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
   `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
-
-### Fixed
-
-- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
-  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
-  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
-  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 
 ## [0.1.0] - 2026-05-17
 
