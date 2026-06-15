@@ -454,6 +454,44 @@ fn chat_event_returns_new_message_change() {
 }
 
 #[test]
+fn recording_new_message_does_not_delete_existing_timeline_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("first", "alice", 1, "hello"))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER panic_message_timeline_delete
+             BEFORE DELETE ON message_timeline
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected full timeline delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let update = store
+        .record_app_event(&chat("second", "alice", 2, "again"))
+        .unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::NewMessage,
+            message,
+        }] if message.message_id_hex == "second"
+    ));
+    assert_eq!(
+        list(&store)
+            .iter()
+            .map(|message| message.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+}
+
+#[test]
 fn agent_operation_event_returns_typed_timeline_change() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

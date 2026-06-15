@@ -245,6 +245,9 @@ impl SqliteAccountStorage {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let affected_message_ids = affected_timeline_message_ids_tx(&tx, event)?;
+        let can_incrementally_project =
+            !app_event_exists_tx(&tx, &event.group_id_hex, &event.message_id_hex)?
+                && can_project_record_app_event_incrementally(event.kind);
         tx.execute(
             "INSERT INTO app_events (
                 group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -280,7 +283,15 @@ impl SqliteAccountStorage {
             ],
         )
         .storage()?;
-        rebuild_message_timeline_for_group_tx(&tx, &event.group_id_hex)?;
+        if can_incrementally_project {
+            upsert_message_timeline_projection_for_message_tx(
+                &tx,
+                &event.group_id_hex,
+                &event.message_id_hex,
+            )?;
+        } else {
+            rebuild_message_timeline_for_group_tx(&tx, &event.group_id_hex)?;
+        }
         let messages =
             timeline_records_by_ids_tx(&tx, &event.group_id_hex, affected_message_ids.clone())?;
         let changes =
@@ -543,58 +554,342 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     )
     .storage()?;
     for row in rows {
-        tx.execute(
-            "INSERT INTO message_timeline (
-                group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                plaintext, kind, tags_json, timeline_at, received_at,
-                reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                deleted, deleted_by_message_id_hex, invalidation_status
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-            params![
-                &row.group_id_hex,
-                &row.message_id_hex,
-                &row.source_message_id_hex,
-                optional_u64_to_i64(row.source_epoch)?,
-                &row.direction,
-                &row.sender,
-                &row.plaintext,
-                u64_to_i64(row.kind)?,
-                tags_json(&row.tags)?,
-                u64_to_i64(row.timeline_at)?,
-                u64_to_i64(row.received_at)?,
-                &row.reply_to_message_id_hex,
-                optional_value_json(&row.media)?,
-                optional_value_json(&row.agent_text_stream)?,
-                reaction_summary_json(&row.reactions)?,
-                if row.deleted { 1_i64 } else { 0_i64 },
-                &row.deleted_by_message_id_hex,
-                &row.invalidation_status,
-            ],
-        )
-        .storage()?;
+        upsert_message_timeline_row_tx(tx, &row)?;
     }
     for start in stream_starts {
-        tx.execute(
-            "INSERT INTO agent_stream_starts (
-                group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
-                tags_json, started_at, received_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                &start.group_id_hex,
-                &start.message_id_hex,
-                &start.source_message_id_hex,
-                &start.sender,
-                &start.stream_id_hex,
-                tags_json(&start.tags)?,
-                u64_to_i64(start.started_at)?,
-                u64_to_i64(start.received_at)?,
-            ],
-        )
-        .storage()?;
+        upsert_agent_stream_start_tx(tx, &start)?;
     }
     Ok(())
+}
+
+fn can_project_record_app_event_incrementally(kind: u64) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_CHAT
+            | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+            | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+    )
+}
+
+fn app_event_exists_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    let exists = tx
+        .query_row(
+            "SELECT 1
+             FROM app_events
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |_| Ok(()),
+        )
+        .optional()
+        .storage()?;
+    Ok(exists.is_some())
+}
+
+fn upsert_message_timeline_projection_for_message_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<()> {
+    tx.execute(
+        "DELETE FROM agent_stream_starts
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+        params![group_id_hex, message_id_hex],
+    )
+    .storage()?;
+
+    let Some((row, stream_start)) =
+        project_single_message_timeline_tx(tx, group_id_hex, message_id_hex)?
+    else {
+        tx.execute(
+            "DELETE FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+        )
+        .storage()?;
+        return Ok(());
+    };
+
+    upsert_message_timeline_row_tx(tx, &row)?;
+    if let Some(stream_start) = stream_start {
+        upsert_agent_stream_start_tx(tx, &stream_start)?;
+    }
+    Ok(())
+}
+
+fn project_single_message_timeline_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
+    let Some(event) = tx
+        .query_row(
+            "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
+                    plaintext, kind, tags_json, recorded_at, received_at,
+                    invalidated, invalidation_reason
+             FROM app_events
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            raw_event_from_row,
+        )
+        .optional()
+        .storage()?
+    else {
+        return Ok(None);
+    };
+
+    let mut stream_start = None;
+    let mut row = match event.kind {
+        MARMOT_APP_EVENT_KIND_CHAT => timeline_row_from_chat(&event),
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+        | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+        | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+        | MARMOT_APP_EVENT_KIND_EDIT => timeline_row_from_app_event(&event),
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
+            let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) else {
+                return Ok(None);
+            };
+            if !event.invalidated {
+                stream_start = Some(StreamStartRow {
+                    group_id_hex: event.group_id_hex.clone(),
+                    message_id_hex: event.message_id_hex.clone(),
+                    source_message_id_hex: event.source_message_id_hex.clone(),
+                    sender: event.sender.clone(),
+                    stream_id_hex: stream_id_hex.to_owned(),
+                    tags: event.tags.clone(),
+                    started_at: event.recorded_at,
+                    received_at: event.received_at,
+                });
+            }
+            timeline_row_from_stream_start(&event)
+        }
+        _ => return Ok(None),
+    };
+
+    if event.invalidated {
+        row.invalidation_status = Some(invalidation_status(&event));
+    }
+    apply_targeted_modifiers_tx(tx, &mut row)?;
+    Ok(Some((row, stream_start)))
+}
+
+fn apply_targeted_modifiers_tx(tx: &Transaction<'_>, row: &mut TimelineRow) -> StorageResult<()> {
+    let reactions = app_events_targeting_message_tx(
+        tx,
+        &row.group_id_hex,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        &row.message_id_hex,
+    )?;
+    let deleted_reaction_ids =
+        deleted_reaction_ids_for_target_tx(tx, &row.group_id_hex, &reactions)?;
+    for reaction in reactions {
+        if deleted_reaction_ids.contains(&reaction.message_id_hex) {
+            continue;
+        }
+        row.reactions.user_reactions.push(TimelineUserReaction {
+            reaction_message_id_hex: reaction.message_id_hex.clone(),
+            target_message_id_hex: row.message_id_hex.clone(),
+            sender: reaction.sender.clone(),
+            emoji: reaction.plaintext.clone(),
+            reacted_at: reaction.recorded_at,
+        });
+    }
+    row.reactions.user_reactions.sort_by(|a, b| {
+        a.reacted_at
+            .cmp(&b.reacted_at)
+            .then_with(|| a.reaction_message_id_hex.cmp(&b.reaction_message_id_hex))
+    });
+    let mut by_emoji = BTreeMap::<String, BTreeSet<String>>::new();
+    for reaction in &row.reactions.user_reactions {
+        by_emoji
+            .entry(reaction.emoji.clone())
+            .or_default()
+            .insert(reaction.sender.clone());
+    }
+    row.reactions.by_emoji = by_emoji
+        .into_iter()
+        .map(|(emoji, senders)| (emoji, senders.into_iter().collect()))
+        .collect();
+
+    let deletes = app_events_targeting_message_tx(
+        tx,
+        &row.group_id_hex,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        &row.message_id_hex,
+    )?;
+    for delete in deletes {
+        if row.sender != delete.sender {
+            continue;
+        }
+        row.deleted = true;
+        row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
+        row.plaintext.clear();
+        row.media = None;
+        row.agent_text_stream = None;
+        row.reactions = TimelineReactionSummary::default();
+    }
+    Ok(())
+}
+
+fn deleted_reaction_ids_for_target_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    reactions: &[RawAppEvent],
+) -> StorageResult<HashSet<String>> {
+    let mut deleted = HashSet::new();
+    for reaction in reactions {
+        let deletes = app_events_targeting_message_tx(
+            tx,
+            group_id_hex,
+            MARMOT_APP_EVENT_KIND_DELETE,
+            &reaction.message_id_hex,
+        )?;
+        if deletes
+            .iter()
+            .any(|delete| delete.sender == reaction.sender)
+        {
+            deleted.insert(reaction.message_id_hex.clone());
+        }
+    }
+    Ok(deleted)
+}
+
+fn app_events_targeting_message_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    kind: u64,
+    target_message_id_hex: &str,
+) -> StorageResult<Vec<RawAppEvent>> {
+    let target_pattern = json_string_like_pattern(target_message_id_hex)?;
+    let mut stmt = tx
+        .prepare(
+            "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
+                    plaintext, kind, tags_json, recorded_at, received_at,
+                    invalidated, invalidation_reason
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND kind = ?2
+               AND invalidated = 0
+               AND tags_json LIKE ?3 ESCAPE '\\'
+             ORDER BY recorded_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    let events = stmt
+        .query_map(
+            params![group_id_hex, u64_to_i64(kind)?, target_pattern],
+            raw_event_from_row,
+        )
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    Ok(events
+        .into_iter()
+        .filter(|event| {
+            tag_values(&event.tags, EVENT_REF_TAG).any(|target| target == target_message_id_hex)
+        })
+        .collect())
+}
+
+fn upsert_message_timeline_row_tx(tx: &Transaction<'_>, row: &TimelineRow) -> StorageResult<()> {
+    tx.execute(
+        "INSERT INTO message_timeline (
+            group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
+            plaintext, kind, tags_json, timeline_at, received_at,
+            reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
+            deleted, deleted_by_message_id_hex, invalidation_status
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+         ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
+            source_message_id_hex = excluded.source_message_id_hex,
+            source_epoch = excluded.source_epoch,
+            direction = excluded.direction,
+            sender = excluded.sender,
+            plaintext = excluded.plaintext,
+            kind = excluded.kind,
+            tags_json = excluded.tags_json,
+            timeline_at = excluded.timeline_at,
+            received_at = excluded.received_at,
+            reply_to_message_id_hex = excluded.reply_to_message_id_hex,
+            media_json = excluded.media_json,
+            agent_stream_json = excluded.agent_stream_json,
+            reactions_json = excluded.reactions_json,
+            deleted = excluded.deleted,
+            deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
+            invalidation_status = excluded.invalidation_status",
+        params![
+            &row.group_id_hex,
+            &row.message_id_hex,
+            &row.source_message_id_hex,
+            optional_u64_to_i64(row.source_epoch)?,
+            &row.direction,
+            &row.sender,
+            &row.plaintext,
+            u64_to_i64(row.kind)?,
+            tags_json(&row.tags)?,
+            u64_to_i64(row.timeline_at)?,
+            u64_to_i64(row.received_at)?,
+            &row.reply_to_message_id_hex,
+            optional_value_json(&row.media)?,
+            optional_value_json(&row.agent_text_stream)?,
+            reaction_summary_json(&row.reactions)?,
+            if row.deleted { 1_i64 } else { 0_i64 },
+            &row.deleted_by_message_id_hex,
+            &row.invalidation_status,
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn upsert_agent_stream_start_tx(tx: &Transaction<'_>, start: &StreamStartRow) -> StorageResult<()> {
+    tx.execute(
+        "INSERT INTO agent_stream_starts (
+            group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
+            tags_json, started_at, received_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
+            source_message_id_hex = excluded.source_message_id_hex,
+            sender = excluded.sender,
+            stream_id_hex = excluded.stream_id_hex,
+            tags_json = excluded.tags_json,
+            started_at = excluded.started_at,
+            received_at = excluded.received_at",
+        params![
+            &start.group_id_hex,
+            &start.message_id_hex,
+            &start.source_message_id_hex,
+            &start.sender,
+            &start.stream_id_hex,
+            tags_json(&start.tags)?,
+            u64_to_i64(start.started_at)?,
+            u64_to_i64(start.received_at)?,
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn json_string_like_pattern(value: &str) -> StorageResult<String> {
+    let quoted =
+        serde_json::to_string(value).map_err(|err| StorageError::Serialization(err.to_string()))?;
+    Ok(format!("%{}%", escape_like_literal(&quoted)))
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn app_events_for_rebuild_tx(

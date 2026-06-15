@@ -22,6 +22,8 @@ mod migration_0010_encrypted_media_epoch_secrets;
 mod migration_0011_chat_list_avatar_url;
 #[path = "migrations/0012_app_event_origin_commit.rs"]
 mod migration_0012_app_event_origin_commit;
+#[path = "migrations/0013_app_event_kind_order_index.rs"]
+mod migration_0013_app_event_kind_order_index;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -93,6 +95,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "0012_app_event_origin_commit",
         apply: migration_0012_app_event_origin_commit::apply,
+    },
+    Migration {
+        version: 13,
+        name: "0013_app_event_kind_order_index",
+        apply: migration_0013_app_event_kind_order_index::apply,
     },
 ];
 
