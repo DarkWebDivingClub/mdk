@@ -801,9 +801,22 @@ fn convergence_status_for_result(
     // Resolving: it is reported any time no eligible branch was
     // selected, including the legitimate fixed-point case "no candidate
     // commits in the input batch at all."
-    let unresolved_input = input_messages
-        .iter()
-        .any(|message| !resolved.contains(message.message_id.as_str()));
+    //
+    // A lone uncommitted Proposal is exempt: commits are the consensus log and
+    // a proposal only takes effect once a commit consumes it
+    // (convergence.md:7-8), so an un-dispositioned proposal does not leave
+    // canonical state ambiguous and MUST NOT pin the pass in `Resolving`
+    // (darkmatter#154). A proposal that *was* consumed by the selected branch
+    // already lands in `resolved` via `accepted_proposals`, so this exemption
+    // only affects proposals with no disposition — exactly the lone case that
+    // would otherwise wedge convergence (and, transitively, all outbound sends)
+    // until a consuming commit arrives, which never happens if the committing
+    // member is offline. When that consuming commit does arrive it is itself a
+    // Commit input that drives its own convergence pass.
+    let unresolved_input = input_messages.iter().any(|message| {
+        !matches!(message.kind, PeeledMessageKind::Proposal { .. })
+            && !resolved.contains(message.message_id.as_str())
+    });
 
     if unresolved_input {
         ConvergenceStatus::Resolving

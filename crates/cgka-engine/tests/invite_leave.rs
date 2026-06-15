@@ -1037,6 +1037,95 @@ async fn selfremove_full_flow_with_auto_commit() {
     );
 }
 
+/// darkmatter#154: a peer that ingests a SelfRemove proposal it is NOT selected
+/// to commit (the "observe" auto-committer decision) must not be blocked from
+/// sending application messages.
+///
+/// Carol (leaf index 2) is neither the leaver (bob, index 1) nor the lowest-index
+/// remaining non-target member (alice, index 0), so the auto-committer returns
+/// `Observe`: carol stores the proposal in OpenMLS but stages no commit and stays
+/// `Stable`. A lone uncommitted proposal does not make canonical state ambiguous
+/// (convergence.md:7-8), so carol must still be able to send.
+///
+/// Before the fix, the `ProposalMessage` ingest arm returned `Processed` without
+/// marking the stored record `Processed`. The record lingered as `Created`,
+/// `has_unresolved_convergence_inputs` reported the group as perpetually
+/// unsettled, and `should_queue_outbound_intent` queued every subsequent send —
+/// indefinitely, since the committing member (alice) may be offline.
+#[tokio::test]
+async fn observed_selfremove_proposal_does_not_block_outbound_app_messages() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mip03".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    // Bob (non-admin) leaves, producing a standalone SelfRemove proposal.
+    let proposal = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        _ => unreachable!(),
+    };
+
+    // Carol ingests bob's proposal. Carol is not the lowest-index non-target
+    // remaining member (alice is), so the auto-committer observes: carol stores
+    // the proposal but stages no commit and stays Stable.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    let outcome = carol.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed));
+
+    // Carol has not advanced epoch (she only observed the proposal).
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 1);
+
+    // Carol sends an application message. The lone uncommitted proposal must NOT
+    // gate this send: it should publish immediately, not get Queued.
+    let send_result = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"hello after observing a proposal"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(send_result, SendResult::ApplicationMessage { .. }),
+        "an observed-but-uncommitted proposal must not block outbound app messages; got {send_result:?}"
+    );
+}
+
 #[tokio::test]
 async fn leave_requires_stable_epoch_state() {
     let mut alice = build_client(b"alice");

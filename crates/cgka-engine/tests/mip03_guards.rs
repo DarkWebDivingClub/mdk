@@ -25,13 +25,16 @@ use cgka_traits::transport::{
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{PreSharedKeyProposal, Proposal};
-use openmls::prelude::{BasicCredential, CredentialWithKey, LeafNodeParameters};
+use openmls::prelude::{
+    BasicCredential, CredentialWithKey, LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn,
+    ProcessedMessageContent,
+};
 use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
-use tls_codec::Serialize as _;
+use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
@@ -307,10 +310,40 @@ fn commit_pending_proposals(
     crypto: &RustCrypto,
     committer: &MemberId,
     group_id: &GroupId,
+    proposal: &TransportMessage,
 ) -> TransportMessage {
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(crypto, storage.mls_storage());
     let (mut mls_group, signer) = load_group_and_signer(storage, crypto, committer, group_id);
+    // Re-process and store the by-reference proposal into the committer's live
+    // OpenMLS proposal store so `commit_to_pending_proposals` can pick it up.
+    //
+    // The engine no longer leaves an observed proposal in a non-committing
+    // member's live OpenMLS store (darkmatter#154): doing so tripped OpenMLS's
+    // `create_message` PendingProposal guard and blocked all outbound app
+    // payloads. The engine never commits received Update proposals by reference
+    // (only the SelfRemove auto-committer commits received proposals), so this
+    // test stages the by-reference commit explicitly here, exactly as a
+    // hypothetical malicious/legacy committer would have, instead of relying on
+    // an engine side-effect that no longer exists.
+    let proposal_in = MlsMessageIn::tls_deserialize_exact(proposal.payload.as_slice())
+        .expect("deserialize by-reference proposal");
+    let protocol = match proposal_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => openmls::framing::ProtocolMessage::from(p),
+        MlsMessageBodyIn::PublicMessage(p) => openmls::framing::ProtocolMessage::from(p),
+        other => panic!("expected a protocol message proposal, got {other:?}"),
+    };
+    let processed = mls_group
+        .process_message(&provider, protocol)
+        .expect("committer processes the by-reference proposal");
+    match processed.into_content() {
+        ProcessedMessageContent::ProposalMessage(queued) => {
+            mls_group
+                .store_pending_proposal(provider.storage(), *queued)
+                .expect("committer stores the by-reference proposal");
+        }
+        other => panic!("expected a proposal message, got {other:?}"),
+    }
     let (commit_out, _welcome_opt, _group_info) = mls_group
         .commit_to_pending_proposals(&provider, &signer)
         .expect("committer can build by-reference update commit");
@@ -453,13 +486,18 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
         IngestOutcome::Processed
     ));
     assert!(matches!(
-        carol.ingest(spoofed_proposal).await.unwrap(),
+        carol.ingest(spoofed_proposal.clone()).await.unwrap(),
         IngestOutcome::Processed
     ));
 
     let before_epoch = carol.epoch(&group_id).expect("carol has group");
-    let by_reference_commit =
-        commit_pending_proposals(&alice_storage, &crypto, &alice.self_id(), &group_id);
+    let by_reference_commit = commit_pending_proposals(
+        &alice_storage,
+        &crypto,
+        &alice.self_id(),
+        &group_id,
+        &spoofed_proposal,
+    );
     let commit_id = canonicalization_message_id(&by_reference_commit);
 
     let outcome = carol.ingest(by_reference_commit).await.unwrap();

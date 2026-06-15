@@ -817,27 +817,47 @@ impl<S: StorageProvider> Engine<S> {
                             .collect(),
                         _ => Vec::new(),
                     };
-                    // Capture attribution before `store_pending_proposal`
-                    // consumes `queued`. A SelfRemove is a leave attributed to
-                    // the leaver; a Remove is attributed to the proposer.
+                    // Capture attribution before a potential
+                    // `store_pending_proposal` consumes `queued`. A SelfRemove
+                    // is a leave attributed to the leaver; a Remove is
+                    // attributed to the proposer.
                     let auto_is_self_remove = matches!(queued.proposal(), Proposal::SelfRemove);
                     let auto_proposer = member_id_of_sender(queued.sender(), &mls_group);
                     // Capture the proposal kind string before `queued` is
                     // consumed below; the not-stable guard re-audits with it.
                     let auto_proposal_kind =
                         crate::audit_helpers::proposal_kind_str(queued.proposal()).to_string();
-                    mls_group
-                    .store_pending_proposal(
-                        <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                            &provider,
-                        ),
-                        *queued,
-                    )
-                    .map_err(|e| EngineError::Backend(format!("store_pending: {e:?}")))?;
                     if matches!(
                         decision_report.decision,
                         crate::auto_committer::AutoCommitDecision::Commit
                     ) {
+                        // Only the elected committer holds the proposal in its
+                        // *live* OpenMLS proposal store and commits it. An
+                        // observing client (the common case: a standalone
+                        // AppDataUpdate request-flow proposal, or a SelfRemove
+                        // this client is not selected to commit) MUST NOT retain
+                        // it in the live store: OpenMLS's `create_message`
+                        // refuses to send while the proposal store is non-empty
+                        // (`MlsGroupStateError::PendingProposal`), so a lingering
+                        // observed proposal would block all outbound application
+                        // payloads until the elected committer's commit arrives —
+                        // indefinitely if that member is offline (darkmatter#154).
+                        //
+                        // Dropping the live-store copy on observe loses nothing:
+                        // the proposal is already persisted as a durable
+                        // `Created` record above, and convergence re-stores it
+                        // from that record (`process_openmls_messages_inner`)
+                        // onto a snapshot group when the consuming commit
+                        // eventually flows through, so it remains available as
+                        // candidate-path input for a later consuming commit.
+                        mls_group
+                            .store_pending_proposal(
+                                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                                    &provider,
+                                ),
+                                *queued,
+                            )
+                            .map_err(|e| EngineError::Backend(format!("store_pending: {e:?}")))?;
                         // Only stage an auto-commit from a Stable epoch. The
                         // engine accepts ingest while Recovering (can_ingest is
                         // true for Recovering), so this arm is reachable in a

@@ -215,11 +215,26 @@ impl<S: StorageProvider> Engine<S> {
             let Ok(projection) = project_mls_message(&message.payload) else {
                 return Ok(true);
             };
+            // A lone uncommitted Proposal does NOT make canonical state
+            // ambiguous: commits are the consensus log; a proposal only takes
+            // effect once a commit consumes it (convergence.md:7-8). So an
+            // outstanding Proposal record MUST NOT gate outbound application
+            // payloads — otherwise a receiver that ingested, e.g., a standalone
+            // AppDataUpdate request-flow proposal or a SelfRemove it is not
+            // selected to commit could never send again until (or unless) the
+            // consuming commit flows through convergence, which never happens if
+            // the committing member is offline (darkmatter#154).
+            //
+            // The Proposal record stays in its `Created`/`Retryable` state and
+            // continues to contribute to the OpenMLS candidate-path graph, so a
+            // later consuming commit still resolves it through convergence; it
+            // simply does not count as *unresolved convergence work* for the
+            // outbound-send gate. Commits and application messages remain
+            // gating: those genuinely leave canonical state ambiguous until
+            // convergence settles.
             if matches!(
                 projection.kind,
-                OpenMlsContentKind::Commit
-                    | OpenMlsContentKind::Proposal
-                    | OpenMlsContentKind::Application
+                OpenMlsContentKind::Commit | OpenMlsContentKind::Application
             ) {
                 return Ok(true);
             }
