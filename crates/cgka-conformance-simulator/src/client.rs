@@ -639,6 +639,19 @@ impl HarnessClient {
         self.engine.members(&gid).expect("members")
     }
 
+    /// Current app-facing group name mirrored from signed group-profile state.
+    ///
+    /// This is a branch-sensitive observable: a `marmot.group.profile.v1`
+    /// (`UpdateGroupData`) commit changes only the group name/description, which
+    /// epoch and member-count observations cannot distinguish. Two clients stuck
+    /// on different competing group-data branches share the same epoch and member
+    /// count but observe different names, so convergence oracles compare this to
+    /// catch a permanent fork that epoch/member equality alone would miss.
+    pub fn group_name(&self) -> String {
+        let gid = self.default_group.clone().expect("group");
+        self.engine.group_record(&gid).expect("group record").name
+    }
+
     pub fn group_id(&self) -> GroupId {
         self.default_group.clone().expect("group")
     }

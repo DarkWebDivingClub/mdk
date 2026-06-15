@@ -271,6 +271,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
+                    group_name: "vector-smoke".into(),
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -286,6 +287,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "bob".into(),
                     epoch: 1,
                     member_count: 3,
+                    group_name: "vector-smoke".into(),
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -301,6 +303,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "carol".into(),
                     epoch: 1,
                     member_count: 3,
+                    group_name: "vector-smoke".into(),
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()

@@ -49,6 +49,7 @@
         "client": "alice",
         "epoch": 0,
         "member_count": 1,
+        "group_name": "publish-fail",
         "event_counts": {
           "message_received": 0,
           "member_added": 0,
