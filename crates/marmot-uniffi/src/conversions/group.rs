@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use marmot_app::{
     AppBlobEndpoint, AppGroupAdminPolicyComponent, AppGroupEncryptedMediaComponent,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, GroupInviteDeclineResult, account_id_hex_from_ref,
-    npub_for_account_id,
+    AppGroupHydrationQuarantineReason, AppGroupMemberRecord, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppQuarantinedGroup,
+    GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
@@ -325,6 +325,60 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             epoch: value.epoch,
             member_count: value.member_count as u32,
             required_app_components: value.required_app_components,
+        }
+    }
+}
+
+/// Coarse, privacy-safe reason a stored group failed session-open hydration and
+/// was quarantined (darkmatter#151 / #417). Carries no group/member ids,
+/// payloads, or key material — only a category the client can map to per-reason
+/// recovery guidance.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum AppGroupHydrationQuarantineReasonFfi {
+    /// OpenMLS returned an error while loading the stored group state.
+    OpenMlsLoadFailed,
+    /// Marmot metadata referenced a group whose OpenMLS state was missing.
+    OpenMlsGroupMissing,
+    /// Member credentials, account-identity proofs, or ratchet-tree export
+    /// validation failed for the loaded MLS group.
+    MemberValidationFailed,
+    /// The Marmot group record could not be loaded or refreshed.
+    GroupRecordLoadFailed,
+    /// Hydrate found a stranded pending commit, but recovery itself failed.
+    PendingCommitRecoveryFailed,
+}
+
+impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReasonFfi {
+    fn from(value: AppGroupHydrationQuarantineReason) -> Self {
+        match value {
+            AppGroupHydrationQuarantineReason::OpenMlsLoadFailed => Self::OpenMlsLoadFailed,
+            AppGroupHydrationQuarantineReason::OpenMlsGroupMissing => Self::OpenMlsGroupMissing,
+            AppGroupHydrationQuarantineReason::MemberValidationFailed => {
+                Self::MemberValidationFailed
+            }
+            AppGroupHydrationQuarantineReason::GroupRecordLoadFailed => Self::GroupRecordLoadFailed,
+            AppGroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
+                Self::PendingCommitRecoveryFailed
+            }
+        }
+    }
+}
+
+/// A stored group that failed session-open hydration and was skipped so the
+/// rest of the account could open (darkmatter#151 / #417). Surfaced so the app
+/// can present a per-group recovery flow (darkmatter#426) distinct from healthy
+/// and archived groups, and offer a non-destructive re-hydration retry.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AppQuarantinedGroupFfi {
+    pub group_id_hex: String,
+    pub reason: AppGroupHydrationQuarantineReasonFfi,
+}
+
+impl From<AppQuarantinedGroup> for AppQuarantinedGroupFfi {
+    fn from(value: AppQuarantinedGroup) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            reason: value.reason.into(),
         }
     }
 }

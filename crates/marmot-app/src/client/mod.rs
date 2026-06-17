@@ -33,10 +33,10 @@ use crate::{
     AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, SendSummary, remember_seen_event,
-    unix_now_seconds,
+    AppMessageQuery, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -243,6 +243,40 @@ impl AppClient {
                 .copied()
                 .collect(),
         })
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped so the
+    /// rest of the account could open (darkmatter#151 / #417). The application
+    /// reads this to surface a per-group recovery flow (darkmatter#426) — these
+    /// groups are not in the live roster and otherwise vanish with no
+    /// explanation. Each entry carries a coarse, privacy-safe recovery reason.
+    pub fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
+        self.runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, reason)| AppQuarantinedGroup {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                reason: reason.into(),
+            })
+            .collect()
+    }
+
+    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    ///
+    /// This is the non-destructive, user-initiated recovery path for a
+    /// transiently-bad group (e.g. a partial DB restore that has since
+    /// completed). Returns `Ok(true)` if the group recovered and is now a live
+    /// group, `Ok(false)` if it is still unhealthy and stays quarantined.
+    /// Errors with `UnknownGroup` if the id is not currently quarantined.
+    ///
+    /// On success the engine queues a `GroupHydrationRecovered` event, so the
+    /// caller should follow up with a sync/catch-up to surface the recovered
+    /// group in chat-list projections.
+    pub fn retry_hydrate_quarantined_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
     }
 
     pub fn safe_export_secret(

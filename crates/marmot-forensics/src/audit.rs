@@ -325,6 +325,12 @@ pub enum AuditEventKind {
         group_digest: DigestHex,
         reason: String,
     },
+    /// A previously hydration-quarantined group was successfully re-hydrated by
+    /// an application-initiated retry (darkmatter#426) and is live again.
+    /// `group_digest` is a SHA-256 digest of the group id with the same
+    /// domain-separation prefix as [`AuditEventKind::GroupHydrationQuarantined`],
+    /// so an analyzer can correlate a quarantine with its later recovery.
+    GroupHydrationRecovered { group_digest: DigestHex },
     /// Pre-commit snapshot created for fork recovery.
     SnapshotCreated {
         snapshot_name: String,
@@ -425,6 +431,7 @@ impl AuditEventKind {
                 "pending_commit_recovered_on_open"
             }
             AuditEventKind::GroupHydrationQuarantined { .. } => "group_hydration_quarantined",
+            AuditEventKind::GroupHydrationRecovered { .. } => "group_hydration_recovered",
             AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
             AuditEventKind::ForkResolution { .. } => "fork_resolution",
             AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",

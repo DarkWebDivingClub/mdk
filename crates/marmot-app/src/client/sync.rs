@@ -33,7 +33,102 @@ impl AppClient {
             .subscription_rebuild_since(self.state.last_transport_timestamp);
         self.runtime.activate_transport(rebuild_since).await?;
         self.sync_runtime_groups().await?;
-        self.sync_sdk_relay().await
+        let mut summary = self.sync_sdk_relay().await?;
+        // Surface engine events queued without an inbound delivery — most
+        // importantly `GroupHydrationQuarantined`, queued during session
+        // `open()` hydration (darkmatter#426). If no relay delivery arrived
+        // above, `sync_sdk_relay` never drained the engine, so these would stay
+        // buffered and invisible to runtime subscribers until some later
+        // unrelated send/ingest. Fold any pending events into this summary.
+        let drained = self.drain_pending_session_events().await?;
+        summary.merge(drained);
+        Ok(summary)
+    }
+
+    /// Drain engine events that were queued without an inbound transport
+    /// delivery and project them into a [`SyncSummary`] the same way
+    /// `ingest_delivery` does, minus the delivery-specific message decoding.
+    ///
+    /// This is the no-inbound counterpart to `sync_sdk_relay`: session `open()`
+    /// hydration queues `GroupHydrationQuarantined`, and a successful
+    /// `retry_hydrate_quarantined_group` queues `GroupHydrationRecovered`. Both
+    /// rely on a drain to reach app/runtime subscribers; without an explicit
+    /// path they only surface when unrelated relay traffic happens to trigger
+    /// one (darkmatter#426). There is no source delivery here, so events that
+    /// reference a not-yet-live (quarantined) group must not abort the drain —
+    /// projection lookups are best-effort.
+    pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
+        let effects = self.runtime.drain().await?;
+        fail_if_publish_failed(&effects)?;
+        let mut summary = SyncSummary::default();
+        if effects.events.is_empty() {
+            return Ok(summary);
+        }
+        let display_names = self.app.display_names_by_id()?;
+        // Synthetic source identity: drained events have no inbound transport
+        // message. A zeroed id / now-timestamp keeps audit + observation happy
+        // without inventing a real delivery.
+        let source_message_id_hex = String::new();
+        let source_recorded_at = unix_now_seconds();
+        for event in &effects.events {
+            let before = self.state.groups.len();
+            let previous_group =
+                event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
+            // Best-effort projection: a quarantined group is not live, so its
+            // routing/metadata components may be unavailable. Skip projection
+            // rather than propagate — the event must still reach subscribers.
+            let group_projection = event_group_id(event)
+                .and_then(|group_id| self.event_group_projection_best_effort(group_id));
+            observe_event(
+                &mut self.state,
+                &display_names,
+                &mut summary,
+                event,
+                group_projection.as_ref(),
+                &source_message_id_hex,
+                source_recorded_at,
+                self.app.allow_loopback_blob_endpoints(),
+            );
+            let updated_group =
+                event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
+            self.audit_observed_group_event(
+                event,
+                previous_group.as_ref(),
+                updated_group.as_ref(),
+                &source_message_id_hex,
+            );
+            if self.state.groups.len() != before {
+                self.refresh_group_routes()?;
+                self.sync_runtime_groups().await?;
+            }
+        }
+        self.app.save_state(&self.state)?;
+        Ok(summary)
+    }
+
+    /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
+    /// component lookup fails (e.g. the group is quarantined and not live).
+    /// Used by the no-inbound drain path where a missing projection must not
+    /// abort processing.
+    fn event_group_projection_best_effort(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Option<EventGroupProjection<'static>> {
+        let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
+        Some(EventGroupProjection {
+            nostr_routing,
+            group_metadata: None,
+            admin_policy: self
+                .runtime
+                .admin_pubkeys(group_id)
+                .map(AppGroupAdminPolicyComponent::new)
+                .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
+            message_retention: self.message_retention_for_group(group_id),
+            agent_text_stream: self.agent_text_stream_for_group(group_id),
+            avatar_url: self.avatar_url_for_group(group_id),
+            encrypted_media: self.encrypted_media_for_group(group_id),
+            image: self.image_for_group(group_id),
+        })
     }
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {

@@ -13,7 +13,8 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -226,6 +227,23 @@ impl AccountDeviceSession {
 
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
         Ok(self.engine.group_record(group_id)?)
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped
+    /// (darkmatter#151 / #417), paired with their coarse quarantine reason.
+    /// Backs the application's per-group recovery surface (darkmatter#426).
+    pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
+        self.engine.quarantined_groups()
+    }
+
+    /// Re-attempt hydration of a single quarantined group. Returns `Ok(true)`
+    /// if the group recovered and is now live, `Ok(false)` if it is still
+    /// unhealthy and stays quarantined. Errors with `UnknownGroup` if the id is
+    /// not currently quarantined. Non-destructive: never edits stored state
+    /// beyond the crash-recovery already performed at open, never re-joins, and
+    /// never discards local history.
+    pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.retry_hydrate_quarantined_group(group_id)?)
     }
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {

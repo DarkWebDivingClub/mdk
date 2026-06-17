@@ -537,6 +537,13 @@ fn snapshot_group_events() {
             reason: GroupHydrationQuarantineReason::OpenMlsGroupMissing,
         }
     );
+    insta::assert_json_snapshot!(
+        "event_group_hydration_recovered",
+        GroupEvent::GroupHydrationRecovered {
+            group_id: gid(),
+            recovered_epoch: EpochId(2),
+        }
+    );
 }
 
 #[test]

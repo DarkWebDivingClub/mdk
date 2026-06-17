@@ -421,6 +421,20 @@ pub enum GroupEvent {
         group_id: GroupId,
         recovered_epoch: EpochId,
     },
+    /// A previously hydration-quarantined group
+    /// ([`GroupEvent::GroupHydrationQuarantined`]) was successfully re-hydrated
+    /// by an application-initiated retry and is now a live group again.
+    ///
+    /// Emitted only by the engine's quarantine-retry recovery path
+    /// (darkmatter#426), never at session-open hydration. The group is usable
+    /// at `recovered_epoch`; the application SHOULD move it out of any
+    /// "needs recovery" surface, refresh its chat-list / projection, and
+    /// trigger a normal resync so it catches up on anything missed while it was
+    /// quarantined.
+    GroupHydrationRecovered {
+        group_id: GroupId,
+        recovered_epoch: EpochId,
+    },
 }
 
 /// Request shape for [`CgkaEngine::create_group`]. Carries the intended

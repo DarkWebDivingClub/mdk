@@ -8,7 +8,9 @@ use cgka_session::{
     SessionEffects,
 };
 use cgka_traits::AppComponentId;
-use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
+use cgka_traits::engine::{
+    CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
+};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
@@ -66,6 +68,20 @@ where
 
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
         Ok(self.session.group_record(group_id)?)
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped
+    /// (darkmatter#151 / #417), paired with their coarse quarantine reason.
+    /// Backs the application's per-group recovery surface (darkmatter#426).
+    pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
+        self.session.quarantined_groups()
+    }
+
+    /// Re-attempt hydration of a single quarantined group. `Ok(true)` if it
+    /// recovered and is now live, `Ok(false)` if still unhealthy. Errors with
+    /// `UnknownGroup` if the id is not currently quarantined.
+    pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.retry_hydrate_quarantined_group(group_id)?)
     }
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> AccountResult<Vec<[u8; 32]>> {
@@ -238,6 +254,18 @@ where
 
     pub fn own_leaf_index(&self, group_id: &GroupId) -> AccountResult<u32> {
         Ok(self.session.own_leaf_index(group_id)?)
+    }
+
+    /// Drain any session effects queued by the engine without an inbound
+    /// transport delivery (e.g. `GroupHydrationQuarantined` queued during
+    /// `open()` hydration, or `GroupHydrationRecovered` queued by a successful
+    /// `retry_hydrate_quarantined_group`). Without this, those events only
+    /// reach app/runtime subscribers when an unrelated relay delivery happens
+    /// to trigger a drain (darkmatter#426). Publishes any incidental transport
+    /// work the same way `ingest_delivery` does.
+    pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
+        let effects = self.session.drain();
+        self.publish_session_effects(effects).await
     }
 
     pub async fn ingest_delivery(

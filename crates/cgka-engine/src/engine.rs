@@ -127,6 +127,15 @@ pub struct Engine<S: StorageProvider> {
     /// `group_context`) inherit the operation's `human_action` instead of
     /// landing context-free. `None` outside a human-initiated operation.
     pub(crate) current_audit_context: Option<AuditEventContext>,
+
+    /// Stored groups that failed session-open hydration and were skipped so the
+    /// rest of the account could open (darkmatter#151 / #417). Keyed by group
+    /// id with the coarse recovery reason, this is the engine-side source of
+    /// truth the application reads to surface a per-group recovery flow
+    /// (darkmatter#426) distinct from healthy or archived groups. Entries are
+    /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
+    /// successful [`Self::retry_hydrate_quarantined_group`].
+    pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -259,6 +268,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
             audit_operation_counter: 0,
             current_audit_context: None,
+            quarantined_groups: HashMap::new(),
         })
     }
 }
@@ -445,7 +455,7 @@ impl<S: StorageProvider> Engine<S> {
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<(), GroupHydrationQuarantineReason> {
+    ) -> Result<EpochId, GroupHydrationQuarantineReason> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -529,7 +539,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
-        Ok(())
+        Ok(group.epoch)
     }
 
     fn quarantine_stored_group_on_hydrate(
@@ -549,11 +559,107 @@ impl<S: StorageProvider> Engine<S> {
             group_digest,
             reason: reason_tag.to_string(),
         });
+        self.quarantined_groups.insert(group_id.clone(), reason);
         self.events_buf
             .push_back(GroupEvent::GroupHydrationQuarantined {
                 group_id: group_id.clone(),
                 reason,
             });
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped so the
+    /// rest of the account could open (darkmatter#151 / #417), paired with the
+    /// coarse [`GroupHydrationQuarantineReason`] that classifies why.
+    ///
+    /// This is the engine-side source of truth for the application's per-group
+    /// recovery flow (darkmatter#426): a quarantined group is not in the live
+    /// roster (`epoch`/`members` return `UnknownGroup`) and otherwise vanishes
+    /// from the account with no explanation. The app reads this list to surface
+    /// those groups distinctly from healthy/archived ones and to offer
+    /// [`Self::retry_hydrate_quarantined_group`].
+    ///
+    /// Order is unspecified. The returned reason is a copy; the engine retains
+    /// its own entry until a retry succeeds.
+    pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
+        self.quarantined_groups
+            .iter()
+            .map(|(group_id, reason)| (group_id.clone(), *reason))
+            .collect()
+    }
+
+    /// Re-attempt hydration of a single quarantined group.
+    ///
+    /// This is the non-destructive, user-initiated recovery path for a
+    /// transiently-bad group — e.g. a partial DB restore that has since been
+    /// completed, or storage that was unreadable at session open but is now
+    /// available. It re-runs the exact same per-group hydration the session
+    /// performs at open ([`Self::hydrate_one_stored_group`]), which only reads
+    /// stored state and, at most, clears a stranded non-removal pending commit
+    /// (the same crash-recovery already performed at open). It never edits the
+    /// encrypted DB, never re-joins, and never discards a group's local
+    /// history.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — the group hydrated successfully; it is removed from the
+    ///   quarantine list, dropped from [`Self::quarantined_groups`], and is now
+    ///   a live group (`epoch`/`members` resolve). A `GroupHydrationRecovered`
+    ///   event is queued for the application to refresh its projection.
+    /// - `Ok(false)` — the group is still unhealthy. It stays quarantined; the
+    ///   stored reason is refreshed to the latest classification so the UI can
+    ///   show whether the failure mode changed.
+    ///
+    /// **Errors.** `UnknownGroup` if the id is not currently quarantined (the
+    /// app should only call this for ids returned by
+    /// [`Self::quarantined_groups`]).
+    ///
+    /// Whether and when to retry — automatically on reconnect, on a timer, or
+    /// only on explicit user action — is a product decision left to the
+    /// application; the engine only exposes the mechanism.
+    pub fn retry_hydrate_quarantined_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if !self.quarantined_groups.contains_key(group_id) {
+            return Err(EngineError::UnknownGroup(group_id.clone()));
+        }
+        match self.hydrate_one_stored_group(group_id) {
+            Ok(recovered_epoch) => {
+                self.quarantined_groups.remove(group_id);
+                let reason_tag = "recovered";
+                let group_digest = hydration_quarantine_group_digest(group_id);
+                tracing::info!(
+                    target: "cgka_engine::hydrate",
+                    method = "retry_hydrate_quarantined_group",
+                    outcome = reason_tag,
+                    "recovered a quarantined stored group on retry"
+                );
+                self.audit(AuditEventKind::GroupHydrationRecovered { group_digest });
+                // `recovered_epoch` is the epoch hydration just established and
+                // wrote through to storage + epoch_manager (set_stable). Use it
+                // directly rather than a second storage.get_group() that could
+                // fail and silently emit epoch 0 (darkmatter#441 finding 3).
+                self.events_buf
+                    .push_back(GroupEvent::GroupHydrationRecovered {
+                        group_id: group_id.clone(),
+                        recovered_epoch,
+                    });
+                Ok(true)
+            }
+            Err(reason) => {
+                // Still unhealthy. Keep it quarantined, but refresh the stored
+                // reason so the UI reflects the current failure mode. Do not
+                // re-emit a quarantine event — the group was never live.
+                let reason_tag = hydration_quarantine_reason_tag(reason);
+                tracing::warn!(
+                    target: "cgka_engine::hydrate",
+                    method = "retry_hydrate_quarantined_group",
+                    reason = reason_tag,
+                    "retry did not recover the quarantined stored group"
+                );
+                self.quarantined_groups.insert(group_id.clone(), reason);
+                Ok(false)
+            }
+        }
     }
 
     pub(crate) fn convergence_now_ms(&self) -> u64 {

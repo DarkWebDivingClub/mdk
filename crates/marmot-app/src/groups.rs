@@ -17,7 +17,7 @@ use cgka_traits::app_components::{
     encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::Group;
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,51 @@ pub struct AppGroupMlsState {
     pub epoch: u64,
     pub member_count: usize,
     pub required_app_components: Vec<u16>,
+}
+
+/// Coarse, app-facing classification of why a stored group failed session-open
+/// hydration and was quarantined (darkmatter#151 / #417). Mirrors
+/// [`cgka_traits::engine::GroupHydrationQuarantineReason`] one-to-one so app
+/// clients can render per-reason recovery guidance without depending on the
+/// engine crate. The categories are deliberately coarse and privacy-safe — they
+/// carry no group/member ids, payloads, or key material.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppGroupHydrationQuarantineReason {
+    /// OpenMLS returned an error while loading the stored group state.
+    OpenMlsLoadFailed,
+    /// Marmot metadata referenced a group whose OpenMLS state was missing.
+    OpenMlsGroupMissing,
+    /// Member credentials, account-identity proofs, or ratchet-tree export
+    /// validation failed for the loaded MLS group.
+    MemberValidationFailed,
+    /// The Marmot group record could not be loaded or refreshed.
+    GroupRecordLoadFailed,
+    /// Hydrate found a stranded pending commit, but recovery itself failed.
+    PendingCommitRecoveryFailed,
+}
+
+impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason {
+    fn from(reason: GroupHydrationQuarantineReason) -> Self {
+        match reason {
+            GroupHydrationQuarantineReason::OpenMlsLoadFailed => Self::OpenMlsLoadFailed,
+            GroupHydrationQuarantineReason::OpenMlsGroupMissing => Self::OpenMlsGroupMissing,
+            GroupHydrationQuarantineReason::MemberValidationFailed => Self::MemberValidationFailed,
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed => Self::GroupRecordLoadFailed,
+            GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
+                Self::PendingCommitRecoveryFailed
+            }
+        }
+    }
+}
+
+/// A stored group that failed session-open hydration and was skipped so the
+/// rest of the account could open (darkmatter#151 / #417). Surfaced to the app
+/// so it can present a per-group recovery flow (darkmatter#426) distinct from
+/// healthy and archived groups, and offer a non-destructive re-hydration retry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppQuarantinedGroup {
+    pub group_id_hex: String,
+    pub reason: AppGroupHydrationQuarantineReason,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -893,7 +938,8 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
-        | GroupEvent::GroupHydrationQuarantined { group_id, .. } => Some(group_id),
+        | GroupEvent::GroupHydrationQuarantined { group_id, .. }
+        | GroupEvent::GroupHydrationRecovered { group_id, .. } => Some(group_id),
     }
 }
 

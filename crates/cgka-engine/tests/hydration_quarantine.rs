@@ -1,20 +1,29 @@
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::capabilities::GroupCapabilities;
+use cgka_traits::Backend;
+use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::group::Group;
+use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::GroupStorage;
+use cgka_traits::storage::{
+    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
+    ConvergencePolicyStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::PendingWelcome;
 use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -274,4 +283,295 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
         )),
         "quarantine event missing: {events:?}"
     );
+}
+
+// ── Re-hydration retry (darkmatter#426) ─────────────────────────────────────
+
+/// Storage wrapper that delegates everything to an inner
+/// [`SqliteAccountStorage`] but can be told to fail `get_group` once, to
+/// simulate a transiently-unreadable Marmot record at session open that later
+/// becomes readable. OpenMLS state is left intact, so once `get_group`
+/// succeeds the group is fully recoverable — exactly the partial-restore case
+/// the retry path targets.
+#[derive(Clone)]
+struct FlakyGroupRecordStorage {
+    inner: SqliteAccountStorage,
+    fail_get_group: Arc<AtomicBool>,
+}
+
+impl FlakyGroupRecordStorage {
+    fn new(inner: SqliteAccountStorage) -> Self {
+        Self {
+            inner,
+            fail_get_group: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_fail_get_group(&self, fail: bool) {
+        self.fail_get_group.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl GroupStorage for FlakyGroupRecordStorage {
+    fn put_group(&self, group: &Group) -> StorageResult<()> {
+        self.inner.put_group(group)
+    }
+    fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
+        if self.fail_get_group.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend("injected get_group failure".into()));
+        }
+        self.inner.get_group(id)
+    }
+    fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_group(id)
+    }
+    fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
+        self.inner.list_groups()
+    }
+}
+
+impl MessageStorage for FlakyGroupRecordStorage {
+    fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.inner.put_message(record)
+    }
+    fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
+        self.inner.get_message(id)
+    }
+    fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
+        self.inner.update_message_state(id, new_state)
+    }
+    fn list_messages(
+        &self,
+        group_id: &GroupId,
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        self.inner.list_messages(group_id, at_or_after_epoch)
+    }
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.create_group_snapshot(group_id, name)
+    }
+    fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
+        self.inner.list_group_snapshots(group_id)
+    }
+    fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.rollback_group_to_snapshot(group_id, name)
+    }
+    fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.release_group_snapshot(group_id, name)
+    }
+}
+
+impl OutboundIntentStorage for FlakyGroupRecordStorage {
+    fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        self.inner.put_queued_outbound_intent(record)
+    }
+    fn list_queued_outbound_intents(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        self.inner.list_queued_outbound_intents(group_id)
+    }
+    fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl WelcomeStorage for FlakyGroupRecordStorage {
+    fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()> {
+        self.inner.put_welcome(welcome)
+    }
+    fn take_welcome(&self, id: &MessageId) -> StorageResult<PendingWelcome> {
+        self.inner.take_welcome(id)
+    }
+    fn list_welcomes(&self) -> StorageResult<Vec<PendingWelcome>> {
+        self.inner.list_welcomes()
+    }
+}
+
+impl CapabilityStorage for FlakyGroupRecordStorage {
+    fn register_feature(&self, feature: Feature, req: CapabilityRequirement) -> StorageResult<()> {
+        self.inner.register_feature(feature, req)
+    }
+    fn feature_requirement(
+        &self,
+        feature: &Feature,
+    ) -> StorageResult<Option<CapabilityRequirement>> {
+        self.inner.feature_requirement(feature)
+    }
+    fn save_member_capabilities(
+        &self,
+        group_id: &GroupId,
+        member: &Member,
+        capabilities: GroupCapabilities,
+    ) -> StorageResult<()> {
+        self.inner
+            .save_member_capabilities(group_id, member, capabilities)
+    }
+    fn member_capabilities(
+        &self,
+        group_id: &GroupId,
+        member_id: &MemberId,
+    ) -> StorageResult<Option<GroupCapabilities>> {
+        self.inner.member_capabilities(group_id, member_id)
+    }
+}
+
+impl ConvergencePolicyStorage for FlakyGroupRecordStorage {
+    fn put_convergence_policy(&self, group_id: &GroupId, policy: &[u8]) -> StorageResult<()> {
+        self.inner.put_convergence_policy(group_id, policy)
+    }
+    fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.convergence_policy(group_id)
+    }
+}
+
+impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
+    fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
+        self.inner.put_account_device_signer(binding)
+    }
+    fn account_device_signer(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
+        self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl StorageProvider for FlakyGroupRecordStorage {
+    type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
+
+    fn mls_storage(&self) -> &Self::Mls {
+        self.inner.mls_storage()
+    }
+
+    fn backend(&self) -> Backend {
+        self.inner.backend()
+    }
+}
+
+fn build_flaky_engine(storage: FlakyGroupRecordStorage) -> Engine<FlakyGroupRecordStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(b"alice-hydration"))
+        .account_identity_proof_signer(proof_signer(b"alice-hydration"))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build flaky engine")
+}
+
+async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorage>) -> GroupId {
+    let (group_id, send_result) = engine
+        .create_group(CreateGroupRequest {
+            name: "healthy".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("create group");
+    let SendResult::GroupCreated { pending, .. } = send_result else {
+        panic!("expected group-created send result");
+    };
+    engine.confirm_published(pending).await.expect("confirm");
+    group_id
+}
+
+#[tokio::test]
+async fn retry_recovers_a_transiently_quarantined_group() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let group_epoch = initial.group_record(&group_id).unwrap().epoch;
+    drop(initial);
+
+    // Reopen with the Marmot record transiently unreadable: the group is
+    // quarantined (GroupRecordLoadFailed) instead of aborting account open.
+    storage.set_fail_get_group(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration quarantines the unreadable group, does not abort");
+
+    assert!(matches!(
+        reopened.epoch(&group_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    let quarantined = reopened.quarantined_groups();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].0, group_id);
+    assert_eq!(
+        quarantined[0].1,
+        GroupHydrationQuarantineReason::GroupRecordLoadFailed
+    );
+    reopened.drain_events();
+
+    // The record becomes readable again (e.g. a completed DB restore). Retry
+    // recovers the group: it is now live and leaves the quarantine list.
+    storage.set_fail_get_group(false);
+    let recovered = reopened
+        .retry_hydrate_quarantined_group(&group_id)
+        .expect("retry must not error for a quarantined id");
+    assert!(recovered, "retry should report recovery");
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(reopened.epoch(&group_id).unwrap(), group_epoch);
+
+    let events = reopened.drain_events();
+    // The recovery event must carry the real recovered epoch — not 0. Finding 3
+    // (darkmatter#441): the engine previously re-read storage.get_group() and
+    // unwrap_or_default()'d the epoch on error, which could silently emit
+    // epoch 0. It now uses the epoch hydration established.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupHydrationRecovered { group_id: gid, recovered_epoch }
+                if gid == &group_id && *recovered_epoch == group_epoch
+        )),
+        "recovery event missing or carried the wrong epoch (expected {group_epoch:?}): {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_keeps_group_quarantined_when_still_unhealthy() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    drop(initial);
+
+    storage.set_fail_get_group(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration quarantines the unreadable group");
+    reopened.drain_events();
+
+    // Still unhealthy at retry time: stays quarantined, returns Ok(false), and
+    // emits no recovery event.
+    let recovered = reopened
+        .retry_hydrate_quarantined_group(&group_id)
+        .expect("retry on a still-broken group is Ok(false), not Err");
+    assert!(!recovered);
+    assert_eq!(reopened.quarantined_groups().len(), 1);
+    assert!(matches!(
+        reopened.epoch(&group_id),
+        Err(EngineError::UnknownGroup(_))
+    ));
+    let events = reopened.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupHydrationRecovered { .. })),
+        "no recovery event should be emitted on a failed retry: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_for_unknown_group_errors() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut engine = build_flaky_engine(storage);
+    let unknown = GroupId::new(b"never-quarantined".to_vec());
+    assert!(matches!(
+        engine.retry_hydrate_quarantined_group(&unknown),
+        Err(EngineError::UnknownGroup(id)) if id == unknown
+    ));
 }

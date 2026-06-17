@@ -395,6 +395,9 @@ fn audit_event_kind_round_trips_all_variants() {
             pending_kind: "group_evolution".into(),
         },
         AuditEventKind::PendingCommitRecoveredOnOpen { recovered_epoch: 3 },
+        AuditEventKind::GroupHydrationRecovered {
+            group_digest: "a".repeat(64),
+        },
         AuditEventKind::SnapshotCreated {
             snapshot_name: "fork-1-2-abc".into(),
             source_epoch: 0,

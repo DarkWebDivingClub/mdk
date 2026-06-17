@@ -26,16 +26,16 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
     AccountRelayListStatus, AgentOperationEventRequest, AgentTextStreamFinishRequest,
     AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AuditLogDeleteOutcome, AuditLogFile,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, TimelineMessageQuery,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
+    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp,
+    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
+    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -871,6 +871,29 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<AppGroupMlsState, AppError> {
         self.accounts.group_mls_state(account_ref, group_id).await
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped
+    /// (darkmatter#151 / #417). Backs the per-group recovery surface
+    /// (darkmatter#426).
+    pub async fn quarantined_groups(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AppQuarantinedGroup>, AppError> {
+        self.accounts.quarantined_groups(account_ref).await
+    }
+
+    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// `Ok(true)` if it recovered and is now live, `Ok(false)` if still
+    /// unhealthy.
+    pub async fn retry_hydrate_quarantined_group(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .retry_hydrate_quarantined_group(account_ref, group_id)
+            .await
     }
 
     pub async fn safe_export_secret(

@@ -9,7 +9,7 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupManagementStateFfi,
+    AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupManagementStateFfi,
     GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi, SendSummaryFfi,
     group_details_ffi, group_id_from_hex, group_management_state_ffi, normalize_member_ref_ffi,
 };
@@ -560,6 +560,41 @@ impl Marmot {
             .group_mls_state(&account_ref, &group_id)
             .await?;
         Ok(state.into())
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped so the
+    /// rest of the account could open (darkmatter#151 / #417). These groups are
+    /// not in the live roster and otherwise vanish from the account with no
+    /// explanation; surface them in a per-group recovery flow (darkmatter#426)
+    /// distinct from healthy and archived groups, using `reason` to pick the
+    /// per-reason guidance, and offer
+    /// [`Self::retry_hydrate_quarantined_group`].
+    pub async fn quarantined_groups(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<AppQuarantinedGroupFfi>, MarmotKitError> {
+        let groups = self.runtime.quarantined_groups(&account_ref).await?;
+        Ok(groups.into_iter().map(Into::into).collect())
+    }
+
+    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    ///
+    /// Non-destructive, user-initiated recovery for a transiently-bad group
+    /// (e.g. a partial DB restore that has since completed). Returns `true` if
+    /// the group recovered and is now a live chat (it leaves the quarantine
+    /// list and reappears in the chat list), `false` if it is still unhealthy
+    /// and stays quarantined. Errors with `UnknownGroup` if the id is not
+    /// currently quarantined.
+    pub async fn retry_hydrate_quarantined_group(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .retry_hydrate_quarantined_group(&account_ref, &group_id)
+            .await?)
     }
 
     /// Flag a group archived (or restore it). Local-only projection state —

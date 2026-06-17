@@ -122,7 +122,8 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             | GroupEvent::CommitRolledBack { .. }
             | GroupEvent::GroupUnrecoverable { .. }
             | GroupEvent::PendingCommitRecovered { .. }
-            | GroupEvent::GroupHydrationQuarantined { .. } => {
+            | GroupEvent::GroupHydrationQuarantined { .. }
+            | GroupEvent::GroupHydrationRecovered { .. } => {
                 ChatListUpdateTrigger::MembershipChanged
             }
             GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => {
@@ -148,6 +149,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
-        | GroupEvent::GroupHydrationQuarantined { group_id, .. } => group_id,
+        | GroupEvent::GroupHydrationQuarantined { group_id, .. }
+        | GroupEvent::GroupHydrationRecovered { group_id, .. } => group_id,
     }
 }

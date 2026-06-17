@@ -630,3 +630,91 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
         TransportEnvelope::Welcome { .. }
     ));
 }
+
+// darkmatter#426 regression: hydration-quarantine events must reach the
+// app/account layer through the no-inbound `drain()` path, not only when an
+// unrelated relay delivery happens to trigger an engine drain. Build a session
+// DB with a group whose Marmot metadata exists but whose OpenMLS state is
+// missing, reopen it (which quarantines the group during hydration), and assert
+// `AccountDeviceRuntime::drain()` surfaces `GroupHydrationQuarantined` with no
+// inbound traffic at all.
+#[tokio::test]
+async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
+    use cgka_traits::engine::GroupHydrationQuarantineReason;
+    use cgka_traits::group::Group;
+    use cgka_traits::types::{EpochId, GroupId};
+    use cgka_traits::{GroupCapabilities, GroupStorage};
+    use storage_sqlite::SqliteAccountStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot drain quarantine key").unwrap();
+    let db_path = dir.path().join("alice.sqlite");
+
+    // Create a healthy account DB so the schema exists, then close it.
+    drop(session(&db_path, &key, b"alice"));
+
+    // Inject a Marmot group record with no backing OpenMLS state directly into
+    // the same encrypted DB. On reopen this group is quarantined with
+    // `OpenMlsGroupMissing` instead of aborting account open (#151 / #417).
+    let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&db_path, &key).unwrap();
+        storage
+            .put_group(&Group {
+                id: broken_group.clone(),
+                name: "broken".into(),
+                description: String::new(),
+                members: Vec::new(),
+                epoch: EpochId(9),
+                required_capabilities: GroupCapabilities::default(),
+            })
+            .unwrap();
+    }
+
+    // Reopen the session (hydration quarantines the bad group) and wrap it in a
+    // runtime. No transport delivery is ingested.
+    let reopened = session(&db_path, &key, b"alice");
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    // The group is queryable via the recovery surface...
+    let quarantined = runtime.quarantined_groups();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].0, broken_group);
+    assert_eq!(
+        quarantined[0].1,
+        GroupHydrationQuarantineReason::OpenMlsGroupMissing
+    );
+
+    // ...and the typed event reaches subscribers through drain() with no
+    // inbound relay traffic — the bug this fixes.
+    let effects = runtime.drain().await.unwrap();
+    assert!(
+        effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupHydrationQuarantined {
+                group_id,
+                reason: GroupHydrationQuarantineReason::OpenMlsGroupMissing,
+            } if group_id == &broken_group
+        )),
+        "quarantine event missing from drain(): {:?}",
+        effects.events
+    );
+
+    // A second drain is empty: the queued event was consumed, not replayed.
+    let drained_again = runtime.drain().await.unwrap();
+    assert!(
+        !drained_again
+            .events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupHydrationQuarantined { .. })),
+        "quarantine event should not replay on a second drain: {:?}",
+        drained_again.events
+    );
+}
