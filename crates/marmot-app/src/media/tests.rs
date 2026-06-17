@@ -63,17 +63,44 @@ fn imeta_parser_rejects_duplicate_single_occurrence_field() {
     assert!(media_attachment_from_imeta_tag(&multi, None, false).is_ok());
 }
 
-fn spawn_http_response(response: Vec<u8>) -> String {
+fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("test server addr");
     thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            let _ = stream.write_all(&response);
+        for response in responses {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
         }
     });
     format!("http://{addr}")
+}
+
+fn spawn_http_response(response: Vec<u8>) -> String {
+    spawn_http_responses(vec![response])
+}
+
+fn http_redirect_response(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn http_ok_response(body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn http_not_found_response() -> Vec<u8> {
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
 }
 
 #[test]
@@ -438,16 +465,113 @@ fn media_fetch_url_policy_allows_loopback_http_only_when_explicitly_enabled() {
     assert!(validate_blossom_fetch_url(&url, false).is_err());
 }
 
+#[test]
+fn blossom_redirect_validation_allows_same_registrable_domain() {
+    let current = Url::parse(&format!("https://blossom.primal.net/{}.bin", valid_hash())).unwrap();
+    let next = Url::parse(&format!(
+        "https://r2a.primal.net/uploads/{}.bin",
+        valid_hash()
+    ))
+    .unwrap();
+
+    super::blossom::validate_blossom_redirect_target(&current, &next, false)
+        .expect("same registrable domain redirect must be allowed");
+}
+
+#[test]
+fn blossom_redirect_validation_rejects_cross_scheme_private_ip_and_cross_domain() {
+    let current = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+    for (next, expected) in [
+        (
+            format!("http://media.example/{}.bin", valid_hash()),
+            "scheme must be https",
+        ),
+        (
+            format!("https://10.0.0.5/{}.bin", valid_hash()),
+            "non-public",
+        ),
+        (
+            format!("https://cdn.attacker.net/{}.bin", valid_hash()),
+            "same host or registrable domain",
+        ),
+    ] {
+        let next = Url::parse(&next).unwrap();
+        let err = super::blossom::validate_blossom_redirect_target(&current, &next, false)
+            .expect_err("unsafe redirect must be rejected");
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+    }
+}
+
 #[tokio::test]
-async fn fetch_blossom_blob_does_not_follow_redirects() {
+async fn fetch_blossom_blob_follows_hashless_redirect_targets() {
+    let final_server = spawn_http_response(http_ok_response(b"hello"));
+    let final_url = format!("{final_server}/signed/opaque-key?X-Amz-Signature=test");
+    let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
+    let url = format!("{redirecting_server}/{}.bin", valid_hash());
+
+    let bytes = fetch_blossom_blob(&url, true)
+        .await
+        .expect("valid redirect should fetch final blob");
+
+    assert_eq!(bytes, b"hello");
+}
+
+#[tokio::test]
+async fn fetch_blossom_blob_rejects_redirect_chain_over_limit() {
+    let responses = (0..6)
+        .map(|idx| http_redirect_response(&format!("/hop-{idx}/{}.bin", valid_hash())))
+        .collect::<Vec<_>>();
+    let server = spawn_http_responses(responses);
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(err.to_string().contains("exceeded 5 hops"));
+}
+
+#[tokio::test]
+async fn fetch_blossom_blob_rejects_redirect_without_location() {
     let server = spawn_http_response(
-        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            .to_vec(),
+        b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
     );
     let url = format!("{server}/{}.bin", valid_hash());
     let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
-    assert!(err.to_string().contains("HTTP 302"));
+    assert!(
+        err.to_string()
+            .contains("redirect response did not include Location")
+    );
+}
+
+#[tokio::test]
+async fn fetch_blossom_blob_reports_terminal_status_after_redirect() {
+    let server = spawn_http_responses(vec![
+        http_redirect_response("/missing-opaque-key"),
+        http_not_found_response(),
+    ]);
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("download returned HTTP 404"),
+        "expected terminal status, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_blossom_blob_follows_redirect_target_with_different_path_hash() {
+    let final_server = spawn_http_response(http_ok_response(b"hello"));
+    let final_url = format!("{final_server}/{}.bin", "22".repeat(32));
+    let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
+    let url = format!("{redirecting_server}/{}.bin", valid_hash());
+
+    let bytes = fetch_blossom_blob(&url, true)
+        .await
+        .expect("redirect target path hash is not authoritative for content integrity");
+
+    assert_eq!(bytes, b"hello");
 }
 
 #[tokio::test]

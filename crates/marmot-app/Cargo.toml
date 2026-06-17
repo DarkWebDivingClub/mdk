@@ -26,6 +26,7 @@ nostr.workspace = true
 nostr-sdk.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+psl.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

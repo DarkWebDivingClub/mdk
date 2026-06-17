@@ -15,6 +15,7 @@ const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const BLOSSOM_REDIRECT_LIMIT: usize = 5;
 pub(crate) const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -79,17 +80,99 @@ pub(crate) async fn fetch_blossom_blob(
     url: &str,
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
-    let url = Url::parse(url)
+    let mut current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
-    let client = media_http_client_for_url(&url, allow_loopback_http).await?;
-    let response = client.get(url).send().await.map_err(reqwest_blob_error)?;
-    if !response.status().is_success() {
-        return Err(AppError::BlobStore(format!(
-            "download returned HTTP {}",
-            response.status().as_u16()
-        )));
+    validate_blossom_fetch_url(&current, allow_loopback_http)
+        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+    let mut redirects = 0_usize;
+
+    loop {
+        let client = media_http_client_for_url(&current, allow_loopback_http).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(reqwest_blob_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await;
+        }
+        if !status.is_redirection() {
+            return Err(AppError::BlobStore(format!(
+                "download returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+
+        if redirects >= BLOSSOM_REDIRECT_LIMIT {
+            return Err(AppError::BlobStore(format!(
+                "media redirect chain exceeded {BLOSSOM_REDIRECT_LIMIT} hops"
+            )));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                AppError::BlobStore("redirect response did not include Location".into())
+            })?
+            .to_str()
+            .map_err(|_| AppError::BlobStore("redirect Location header is invalid".into()))?;
+        let next = current.join(location).map_err(|_| {
+            AppError::BlobStore("redirect Location header is not a valid URL".into())
+        })?;
+        validate_blossom_redirect_target(&current, &next, allow_loopback_http)?;
+        current = next;
+        redirects += 1;
     }
-    read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await
+}
+
+pub(super) fn validate_blossom_redirect_target(
+    current: &Url,
+    next: &Url,
+    allow_loopback_http: bool,
+) -> Result<(), AppError> {
+    validate_blossom_fetch_url(next, allow_loopback_http)
+        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom redirect URL: {err}")))?;
+    validate_blossom_redirect_host(current, next)
+        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom redirect host: {err}")))
+}
+
+fn validate_blossom_redirect_host(current: &Url, next: &Url) -> Result<(), String> {
+    let current_host = current
+        .host()
+        .ok_or("redirect source URL must include a host")?;
+    let next_host = next
+        .host()
+        .ok_or("redirect target URL must include a host")?;
+    if url_hosts_match(&current_host, &next_host) {
+        return Ok(());
+    }
+    match (current_host, next_host) {
+        (Host::Domain(current_domain), Host::Domain(next_domain))
+            if same_registrable_domain(current_domain, next_domain) =>
+        {
+            Ok(())
+        }
+        _ => Err("redirect host must stay on the same host or registrable domain".into()),
+    }
+}
+
+fn url_hosts_match(left: &Host<&str>, right: &Host<&str>) -> bool {
+    match (left, right) {
+        (Host::Domain(left), Host::Domain(right)) => left.eq_ignore_ascii_case(right),
+        (Host::Ipv4(left), Host::Ipv4(right)) => left == right,
+        (Host::Ipv6(left), Host::Ipv6(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn same_registrable_domain(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('.').to_ascii_lowercase();
+    let right = right.trim_end_matches('.').to_ascii_lowercase();
+    match (psl::domain_str(&left), psl::domain_str(&right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 async fn media_http_client_for_url(
