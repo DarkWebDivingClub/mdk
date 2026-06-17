@@ -318,6 +318,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -326,6 +327,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -334,6 +336,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -342,6 +345,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -350,6 +354,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -358,6 +363,7 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 0)
@@ -653,6 +659,7 @@ fn latest_kind9_message_tx(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
+           AND invalidation_status IS NULL
          ORDER BY timeline_at DESC, message_id_hex DESC
          LIMIT 1",
         params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],

@@ -431,3 +431,91 @@ fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
     assert_eq!(row.last_read_message_id_hex.as_deref(), Some("own"));
     assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "own");
 }
+
+#[test]
+fn chat_list_preview_skips_invalidated_kind9_tombstone() {
+    // Repro for #444: a visible delivered chat is followed by an invalidated
+    // kind:9 row (losing branch) whose sender-claimed timeline_at sorts after
+    // the visible message. The invalidated tombstone must not become the
+    // chat-list preview/sort anchor; the latest *delivered* visible message
+    // wins. This mirrors the invalidation_status filter already applied to
+    // unread-count queries in #443.
+    let store = setup_store();
+
+    // Visible delivered chat.
+    store
+        .record_app_event(&chat("visible", REMOTE, 10, "real message"))
+        .unwrap();
+    // Losing-branch chat that arrives "later" by sender-claimed time.
+    store
+        .record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
+        .unwrap();
+
+    // Before invalidation the latest row wins, as usual.
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    let last_message = row.last_message.expect("last message");
+    assert_eq!(last_message.message_id_hex, "phantom");
+
+    // Convergence invalidates the losing-branch row (kept as a tombstone).
+    store
+        .invalidate_app_event_by_message_id("phantom", "LosingBranch")
+        .unwrap();
+
+    // Preview and sort anchor must fall back to the visible delivered message,
+    // not the invalidated tombstone.
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    let last_message = row.last_message.expect("last message");
+    assert_eq!(last_message.message_id_hex, "visible");
+    assert_eq!(last_message.plaintext, "real message");
+    assert_eq!(last_message.timeline_at, 10);
+
+    // The cached projection read path agrees with the refresh path.
+    let cached = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+    assert_eq!(
+        cached.last_message.as_ref().unwrap().message_id_hex,
+        "visible"
+    );
+
+    // And the completeness check considers the projection up to date, so a
+    // subsequent ensure pass is a no-op rather than perpetually rebuilding.
+    store.ensure_chat_list_rows(LOCAL).unwrap();
+    let after_ensure = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+    assert_eq!(
+        after_ensure.last_message.as_ref().unwrap().message_id_hex,
+        "visible"
+    );
+}
+
+#[test]
+fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
+    // When every kind:9 row in a group is an invalidated tombstone, the
+    // chat-list preview must be absent rather than anchored on a losing-branch
+    // message.
+    let store = setup_store();
+    store
+        .record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
+        .unwrap();
+    store
+        .invalidate_app_event_by_message_id("phantom", "LosingBranch")
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.last_message, None);
+}
