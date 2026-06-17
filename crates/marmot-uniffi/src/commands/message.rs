@@ -5,6 +5,7 @@ use marmot_app::AppMessageQuery;
 use crate::Marmot;
 use crate::conversions::{AppMessageRecordFfi, SendSummaryFfi, group_id_from_hex};
 use crate::errors::MarmotKitError;
+use crate::optional_group_id_hex;
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
@@ -127,7 +128,7 @@ impl Marmot {
         limit: Option<u32>,
     ) -> Result<Vec<AppMessageRecordFfi>, MarmotKitError> {
         let query = AppMessageQuery {
-            group_id_hex,
+            group_id_hex: optional_group_id_hex(group_id_hex)?,
             limit: limit.map(|n| n as usize),
         };
         let records = self.runtime.messages_with_query(&account_ref, query)?;

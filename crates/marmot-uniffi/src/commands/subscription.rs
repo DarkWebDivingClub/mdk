@@ -75,7 +75,7 @@ impl Marmot {
         group_id_hex: Option<String>,
     ) -> Result<Arc<MessagesSubscription>, MarmotKitError> {
         let query = AppMessageQuery {
-            group_id_hex,
+            group_id_hex: optional_group_id_hex(group_id_hex)?,
             limit: None,
         };
         let inner = self.runtime.subscribe_messages(&account_ref, query)?;

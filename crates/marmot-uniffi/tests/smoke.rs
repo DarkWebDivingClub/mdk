@@ -702,3 +702,44 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
     };
     assert!(format!("{subscribe_error}").contains("missing"));
 }
+
+#[tokio::test]
+async fn message_history_binding_methods_validate_group_hex() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    // Invalid group hex must be rejected with InvalidHex before the account
+    // lookup, matching every other group-scoped FFI method (regression for
+    // darkmatter#204: messages() previously passed the host string straight
+    // into the query, silently yielding empty history).
+    let invalid_group = kit
+        .messages("missing".into(), Some("not-hex".into()), Some(25))
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_group}").contains("invalid hex"));
+
+    let invalid_subscribe = match kit
+        .subscribe_messages("missing".into(), Some("not-hex".into()))
+        .await
+    {
+        Ok(_) => panic!("invalid group hex subscription should fail"),
+        Err(err) => err,
+    };
+    assert!(format!("{invalid_subscribe}").contains("invalid hex"));
+
+    // Valid hex (even uppercase/whitespace-padded) gets past validation and
+    // then fails on the missing account, proving the value was canonicalized
+    // rather than treated as an opaque host string.
+    let missing_account = kit
+        .messages(
+            "missing".into(),
+            Some(format!(" {} ", "AB".repeat(32))),
+            Some(25),
+        )
+        .expect_err("missing account should fail after hex validation");
+    assert!(format!("{missing_account}").contains("missing"));
+}

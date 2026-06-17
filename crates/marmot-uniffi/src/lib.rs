@@ -178,4 +178,19 @@ mod tests {
         );
         assert!(optional_message_id_hex(Some("abcd".into())).is_err());
     }
+
+    #[test]
+    fn optional_group_id_hex_trims_and_canonicalizes() {
+        // None and blank input map to the account-wide tail (None), not an error.
+        assert_eq!(optional_group_id_hex(None).unwrap(), None);
+        assert_eq!(optional_group_id_hex(Some("   ".into())).unwrap(), None);
+        // Uppercase + surrounding whitespace canonicalize to lowercase hex so the
+        // case-sensitive storage match and live filter compare against the same form.
+        assert_eq!(
+            optional_group_id_hex(Some(format!(" {} ", "AB".repeat(32)))).unwrap(),
+            Some("ab".repeat(32))
+        );
+        // Invalid hex is rejected rather than silently yielding empty history.
+        assert!(optional_group_id_hex(Some("nothex".into())).is_err());
+    }
 }
