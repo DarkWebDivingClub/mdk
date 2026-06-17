@@ -76,6 +76,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `dm --help`, `dm <subcommand> --help`, and `dm --version` now print to stdout instead of stderr (exit code 0 was
+  already correct). Previously every clap parse result — including the help/version display "errors" that carry exit
+  code 0 — was routed to stderr, leaving stdout empty and breaking shell piping and scripts (e.g. `dm --help | less`).
+  With `--json`, help/version are now reported as `{"ok": true, "result": {"help"|"version": "..."}}` rather than being
+  wrapped as an error object; genuine usage errors still go to stderr (and `ok: false` in JSON mode). Routing is gated
+  on clap's exit code, not just the error kind: a missing required subcommand (e.g. `dm messages` with no subcommand)
+  renders help text but exits nonzero, so it stays a usage error on stderr / `ok: false` instead of being reported as
+  successful help output.
 - The distributed-convergence canonicalization apply path now persists its multi-write merge atomically. The
   `merge_staged_commit` replay, Marmot group-record refresh, and message-disposition writes that run when a stored
   out-of-order commit is replayed are wrapped in a single SQLite transaction, closing the residual torn-write window

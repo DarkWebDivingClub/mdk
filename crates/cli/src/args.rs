@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
     name = "dm",
+    version,
     about = "Darkmatter account, group, message, stream, and daemon CLI",
     disable_help_subcommand = true
 )]

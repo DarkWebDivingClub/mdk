@@ -106,6 +106,39 @@ where
     let mut cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
+            use clap::error::ErrorKind;
+            // clap reports explicit `--help`/`--version` as `Err` with exit code
+            // 0; the rendered string is the help/version text, which belongs on
+            // stdout (clap's own default). Real usage errors go to stderr.
+            //
+            // Crucially, gate on the exit code, not just the kind:
+            // `DisplayHelpOnMissingArgumentOrSubcommand` is also rendered as help
+            // text but exits nonzero (e.g. `dm messages` with no subcommand). That
+            // is a genuine usage error and must stay on stderr / `ok:false`, never
+            // be reported as success. Only zero-exit display errors are real
+            // help/version requests.
+            let is_zero_exit_display = err.exit_code() == 0
+                && matches!(
+                    err.kind(),
+                    ErrorKind::DisplayHelp
+                        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                        | ErrorKind::DisplayVersion
+                );
+            if is_zero_exit_display {
+                let label = if err.kind() == ErrorKind::DisplayVersion {
+                    "version"
+                } else {
+                    "help"
+                };
+                if wants_json {
+                    return clap_display_json(err.exit_code(), label, err.to_string());
+                }
+                return CliOutput {
+                    code: err.exit_code(),
+                    stdout: err.to_string(),
+                    stderr: String::new(),
+                };
+            }
             if wants_json {
                 return json_error(err.exit_code(), "usage", err.to_string());
             }
@@ -1045,6 +1078,25 @@ fn ensure_trailing_newline(mut value: String) -> String {
     value
 }
 
+/// Render clap's help/version text as a successful JSON response. These clap
+/// "errors" carry exit code 0 and their rendered string is the help/version
+/// payload, so they must be reported as `ok: true` rather than wrapped as an
+/// error object. `field` is `"help"` or `"version"`.
+fn clap_display_json(code: i32, field: &str, text: String) -> CliOutput {
+    CliOutput {
+        code,
+        stdout: format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "ok": true,
+                "result": { field: text },
+            }))
+            .expect("JSON response serialization cannot fail")
+        ),
+        stderr: String::new(),
+    }
+}
+
 fn json_error(code: i32, error_code: &str, message: String) -> CliOutput {
     CliOutput {
         code,
@@ -1728,5 +1780,179 @@ mod tests {
             "expected a client-side size-limit error, got stdout: {}",
             output.stdout
         );
+    }
+
+    // Regression for #192: clap renders `--help`/`--version` as `Err` with exit
+    // code 0; that text is the help/version payload and must go to stdout (not
+    // stderr), so piping and scripting work.
+    #[tokio::test]
+    async fn top_level_help_goes_to_stdout_not_stderr() {
+        let output = run_from([OsString::from("dm"), OsString::from("--help")]).await;
+        assert_eq!(output.code, 0, "help exit code must be 0");
+        assert!(
+            !output.stdout.is_empty(),
+            "help text must be on stdout, got empty stdout"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "help must not write to stderr, got: {}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Usage"),
+            "expected usage text on stdout, got: {}",
+            output.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn subcommand_help_goes_to_stdout_not_stderr() {
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("messages"),
+            OsString::from("--help"),
+        ])
+        .await;
+        assert_eq!(output.code, 0, "subcommand help exit code must be 0");
+        assert!(
+            !output.stdout.is_empty(),
+            "subcommand help text must be on stdout"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "subcommand help must not write to stderr, got: {}",
+            output.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn version_goes_to_stdout_not_stderr() {
+        let output = run_from([OsString::from("dm"), OsString::from("--version")]).await;
+        assert_eq!(output.code, 0, "version exit code must be 0");
+        assert!(
+            !output.stdout.is_empty(),
+            "version text must be on stdout, got empty stdout"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "version must not write to stderr, got: {}",
+            output.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn help_in_json_mode_is_reported_as_ok() {
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("--help"),
+        ])
+        .await;
+        assert_eq!(output.code, 0, "json help exit code must be 0");
+        assert!(output.stderr.is_empty(), "json help must not use stderr");
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json help must be valid JSON");
+        assert_eq!(
+            value["ok"], true,
+            "help with exit 0 must be ok:true, got: {value}"
+        );
+        assert!(
+            value["result"]["help"].is_string(),
+            "expected result.help string, got: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_in_json_mode_is_reported_as_ok() {
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("--version"),
+        ])
+        .await;
+        assert_eq!(output.code, 0, "json version exit code must be 0");
+        assert!(output.stderr.is_empty(), "json version must not use stderr");
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json version must be valid JSON");
+        assert_eq!(value["ok"], true, "version with exit 0 must be ok:true");
+        assert!(
+            value["result"]["version"].is_string(),
+            "expected result.version string, got: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_usage_error_still_goes_to_stderr() {
+        // An unknown subcommand is a genuine usage error (nonzero exit) and must
+        // keep going to stderr.
+        let output = run_from([OsString::from("dm"), OsString::from("definitely-not-a-cmd")]).await;
+        assert_ne!(output.code, 0, "usage error must have nonzero exit");
+        assert!(
+            output.stdout.is_empty(),
+            "usage error must not write to stdout, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "usage error must write to stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_usage_error_in_json_mode_is_reported_as_error() {
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("definitely-not-a-cmd"),
+        ])
+        .await;
+        assert_ne!(output.code, 0, "json usage error must have nonzero exit");
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json error must be valid JSON");
+        assert_eq!(value["ok"], false, "usage error must be ok:false");
+        assert_eq!(value["error"]["code"], "usage");
+    }
+
+    #[tokio::test]
+    async fn missing_subcommand_is_a_usage_error_not_help() {
+        // `dm messages` with no subcommand renders help text but exits nonzero
+        // (clap's DisplayHelpOnMissingArgumentOrSubcommand). It is a genuine
+        // usage error and must go to stderr, never stdout, despite resembling
+        // help output. Regression for darkmatter#192 adversarial review.
+        let output = run_from([OsString::from("dm"), OsString::from("messages")]).await;
+        assert_ne!(output.code, 0, "missing subcommand must have nonzero exit");
+        assert!(
+            output.stdout.is_empty(),
+            "missing subcommand must not write to stdout, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "missing subcommand must write help/usage text to stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_subcommand_in_json_mode_is_reported_as_error() {
+        // `dm --json messages` with no subcommand must be ok:false with a
+        // nonzero exit, not wrapped as a success help object. Regression for
+        // darkmatter#192 adversarial review.
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("messages"),
+        ])
+        .await;
+        assert_ne!(
+            output.code, 0,
+            "missing subcommand in json mode must have nonzero exit"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json error must be valid JSON");
+        assert_eq!(
+            value["ok"], false,
+            "missing subcommand must be ok:false, got: {value}"
+        );
+        assert_eq!(value["error"]["code"], "usage");
     }
 }
