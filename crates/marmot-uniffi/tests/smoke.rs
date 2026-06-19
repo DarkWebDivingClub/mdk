@@ -308,10 +308,21 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     };
 
     let send_error = kit
-        .send_media_attachments("alice".into(), "not-hex".into(), vec![reference], None)
+        .send_media_attachments(
+            "alice".into(),
+            "not-hex".into(),
+            vec![reference.clone()],
+            None,
+        )
         .await
         .expect_err("invalid group hex should fail before sending");
     assert!(format!("{send_error}").contains("invalid hex"));
+
+    let singular_send_error = kit
+        .send_media_reference("alice".into(), "not-hex".into(), reference, None)
+        .await
+        .expect_err("singular compatibility helper should validate group hex");
+    assert!(format!("{singular_send_error}").contains("invalid hex"));
 
     let upload_error = kit
         .upload_media("alice".into(), "not-hex".into(), request)

@@ -33,6 +33,20 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Backward-compatible single-attachment send helper. Prefer
+    /// `send_media_attachments` for new callers so one chat can carry ordered
+    /// mixed media attachments.
+    pub async fn send_media_reference(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reference: MediaAttachmentReferenceFfi,
+        caption: Option<String>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        self.send_media_attachments(account_ref, group_id_hex, vec![reference], caption)
+            .await
+    }
+
     /// Encrypt plaintext attachments, upload the ciphertext blobs, and
     /// optionally send the resulting media references into the group.
     pub async fn upload_media(

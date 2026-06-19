@@ -255,3 +255,103 @@ fn media_attachment_from_imeta_tag(
         thumbhash: fields.get("thumbhash").cloned(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
+        let mut tag = vec![
+            "imeta".to_owned(),
+            "v encrypted-media-v1".to_owned(),
+            format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([byte; 32])
+            ),
+            format!("ciphertext_sha256 {}", hex::encode([byte; 32])),
+            format!(
+                "plaintext_sha256 {}",
+                hex::encode([byte.wrapping_add(1); 32])
+            ),
+            format!("nonce {}", hex::encode([byte; 12])),
+            format!("m {media_type}"),
+            format!("filename {file_name}"),
+        ];
+        tag.extend(extra.iter().map(|field| (*field).to_owned()));
+        tag
+    }
+
+    #[test]
+    fn media_records_ffi_projects_ordered_multi_attachment_records() {
+        let message = AppMessageRecord {
+            message_id_hex: "aa".repeat(32),
+            direction: "incoming".to_owned(),
+            group_id_hex: "bb".repeat(32),
+            sender: "alice".to_owned(),
+            plaintext: "album caption".to_owned(),
+            kind: 9,
+            tags: vec![
+                imeta_tag(
+                    0x11,
+                    "image/png",
+                    "diagram.png",
+                    &["dim 800x600", "thumbhash 1QcSHQRnh493V4dIh4eXh1h4kJUI"],
+                ),
+                imeta_tag(0x22, "video/mp4", "clip.mp4", &["dim 1920x1080"]),
+                imeta_tag(0x33, "audio/ogg", "voice.ogg", &[]),
+            ],
+            source_epoch: Some(7),
+            recorded_at: 10,
+            received_at: 11,
+        };
+
+        let records = media_records_ffi(vec![message]);
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].attachment_index, 0);
+        assert_eq!(records[0].caption.as_deref(), Some("album caption"));
+        assert_eq!(records[0].reference.media_type, "image/png");
+        assert_eq!(records[0].reference.file_name, "diagram.png");
+        assert_eq!(records[0].reference.source_epoch, 7);
+        assert_eq!(records[0].reference.dim.as_deref(), Some("800x600"));
+        assert_eq!(
+            records[0].reference.thumbhash.as_deref(),
+            Some("1QcSHQRnh493V4dIh4eXh1h4kJUI")
+        );
+        assert_eq!(records[1].attachment_index, 1);
+        assert_eq!(records[1].reference.media_type, "video/mp4");
+        assert_eq!(records[1].reference.file_name, "clip.mp4");
+        assert_eq!(records[1].reference.dim.as_deref(), Some("1920x1080"));
+        assert_eq!(records[2].attachment_index, 2);
+        assert_eq!(records[2].reference.media_type, "audio/ogg");
+        assert_eq!(records[2].reference.file_name, "voice.ogg");
+    }
+
+    #[test]
+    fn media_attachment_reference_ffi_round_trips_non_image_type() {
+        let ffi = MediaAttachmentReferenceFfi {
+            locators: vec![MediaLocatorFfi {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x44; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x44; 32]),
+            plaintext_sha256: hex::encode([0x45; 32]),
+            nonce_hex: hex::encode([0x46; 12]),
+            file_name: "brief.pdf".to_owned(),
+            media_type: "application/pdf".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 42,
+            dim: None,
+            thumbhash: None,
+        };
+
+        let app: MediaAttachmentReference = ffi.clone().into();
+        let round_trip: MediaAttachmentReferenceFfi = app.into();
+
+        assert_eq!(round_trip.locators.len(), 1);
+        assert_eq!(round_trip.locators[0].kind, "blossom-v1");
+        assert_eq!(round_trip.media_type, "application/pdf");
+        assert_eq!(round_trip.file_name, "brief.pdf");
+        assert_eq!(round_trip.source_epoch, 42);
+    }
+}
