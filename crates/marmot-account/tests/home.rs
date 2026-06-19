@@ -105,6 +105,29 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
 }
 
 #[test]
+fn account_home_accounts_skips_unreadable_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let good = home.create_account("good").unwrap();
+    let corrupted = home.create_account("corrupted").unwrap();
+    std::fs::write(
+        dir.path()
+            .join("accounts")
+            .join(&corrupted.label)
+            .join("account.json"),
+        b"{",
+    )
+    .unwrap();
+
+    assert_eq!(home.accounts().unwrap(), vec![good]);
+    assert!(matches!(
+        home.account(&corrupted.label),
+        Err(AccountHomeError::Json(_))
+    ));
+}
+
+#[test]
 fn account_home_rejects_path_like_labels() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

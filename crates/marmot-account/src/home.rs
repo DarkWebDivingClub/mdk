@@ -14,6 +14,7 @@ const ACCOUNT_RECORD_FILE: &str = "account.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
+const TRACE_TARGET: &str = "marmot_account::home";
 
 /// Persistent home for local Nostr account records and their signing
 /// credentials.
@@ -172,11 +173,23 @@ impl AccountHome {
         }
 
         let mut accounts = Vec::new();
+        let mut skipped_unreadable_records = 0usize;
         for entry in fs::read_dir(dir)? {
             let path = entry?.path().join(ACCOUNT_RECORD_FILE);
             if path.exists() {
-                accounts.push(read_json(path)?);
+                match read_json(path) {
+                    Ok(account) => accounts.push(account),
+                    Err(_) => skipped_unreadable_records += 1,
+                }
             }
+        }
+        if skipped_unreadable_records > 0 {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "accounts",
+                skipped_account_records = skipped_unreadable_records,
+                "skipped unreadable account records while listing accounts"
+            );
         }
         accounts.sort_by(|a: &AccountSummary, b| a.account_id_hex.cmp(&b.account_id_hex));
         Ok(accounts)
