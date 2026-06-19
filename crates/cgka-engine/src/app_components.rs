@@ -152,6 +152,20 @@ pub(crate) fn app_component_data_of_group(
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
 }
 
+pub(crate) fn message_retention_seconds_of_group(
+    mls_group: &MlsGroup,
+) -> Result<Option<u64>, EngineError> {
+    let Some(bytes) = app_component_bytes(mls_group, GROUP_MESSAGE_RETENTION_COMPONENT_ID) else {
+        return Ok(None);
+    };
+    let seconds = decode_message_retention(bytes)?;
+    if seconds == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(seconds))
+    }
+}
+
 pub(crate) fn nostr_routing_of_group(
     mls_group: &MlsGroup,
 ) -> Result<Option<NostrRoutingV1>, EngineError> {
@@ -641,13 +655,20 @@ fn group_image_present(bytes: &[u8]) -> bool {
         || !media_type.is_empty()
 }
 
-fn validate_message_retention(bytes: &[u8]) -> Result<(), EngineError> {
+fn decode_message_retention(bytes: &[u8]) -> Result<u64, EngineError> {
     if bytes.len() != 8 {
         return Err(EngineError::Serialize(format!(
             "message-retention component must be 8 bytes, got {}",
             bytes.len()
         )));
     }
+    let mut encoded = [0u8; 8];
+    encoded.copy_from_slice(bytes);
+    Ok(u64::from_be_bytes(encoded))
+}
+
+fn validate_message_retention(bytes: &[u8]) -> Result<(), EngineError> {
+    decode_message_retention(bytes)?;
     Ok(())
 }
 
@@ -755,5 +776,12 @@ mod tests {
         validate_group_image(&absent).expect("five-empty-fields is the absent state");
         // The previous (buggy) zero-byte encoding must NOT validate.
         assert!(validate_group_image(&[]).is_err());
+    }
+
+    #[test]
+    fn message_retention_state_is_big_endian_seconds() {
+        assert_eq!(decode_message_retention(&42u64.to_be_bytes()).unwrap(), 42);
+        assert_eq!(decode_message_retention(&0u64.to_be_bytes()).unwrap(), 0);
+        assert!(decode_message_retention(&[0u8; 7]).is_err());
     }
 }

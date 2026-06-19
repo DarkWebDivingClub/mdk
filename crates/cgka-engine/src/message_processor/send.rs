@@ -11,6 +11,7 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
+use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -553,7 +554,12 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        let app_event =
+            crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        let wrap_metadata = GroupMessageMetadata::application(
+            app_event.created_at,
+            crate::app_components::message_retention_seconds_of_group(&mls_group)?,
+        );
 
         let out: MlsMessageOut = mls_group
             .create_message(&provider, &self.identity.signer, &payload)
@@ -565,12 +571,13 @@ impl<S: StorageProvider> Engine<S> {
         let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let wrapped = self
             .peeler
-            .wrap_group_message(
+            .wrap_group_message_with_metadata(
                 &EncryptedPayload {
                     ciphertext: out_bytes.clone(),
                     aad: vec![],
                 },
                 &ctx,
+                &wrap_metadata,
             )
             .await
             .map_err(EngineError::Peeler)?;

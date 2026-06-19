@@ -3,19 +3,22 @@
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
+};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -44,6 +47,9 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 }
 
 struct MockPeeler;
+struct RecordingPeeler {
+    seen_metadata: Arc<Mutex<Vec<GroupMessageMetadata>>>,
+}
 struct FailOncePeeler {
     failed: Mutex<HashSet<MessageId>>,
 }
@@ -126,6 +132,47 @@ impl TransportPeeler for MockPeeler {
                 recipient: recipient.clone(),
             },
         })
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for RecordingPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: &GroupMessageMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.seen_metadata.lock().unwrap().push(*metadata);
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
     }
 }
 
@@ -215,6 +262,56 @@ fn app_content(payload: &[u8]) -> Vec<u8> {
         .expect("test app event decodes")
         .content
         .into_bytes()
+}
+
+#[tokio::test]
+async fn send_app_message_passes_retention_metadata_to_peeler() {
+    let seen_metadata = Arc::new(Mutex::new(Vec::new()));
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported)
+        .peeler(Box::new(RecordingPeeler {
+            seen_metadata: seen_metadata.clone(),
+        }))
+        .build()
+        .unwrap();
+
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "retention".into(),
+            description: "metadata".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match created {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("unexpected create result: {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let payload = app_payload_for(&alice, b"expiring hello");
+    let sent = alice
+        .send(SendIntent::AppMessage { group_id, payload })
+        .await
+        .unwrap();
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
+
+    let seen = seen_metadata.lock().unwrap();
+    assert_eq!(
+        seen.as_slice(),
+        &[GroupMessageMetadata::application(1_700_000_000, Some(60))]
+    );
 }
 
 // ── Every StaleReason reachable ─────────────────────────────────────────────

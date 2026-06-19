@@ -78,7 +78,7 @@ pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState, StoredMessagePayload};
-pub use peeler::TransportPeeler;
+pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
 pub use storage::{
     CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
     StorageError, StorageProvider, StorageResult, WelcomeStorage,

@@ -10,7 +10,7 @@ use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{GroupId, MemberId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -24,6 +24,7 @@ use std::sync::Arc;
 const NONCE_LEN: usize = 12;
 const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 const KEY_PACKAGE_EVENT_TAG: &str = "e";
+const EXPIRATION_TAG: &str = "expiration";
 const WELCOME_RELAYS_TAG: &str = "relays";
 
 /// Empty AAD for the outer kind-445 ChaCha20-Poly1305 sealing
@@ -89,6 +90,76 @@ impl NostrMlsPeeler {
             });
         }
         Ok(secret)
+    }
+
+    fn wrap_group_message_inner(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: Option<&GroupMessageMetadata>,
+    ) -> Result<TransportMessage, PeelerError> {
+        let group_id = ctx
+            .transport_group_id()
+            .ok_or_else(|| PeelerError::MissingContext {
+                label: "transport_group_id".into(),
+            })?;
+        // spec/transports/nostr.md: the AEAD AAD is the empty byte string and is
+        // never serialized into the event. Callers that pass a non-empty AAD are
+        // off-spec; fail closed rather than silently dropping bytes.
+        if !payload.aad.is_empty() {
+            return Err(PeelerError::WrapFailed(
+                "Nostr kind-445 group wrap requires empty AAD".into(),
+            ));
+        }
+        let key = self.group_key(ctx)?;
+        let mut nonce = [0_u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let cipher = ChaCha20Poly1305::new_from_slice(key)
+            .map_err(|e| PeelerError::WrapFailed(e.to_string()))?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &payload.ciphertext,
+                    aad: GROUP_AAD,
+                },
+            )
+            .map_err(|_| PeelerError::WrapFailed("group encryption failed".into()))?;
+        // content = base64(nonce || ciphertext).
+        let mut framed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        framed.extend_from_slice(&nonce);
+        framed.extend_from_slice(&ciphertext);
+        let content = BASE64_STANDARD.encode(&framed);
+
+        // spec/transports/nostr.md:32-34 — the outer kind-445 event MUST be
+        // signed by a fresh ephemeral Nostr key generated for this event, never
+        // the sender's account identity and never reused. Generate one per
+        // call and sign here so the adapter publishes the event as-is rather
+        // than re-signing it with the account signer.
+        let ephemeral = Keys::generate();
+        let mut tags = vec![Tag::custom(
+            nostr::TagKind::custom(GROUP_TAG),
+            [hex::encode(group_id)],
+        )];
+        if let Some(expiration) = metadata
+            .map(|metadata| metadata.expiration_timestamp())
+            .transpose()
+            .map_err(|err| {
+                PeelerError::WrapFailed(format!("invalid group-message metadata: {err:?}"))
+            })?
+            .flatten()
+        {
+            tags.push(Tag::custom(
+                nostr::TagKind::custom(EXPIRATION_TAG),
+                [expiration.to_string()],
+            ));
+        }
+        let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
+            .tags(tags)
+            .sign_with_keys(&ephemeral)
+            .map_err(|e| PeelerError::WrapFailed(format!("ephemeral kind-445 sign: {e}")))?;
+        let event = NostrTransportEvent::from_nostr_event(&signed).map_err(to_peeler_error)?;
+        event.to_transport_message().map_err(to_peeler_error)
     }
 
     fn recipient_pubkey(recipient: &MemberId) -> Result<PublicKey, PeelerError> {
@@ -219,54 +290,16 @@ impl TransportPeeler for NostrMlsPeeler {
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        let group_id = ctx
-            .transport_group_id()
-            .ok_or_else(|| PeelerError::MissingContext {
-                label: "transport_group_id".into(),
-            })?;
-        // spec/transports/nostr.md: the AEAD AAD is the empty byte string and is
-        // never serialized into the event. Callers that pass a non-empty AAD are
-        // off-spec; fail closed rather than silently dropping bytes.
-        if !payload.aad.is_empty() {
-            return Err(PeelerError::WrapFailed(
-                "Nostr kind-445 group wrap requires empty AAD".into(),
-            ));
-        }
-        let key = self.group_key(ctx)?;
-        let mut nonce = [0_u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let cipher = ChaCha20Poly1305::new_from_slice(key)
-            .map_err(|e| PeelerError::WrapFailed(e.to_string()))?;
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &payload.ciphertext,
-                    aad: GROUP_AAD,
-                },
-            )
-            .map_err(|_| PeelerError::WrapFailed("group encryption failed".into()))?;
-        // content = base64(nonce || ciphertext).
-        let mut framed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        framed.extend_from_slice(&nonce);
-        framed.extend_from_slice(&ciphertext);
-        let content = BASE64_STANDARD.encode(&framed);
+        self.wrap_group_message_inner(payload, ctx, None)
+    }
 
-        // spec/transports/nostr.md:32-34 — the outer kind-445 event MUST be
-        // signed by a fresh ephemeral Nostr key generated for this event, never
-        // the sender's account identity and never reused. Generate one per
-        // call and sign here so the adapter publishes the event as-is rather
-        // than re-signing it with the account signer.
-        let ephemeral = Keys::generate();
-        let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
-            .tags([Tag::custom(
-                nostr::TagKind::custom(GROUP_TAG),
-                [hex::encode(group_id)],
-            )])
-            .sign_with_keys(&ephemeral)
-            .map_err(|e| PeelerError::WrapFailed(format!("ephemeral kind-445 sign: {e}")))?;
-        let event = NostrTransportEvent::from_nostr_event(&signed).map_err(to_peeler_error)?;
-        event.to_transport_message().map_err(to_peeler_error)
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: &GroupMessageMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.wrap_group_message_inner(payload, ctx, Some(metadata))
     }
 
     async fn wrap_welcome(
@@ -532,6 +565,85 @@ mod tests {
             )
             .await
             .expect_err("non-empty AAD is off-spec for kind-445");
+        assert!(matches!(err, PeelerError::WrapFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn group_wrap_metadata_adds_expiration_for_app_messages() {
+        let group_id = vec![0x99; 32];
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(group_id.clone()),
+        );
+        let wrapped = NostrMlsPeeler::default()
+            .wrap_group_message_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &ctx,
+                &GroupMessageMetadata::application(1_700_000_000, Some(60)),
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let event = NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+        let expected_group_id = hex::encode(group_id);
+        assert_eq!(event.tag_value("h"), Some(expected_group_id.as_str()));
+        assert_eq!(event.tag_value(EXPIRATION_TAG), Some("1700000060"));
+        assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_wrap_metadata_omits_expiration_for_control_or_disabled_retention() {
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(vec![0x99; 32]),
+        );
+        for metadata in [
+            GroupMessageMetadata::commit_or_proposal(),
+            GroupMessageMetadata::application(1_700_000_000, None),
+            GroupMessageMetadata::application(1_700_000_000, Some(0)),
+        ] {
+            let wrapped = NostrMlsPeeler::default()
+                .wrap_group_message_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: b"inner mls bytes".to_vec(),
+                        aad: vec![],
+                    },
+                    &ctx,
+                    &metadata,
+                )
+                .await
+                .expect("wrap succeeds");
+            let event =
+                NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+            assert_eq!(event.tag_value(EXPIRATION_TAG), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn group_wrap_rejects_overflowing_expiration_metadata() {
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(vec![0x99; 32]),
+        );
+
+        let err = NostrMlsPeeler::default()
+            .wrap_group_message_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &ctx,
+                &GroupMessageMetadata::application(u64::MAX, Some(1)),
+            )
+            .await
+            .expect_err("overflow should fail closed");
+
         assert!(matches!(err, PeelerError::WrapFailed(_)));
     }
 

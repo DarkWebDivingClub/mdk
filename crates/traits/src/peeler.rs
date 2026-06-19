@@ -15,6 +15,65 @@ use crate::transport::{EncryptedPayload, TransportMessage};
 use crate::types::MemberId;
 use async_trait::async_trait;
 
+/// MLS group-message payload metadata the engine knows before transport wrap.
+///
+/// Transport peelers cannot inspect the encrypted MLS bytes. Any transport hint
+/// that depends on the plaintext application payload or MLS message class must
+/// be carried explicitly at this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupMessageMetadata {
+    /// An MLS application message whose plaintext is a Marmot inner app event.
+    Application {
+        /// The sender-authenticated `created_at` from the inner app event.
+        inner_created_at: u64,
+        /// The active group message-retention duration, in seconds. `None` and
+        /// `Some(0)` both mean transport expiration is disabled.
+        retention_seconds: Option<u64>,
+    },
+    /// MLS group-state history: commits and proposals. Transport expiration
+    /// MUST NOT be attached to these messages.
+    CommitOrProposal,
+}
+
+impl GroupMessageMetadata {
+    pub fn application(inner_created_at: u64, retention_seconds: Option<u64>) -> Self {
+        Self::Application {
+            inner_created_at,
+            retention_seconds,
+        }
+    }
+
+    pub fn commit_or_proposal() -> Self {
+        Self::CommitOrProposal
+    }
+
+    /// Compute the transport-level expiration timestamp, if any.
+    pub fn expiration_timestamp(&self) -> Result<Option<u64>, GroupMessageMetadataError> {
+        let Self::Application {
+            inner_created_at,
+            retention_seconds,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let Some(retention_seconds) = retention_seconds else {
+            return Ok(None);
+        };
+        if *retention_seconds == 0 {
+            return Ok(None);
+        }
+        inner_created_at
+            .checked_add(*retention_seconds)
+            .map(Some)
+            .ok_or(GroupMessageMetadataError::ExpirationTimestampOverflow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupMessageMetadataError {
+    ExpirationTimestampOverflow,
+}
+
 /// Unwrap and rewrap transport-layer envelopes. A single peeler typically
 /// handles one transport (e.g. `NostrMlsPeeler`).
 ///
@@ -51,6 +110,15 @@ pub trait TransportPeeler: Send + Sync {
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError>;
+
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        _metadata: &GroupMessageMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.wrap_group_message(payload, ctx).await
+    }
 
     async fn wrap_welcome(
         &self,
