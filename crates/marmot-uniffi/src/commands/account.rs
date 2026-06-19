@@ -34,6 +34,20 @@ impl Marmot {
         Ok(())
     }
 
+    /// Destructive sign-out: leave every active MLS group (best-effort), delete
+    /// the account's relay-published KeyPackages, then wipe all local state for
+    /// this account (MLS state DB, cached media/secrets, SQL account row, and
+    /// the secret-store nsec). After this returns the account ref is no longer
+    /// valid for any further FFI call. The returned `WipeOutcomeFfi` reports
+    /// each stage independently so the app can show progress and a
+    /// partial-failure sheet (darkmatter#478).
+    pub async fn sign_out_and_wipe(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::WipeOutcomeFfi, MarmotKitError> {
+        Ok(self.runtime.sign_out_and_wipe(&account_ref).await?.into())
+    }
+
     /// Create a brand-new Nostr identity, store its secret in the platform
     /// keychain, and publish initial relay lists + key package.
     pub async fn create_identity(

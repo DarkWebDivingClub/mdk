@@ -534,6 +534,93 @@ pub struct ManagedAccount {
     pub running: bool,
 }
 
+/// Structured outcome of [`MarmotAppRuntime::sign_out_and_wipe`].
+///
+/// Every stage of the destructive sign-out is reported independently so the
+/// app can render progress and a partial-failure sheet. The network-bound
+/// stages (group leave, KeyPackage deletion) are best-effort and may report
+/// per-target failures without aborting the wipe; the local-cleanup stage is
+/// all-or-nothing (see the type-level invariant on
+/// [`MarmotAppRuntime::sign_out_and_wipe`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WipeOutcome {
+    /// Number of active MLS groups this account successfully left.
+    pub groups_left: u32,
+    /// Per-group leave failures. Best-effort: the wipe does not abort on these.
+    pub group_leave_failures: Vec<GroupLeaveFailure>,
+    /// Number of relay-published KeyPackage events successfully deleted.
+    pub key_packages_deleted: u32,
+    /// Per-relay KeyPackage deletion failures. Best-effort.
+    pub key_package_failures: Vec<RelayFailure>,
+    /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
+    /// secret-store nsec, ephemeral relay/subscription state) completed.
+    pub local_cleanup: LocalCleanupReport,
+}
+
+/// A failed attempt to leave a single MLS group during the wipe.
+///
+/// `reason` is a privacy-safe, human-readable summary — it MUST NOT contain
+/// relay URLs, pubkeys, payloads, or key material.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupLeaveFailure {
+    pub group_id_hex: String,
+    pub reason: String,
+}
+
+/// A failed relay-side operation (currently KeyPackage deletion) during the
+/// wipe. `event_id_hex` identifies the KeyPackage event the deletion targeted
+/// (empty when the failure happened during discovery, before any specific
+/// event was known) and `reason` is a privacy-safe summary — it MUST NOT
+/// contain relay URLs, pubkeys, payloads, or key material.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayFailure {
+    pub event_id_hex: String,
+    pub reason: String,
+}
+
+/// Local-cleanup stage result. In darkmatter, removing the account directory
+/// atomically drops the SQLCipher session database (MLS state + projections),
+/// the cached media/source-epoch secrets, the on-disk KeyPackage material, the
+/// SQL account record, and the secret-store nsec; the in-memory caches,
+/// subscriptions, and the managed account worker are torn down first. The wipe
+/// only marks this stage `completed` once that removal returns `Ok`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCleanupReport {
+    /// Whether local cleanup finished. When `false`, `reason` carries the
+    /// failure summary and the account ref may still be partially valid.
+    pub completed: bool,
+    /// Failure summary when `completed` is `false`. Privacy-safe.
+    pub reason: Option<String>,
+}
+
+/// Map an [`AppError`] to a stable, privacy-safe failure category for the
+/// app-facing [`WipeOutcome`] reports.
+///
+/// The wipe report fields are surfaced to the app (and over FFI) for a
+/// partial-failure sheet, so they must obey the same privacy contract as
+/// tracing: no relay URLs, pubkeys, group/account/message ids, paths,
+/// payloads, ciphertext, plaintext, or key material. Many `AppError` variants
+/// wrap transparent transport/storage/IO errors whose `Display` text can embed
+/// exactly those identifiers, so we never interpolate `err` here — we classify
+/// it into a fixed phrase instead.
+fn wipe_failure_reason(err: &AppError) -> String {
+    let category = match err {
+        AppError::RuntimeStopping => "runtime is shutting down",
+        AppError::Transport(_) | AppError::TransportClosed => "transport error",
+        AppError::Publish(_) => "relay publish failed",
+        AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
+            "local storage error"
+        }
+        AppError::Io(_) => "filesystem error",
+        AppError::Account(_) | AppError::AccountHome(_) => "account error",
+        AppError::Session(_) => "session error",
+        AppError::UnknownGroup(_) => "unknown local group",
+        AppError::MissingKeyPackage(_) => "no published key package",
+        _ => "operation failed",
+    };
+    category.to_owned()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountSetupRequest {
     pub identity: Option<String>,
@@ -1586,6 +1673,161 @@ impl MarmotAppRuntime {
         self.accounts
             .delete_key_package(account_ref, event_id_hex, relays)
             .await
+    }
+
+    /// Destructive sign-out: fully remove the account's footprint from this
+    /// device and from the relays the engine controls publishing to.
+    ///
+    /// Stages run in the order the spec (darkmatter#478) mandates:
+    /// 1. Best-effort leave for every active MLS group. Failures are collected
+    ///    per group and do not abort the wipe. This MUST happen while MLS state
+    ///    still exists — once the session DB is wiped the engine can no longer
+    ///    sign leave messages. "Active" here means *locally MLS-joined*, which
+    ///    in darkmatter includes groups still marked `pending_confirmation`: an
+    ///    incoming Welcome auto-joins MLS state before the user accepts, so a
+    ///    pending invite is a real committed membership this device must leave
+    ///    (the decline path leaves such groups too). Group-enumeration failures
+    ///    are surfaced as a recorded failure rather than silently dropped.
+    /// 2. Best-effort delete of every relay-published KeyPackage event, always
+    ///    (no toggle), mirroring the `delete_key_package` path.
+    /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
+    ///    and in-memory caches, then remove the account directory. In darkmatter
+    ///    `remove_account` first **atomically renames** the live account
+    ///    directory out of the active namespace and only then deletes the
+    ///    tombstoned bytes (the SQLCipher session database holding MLS state,
+    ///    projections, and cached media/source-epoch secrets, the on-disk
+    ///    KeyPackage material, and the SQL account record) plus the secret-store
+    ///    nsec. Ephemeral relay/subscription state is held by the worker that was
+    ///    just shut down.
+    ///
+    /// # Invariants
+    /// - Stage 3 (local MLS-DB wipe) is all-or-nothing: `remove_account`
+    ///   atomically renames the account directory out of the live namespace as
+    ///   its single commit point, so the MLS database is never observably left
+    ///   partially wiped — a live account either still fully exists (rename not
+    ///   done) or is entirely gone (rename done). `local_cleanup.completed` is
+    ///   only `false` when that rename never happened (nothing was wiped); once
+    ///   it succeeds the wipe completes even if deleting the orphaned tombstone
+    ///   bytes later fails.
+    /// - After a successful wipe the `account_ref` is no longer valid for any
+    ///   further runtime/FFI call.
+    /// - Stages 1 and 2 are network-bound; their per-target failures are
+    ///   surfaced for the app's partial-failure sheet and never block local
+    ///   cleanup.
+    pub async fn sign_out_and_wipe(&self, account_ref: &str) -> Result<WipeOutcome, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        if !account.local_signing {
+            // A wipe must sign group-leave messages and KeyPackage deletions;
+            // a tracked-only (npub) account can do neither, so there is nothing
+            // remote to clean up. Surface the same error the worker path uses.
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+        }
+
+        let mut outcome = WipeOutcome::default();
+
+        // Stage 1: best-effort leave for every active MLS group. We read the
+        // group set directly from the in-memory account state (no relay round
+        // trip). We attempt the leave for *every* group with local MLS
+        // membership, including ones still marked `pending_confirmation`: in
+        // darkmatter an incoming Welcome auto-joins MLS state while the app
+        // keeps the invite pending until the user accepts, so a
+        // pending-confirmation group is already a committed MLS member this
+        // device can — and must — leave before its state is wiped (mirroring
+        // `decline_group_invite`, which leaves the group before archiving). If
+        // we skipped them, signing out before accepting an invite would wipe
+        // the local MLS state without ever publishing a leave, and the engine
+        // could never sign one afterwards. A failure to enumerate groups is a
+        // recorded failure, not a silent "no groups" — it must not let the wipe
+        // skip remote leaves without surfacing why.
+        let groups = match self.accounts.app.groups(&account.label) {
+            Ok(groups) => groups,
+            Err(err) => {
+                outcome.group_leave_failures.push(GroupLeaveFailure {
+                    group_id_hex: String::new(),
+                    reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
+                });
+                Vec::new()
+            }
+        };
+        for group in groups {
+            let group_id_hex = group.group_id_hex.clone();
+            let group_id = match hex::decode(&group_id_hex) {
+                Ok(bytes) => GroupId::new(bytes),
+                Err(_) => {
+                    outcome.group_leave_failures.push(GroupLeaveFailure {
+                        group_id_hex,
+                        reason: "invalid group id".to_owned(),
+                    });
+                    continue;
+                }
+            };
+            match self.leave_group(account_ref, &group_id).await {
+                Ok(_) => outcome.groups_left += 1,
+                Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                    group_id_hex,
+                    reason: wipe_failure_reason(&err),
+                }),
+            }
+        }
+
+        // Stage 2: delete every relay-published KeyPackage. Discovery itself is
+        // network-bound; a discovery failure is recorded as a single failure
+        // (no event id) and must not abort the wipe.
+        match self.account_key_packages(account_ref, Vec::new()).await {
+            Ok(packages) => {
+                for package in packages {
+                    if !package.relay {
+                        continue;
+                    }
+                    let event_id_hex = package.key_package_event_id.clone();
+                    let relays = package
+                        .source_relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect::<Vec<_>>();
+                    match self
+                        .delete_key_package(account_ref, &event_id_hex, relays)
+                        .await
+                    {
+                        Ok(_) => outcome.key_packages_deleted += 1,
+                        Err(err) => outcome.key_package_failures.push(RelayFailure {
+                            event_id_hex,
+                            reason: wipe_failure_reason(&err),
+                        }),
+                    }
+                }
+            }
+            Err(err) => outcome.key_package_failures.push(RelayFailure {
+                event_id_hex: String::new(),
+                reason: format!(
+                    "key package discovery failed: {}",
+                    wipe_failure_reason(&err)
+                ),
+            }),
+        }
+
+        // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
+        // drops in-memory caches, and removes the account directory (MLS DB,
+        // media, KeyPackage material, SQL row) plus the secret-store nsec in a
+        // single all-or-nothing step.
+        match self.accounts.remove_account(account_ref).await {
+            Ok(()) => {
+                outcome.local_cleanup = LocalCleanupReport {
+                    completed: true,
+                    reason: None,
+                };
+            }
+            Err(err) => {
+                outcome.local_cleanup = LocalCleanupReport {
+                    completed: false,
+                    reason: Some(wipe_failure_reason(&err)),
+                };
+            }
+        }
+
+        Ok(outcome)
     }
 
     pub async fn publish_user_profile(

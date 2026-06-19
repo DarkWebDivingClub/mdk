@@ -89,14 +89,15 @@ pub(crate) use groups::AppGroupImageInput;
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    AgentTextStreamCryptoContext, ChatListUpdateTrigger, ManagedAccount, MarmotAppEvent,
-    MarmotAppRuntime, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
-    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
-    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
-    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    StreamStartView, TimelineWindowHandle,
+    AgentTextStreamCryptoContext, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
+    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RelayFailure, RuntimeAccountError,
+    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
+    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
+    TimelineWindowHandle, WipeOutcome,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};

@@ -1,6 +1,7 @@
 //! Persistent account home: local Nostr account records and signing credentials.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,15 @@ pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
 const TRACE_TARGET: &str = "marmot_account::home";
+/// Subdirectory of the home root that holds account directories that have been
+/// atomically renamed out of the live `accounts/` namespace by
+/// [`AccountHome::remove_account`] and are pending best-effort deletion. It is
+/// deliberately not under `accounts/` so account enumeration never observes a
+/// tombstone as a live record.
+const WIPE_TOMBSTONE_DIR: &str = ".wipe-tombstones";
+
+/// Disambiguates concurrent tombstone names within a single process.
+static TOMBSTONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Persistent home for local Nostr account records and their signing
 /// credentials.
@@ -195,24 +205,106 @@ impl AccountHome {
         Ok(accounts)
     }
 
+    /// Remove an account's entire local footprint: its on-disk account
+    /// directory (the SQLCipher session database with MLS state + projections,
+    /// cached media/source-epoch secrets, on-disk KeyPackage material, and the
+    /// SQL account record) and its signing secret.
+    ///
+    /// # All-or-nothing local wipe
+    ///
+    /// The account directory is first **atomically renamed** out of the live
+    /// `accounts/` namespace into a tombstone under [`WIPE_TOMBSTONE_DIR`]; only
+    /// then are the secret and the tombstone bytes deleted. `fs::rename` within
+    /// the same filesystem is atomic, so from the perspective of every live
+    /// account read ([`AccountHome::account`], [`AccountHome::accounts`]) the
+    /// account either still fully exists (rename not yet done) or is entirely
+    /// gone (rename done) — there is no observable partial-MLS-DB state.
+    ///
+    /// This matters for destructive sign-out (`sign_out_and_wipe`): the issue
+    /// invariant is that once the MLS-DB wipe starts it must complete, because a
+    /// half-wiped MLS database is worse than either extreme. The rename is that
+    /// commit point. If the rename itself fails, nothing has been touched and
+    /// the error is safe to surface as "wipe did not start". If deleting the
+    /// secret or the tombstone fails *after* the rename, the live account is
+    /// already gone; the residual tombstone bytes are orphaned junk outside any
+    /// live account, so the call still reports success rather than a forbidden
+    /// partial-live state.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
         // Hold the mutation lock across the shared-credential check and
         // the matching `remove_secret` call so two concurrent removals on
         // twin records cannot both observe the other as still present,
-        // both skip deletion, and orphan the shared credential.
+        // both skip deletion, and orphan the shared credential. The lock
+        // also serializes the rename-to-tombstone commit point.
         let _guard = self
             .mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = self.account(account_ref)?;
+
+        // Commit point: atomically move the live account directory into the
+        // tombstone namespace. After this returns Ok the account is no longer a
+        // live record and the MLS DB can never be observed half-wiped. A
+        // missing directory is treated as already-removed (idempotent).
+        let live_dir = self.account_dir(&account.label);
+        let tombstone = self.move_account_dir_to_tombstone(&account.label, &live_dir)?;
+
+        // Drop the signing secret unless a twin record still depends on a
+        // shared (account-id-keyed) credential. For the local-file store the
+        // secret lived inside the account directory we just renamed, so this is
+        // a no-op (NotFound -> Ok); the bytes are destroyed with the tombstone
+        // below. For the keychain store the entry is independent of the
+        // directory and is removed here.
         if !self.secret_shared_with_other_record(&account)? {
             self.secret_store.remove_secret(&account)?;
         }
-        match fs::remove_dir_all(self.account_dir(&account.label)) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
+
+        // Best-effort deletion of the tombstoned bytes. A failure here leaves
+        // orphaned bytes outside the live `accounts/` namespace, never a
+        // partially wiped *live* account, so the wipe is still considered
+        // complete.
+        if let Some(tombstone) = tombstone
+            && let Err(err) = fs::remove_dir_all(&tombstone)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "remove_account",
+                "failed to delete wiped account tombstone; bytes are orphaned but no live account remains"
+            );
         }
+        Ok(())
+    }
+
+    /// Atomically rename a live account directory into the tombstone namespace.
+    ///
+    /// Returns the tombstone path on success, or `None` if the live directory
+    /// did not exist (already removed). On any other error the live directory
+    /// is left untouched so the caller can report that the wipe never started.
+    fn move_account_dir_to_tombstone(
+        &self,
+        label: &str,
+        live_dir: &Path,
+    ) -> AccountHomeResult<Option<PathBuf>> {
+        if !live_dir.exists() {
+            return Ok(None);
+        }
+        let tombstone_root = self.root.join(WIPE_TOMBSTONE_DIR);
+        fs::create_dir_all(&tombstone_root)?;
+        for _ in 0..32 {
+            let attempt = TOMBSTONE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tombstone =
+                tombstone_root.join(format!("{label}.{}.{attempt}", std::process::id()));
+            match fs::rename(live_dir, &tombstone) {
+                Ok(()) => return Ok(Some(tombstone)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique account wipe tombstone",
+        )
+        .into())
     }
 
     /// Account-id-keyed stores hold one credential per account id, so records

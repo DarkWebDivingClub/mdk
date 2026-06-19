@@ -1,6 +1,9 @@
 //! Account summary, send summary, key-package, and user-profile FFI conversions.
 
-use marmot_app::{AccountKeyPackageRecord, SendSummary, UserProfileMetadata};
+use marmot_app::{
+    AccountKeyPackageRecord, GroupLeaveFailure, LocalCleanupReport, RelayFailure, SendSummary,
+    UserProfileMetadata, WipeOutcome,
+};
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountSummaryFfi {
@@ -90,6 +93,88 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
             lud16: value.lud16,
             created_at: 0,
             source_relays: vec![],
+        }
+    }
+}
+
+/// Structured result of `signOutAndWipe`. Every stage of the destructive
+/// sign-out is reported independently so the app can render progress and a
+/// partial-failure sheet.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct WipeOutcomeFfi {
+    /// Active MLS groups this account successfully left.
+    pub groups_left: u32,
+    /// Per-group leave failures. Best-effort: the wipe does not abort on these.
+    pub group_leave_failures: Vec<GroupLeaveFailureFfi>,
+    /// Relay-published KeyPackage events successfully deleted.
+    pub key_packages_deleted: u32,
+    /// Per-relay KeyPackage deletion (or discovery) failures.
+    pub key_package_failures: Vec<RelayFailureFfi>,
+    /// Local cleanup (MLS DB, media cache, SQL row, secret-store nsec) result.
+    pub local_cleanup: LocalCleanupReportFfi,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupLeaveFailureFfi {
+    pub group_id_hex: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayFailureFfi {
+    pub event_id_hex: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct LocalCleanupReportFfi {
+    pub completed: bool,
+    pub reason: Option<String>,
+}
+
+impl From<WipeOutcome> for WipeOutcomeFfi {
+    fn from(value: WipeOutcome) -> Self {
+        Self {
+            groups_left: value.groups_left,
+            group_leave_failures: value
+                .group_leave_failures
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            key_packages_deleted: value.key_packages_deleted,
+            key_package_failures: value
+                .key_package_failures
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            local_cleanup: value.local_cleanup.into(),
+        }
+    }
+}
+
+impl From<GroupLeaveFailure> for GroupLeaveFailureFfi {
+    fn from(value: GroupLeaveFailure) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<RelayFailure> for RelayFailureFfi {
+    fn from(value: RelayFailure) -> Self {
+        Self {
+            event_id_hex: value.event_id_hex,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<LocalCleanupReport> for LocalCleanupReportFfi {
+    fn from(value: LocalCleanupReport) -> Self {
+        Self {
+            completed: value.completed,
+            reason: value.reason,
         }
     }
 }
