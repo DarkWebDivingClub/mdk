@@ -144,8 +144,8 @@ GitHub-generated source archives are the downloadable artifacts.
 ## DM Agent Release
 
 Use this for the Dark Matter agent connector entry point. The release publishes `dm-agent` binaries for supported
-platforms plus adapter install assets. Today that includes the Hermes Marmot plugin and `install-hermes-marmot.sh`; the
-same release track can grow OpenClaw or other agent-system assets later.
+platforms plus adapter install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, and the OpenClaw Marmot
+channel plugin + `install-openclaw-marmot.sh`. The track can grow other agent-system assets later.
 
 The workflow lives at:
 
@@ -162,6 +162,7 @@ Before a DM Agent release, run the normal preflight plus:
 ```sh
 cargo test -p agent-connector
 bash scripts/install-hermes-marmot.sh --dry-run
+bash scripts/install-openclaw-marmot.sh --dry-run
 ```
 
 Cut the release tag from the current `origin/master` commit:
@@ -187,13 +188,22 @@ The release job creates these assets:
 - `dm-agent-darwin-aarch64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
+- `openclaw-marmot-plugin-<version>.tgz`
+- `openclaw-marmot-plugin-<version>.tgz.sha256`
 - `install-hermes-marmot.sh`
+- `install-openclaw-marmot.sh`
 
-The installer asset is generated during the release and defaults to its own `dm-agent-v<version>` release tag and
+Each plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and workspace
+version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
+
+The installer assets are generated during the release and default to their own `dm-agent-v<version>` release tag and
 `<version>` asset suffix. A release install looks like:
 
 ```sh
+# Hermes gateway
 curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-hermes-marmot.sh | bash
+# OpenClaw gateway
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-openclaw-marmot.sh | bash
 ```
 
 ## MarmotKit Binding Release

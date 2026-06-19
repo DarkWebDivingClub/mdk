@@ -120,6 +120,45 @@ hermes-dev-e2e-connector root="":
         ./scripts/hermes_marmot_connector_e2e.sh --root "{{root}}"
     fi
 
+openclaw-dev-setup args="":
+    ./scripts/openclaw_marmot_dev_setup.sh {{args}}
+
+openclaw-dev-teardown args="":
+    ./scripts/openclaw_marmot_dev_teardown.sh {{args}}
+
+openclaw-dev-test:
+    cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
+
+openclaw-phone-test-up:
+    docker compose --profile openclaw-phone-test up -d --build openclaw-marmot-phone-test
+
+openclaw-phone-test-bootstrap:
+    docker compose exec openclaw-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+
+openclaw-phone-test-logs:
+    docker compose logs -f openclaw-marmot-phone-test
+
+openclaw-phone-test-down:
+    docker compose --profile openclaw-phone-test down
+
+openclaw-phone-test-reset:
+    docker compose --profile openclaw-phone-test down -v
+
+openclaw-gateway-up:
+    docker compose --profile openclaw-gateway up -d --build openclaw-gateway
+
+openclaw-gateway-bootstrap:
+    docker compose exec openclaw-gateway dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+
+openclaw-gateway-logs:
+    docker compose logs -f openclaw-gateway
+
+openclaw-gateway-down:
+    docker compose --profile openclaw-gateway down
+
+openclaw-gateway-reset:
+    docker compose --profile openclaw-gateway down -v
+
 e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail

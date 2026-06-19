@@ -7,8 +7,9 @@ Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encry
 composition. Agent runtimes such as Hermes, and later OpenClaw, stay thin: they run models and tools, then talk to
 `dm-agent` through the local agent-control socket.
 
-Hermes is the first supported adapter. OpenClaw is expected to use the same connector shape after the control and stream
-contracts settle.
+Hermes is the first supported adapter. OpenClaw is the second: a TypeScript channel plugin at
+[`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
+connector.
 
 ## Names
 

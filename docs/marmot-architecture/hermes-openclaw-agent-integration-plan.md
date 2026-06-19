@@ -1,7 +1,7 @@
 ---
 title: "Hermes And OpenClaw Agent Integration Plan"
 created: 2026-06-06
-updated: 2026-06-08
+updated: 2026-06-17
 tags: [marmot, architecture, agents, hermes, openclaw, quic]
 status: working-plan
 ---
@@ -277,6 +277,13 @@ Do not require per-token output for v1. Block-level or edit-level progress is en
 records.
 
 ## Workstream 7: OpenClaw Channel Shim
+
+Status (2026-06-17): implemented at `integrations/openclaw/marmot` as a TypeScript channel plugin pinned to
+`openclaw@2026.6.8`, using `openclaw/plugin-sdk/channel-outbound` for the durable message adapter. The Marmot-side
+logic (transcript-hash parity, control client, durable send, live-preview state machine, inbound bridge, config /
+account / allowlist resolution) is unit-tested. The inbound→agent turn dispatch and the live-preview streaming-pipeline
+wiring use OpenClaw gateway runtime internals and are validated by the docker phone test rather than unit tests. The
+path drift below is resolved: `channel-outbound` is the current message-lifecycle surface.
 
 OpenClaw is second because its SDK docs currently show some path drift.
 
