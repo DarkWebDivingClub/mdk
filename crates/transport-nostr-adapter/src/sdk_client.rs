@@ -373,43 +373,17 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 .add_relay(endpoint.clone())
                 .await
                 .map_err(|e| TransportAdapterError::Subscription(format!("add relay: {e}")))?;
-            // #121 instrumentation: record the per-endpoint connect outcome (no relay
-            // URL, aggregate only) before propagating, so we can confirm whether a
-            // propagated connect failure is load-bearing for wake-delivery. The control
-            // flow is unchanged — the first failure still aborts. Temporary; remove when
-            // #121 is resolved.
-            match timeout(
-                SDK_RELAY_CONNECT_WAIT,
-                self.client.connect_relay(endpoint.clone()),
-            )
-            .await
-            {
-                Err(_) => {
-                    tracing::warn!(
-                        target: "transport_nostr_adapter::sdk_client",
-                        method = "subscribe",
-                        connect_outcome = "timeout",
-                        "relay connect timed out during subscribe"
-                    );
-                    return Err(TransportAdapterError::Subscription(
-                        "connect relay timed out".to_owned(),
-                    ));
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "transport_nostr_adapter::sdk_client",
-                        method = "subscribe",
-                        connect_outcome = "error",
-                        "relay connect failed during subscribe"
-                    );
-                    return Err(TransportAdapterError::Subscription(format!(
-                        "connect relay: {e}"
-                    )));
-                }
-                Ok(Ok(())) => {}
-            }
         }
-        self.client
+
+        // Let nostr-sdk own connection lifecycle for subscriptions. `connect()`
+        // starts background connection tasks for any newly added relays and those
+        // tasks keep retrying; the subscription below is queued/resubscribed as
+        // relays become available instead of blocking activation on a per-relay
+        // connection attempt.
+        self.client.connect().await;
+
+        let output = self
+            .client
             .subscribe_with_id_to(
                 plan.endpoints.clone(),
                 plan.subscription_id.clone(),
@@ -419,11 +393,28 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .await
             .map_err(|e| TransportAdapterError::Subscription(format!("subscribe: {e}")))?;
 
-        // #121 instrumentation: the subscription registered on every planned endpoint.
+        if output.success.is_empty() {
+            return Err(TransportAdapterError::Subscription(format!(
+                "subscribe registered on 0 of {} relays",
+                plan.endpoints.len()
+            )));
+        }
+
+        if !output.failed.is_empty() {
+            tracing::warn!(
+                target: "transport_nostr_adapter::sdk_client",
+                method = "subscribe",
+                registered_count = output.success.len(),
+                failed_count = output.failed.len(),
+                "SDK relay subscription partially registered"
+            );
+        }
+
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "subscribe",
             endpoint_count = plan.endpoints.len(),
+            registered_count = output.success.len(),
             "SDK relay subscription registered"
         );
 

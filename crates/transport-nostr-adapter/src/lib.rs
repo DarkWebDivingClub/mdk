@@ -24,6 +24,7 @@ use cgka_traits::{
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::task::JoinSet;
 use transport_nostr_peeler::{NOSTR_SOURCE, NostrTransportEvent};
 
 mod key_package;
@@ -259,6 +260,43 @@ impl NostrTransportAdapter {
         metrics
     }
 
+    async fn subscribe_all(
+        &self,
+        caller: &'static str,
+        subscriptions: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
+        let mut tasks = JoinSet::new();
+        for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
+            let relay_client = self.relay_client.clone();
+            tasks.spawn(async move { (sub_index, relay_client.subscribe(subscription).await) });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((_sub_index, Ok(()))) => {}
+                Ok((sub_index, Err(err))) => {
+                    tasks.abort_all();
+                    tracing::warn!(
+                        target: "transport_nostr_adapter::adapter",
+                        method = caller,
+                        sub_index,
+                        issued_count = subscriptions.len(),
+                        "transport subscription failed"
+                    );
+                    return Err(err);
+                }
+                Err(err) => {
+                    tasks.abort_all();
+                    return Err(TransportAdapterError::Subscription(format!(
+                        "subscription task failed: {err}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Aggregate cross-relay arrival-spread snapshot for diagnostics and
     /// quiescence tuning. Privacy-safe: counts and millisecond buckets only.
     pub async fn delivery_spread(&self) -> RelayDeliverySpread {
@@ -434,23 +472,7 @@ impl TransportAdapter for NostrTransportAdapter {
         for group in &activation.group_subscriptions {
             issued.push(group_subscription(&account_id, group, activation.since));
         }
-        // #121 instrumentation: subscriptions are issued sequentially and the first
-        // failure aborts the whole activation (behavior unchanged). Record which
-        // position in the sequence aborted so we can confirm the all-or-nothing
-        // hypothesis against missing wake-delivery. Temporary; remove when #121 is
-        // resolved.
-        for (sub_index, subscription) in issued.iter().enumerate() {
-            if let Err(err) = self.relay_client.subscribe(subscription.clone()).await {
-                tracing::warn!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "activate_account",
-                    sub_index,
-                    issued_count = issued.len(),
-                    "transport subscription failed; aborting activation"
-                );
-                return Err(err);
-            }
-        }
+        self.subscribe_all("activate_account", &issued).await?;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "activate_account",
@@ -499,21 +521,7 @@ impl TransportAdapter for NostrTransportAdapter {
             )
         };
 
-        // #121 instrumentation: same all-or-nothing sequential issue path as
-        // activate_account — a single failed add aborts the sync. Temporary; remove
-        // when #121 is resolved.
-        for (sub_index, subscription) in to_add.iter().enumerate() {
-            if let Err(err) = self.relay_client.subscribe(subscription.clone()).await {
-                tracing::warn!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "sync_account_groups",
-                    sub_index,
-                    add_count = to_add.len(),
-                    "transport subscription failed; aborting group sync"
-                );
-                return Err(err);
-            }
-        }
+        self.subscribe_all("sync_account_groups", &to_add).await?;
         for subscription in &to_remove {
             self.relay_client.unsubscribe(subscription.clone()).await?;
         }
