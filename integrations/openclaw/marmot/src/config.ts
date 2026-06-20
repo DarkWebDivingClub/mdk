@@ -175,6 +175,23 @@ function splitCandidates(value: string[] | string | undefined): string[] {
   return parts.map((part) => String(part).trim()).filter((part) => part.length > 0);
 }
 
+/**
+ * Resolve QUIC preview broker candidates with the same semantics as the Hermes
+ * resolver (`resolve_quic_candidates` in integrations/hermes/marmot/adapter.py):
+ * channel config wins; otherwise fall back to env, preferring plural
+ * `MARMOT_QUIC_CANDIDATES` then singular `MARMOT_QUIC_CANDIDATE`. Candidates are
+ * filtered to the `quic://` scheme so a malformed entry never reaches the
+ * connector (which would reject it).
+ */
+function resolveQuicCandidates(
+  cfg: MarmotChannelAccountConfig,
+  env: Record<string, string | undefined>,
+): string[] {
+  const configured =
+    cfg.quicCandidates ?? firstNonEmpty(env.MARMOT_QUIC_CANDIDATES, env.MARMOT_QUIC_CANDIDATE);
+  return splitCandidates(configured).filter((candidate) => candidate.startsWith("quic://"));
+}
+
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
     if (value !== undefined && String(value).trim() !== "") {
@@ -298,9 +315,7 @@ export function resolveMarmotAccount(
     }
   }
 
-  const quicCandidates = splitCandidates(
-    cfg.quicCandidates ?? env.MARMOT_QUIC_CANDIDATES,
-  );
+  const quicCandidates = resolveQuicCandidates(cfg, env);
 
   const profileOnboardingStatePath = expandHome(
     firstNonEmpty(env.MARMOT_PROFILE_ONBOARDING_STATE) ??

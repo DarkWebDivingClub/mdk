@@ -25,6 +25,50 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.accountId).toBe("openclaw-acct");
   });
 
+  it("accepts the singular MARMOT_QUIC_CANDIDATE and filters to the quic:// scheme", () => {
+    // Singular env var (Hermes parity: plural is preferred, singular is the fallback).
+    expect(
+      resolveMarmotAccount(undefined, null, deps({ MARMOT_QUIC_CANDIDATE: "quic://solo:1" }))
+        .quicCandidates,
+    ).toEqual(["quic://solo:1"]);
+
+    // Plural wins when both are set and non-empty.
+    expect(
+      resolveMarmotAccount(
+        undefined,
+        null,
+        deps({ MARMOT_QUIC_CANDIDATES: "quic://plural:1", MARMOT_QUIC_CANDIDATE: "quic://solo:1" }),
+      ).quicCandidates,
+    ).toEqual(["quic://plural:1"]);
+
+    // An empty plural falls through to the singular (firstNonEmpty semantics).
+    expect(
+      resolveMarmotAccount(
+        undefined,
+        null,
+        deps({ MARMOT_QUIC_CANDIDATES: "  ", MARMOT_QUIC_CANDIDATE: "quic://solo:1" }),
+      ).quicCandidates,
+    ).toEqual(["quic://solo:1"]);
+
+    // Non-quic:// candidates are dropped so a malformed entry never reaches the connector.
+    expect(
+      resolveMarmotAccount(
+        undefined,
+        null,
+        deps({ MARMOT_QUIC_CANDIDATES: "quic://ok:1, https://bad:2, ws://nope:3, quic://ok:2" }),
+      ).quicCandidates,
+    ).toEqual(["quic://ok:1", "quic://ok:2"]);
+
+    // The scheme filter also applies to channel config candidates.
+    expect(
+      resolveMarmotAccount(
+        { quicCandidates: ["quic://ok:1", "tcp://bad:2"] },
+        null,
+        deps({}),
+      ).quicCandidates,
+    ).toEqual(["quic://ok:1"]);
+  });
+
   it("lets channel config override env", () => {
     const resolved = resolveMarmotAccount(
       { socketPath: "/tmp/x.sock", accountIdHex: "bb", quicCandidates: ["quic://c:3"], streaming: false },

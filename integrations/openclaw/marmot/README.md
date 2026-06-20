@@ -86,7 +86,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `authTokenFile` | `MARMOT_AGENT_AUTH_TOKEN_FILE` | — |
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
-| `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
+| `quicCandidates` | `MARMOT_QUIC_CANDIDATES` (or singular `MARMOT_QUIC_CANDIDATE`) | — (final-only); filtered to the `quic://` scheme |
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
