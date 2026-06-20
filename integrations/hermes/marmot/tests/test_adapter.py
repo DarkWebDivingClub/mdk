@@ -708,7 +708,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             client=FakeClient(),
         )
 
-        await adapter._consume_inbound_once()
+        await adapter._consume_inbound_once(drain=True)
 
         self.assertEqual(len(adapter.events), 1)
         event = adapter.events[0]
@@ -812,6 +812,149 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0].text, "recovered after resync")
 
+    async def test_slow_group_turn_does_not_block_dispatch_for_other_groups(self):
+        # darkmatter#513: inbound was dispatched serially (async for -> await handle_message),
+        # so a slow/hung turn in one group blocked dispatch for every group. With per-group
+        # serialization, a stuck turn in group A must NOT prevent group B's turn from running.
+        group_a = "aa" * 32
+        group_b = "bb" * 32
+
+        def make_event(group_id_hex, message_id_hex, text):
+            return {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group_id_hex,
+                "message_id_hex": message_id_hex,
+                "sender_account_id_hex": "44" * 32,
+                "text": text,
+            }
+
+        events = [
+            make_event(group_a, "01" * 32, "slow group A"),
+            make_event(group_b, "02" * 32, "fast group B"),
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+                # Keep the subscription open after yielding so the consume loop parks on the
+                # next event instead of draining the queue (which would serialize the turns).
+                await asyncio.sleep(3600)
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        release_a = asyncio.Event()
+        completed = []
+
+        async def handle_message(event):
+            chat_id = event.source.chat_id
+            if chat_id == group_a:
+                # Group A's turn is "slow/hung": it blocks until the test releases it.
+                await release_a.wait()
+            completed.append(chat_id)
+
+        adapter.handle_message = handle_message
+
+        loop_task = asyncio.ensure_future(adapter._consume_inbound_once())
+        try:
+            # Group B should complete while group A is still blocked: no head-of-line blocking.
+            for _ in range(200):
+                if group_b in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(
+                group_b,
+                completed,
+                "group B turn must dispatch while group A's turn is still in flight",
+            )
+            self.assertNotIn(
+                group_a,
+                completed,
+                "group A turn must still be blocked (it was not released yet)",
+            )
+
+            # Releasing group A lets its turn finish too — nothing was dropped.
+            release_a.set()
+            for _ in range(200):
+                if group_a in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(group_a, completed, "group A turn must complete once released")
+        finally:
+            loop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await loop_task
+            await adapter._inbound_queue.cancel_all()
+
+    async def test_same_group_turns_dispatch_in_fifo_order(self):
+        # Per-group ordering must be preserved: two messages for the SAME group run strictly
+        # in arrival order, with the second turn waiting for the first to finish.
+        group = "cc" * 32
+
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group,
+                "message_id_hex": "01" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "first",
+            },
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group,
+                "message_id_hex": "02" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "second",
+            },
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        order = []
+
+        async def handle_message(event):
+            text = event.text
+            order.append(f"start:{text}")
+            if text == "first":
+                # Yield control after the first turn starts so that, if ordering were broken,
+                # the second turn would have a chance to interleave before "first" finishes.
+                await asyncio.sleep(0.05)
+            order.append(f"end:{text}")
+
+        adapter.handle_message = handle_message
+
+        await adapter._consume_inbound_once(drain=True)
+
+        # Strict FIFO: first fully completes before second starts.
+        self.assertEqual(
+            order,
+            ["start:first", "end:first", "start:second", "end:second"],
+        )
+
     async def test_first_inbound_message_prompts_for_public_profile_name(self):
         events = [
             {
@@ -849,7 +992,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 client=fake_client,
             )
 
-            await adapter._consume_inbound_once()
+            await adapter._consume_inbound_once(drain=True)
 
         self.assertEqual(adapter.events, [])
         self.assertEqual(len(fake_client.final_sends), 1)
@@ -911,13 +1054,261 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 client=fake_client,
             )
 
-            await adapter._consume_inbound_once()
+            await adapter._consume_inbound_once(drain=True)
 
         self.assertEqual(adapter.events, [])
         self.assertEqual(fake_client.published_profiles, [(account_id, "Hermes Agent", "Hermes Agent")])
         self.assertEqual(len(fake_client.final_sends), 1)
         self.assertIn('published this agent', fake_client.final_sends[0][2])
         self.assertEqual(fake_client.final_sends[0][3], "33" * 32)
+
+    async def test_hung_group_does_not_block_reconnect_for_other_groups(self):
+        # darkmatter#513 (adversarial follow-up): the inline-dispatch fix kept the happy path
+        # unblocked, but draining the per-group queue on stream end re-introduced head-of-line
+        # blocking on the RECONNECT path. The queue is long-lived (owned by the adapter) and must
+        # survive resync: a hung turn in group A must not hold the resync hostage, or group B —
+        # delivered only on the fresh post-resync subscription — never runs.
+        group_a = "aa" * 32
+        group_b = "bb" * 32
+        attempts = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                attempts["n"] += 1
+                await asyncio.sleep(0)
+                if attempts["n"] == 1:
+                    # First subscription: a slow/hung group-A turn, then a resync forces reconnect.
+                    yield {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_a,
+                        "message_id_hex": "01" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "slow group A",
+                    }
+                    yield {
+                        "type": "resync_required",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_a,
+                        "dropped_events": 3,
+                    }
+                elif attempts["n"] == 2:
+                    # Fresh subscription after resync delivers group B's message.
+                    yield {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_b,
+                        "message_id_hex": "02" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "fast group B",
+                    }
+                else:
+                    await asyncio.sleep(3600)
+                    return
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        release_a = asyncio.Event()
+        completed = []
+
+        async def handle_message(event):
+            chat_id = event.source.chat_id
+            if chat_id == group_a:
+                await release_a.wait()  # group A's turn is hung until the test releases it
+            completed.append(chat_id)
+
+        adapter.handle_message = handle_message
+
+        loop_task = asyncio.ensure_future(adapter._consume_inbound_loop())
+        try:
+            # Group B must complete even though group A's turn is still hung AND a resync had to
+            # reconnect the subscription in between. If the loop joined the queue on stream end,
+            # the resync (and therefore group B) would be stuck behind hung group A forever.
+            for _ in range(300):
+                if group_b in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(
+                group_b,
+                completed,
+                "group B must dispatch after resync-reconnect even while group A is hung",
+            )
+            self.assertNotIn(
+                group_a,
+                completed,
+                "group A turn must still be blocked (it was not released yet)",
+            )
+            self.assertGreaterEqual(attempts["n"], 2, "loop should reconnect after resync")
+
+            # Releasing group A lets its turn finish too — nothing was dropped.
+            release_a.set()
+            for _ in range(300):
+                if group_a in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(group_a, completed, "group A turn must complete once released")
+        finally:
+            loop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await loop_task
+            await adapter._inbound_queue.cancel_all()
+
+    async def test_concurrent_first_messages_prompt_once_and_consume_one(self):
+        # darkmatter#513 (adversarial follow-up): under the new per-group concurrency, two first
+        # messages for the SAME account in DIFFERENT groups could both read empty onboarding state
+        # before either wrote "prompted", so both sent a prompt and both original user messages
+        # were swallowed. The atomic try_claim_prompt() must let exactly one group win the prompt;
+        # the other group's message must fall through to a normal agent turn (not be consumed).
+        account = "11" * 32
+        group_a = "aa" * 32
+        group_b = "bb" * 32
+
+        def make_event(group_id_hex, message_id_hex, text):
+            return {
+                "type": "inbound_message",
+                "account_id_hex": account,
+                "group_id_hex": group_id_hex,
+                "message_id_hex": message_id_hex,
+                "sender_account_id_hex": "44" * 32,
+                "text": text,
+            }
+
+        class FakeClient:
+            def __init__(self):
+                self.final_sends = []
+                self._prompt_started = asyncio.Event()
+                self._release = asyncio.Event()
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                if False:  # pragma: no cover - generator shape only
+                    yield {}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                # Make the first prompt-send slow so both groups are in flight concurrently:
+                # the race window is widest when one send is suspended mid-flight.
+                first = not self._prompt_started.is_set()
+                if first:
+                    self._prompt_started.set()
+                    await self._release.wait()
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(Path(tempdir) / "profile-state.json"),
+                    }
+                ),
+                client=fake_client,
+            )
+
+            turns = []
+
+            async def handle_message(event):
+                turns.append((event.source.chat_id, event.text))
+
+            adapter.handle_message = handle_message
+
+            # Dispatch both groups' first messages concurrently through the real per-group queue.
+            adapter._inbound_queue.enqueue(
+                group_a, lambda: adapter._dispatch_inbound_message(make_event(group_a, "01" * 32, "hi from A"))
+            )
+            adapter._inbound_queue.enqueue(
+                group_b, lambda: adapter._dispatch_inbound_message(make_event(group_b, "02" * 32, "hi from B"))
+            )
+
+            # Let both dispatch tasks reach the prompt-claim/send seam, then release the slow send.
+            for _ in range(200):
+                if fake_client._prompt_started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            fake_client._release.set()
+            await adapter._inbound_queue.join()
+
+        # Exactly one prompt was sent (the claim winner); the loser did NOT also prompt.
+        self.assertEqual(
+            len(fake_client.final_sends), 1, f"expected exactly one prompt, got {fake_client.final_sends}"
+        )
+        # Exactly one original message was consumed as a prompt trigger; the other fell through
+        # to a normal agent turn instead of being swallowed.
+        self.assertEqual(len(turns), 1, f"expected exactly one normal turn, got {turns}")
+        # The group that was prompted is NOT the group that ran a normal turn.
+        prompted_group = fake_client.final_sends[0][1]
+        turn_group = turns[0][0]
+        self.assertNotEqual(prompted_group, turn_group)
+        self.assertEqual({prompted_group, turn_group}, {group_a, group_b})
+
+    async def test_profile_prompt_send_failure_releases_claim_for_retry(self):
+        # If the claim winner cannot deliver the prompt, it must release the slot (clear) so a
+        # later inbound message retries — otherwise the account is stuck "prompted" with no
+        # prompt ever delivered and every message is silently swallowed.
+        account = "11" * 32
+        group = "22" * 32
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+                self.final_sends = []
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                if False:  # pragma: no cover - generator shape only
+                    yield {}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.calls += 1
+                if self.calls == 1:
+                    # First prompt send fails: _send_final_direct maps a raised exception to
+                    # SendResult(success=False), which must trigger the claim release.
+                    raise RuntimeError("transient send failure")
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            state_path = Path(tempdir) / "profile-state.json"
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(state_path),
+                    }
+                ),
+                client=fake_client,
+            )
+            store = adapter.profile_name_onboarding
+
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": account,
+                "group_id_hex": group,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "hi",
+            }
+
+            # First attempt: claim succeeds, send fails, slot must be released (not "prompted").
+            consumed_first = await adapter._maybe_handle_profile_name_onboarding(event)
+            self.assertFalse(consumed_first, "failed prompt must not consume the message")
+            self.assertEqual(await store.get(account), {}, "claim must be released after send failure")
+
+            # Second attempt: a later message retries and now succeeds.
+            consumed_second = await adapter._maybe_handle_profile_name_onboarding(event)
+            self.assertTrue(consumed_second, "retry should prompt and consume the message")
+            self.assertEqual(len(fake_client.final_sends), 1)
+            self.assertEqual((await store.get(account)).get("status"), "prompted")
 
     async def test_progressive_edit_stream_finalizes_then_sends_durable_message(self):
         class FakeClient:
