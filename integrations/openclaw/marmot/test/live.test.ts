@@ -197,6 +197,123 @@ describe("MarmotLivePreview", () => {
     await expect(live.finalize("hello world!")).rejects.toThrow(/finalized or cancelled/);
   });
 
+  it("issues a single stream_begin for concurrent first calls", async () => {
+    const calls = emptyCalls();
+    // Gate streamBegin so both first callers reach it before either resolves.
+    let releaseBegin: (() => void) | undefined;
+    const beginGate = new Promise<void>((resolve) => {
+      releaseBegin = resolve;
+    });
+    let beginCount = 0;
+    const client = {
+      async streamBegin(account: string, group: string, opts?: { quicCandidates?: Iterable<string> }) {
+        beginCount += 1;
+        await beginGate;
+        const quic = [...(opts?.quicCandidates ?? [])];
+        calls.begin.push({ account, group, quic });
+        return {
+          type: "stream_begun",
+          stream_id_hex: STREAM_ID,
+          start_message_id_hex: START_ID,
+          quic_candidates: quic,
+        };
+      },
+      async streamAppend(streamId: string, text: string) {
+        calls.append.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamStatus(streamId: string, text: string) {
+        calls.status.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamProgress(streamId: string, text: string) {
+        calls.progress.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
+        calls.finalize.push({ streamId, finalText, hash, count });
+        return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+      },
+      async streamCancel() {
+        return { type: "ack" };
+      },
+    } as unknown as StreamControlClient;
+
+    const live = new MarmotLivePreview(client, {
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      quicCandidates: ["quic://broker:4450"],
+    });
+
+    // Two concurrent first calls race before any begin/prewarm.
+    const statusCall = live.status("thinking");
+    const progressCall = live.progress("searching");
+    // Both should now be parked on the shared in-flight begin.
+    releaseBegin?.();
+    await Promise.all([statusCall, progressCall]);
+
+    // Only one stream_begin should have been issued despite the race.
+    expect(beginCount).toBe(1);
+    expect(calls.begin).toHaveLength(1);
+    expect(calls.status.map((c) => c.text)).toEqual(["thinking"]);
+    expect(calls.progress.map((c) => c.text)).toEqual(["searching"]);
+  });
+
+  it("retries stream_begin after the first begin attempt fails", async () => {
+    const calls = emptyCalls();
+    let beginCount = 0;
+    const client = {
+      async streamBegin(account: string, group: string, opts?: { quicCandidates?: Iterable<string> }) {
+        beginCount += 1;
+        if (beginCount === 1) {
+          throw new Error("begin boom");
+        }
+        const quic = [...(opts?.quicCandidates ?? [])];
+        calls.begin.push({ account, group, quic });
+        return {
+          type: "stream_begun",
+          stream_id_hex: STREAM_ID,
+          start_message_id_hex: START_ID,
+          quic_candidates: quic,
+        };
+      },
+      async streamAppend(streamId: string, text: string) {
+        calls.append.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamStatus() {
+        return { type: "ack" };
+      },
+      async streamProgress() {
+        return { type: "ack" };
+      },
+      async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
+        calls.finalize.push({ streamId, finalText, hash, count });
+        return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+      },
+      async streamCancel() {
+        return { type: "ack" };
+      },
+    } as unknown as StreamControlClient;
+
+    const live = new MarmotLivePreview(client, {
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      quicCandidates: [],
+    });
+
+    // A failed begin must clear the in-flight guard so a later call retries
+    // rather than awaiting a permanently-rejected begin promise.
+    await expect(live.update("hello world")).rejects.toThrow("begin boom");
+    await live.update("hello world");
+    await live.finalize("hello world");
+
+    expect(beginCount).toBe(2);
+    expect(calls.begin).toHaveLength(1);
+    expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
+    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
+  });
+
   it("does not advance local state when streamAppend fails (retry-safe)", async () => {
     const calls = emptyCalls();
     let appendCalls = 0;

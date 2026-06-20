@@ -32,6 +32,7 @@ export interface MarmotLiveFinalizeResult {
 
 export class MarmotLivePreview {
   private begun = false;
+  private beginPromise: Promise<void> | null = null;
   private closed = false;
   private streamIdHex: string | null = null;
   private startMessageIdHex: string | null = null;
@@ -68,6 +69,25 @@ export class MarmotLivePreview {
     if (this.begun) {
       return;
     }
+    // Guard against concurrent first calls (e.g. a `status` racing a `partial`
+    // before any `begin()`/`prewarm()`): the first caller starts the remote
+    // begin and stashes the in-flight promise; subsequent callers await the
+    // same promise instead of issuing a second `stream_begin`. On failure the
+    // promise is cleared so a later call can retry the begin.
+    if (this.beginPromise) {
+      await this.beginPromise;
+      return;
+    }
+    this.beginPromise = this.beginStream();
+    try {
+      await this.beginPromise;
+    } catch (error) {
+      this.beginPromise = null;
+      throw error;
+    }
+  }
+
+  private async beginStream(): Promise<void> {
     const response = await this.client.streamBegin(
       this.options.accountIdHex,
       this.options.groupIdHex,
