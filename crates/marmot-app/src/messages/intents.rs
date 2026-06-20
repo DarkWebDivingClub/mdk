@@ -9,10 +9,56 @@ use cgka_traits::app_event::{
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG,
     STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
+use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
 
+use crate::ids::parse_account_id_hex;
 use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
 use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
+
+/// Nostr pubkey-reference (`p`) tag name.
+const PUBKEY_REF_TAG: &str = "p";
+
+/// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
+/// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
+/// Event/coordinate references (`note`/`nevent`/`naddr`) are not pubkey mentions.
+fn mention_pubkey_hex(token: &str) -> Option<String> {
+    if let Ok(parsed) = Nip21::parse(&format!("nostr:{token}")) {
+        return match parsed {
+            Nip21::Pubkey(pubkey) => Some(pubkey.to_hex()),
+            Nip21::Profile(profile) => Some(profile.public_key.to_hex()),
+            _ => None,
+        };
+    }
+    // Non-NIP-21 fallback: a bare hex pubkey or bare npub.
+    parse_account_id_hex(token).ok()
+}
+
+/// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline `nostr:` mentions in
+/// message content. Each distinct mentioned pubkey gets one tag (in first-seen
+/// order); event references and unparseable tokens are ignored. This is how a
+/// Marmot client makes a mention discoverable (a p-tag alongside the inline
+/// `nostr:` reference), per NIP-27.
+fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tags = Vec::new();
+    for (idx, _) in content.match_indices("nostr:") {
+        let rest = &content[idx + "nostr:".len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(hex) = mention_pubkey_hex(token)
+            && seen.insert(hex.clone())
+        {
+            tags.push(vec![PUBKEY_REF_TAG.to_owned(), hex]);
+        }
+    }
+    tags
+}
 
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
@@ -111,7 +157,7 @@ pub(crate) fn build_inner_event(
     match intent {
         AppMessageIntent::Chat { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_CHAT,
-            Vec::new(),
+            mention_p_tags(content),
             content.clone(),
         )),
         AppMessageIntent::Reaction {
@@ -140,14 +186,12 @@ pub(crate) fn build_inner_event(
                     "reply requires non-empty text".into(),
                 ));
             }
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_CHAT,
-                vec![
-                    event_ref_tag(target_message_id),
-                    vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
-                ],
-                text.clone(),
-            ))
+            let mut tags = vec![
+                event_ref_tag(target_message_id),
+                vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
+            ];
+            tags.extend(mention_p_tags(text));
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
         }
         AppMessageIntent::Edit {
             target_message_id,
@@ -159,11 +203,9 @@ pub(crate) fn build_inner_event(
                     "edit requires non-empty content".into(),
                 ));
             }
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_EDIT,
-                vec![event_ref_tag(target_message_id)],
-                content.clone(),
-            ))
+            let mut tags = vec![event_ref_tag(target_message_id)];
+            tags.extend(mention_p_tags(content));
+            Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
         }
         AppMessageIntent::Unreact { .. } | AppMessageIntent::Delete { .. } => {
             let target_message_id = match intent {
@@ -200,10 +242,13 @@ pub(crate) fn build_inner_event(
                     ));
                 }
             }
-            let tags = attachments
+            let mut tags: Vec<Vec<String>> = attachments
                 .iter()
                 .map(MediaAttachmentReference::imeta_tag)
                 .collect();
+            if let Some(caption) = caption {
+                tags.extend(mention_p_tags(caption));
+            }
             Ok(event(
                 MARMOT_APP_EVENT_KIND_CHAT,
                 tags,
@@ -477,4 +522,70 @@ pub fn tag_values<'a>(tags: &'a [Vec<String>], name: &str) -> Vec<&'a str> {
         .filter_map(|tag| tag.get(1))
         .map(String::as_str)
         .collect()
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use crate::ids::{nprofile_for_account_id, npub_for_account_id};
+
+    fn valid_pubkey_hex() -> String {
+        nostr::Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn mention_p_tags_handles_npub_nprofile_and_hex() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let nprofile = nprofile_for_account_id(&hex, &[]).unwrap();
+        for token in [npub.as_str(), nprofile.as_str(), hex.as_str()] {
+            let content = format!("hey nostr:{token} how are you?");
+            assert_eq!(
+                mention_p_tags(&content),
+                vec![vec!["p".to_owned(), hex.clone()]],
+                "mention token form failed: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn mention_p_tags_dedups_same_pubkey_and_ignores_plain_text() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        // Same pubkey referenced twice (npub then hex) collapses to one p-tag.
+        let content = format!("ping nostr:{npub} ... and again nostr:{hex}");
+        assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
+        assert!(mention_p_tags("plain text, no mentions here").is_empty());
+        assert!(mention_p_tags("a dangling nostr: with no token").is_empty());
+    }
+
+    #[test]
+    fn chat_intent_p_tags_the_inline_mention() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let intent = AppMessageIntent::Chat {
+            content: format!("yo nostr:{npub}"),
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn reply_intent_keeps_e_q_and_adds_mention_p_tag() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let target = "ff".repeat(32);
+        let intent = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: format!("re nostr:{npub}"),
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(
+            event
+                .tags
+                .contains(&vec![EVENT_REF_TAG.to_owned(), target.clone()])
+        );
+        assert!(event.tags.contains(&vec![QUOTE_REF_TAG.to_owned(), target]));
+        assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
 }

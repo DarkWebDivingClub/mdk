@@ -38,6 +38,65 @@ impl DebugFinalSendStore {
     }
 }
 
+/// Maximum number of recent idempotency keys retained for durable-send dedup.
+/// Oldest keys are evicted FIFO once the cap is reached; this bounds memory while
+/// comfortably covering any plausible in-flight retry window.
+const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
+
+/// Bounded FIFO map from a client-supplied idempotency key to a server-derived
+/// request fingerprint plus the durable message ids produced by the first
+/// successful `send_final` for that key.
+///
+/// A retry that reuses the same key AND matches the recorded fingerprint returns
+/// the cached ids without re-sending, so a retry after a post-write timeout cannot
+/// double-post an unrecallable encrypted message. A reused key whose fingerprint
+/// differs (a different request body under the same key) is treated as a cache
+/// miss, so it can never return ids belonging to an unrelated send. Keys are
+/// evicted oldest-first once the capacity is reached.
+#[derive(Clone, Default)]
+pub(crate) struct SendIdempotencyStore {
+    inner: Arc<Mutex<SendIdempotencyInner>>,
+}
+
+#[derive(Default)]
+struct SendIdempotencyInner {
+    order: std::collections::VecDeque<String>,
+    seen: HashMap<String, (u64, Vec<String>)>,
+}
+
+impl SendIdempotencyStore {
+    /// The message ids recorded for `key` by an earlier successful send, but only
+    /// when the recorded request `fingerprint` matches. A key hit with a different
+    /// fingerprint returns `None` (treated as a cache miss).
+    pub(crate) fn get(&self, key: &str, fingerprint: u64) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("send idempotency lock poisoned")
+            .seen
+            .get(key)
+            .filter(|(recorded, _)| *recorded == fingerprint)
+            .map(|(_, ids)| ids.clone())
+    }
+
+    /// Record the request `fingerprint` and durable message ids produced for
+    /// `key`. A repeat record for an existing key keeps the original entry (the
+    /// first successful send wins); otherwise the key is appended and the oldest
+    /// is evicted once at capacity.
+    pub(crate) fn record(&self, key: String, fingerprint: u64, message_ids: Vec<String>) {
+        let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
+        if inner.seen.contains_key(&key) {
+            return;
+        }
+        if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
+            && let Some(evicted) = inner.order.pop_front()
+        {
+            inner.seen.remove(&evicted);
+        }
+        inner.seen.insert(key.clone(), (fingerprint, message_ids));
+        inner.order.push_back(key);
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct StreamSessionStore {
     sessions: Arc<Mutex<HashMap<String, ActiveStreamSession>>>,

@@ -395,9 +395,11 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
+        AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::StreamBegun { .. } => "stream_begun",
         AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",
+        AgentControlResponse::MediaDownloaded { .. } => "media_downloaded",
     }
 }
 

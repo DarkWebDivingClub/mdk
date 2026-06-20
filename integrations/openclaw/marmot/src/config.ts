@@ -14,6 +14,14 @@ export const DEFAULT_MARMOT_HOME = "~/.marmot";
 /** OpenClaw preview-streaming mode (we map any non-"off" mode onto QUIC previews). */
 export type StreamMode = "off" | "partial" | "block" | "progress";
 
+/**
+ * When the agent replies in a group. `mention` (default): only when addressed
+ * (the agent is `p`-tagged, a configured trigger matches, or the conversation is
+ * an effective DM — exactly two members). `always`: every message (the prior
+ * behavior). Effective DMs always get a reply regardless of this setting.
+ */
+export type GroupActivation = "mention" | "always";
+
 /** The subset of OpenClaw's `channels.<id>.streaming` object we read. */
 export interface MarmotStreamingConfig {
   mode?: StreamMode;
@@ -31,6 +39,12 @@ export interface MarmotChannelAccountConfig {
   quicCandidates?: string[] | string;
   streaming?: MarmotStreamingConfig | boolean;
   blockStreaming?: boolean;
+  /** Coalesce rapid same-sender/group inbound messages within this window into one turn (ms). 0 = off. */
+  debounceMs?: number;
+  /** When to reply in a multi-party group: "mention" (default) or "always". */
+  groupActivation?: GroupActivation;
+  /** Extra case-insensitive trigger phrases that count as addressing the agent. */
+  mentionPatterns?: string[] | string;
   profileNameOnboarding?: boolean;
   dm?: {
     enabled?: boolean;
@@ -49,6 +63,9 @@ export interface ResolvedMarmotAccount {
   quicCandidates: string[];
   streamMode: StreamMode;
   blockStreaming: boolean;
+  debounceMs: number;
+  groupActivation: GroupActivation;
+  mentionPatterns: string[];
   profileNameOnboarding: boolean;
   profileOnboardingStatePath: string;
   dmPolicy?: string;
@@ -86,6 +103,22 @@ const MARMOT_ACCOUNT_PROPERTIES = {
     type: "boolean",
     description:
       "Enable OpenClaw completed-block delivery into Marmot's live preview sink. Defaults on when QUIC candidates are configured and Marmot streaming is not off.",
+  },
+  debounceMs: {
+    type: "number",
+    description:
+      "Coalesce rapid same-sender/group inbound messages within this window (ms) into a single agent turn. 0 disables (default).",
+  },
+  groupActivation: {
+    type: "string",
+    enum: ["mention", "always"],
+    description:
+      "When to reply in a multi-party group: 'mention' (only when addressed; default) or 'always'. Effective DMs (two members) always reply.",
+  },
+  mentionPatterns: {
+    type: "array",
+    items: { type: "string" },
+    description: "Extra case-insensitive phrases that count as addressing the agent.",
   },
   profileNameOnboarding: { type: "boolean" },
   dm: {
@@ -160,6 +193,27 @@ function parseBoolEnv(value: string | undefined): boolean | undefined {
     return undefined;
   }
   return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/** Parse a non-negative integer from config (number) or env (string); undefined if absent/invalid. */
+function resolveNonNegInt(
+  configValue: number | undefined,
+  envValue: string | undefined,
+): number | undefined {
+  if (typeof configValue === "number" && Number.isFinite(configValue) && configValue >= 0) {
+    return Math.floor(configValue);
+  }
+  if (envValue !== undefined && envValue.trim() !== "") {
+    const parsed = Number(envValue.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return undefined;
+}
+
+function normalizeGroupActivation(value: string | undefined): GroupActivation {
+  return String(value ?? "").trim().toLowerCase() === "always" ? "always" : "mention";
 }
 
 function normalizeStreamMode(value: string | undefined): StreamMode | undefined {
@@ -256,6 +310,11 @@ export function resolveMarmotAccount(
 
   const streamMode = resolveStreamMode(cfg.streaming, env.MARMOT_STREAM_MODE);
   const blockStreaming = resolveBlockStreaming(cfg, env, streamMode, quicCandidates);
+  const debounceMs = resolveNonNegInt(cfg.debounceMs, env.MARMOT_DEBOUNCE_MS) ?? 0;
+  const groupActivation = normalizeGroupActivation(
+    firstNonEmpty(cfg.groupActivation, env.MARMOT_GROUP_ACTIVATION),
+  );
+  const mentionPatterns = splitCandidates(cfg.mentionPatterns ?? env.MARMOT_MENTION_PATTERNS);
 
   return {
     accountId: accountId ?? null,
@@ -266,6 +325,9 @@ export function resolveMarmotAccount(
     quicCandidates,
     streamMode,
     blockStreaming,
+    debounceMs,
+    groupActivation,
+    mentionPatterns,
     // On by default: the agent always offers to publish a profile on join; the
     // user's in-chat choice is the consent. Operators can disable it explicitly.
     profileNameOnboarding:

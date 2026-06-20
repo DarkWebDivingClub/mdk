@@ -28,7 +28,46 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       });
       break;
     case "send_final":
-      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("ab")] });
+      // Echo back the idempotency_key (when present) so a test can assert the
+      // client forwarded it; real dm-agent never returns it.
+      send(socket, id, {
+        type: "final_sent",
+        message_ids_hex: [HEX32("ab")],
+        echoed_idempotency_key: req.idempotency_key ?? null,
+      });
+      break;
+    case "delete_message":
+      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
+      break;
+    case "send_media":
+      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("11")] });
+      break;
+    case "download_media":
+      send(socket, id, {
+        type: "media_downloaded",
+        path: "/tmp/marmot-media/abc/a.png",
+        media_type: "image/png",
+        file_name: "a.png",
+        size_bytes: 4,
+      });
+      break;
+    case "stream_begin":
+      send(socket, id, {
+        type: "stream_begun",
+        stream_id_hex: HEX32("ee"),
+        start_message_id_hex: HEX32("ff"),
+        quic_candidates: [],
+      });
+      break;
+    case "group_info":
+      send(socket, id, {
+        type: "group_info",
+        account_id_hex: req.account_id_hex ?? HEX32("aa"),
+        group_id_hex: req.group_id_hex ?? HEX32("cc"),
+        member_count: 2,
+        is_direct: true,
+        subject: null,
+      });
       break;
     case "explode":
       send(socket, id, { type: "error", code: "bad_request", message: "nope" });
@@ -62,7 +101,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   }
 }
 
-function startServer(socketPath: string): Promise<Server> {
+function startServer(socketPath: string, responseDelayMs = 0): Promise<Server> {
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
     socket.on("data", (chunk) => {
@@ -72,7 +111,12 @@ function startServer(socketPath: string): Promise<Server> {
         const line = buffer.subarray(0, index);
         buffer = buffer.subarray(index + 1);
         if (line.length > 0) {
-          handleRequest(socket, JSON.parse(line.toString("utf8")));
+          const req = JSON.parse(line.toString("utf8"));
+          if (responseDelayMs > 0) {
+            setTimeout(() => handleRequest(socket, req), responseDelayMs);
+          } else {
+            handleRequest(socket, req);
+          }
         }
         index = buffer.indexOf(0x0a);
       }
@@ -114,6 +158,62 @@ describe("MarmotAgentControlClient", () => {
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
   });
 
+  it("forwards an idempotency_key on send_final when supplied, and omits it otherwise", async () => {
+    const withKey = (await client.sendFinal(
+      HEX32("aa"),
+      HEX32("cc"),
+      "done",
+      null,
+      "retry-key-1",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withKey.echoed_idempotency_key).toBe("retry-key-1");
+
+    const withoutKey = (await client.sendFinal(
+      HEX32("aa"),
+      HEX32("cc"),
+      "done",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withoutKey.echoed_idempotency_key).toBeNull();
+  });
+
+  it("deletes a message and returns the deletion event ids", async () => {
+    const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
+    expect(res.message_ids_hex).toEqual([HEX32("de")]);
+  });
+
+  it("uploads media and returns the durable message ids from send_media", async () => {
+    const res = await client.sendMedia(
+      HEX32("aa"),
+      HEX32("cc"),
+      [{ path: "/tmp/a.png", media_type: "image/png", file_name: "a.png" }],
+      "look at this",
+    );
+    expect(res.message_ids_hex).toEqual([HEX32("11")]);
+  });
+
+  it("downloads media and returns the host-local path + metadata", async () => {
+    const res = await client.downloadMedia(HEX32("aa"), HEX32("cc"), {
+      media_type: "image/png",
+      file_name: "a.png",
+      ciphertext_sha256: HEX32("cd"),
+      plaintext_sha256: HEX32("ab"),
+      nonce_hex: "0".repeat(24),
+      version: "encrypted-media-v1",
+      source_epoch: 7,
+      locators: [{ kind: "blossom-v1", value: `https://blossom.example.com/${HEX32("cd")}.bin` }],
+    });
+    expect(res.type).toBe("media_downloaded");
+    expect(res.file_name).toBe("a.png");
+    expect(res.size_bytes).toBe(4);
+    expect(res.path).toBe("/tmp/marmot-media/abc/a.png");
+  });
+
+  it("round-trips group_info (member count + is_direct)", async () => {
+    const res = await client.groupInfo(HEX32("aa"), HEX32("cc"));
+    expect(res.member_count).toBe(2);
+    expect(res.is_direct).toBe(true);
+  });
+
   it("maps an error response to a typed AgentControlError", async () => {
     await expect(client.request({ type: "explode" })).rejects.toMatchObject({
       name: "AgentControlError",
@@ -148,6 +248,46 @@ describe("MarmotAgentControlClient", () => {
       requestTimeoutMs: 1000,
     });
     await expect(broken.accountList()).rejects.toMatchObject({ retryable: true });
+  });
+});
+
+describe("preview op timeouts", () => {
+  let dir: string;
+  let socketPath: string;
+  let server: Server;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "oc-marmot-delay-"));
+    socketPath = join(dir, "delay.sock");
+    // Every response is delayed 400ms: well past the short preview timeout, well
+    // under the durable request timeout.
+    server = await startServer(socketPath, 400);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("abandons a best-effort preview op at the short preview timeout", async () => {
+    const client = new MarmotAgentControlClient({
+      socketPath,
+      requestTimeoutMs: 3000,
+      previewRequestTimeoutMs: 80,
+    });
+    await expect(client.streamBegin(HEX32("aa"), HEX32("cc"))).rejects.toMatchObject({
+      code: "timeout",
+    });
+  });
+
+  it("still completes a durable send under the full request timeout", async () => {
+    const client = new MarmotAgentControlClient({
+      socketPath,
+      requestTimeoutMs: 3000,
+      previewRequestTimeoutMs: 80,
+    });
+    const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
+    expect(res.message_ids_hex).toEqual([HEX32("ab")]);
   });
 });
 

@@ -45,7 +45,7 @@ pub(crate) use marmot_app::AppMessageQuery;
 
 use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
-use crate::stream_session::{DebugFinalSendStore, StreamSessionStore};
+use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
 use crate::validation::{endpoint, validate_control_plane_config};
 
 pub(crate) const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
@@ -107,6 +107,7 @@ pub struct AgentConnector {
     pub(crate) auth_token: Option<String>,
     pub(crate) debug_events: broadcast::Sender<AgentControlEvent>,
     pub(crate) debug_final_sends: DebugFinalSendStore,
+    pub(crate) idempotency: SendIdempotencyStore,
     pub(crate) streams: StreamSessionStore,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: MarmotAppRuntime,
@@ -136,6 +137,7 @@ impl AgentConnector {
             auth_token: config.auth_token,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
+            idempotency: SendIdempotencyStore::default(),
             streams: StreamSessionStore::default(),
             app,
             runtime,

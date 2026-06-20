@@ -501,7 +501,7 @@ async fn fetch_encrypted_media_blob(
     Err(last_error.unwrap_or_else(|| AppError::BlobStore("download failed".into())))
 }
 
-pub(crate) fn media_attachment_from_imeta_tag(
+pub fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
     allow_loopback_http: bool,

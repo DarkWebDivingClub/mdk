@@ -76,6 +76,17 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         text: String,
         reply_to_message_id_hex: Option<String>,
+        /// Optional client-supplied dedup key. When present, the connector dedups
+        /// repeated sends with the same key (returning the original message ids)
+        /// so a retry after a post-write timeout cannot double-post an
+        /// unrecallable durable message. Omitted = no dedup (legacy behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
+    DeleteMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
     },
     StreamBegin {
         account_id_hex: String,
@@ -150,6 +161,10 @@ pub enum AgentControlRequest {
         text: String,
         data: Option<Value>,
     },
+    GroupInfo {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     AllowlistList {
         account_id_hex: String,
     },
@@ -169,6 +184,62 @@ pub enum AgentControlRequest {
         text: String,
     },
     DebugRecordedFinals,
+    /// Encrypt + upload local files as encrypted media and send them as a kind-9
+    /// message in the group. Files are read from the connector host by `path`;
+    /// the control plane never carries plaintext bytes or the content key.
+    SendMedia {
+        account_id_hex: String,
+        group_id_hex: String,
+        attachments: Vec<AgentControlMediaUpload>,
+        caption: Option<String>,
+    },
+    /// Fetch + decrypt an inbound media reference and write the plaintext to a
+    /// temp file on the connector host. The content key stays in the connector;
+    /// the reply carries only the local path and metadata.
+    DownloadMedia {
+        account_id_hex: String,
+        group_id_hex: String,
+        media: AgentControlMediaRef,
+    },
+}
+
+/// A local file to encrypt + upload as an attachment. The connector reads the
+/// bytes from `path`; the control plane never carries plaintext or a content key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaUpload {
+    pub path: String,
+    pub media_type: String,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
+}
+
+/// A single fetch locator for an encrypted media reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaLocator {
+    pub kind: String,
+    pub value: String,
+}
+
+/// Faithful, non-secret mirror of `MediaAttachmentReference`. Carries everything
+/// needed to fetch + authenticate a blob EXCEPT the content key, which never
+/// leaves the connector.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaRef {
+    pub media_type: String,
+    pub file_name: String,
+    pub ciphertext_sha256: String,
+    pub plaintext_sha256: String,
+    pub nonce_hex: String,
+    pub version: String,
+    pub source_epoch: u64,
+    pub locators: Vec<AgentControlMediaLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +275,16 @@ pub enum AgentControlResponse {
         account_id_hex: String,
         welcomer_account_ids_hex: Vec<String>,
     },
+    GroupInfo {
+        account_id_hex: String,
+        group_id_hex: String,
+        member_count: u32,
+        /// True when the group has exactly two members (the agent + one peer),
+        /// i.e. an effective direct conversation where the agent always replies.
+        is_direct: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+    },
     StreamBegun {
         stream_id_hex: String,
         start_message_id_hex: String,
@@ -215,6 +296,15 @@ pub enum AgentControlResponse {
     },
     DebugRecordedFinals {
         sends: Vec<AgentControlDebugFinalSend>,
+    },
+    /// An inbound media reference was fetched, decrypted, and written to a local
+    /// temp file on the connector host. The path is host-local; no bytes or key
+    /// material cross the control plane.
+    MediaDownloaded {
+        path: String,
+        media_type: String,
+        file_name: String,
+        size_bytes: u64,
     },
 }
 
@@ -243,6 +333,44 @@ pub enum AgentControlEvent {
         message_id_hex: String,
         sender_account_id_hex: String,
         text: String,
+        /// True when the receiving agent's account is `p`-tagged (mentioned) in
+        /// the message. Lets a channel gate group replies on being addressed.
+        #[serde(default)]
+        mentions_self: bool,
+        /// The message id this message replies to (`e` tag), when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id_hex: Option<String>,
+        /// The sender's display name, when resolvable from the directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_display_name: Option<String>,
+        /// Encrypted media references (`imeta` tags) attached to this message.
+        /// Empty for a plain text message; the content key is never carried here,
+        /// only the fetch + authentication metadata (use `download_media`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<AgentControlMediaRef>,
+    },
+    /// A previously-sent group message was deleted (kind-5) by another member.
+    MessageDeleted {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        sender_account_id_hex: String,
+    },
+    /// A durable, MLS-authenticated change to group state was observed (a member
+    /// add/remove/leave, an admin grant/revoke, or a group rename/avatar change).
+    /// Privacy: the subject member's pubkey is never surfaced — only a coarse
+    /// `change` kind plus, for a rename, the new group display name in `detail`.
+    GroupStateChanged {
+        account_id_hex: String,
+        group_id_hex: String,
+        /// Coarse change kind: `"member_added"`, `"member_removed"`,
+        /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
+        /// `"group_renamed"`, or `"group_avatar_changed"`.
+        change: String,
+        /// The new group display name for `group_renamed`; `None` otherwise.
+        /// Never carries a member pubkey.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     GroupInvite {
         account_id_hex: String,
@@ -357,9 +485,9 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlRequest, AgentControlResponse,
-        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
-        write_frame,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
+        AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame,
+        read_envelope, read_frame, write_frame,
     };
 
     #[test]
@@ -401,6 +529,67 @@ mod tests {
 
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
+        // Additive, v1-compatible field: omitted from the wire when None so an
+        // old peer's frame stays byte-identical; present and round-tripping when
+        // a client supplies it for dedup.
+        let without = AgentControlRequest::SendFinal {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            text: "done".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("idempotency_key").is_none(),
+            "absent key must not be serialized"
+        );
+
+        let with = AgentControlRequest::SendFinal {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            text: "done".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: Some("key-1".to_owned()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["idempotency_key"], "key-1");
+        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn group_state_changed_event_round_trips_with_optional_detail() {
+        let renamed = AgentControlEvent::GroupStateChanged {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            change: "group_renamed".to_owned(),
+            detail: Some("Team".to_owned()),
+        };
+        let value = serde_json::to_value(&renamed).unwrap();
+        assert_eq!(value["type"], "group_state_changed");
+        assert_eq!(value["change"], "group_renamed");
+        assert_eq!(value["detail"], "Team");
+        let back: AgentControlEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(back, renamed);
+
+        let member_added = AgentControlEvent::GroupStateChanged {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            change: "member_added".to_owned(),
+            detail: None,
+        };
+        let value = serde_json::to_value(&member_added).unwrap();
+        assert!(
+            value.get("detail").is_none(),
+            "no member detail must be surfaced"
+        );
+        let back: AgentControlEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(back, member_added);
     }
 
     #[tokio::test]
@@ -537,8 +726,17 @@ mod tests {
                     group_id_hex: group(),
                     text: "done".to_owned(),
                     reply_to_message_id_hex: None,
+                    idempotency_key: None,
                 },
                 "send_final",
+            ),
+            (
+                AgentControlRequest::DeleteMessage {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                },
+                "delete_message",
             ),
             (
                 AgentControlRequest::StreamBegin {
@@ -650,6 +848,13 @@ mod tests {
                 "send_group_system_event",
             ),
             (
+                AgentControlRequest::GroupInfo {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "group_info",
+            ),
+            (
                 AgentControlRequest::AllowlistList {
                     account_id_hex: account(),
                 },
@@ -682,6 +887,43 @@ mod tests {
             (
                 AgentControlRequest::DebugRecordedFinals,
                 "debug_recorded_finals",
+            ),
+            (
+                AgentControlRequest::SendMedia {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    attachments: vec![crate::AgentControlMediaUpload {
+                        path: "/tmp/a.png".to_owned(),
+                        media_type: "image/png".to_owned(),
+                        file_name: "a.png".to_owned(),
+                        dim: Some("16x16".to_owned()),
+                        thumbhash: None,
+                    }],
+                    caption: Some("look".to_owned()),
+                },
+                "send_media",
+            ),
+            (
+                AgentControlRequest::DownloadMedia {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    media: crate::AgentControlMediaRef {
+                        media_type: "image/png".to_owned(),
+                        file_name: "a.png".to_owned(),
+                        ciphertext_sha256: hash(),
+                        plaintext_sha256: hash(),
+                        nonce_hex: "0".repeat(24),
+                        version: "marmot.encrypted-media.v1".to_owned(),
+                        source_epoch: 0,
+                        locators: vec![crate::AgentControlMediaLocator {
+                            kind: "blossom-v1".to_owned(),
+                            value: "https://example.invalid/a".to_owned(),
+                        }],
+                        dim: None,
+                        thumbhash: None,
+                    },
+                },
+                "download_media",
             ),
         ];
 

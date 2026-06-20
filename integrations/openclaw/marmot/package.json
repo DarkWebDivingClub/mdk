@@ -23,7 +23,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoketest": "node ./scripts/dm-agent-smoketest.ts"
   },
   "devDependencies": {
     "@types/node": "^22.19.0",

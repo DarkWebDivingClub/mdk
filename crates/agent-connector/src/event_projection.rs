@@ -4,10 +4,107 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use agent_control::{AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent};
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, STREAM_TAG,
+use agent_control::{
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent, AgentControlMediaLocator,
+    AgentControlMediaRef,
 };
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, STREAM_TAG,
+};
+
+/// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
+/// account was mentioned/addressed in the message.
+const PUBKEY_MENTION_TAG: &str = "p";
+
+/// Whether the message mentions the given account. Marmot clients address a
+/// member with an inline `nostr:<pubkey-hex>` reference in the body (the account
+/// id IS the Nostr pubkey hex), so check the plaintext for that; also honor a
+/// `["p", <pubkey-hex>]` tag in case a client emits one. Used to let a channel
+/// gate group replies on being addressed.
+fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_hex: &str) -> bool {
+    if account_id_hex.is_empty() {
+        return false;
+    }
+    // Authoritative signal: a Marmot mention carries a `["p", <pubkey-hex>]` tag
+    // for the mentioned account. This is present regardless of how the inline
+    // text encodes the reference, so it is the reliable check.
+    let tagged = tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == PUBKEY_MENTION_TAG)
+            && tag
+                .get(1)
+                .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
+    });
+    if tagged {
+        return true;
+    }
+    // Fallback for a p-tag-less mention: an inline NIP-21 `nostr:` reference to
+    // the account in the body, in either hex or bech32 (`npub`) form (the
+    // displayed mention text). `nprofile` mentions still rely on the p-tag above.
+    if plaintext_has_nostr_ref(plaintext, account_id_hex) {
+        return true;
+    }
+    marmot_app::npub_for_account_id(account_id_hex)
+        .is_ok_and(|npub| plaintext_has_nostr_ref(plaintext, &npub))
+}
+
+/// Whether `plaintext` contains a `nostr:<reference>` token that is not glued to
+/// surrounding alphanumerics (so `nostr:<hex>junk` does NOT match the reference).
+/// Case-insensitive on both sides.
+fn plaintext_has_nostr_ref(plaintext: &str, reference: &str) -> bool {
+    let body = plaintext.to_ascii_lowercase();
+    let needle = format!("nostr:{}", reference.to_ascii_lowercase());
+    body.match_indices(&needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let before_ok = start == 0 || !body.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == body.len() || !body.as_bytes()[end].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
+}
+
+/// The replied-to message id from the first `e` tag, if present. The tag value is
+/// sender-controlled, so it is normalized + validated as hex (a malformed value is
+/// dropped rather than passed through as a reply/delete target).
+fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
+    tags.iter()
+        .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
+        .and_then(|tag| tag.get(1))
+        .and_then(|value| normalize_hex(value).ok())
+}
+
+/// Project every parseable `imeta` media tag into a control-plane media ref.
+/// Each tag is parsed by the authoritative app-runtime parser; a tag that fails
+/// structural validation is dropped (it would be unfetchable anyway) rather than
+/// failing the whole message. Loopback-HTTP locators are rejected here (the
+/// connector serves real deployments), matching the runtime download policy.
+fn media_refs_from_tags(tags: &[Vec<String>], source_epoch: u64) -> Vec<AgentControlMediaRef> {
+    tags.iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter_map(|tag| {
+            marmot_app::media_attachment_from_imeta_tag(tag, Some(source_epoch), false).ok()
+        })
+        .map(|reference| AgentControlMediaRef {
+            media_type: reference.media_type,
+            file_name: reference.file_name,
+            ciphertext_sha256: reference.ciphertext_sha256,
+            plaintext_sha256: reference.plaintext_sha256,
+            nonce_hex: reference.nonce_hex,
+            version: reference.version,
+            source_epoch: reference.source_epoch,
+            locators: reference
+                .locators
+                .into_iter()
+                .map(|locator| AgentControlMediaLocator {
+                    kind: locator.kind,
+                    value: locator.value,
+                })
+                .collect(),
+            dim: reference.dim,
+            thumbhash: reference.thumbhash,
+        })
+        .collect()
+}
+use cgka_traits::engine::GroupStateChange;
 use cgka_traits::{GroupId, engine::GroupEvent};
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
@@ -22,9 +119,27 @@ pub(crate) fn control_event_from_runtime_event(
 ) -> Option<AgentControlEvent> {
     match event {
         MarmotAppEvent::MessageReceived(update) => {
+            // A kind-5 deletion from another member retracts an earlier message;
+            // surface it as a distinct control event (the `e` tag is the target).
+            if update.message.kind == MARMOT_APP_EVENT_KIND_DELETE {
+                let group_id_hex = inbound_event_group_id_hex(
+                    account_filter,
+                    &update.account_id_hex,
+                    group_filter,
+                    &update.message.group_id,
+                    &update.message.sender,
+                )?;
+                let target_message_id_hex = reply_target_from_tags(&update.message.tags)?;
+                return Some(AgentControlEvent::MessageDeleted {
+                    account_id_hex: update.account_id_hex,
+                    group_id_hex,
+                    target_message_id_hex,
+                    sender_account_id_hex: update.message.sender,
+                });
+            }
             // Only kind-9 chat/media is conversational input. Edits, reactions,
-            // deletes, and telemetry need explicit control semantics before they
-            // can safely influence an agent prompt.
+            // and telemetry need explicit control semantics before they can
+            // safely influence an agent prompt.
             if update.message.kind != MARMOT_APP_EVENT_KIND_CHAT {
                 return None;
             }
@@ -35,12 +150,23 @@ pub(crate) fn control_event_from_runtime_event(
                 &update.message.group_id,
                 &update.message.sender,
             )?;
+            let mentions_self = message_mentions_account(
+                &update.message.tags,
+                &update.message.plaintext,
+                &update.account_id_hex,
+            );
+            let reply_to_message_id_hex = reply_target_from_tags(&update.message.tags);
+            let media = media_refs_from_tags(&update.message.tags, update.message.source_epoch);
             Some(AgentControlEvent::InboundMessage {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
                 message_id_hex: update.message.message_id_hex,
                 sender_account_id_hex: update.message.sender,
                 text: update.message.plaintext,
+                mentions_self,
+                reply_to_message_id_hex,
+                sender_display_name: update.message.sender_display_name,
+                media,
             })
         }
         MarmotAppEvent::AgentStreamStarted(update) => {
@@ -90,6 +216,37 @@ pub(crate) fn control_event_from_runtime_event(
                     welcomer_account_id_hex: welcomer.map(|member| hex::encode(member.as_slice())),
                 })
             }
+            GroupEvent::GroupStateChanged {
+                group_id, change, ..
+            } => {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                if !inbound_filter_matches(
+                    account_filter,
+                    &group_event.account_id_hex,
+                    group_filter,
+                    &group_id_hex,
+                ) {
+                    return None;
+                }
+                // Map to a coarse change kind. Privacy: the subject member's
+                // pubkey is NEVER surfaced; only a rename carries a detail (the
+                // new group display name, which is operationally visible).
+                let (change, detail) = match change {
+                    GroupStateChange::MemberAdded { .. } => ("member_added", None),
+                    GroupStateChange::MemberRemoved { .. } => ("member_removed", None),
+                    GroupStateChange::MemberLeft { .. } => ("member_left", None),
+                    GroupStateChange::AdminAdded { .. } => ("admin_added", None),
+                    GroupStateChange::AdminRemoved { .. } => ("admin_removed", None),
+                    GroupStateChange::GroupRenamed { name } => ("group_renamed", Some(name)),
+                    GroupStateChange::GroupAvatarChanged => ("group_avatar_changed", None),
+                };
+                Some(AgentControlEvent::GroupStateChanged {
+                    account_id_hex: group_event.account_id_hex,
+                    group_id_hex,
+                    change: change.to_owned(),
+                    detail,
+                })
+            }
             _ => None,
         },
         _ => None,
@@ -102,7 +259,17 @@ pub(crate) fn control_event_from_debug_event(
     group_filter: Option<&str>,
 ) -> Option<AgentControlEvent> {
     let (account_id_hex, group_id_hex) = match &event {
-        AgentControlEvent::InboundMessage {
+        AgentControlEvent::MessageDeleted {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::GroupStateChanged {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::InboundMessage {
             account_id_hex,
             group_id_hex,
             ..
@@ -219,12 +386,20 @@ pub(crate) fn inbound_message_event_from_record(
     ) {
         return None;
     }
+    let mentions_self = message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
+    let reply_to_message_id_hex = reply_target_from_tags(&record.tags);
+    let media = media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or(0));
     Some(AgentControlEvent::InboundMessage {
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex: record.group_id_hex,
         message_id_hex: record.message_id_hex,
         sender_account_id_hex: record.sender,
         text: record.plaintext,
+        mentions_self,
+        reply_to_message_id_hex,
+        // Storage replay has no directory join; display name is best-effort live-only.
+        sender_display_name: None,
+        media,
     })
 }
 

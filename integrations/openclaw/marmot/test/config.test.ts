@@ -66,6 +66,35 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.authToken).toBe("tok-123");
   });
 
+  it("resolves the inbound debounce window (off by default; config wins over env)", () => {
+    expect(resolveMarmotAccount(undefined, null, deps({})).debounceMs).toBe(0);
+    expect(resolveMarmotAccount(undefined, null, deps({ MARMOT_DEBOUNCE_MS: "750" })).debounceMs).toBe(750);
+    expect(resolveMarmotAccount({ debounceMs: 1200 }, null, deps({ MARMOT_DEBOUNCE_MS: "750" })).debounceMs).toBe(1200);
+    expect(resolveMarmotAccount(undefined, null, deps({ MARMOT_DEBOUNCE_MS: "nope" })).debounceMs).toBe(0);
+  });
+
+  it("resolves group activation and mention patterns (defaults: mention, none)", () => {
+    const def = resolveMarmotAccount(undefined, null, deps({}));
+    expect(def.groupActivation).toBe("mention");
+    expect(def.mentionPatterns).toEqual([]);
+
+    const fromConfig = resolveMarmotAccount(
+      { groupActivation: "always", mentionPatterns: ["bot", "assistant"] },
+      null,
+      deps({}),
+    );
+    expect(fromConfig.groupActivation).toBe("always");
+    expect(fromConfig.mentionPatterns).toEqual(["bot", "assistant"]);
+
+    const fromEnv = resolveMarmotAccount(
+      undefined,
+      null,
+      deps({ MARMOT_GROUP_ACTIVATION: "always", MARMOT_MENTION_PATTERNS: "x, y" }),
+    );
+    expect(fromEnv.groupActivation).toBe("always");
+    expect(fromEnv.mentionPatterns).toEqual(["x", "y"]);
+  });
+
   it("maps the dm policy and allow-from list", () => {
     const resolved = resolveMarmotAccount(
       { dm: { policy: "allowlist", allowFrom: ["aa", "bb"] } },

@@ -4,7 +4,6 @@ use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
     AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
-use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamTranscriptV1,
@@ -15,6 +14,8 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
 };
+use cgka_traits::engine::{GroupEvent, GroupStateChange};
+use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountSetupRequest, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
@@ -121,6 +122,140 @@ fn control_event_forwards_only_chat_inner_events_as_inbound_messages() {
         panic!("expected kind-9 chat event to become an inbound message");
     };
     assert_eq!(text, "hello agent");
+}
+
+#[test]
+fn control_event_projects_kind5_deletion_as_message_deleted() {
+    let agent_account_id_hex = "aa".repeat(32);
+    let target = "99".repeat(32);
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        message: received_message(
+            MARMOT_APP_EVENT_KIND_DELETE,
+            "",
+            vec![vec!["e".to_owned(), target.clone()]],
+        ),
+    });
+
+    let Some(AgentControlEvent::MessageDeleted {
+        account_id_hex,
+        target_message_id_hex,
+        sender_account_id_hex,
+        ..
+    }) = control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected kind-5 deletion to become MessageDeleted");
+    };
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(target_message_id_hex, target);
+    assert_eq!(sender_account_id_hex, "bb".repeat(32));
+}
+
+#[test]
+fn control_event_projects_group_rename_as_group_state_changed() {
+    // A GroupRenamed change projects to a coarse `group_renamed` control event
+    // carrying the new group display name in `detail`. Privacy: member/admin
+    // changes carry NO detail (the subject member's pubkey is never surfaced).
+    let agent_account_id_hex = "aa".repeat(32);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(3),
+            actor: None,
+            change: GroupStateChange::GroupRenamed {
+                name: "Team".to_owned(),
+            },
+            origin_commit_id: None,
+        },
+    });
+
+    let Some(AgentControlEvent::GroupStateChanged {
+        account_id_hex,
+        group_id_hex,
+        change,
+        detail,
+    }) = control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected a group state change to project to GroupStateChanged");
+    };
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(group_id_hex, "22".repeat(32));
+    assert_eq!(change, "group_renamed");
+    assert_eq!(detail, Some("Team".to_owned()));
+}
+
+#[test]
+fn control_event_group_state_change_member_add_carries_no_member_detail() {
+    // A member add must NOT surface the subject member's pubkey: the projection
+    // collapses to a coarse change kind with `detail == None`.
+    let agent_account_id_hex = "aa".repeat(32);
+    let member = cgka_traits::MemberId::new(vec![0x99; 32]);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex,
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(4),
+            actor: None,
+            change: GroupStateChange::MemberAdded { member },
+            origin_commit_id: None,
+        },
+    });
+
+    let Some(AgentControlEvent::GroupStateChanged { change, detail, .. }) =
+        control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected a member add to project to GroupStateChanged");
+    };
+    assert_eq!(change, "member_added");
+    assert_eq!(detail, None, "member pubkey must never be surfaced");
+}
+
+#[test]
+fn control_event_projects_imeta_tag_into_inbound_media_ref() {
+    // A kind-9 chat carrying a structurally valid `imeta` tag must project a
+    // single media reference onto the InboundMessage (the non-secret mirror: no
+    // content key, just fetch + authentication metadata for download_media).
+    let agent_account_id_hex = "aa".repeat(32);
+    // A blossom-v1 locator URL MUST carry the ciphertext hash so the fetched blob
+    // matches the reference; the parser enforces this binding.
+    let ciphertext_sha256 = "cd".repeat(32);
+    let plaintext_sha256 = "ab".repeat(32);
+    let nonce_hex = "0".repeat(24); // 12 bytes
+    let locator_url = format!("https://blossom.example.com/{ciphertext_sha256}.bin");
+    let imeta = vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("locator blossom-v1 {locator_url}"),
+        format!("ciphertext_sha256 {ciphertext_sha256}"),
+        format!("plaintext_sha256 {plaintext_sha256}"),
+        format!("nonce {nonce_hex}"),
+        "m image/png".to_owned(),
+        "filename a.png".to_owned(),
+    ];
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: agent_account_id_hex,
+        account_label: "agent".to_owned(),
+        message: received_message(MARMOT_APP_EVENT_KIND_CHAT, "see this", vec![imeta]),
+    });
+
+    let Some(AgentControlEvent::InboundMessage { media, .. }) =
+        control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected kind-9 chat event to become an inbound message");
+    };
+    assert_eq!(media.len(), 1, "one imeta tag should project one media ref");
+    let attachment = &media[0];
+    assert_eq!(attachment.media_type, "image/png");
+    assert_eq!(attachment.file_name, "a.png");
+    assert_eq!(attachment.ciphertext_sha256, ciphertext_sha256);
+    assert_eq!(attachment.source_epoch, 7); // received_message uses source_epoch 7
+    assert_eq!(attachment.locators.len(), 1);
+    assert_eq!(attachment.locators[0].kind, "blossom-v1");
+    assert_eq!(attachment.locators[0].value, locator_url);
 }
 
 #[test]
@@ -541,6 +676,7 @@ async fn connector_socket_subscribes_to_inbound_messages() {
             group_id_hex: group_id_hex.clone(),
             text: "hello agent".to_owned(),
             reply_to_message_id_hex: None,
+            idempotency_key: None,
         },
     );
     write_frame(&mut sender_write, &send).await.unwrap();
@@ -684,6 +820,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
         message_id_hex: event_message_id_hex,
         sender_account_id_hex: event_sender_account_id_hex,
         text,
+        ..
     } = inbound.payload
     else {
         panic!("expected debug inbound message event");
@@ -702,6 +839,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
             group_id_hex: group_id_hex.clone(),
             text: "marmot-e2e-ok: ping from connector".to_owned(),
             reply_to_message_id_hex: Some(message_id_hex.clone()),
+            idempotency_key: None,
         },
     )
     .await;
@@ -1565,6 +1703,7 @@ async fn connector_socket_sends_final_message() {
             group_id_hex,
             text: "final answer".to_owned(),
             reply_to_message_id_hex: None,
+            idempotency_key: None,
         },
     );
     write_frame(&mut client_write, &request).await.unwrap();
@@ -2099,8 +2238,97 @@ fn inbound_message_event_from_record_projects_received_chat() {
             message_id_hex: "aa".to_owned(),
             sender_account_id_hex: "cc".to_owned(),
             text: "hello agent".to_owned(),
+            mentions_self: false,
+            reply_to_message_id_hex: None,
+            sender_display_name: None,
+            media: Vec::new(),
         }
     );
+}
+
+#[test]
+fn inbound_message_event_from_record_extracts_mention_and_reply() {
+    // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
+    // the reply target. Both let a channel gate/thread without re-parsing tags.
+    let parent_msg_id = "bb".repeat(32);
+    let mut record = received_chat_record("aa", "bb", "cc", "hey there");
+    record.tags = vec![
+        vec!["p".to_owned(), "acct".to_owned()],
+        vec!["e".to_owned(), parent_msg_id.clone()],
+    ];
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage {
+        mentions_self,
+        reply_to_message_id_hex,
+        ..
+    } = event
+    else {
+        panic!("expected inbound message event");
+    };
+    assert!(mentions_self, "p-tag for the account should mark a mention");
+    assert_eq!(
+        reply_to_message_id_hex.as_deref(),
+        Some(parent_msg_id.as_str())
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_inline_nostr_mention() {
+    // Marmot clients address a member with an inline `nostr:<pubkey-hex>` token
+    // (no p-tag), and the account id IS the pubkey hex.
+    let record = received_chat_record("aa", "bb", "cc", "hey nostr:acct can you help?");
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(mentions_self, "inline nostr:<pubkey> should mark a mention");
+}
+
+#[test]
+fn inbound_message_event_detects_npub_bech32_mention() {
+    // A p-tag-less mention whose inline text is the bech32 `nostr:npub1…` form
+    // (what marmot-markdown renders) must still be detected.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("hey nostr:{npub} can you help?");
+    let record = received_chat_record("11", "bb", "cc", &text);
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        mentions_self,
+        "inline nostr:<npub> bech32 mention should be detected"
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
+    // The p-tag is authoritative: a mention with only the structured tag (no
+    // inline nostr: reference in the body) is still detected.
+    let account = "aa".repeat(32);
+    let mut record = received_chat_record("11", "bb", "cc", "please take a look");
+    record.tags = vec![vec!["p".to_owned(), account.clone()]];
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        mentions_self,
+        "p-tag mention should be detected without inline text"
+    );
+}
+
+#[test]
+fn safe_media_filename_strips_path_traversal() {
+    use crate::messaging::safe_media_filename;
+    assert_eq!(safe_media_filename("a.png"), "a.png");
+    assert_eq!(safe_media_filename("../../etc/passwd"), "passwd");
+    assert_eq!(safe_media_filename("dir/b.jpg"), "b.jpg");
+    assert_eq!(safe_media_filename(".."), "media");
+    assert_eq!(safe_media_filename(""), "media");
 }
 
 #[test]
@@ -2200,6 +2428,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             &group_id_hex,
             "missed while lagging".to_owned(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2264,5 +2493,165 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             AgentControlEvent::InboundMessage { text, .. } if text == "missed while lagging"
         )),
         "second replay must not duplicate an already-delivered message"
+    );
+}
+
+#[tokio::test]
+async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
+    // GAP-06: a retry that reuses the same idempotency key must return the
+    // ORIGINAL durable message ids without re-sending, so a post-write-timeout
+    // retry can never double-post an unrecallable encrypted message. Observable
+    // proof of "no second send": only one copy of the text lands in storage.
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent idempotent send",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("dm-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+
+    let key = "retry-key-1".to_owned();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: first_ids,
+    } = connector
+        .send_final_response(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            "idempotent reply".to_owned(),
+            None,
+            Some(key.clone()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected first send to return FinalSent");
+    };
+    assert!(!first_ids.is_empty(), "a real send returns message ids");
+
+    // Second call with the SAME key returns the cached ids verbatim.
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: second_ids,
+    } = connector
+        .send_final_response(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            "idempotent reply".to_owned(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected second send to return cached FinalSent");
+    };
+    assert_eq!(
+        second_ids, first_ids,
+        "a repeated idempotency key must return the original message ids"
+    );
+
+    // Observable proof there was no second underlying send: exactly one copy of
+    // the text exists in the agent's own group storage projection.
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )
+        .unwrap();
+    let copies = stored
+        .iter()
+        .filter(|m| m.plaintext == "idempotent reply")
+        .count();
+    assert_eq!(copies, 1, "a deduped retry must not re-post the message");
+}
+
+#[test]
+fn send_idempotency_store_returns_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let store = SendIdempotencyStore::default();
+    assert_eq!(store.get("k1", 7), None, "an unseen key has no cached ids");
+
+    let ids = vec!["aa".repeat(32), "bb".repeat(32)];
+    store.record("k1".to_owned(), 7, ids.clone());
+    assert_eq!(
+        store.get("k1", 7),
+        Some(ids),
+        "a recorded key returns its message ids for a matching fingerprint"
+    );
+    assert_eq!(
+        store.get("k1", 8),
+        None,
+        "a recorded key with a non-matching fingerprint is a cache miss"
+    );
+    assert_eq!(store.get("k2", 7), None, "an unrelated key stays absent");
+}
+
+#[test]
+fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let store = SendIdempotencyStore::default();
+    let first = vec!["11".repeat(32)];
+    let second = vec!["22".repeat(32)];
+    store.record("dup".to_owned(), 1, first.clone());
+    // A repeat record (e.g. a racing duplicate) must not overwrite the original
+    // committed entry: the first successful send for a key always wins, even if
+    // the later record carries a different fingerprint.
+    store.record("dup".to_owned(), 2, second);
+    assert_eq!(store.get("dup", 1), Some(first));
+}
+
+#[test]
+fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
+    // the newest remain. This bounds memory for a long-lived connector.
+    let store = SendIdempotencyStore::default();
+    for n in 0..1100u32 {
+        store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
+    }
+    assert_eq!(store.get("key-0", 0), None, "oldest key must be evicted");
+    assert_eq!(store.get("key-75", 75), None, "early keys must be evicted");
+    assert_eq!(
+        store.get("key-1099", 1099),
+        Some(vec![format!("{:064x}", 1099)]),
+        "the newest key must still be cached"
+    );
+    assert_eq!(
+        store.get("key-200", 200),
+        Some(vec![format!("{:064x}", 200)]),
+        "a key within the retained window must still be cached"
     );
 }

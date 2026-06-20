@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { StreamMode } from "../src/config.js";
+import { AgentControlError, type AgentControlMediaRef } from "../src/client.js";
+import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
   createMarmotInboundDispatcher,
   MarmotReplySink,
+  type MarmotDispatchClient,
   type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
+
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   buildChannelInboundEventContext: vi.fn((params: unknown) => params),
@@ -16,6 +21,22 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
     },
   ),
 }));
+
+vi.mock("openclaw/plugin-sdk/media-store", () => ({
+  saveMediaBuffer: vi.fn(async (_buf: Buffer, ct?: string, _sub?: string, _max?: number, name?: string) => ({
+    id: "id1",
+    path: `/oc/media/inbound/${name}`,
+    size: 4,
+    contentType: ct,
+  })),
+}));
+
+vi.mock("node:fs/promises", () => ({
+  readFile: vi.fn(async () => Buffer.from("x")),
+  unlink: vi.fn(async () => {}),
+}));
+
+const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
 
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
@@ -37,11 +58,21 @@ function emptyCalls(): Calls {
   return { sendFinal: [], begin: 0, append: [], status: [], progress: [], finalize: [], cancel: [] };
 }
 
-function stubClient(calls: Calls): MarmotSinkClient {
+function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSinkClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
       calls.sendFinal.push({ accountIdHex: _account, text, replyTo: replyTo ?? null });
       return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+    },
+    async groupInfo(accountIdHex: string, groupIdHex: string) {
+      return {
+        type: "group_info",
+        account_id_hex: accountIdHex,
+        group_id_hex: groupIdHex,
+        member_count: opts.isDirect ? 2 : 5,
+        is_direct: opts.isDirect ?? false,
+        subject: null,
+      };
     },
     async streamBegin() {
       calls.begin += 1;
@@ -380,6 +411,60 @@ describe("MarmotReplySink", () => {
     await makeSink(calls, { streamMode: "off" }).deliver({ text: "searching..." }, { kind: "tool" });
     expect(calls).toEqual(emptyCalls());
   });
+
+  it("retries a retryable durable final, reusing one idempotency key per call", async () => {
+    const keys: (string | undefined)[] = [];
+    let attempts = 0;
+    const client = {
+      async sendFinal(
+        _account: string,
+        _group: string,
+        _text: string,
+        _replyTo?: string | null,
+        idempotencyKey?: string,
+      ) {
+        keys.push(idempotencyKey);
+        attempts += 1;
+        if (attempts === 1) {
+          throw new AgentControlError("transient", { code: "io_error", retryable: true });
+        }
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+    } as unknown as MarmotSinkClient;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "off",
+      quicCandidates: [],
+    });
+
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+    expect(attempts).toBe(2);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]); // same key reused across the retry
+  });
+
+  it("does not retry a non-retryable durable final and rethrows", async () => {
+    let attempts = 0;
+    const client = {
+      async sendFinal() {
+        attempts += 1;
+        throw new AgentControlError("bad request", { code: "bad_request", retryable: false });
+      },
+    } as unknown as MarmotSinkClient;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "off",
+      quicCandidates: [],
+    });
+
+    await expect(sink.deliver({ text: "hello" }, { kind: "final" })).rejects.toThrow("bad request");
+    expect(attempts).toBe(1);
+  });
 });
 
 describe("createMarmotInboundDispatcher", () => {
@@ -417,11 +502,13 @@ describe("createMarmotInboundDispatcher", () => {
     const dispatch = createMarmotInboundDispatcher({
       cfg: {},
       runtimeChannel,
-      client: stubClient(calls),
+      client: stubClient(calls) as unknown as MarmotDispatchClient,
       channelAccountId: "default",
       streamMode: "off",
       blockStreaming: true,
       quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
     });
 
     await dispatch({
@@ -448,5 +535,271 @@ describe("createMarmotInboundDispatcher", () => {
     ).toBe(false);
     expect(calls.sendFinal[0]?.accountIdHex).toBe(HEX32("aa"));
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
+    // GAP-01: the durable reply threads to the triggering message id.
+    expect(calls.sendFinal[0]?.replyTo).toBe(HEX32("dd"));
+  });
+});
+
+describe("createMarmotInboundDispatcher activation gating", () => {
+  function gatingRuntime(turnRan: { value: boolean }): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-gating-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          turnRan.value = true;
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "ok" }, { kind: "final" });
+        },
+      },
+    };
+  }
+
+  const baseMessage: MarmotInboundMessage = {
+    accountIdHex: HEX32("aa"),
+    groupIdHex: HEX32("cc"),
+    messageIdHex: HEX32("dd"),
+    senderAccountIdHex: HEX32("bb"),
+    text: "just chatting amongst ourselves",
+  };
+
+  async function runCase(opts: {
+    groupActivation: "mention" | "always";
+    mentionPatterns?: string[];
+    isDirect?: boolean;
+    message?: Partial<MarmotInboundMessage>;
+  }): Promise<boolean> {
+    const turnRan = { value: false };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: gatingRuntime(turnRan),
+      client: stubClient(emptyCalls(), {
+        isDirect: opts.isDirect,
+      }) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: opts.groupActivation,
+      mentionPatterns: opts.mentionPatterns ?? [],
+    });
+    await dispatch({ ...baseMessage, ...opts.message });
+    return turnRan.value;
+  }
+
+  it("skips an unaddressed message in a multi-party group", async () => {
+    expect(await runCase({ groupActivation: "mention", isDirect: false })).toBe(false);
+  });
+
+  it("replies in an effective DM (two members) even when unaddressed", async () => {
+    expect(await runCase({ groupActivation: "mention", isDirect: true })).toBe(true);
+  });
+
+  it("replies when the agent is mentioned (p-tagged)", async () => {
+    expect(
+      await runCase({ groupActivation: "mention", isDirect: false, message: { mentionsSelf: true } }),
+    ).toBe(true);
+  });
+
+  it("replies when a configured trigger phrase matches", async () => {
+    expect(
+      await runCase({
+        groupActivation: "mention",
+        mentionPatterns: ["marvin"],
+        isDirect: false,
+        message: { text: "hey Marvin, can you help?" },
+      }),
+    ).toBe(true);
+  });
+
+  it("replies to everything when groupActivation is always", async () => {
+    expect(await runCase({ groupActivation: "always", isDirect: false })).toBe(true);
+  });
+});
+
+describe("createMarmotInboundDispatcher inbound media", () => {
+  function mediaRuntime(): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-media-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "ok" }, { kind: "final" });
+        },
+      },
+    };
+  }
+
+  function imageRef(byte: string, mediaType = "image/png"): AgentControlMediaRef {
+    return {
+      media_type: mediaType,
+      file_name: `img-${byte}.png`,
+      ciphertext_sha256: HEX32(byte),
+      plaintext_sha256: HEX32(byte),
+      nonce_hex: HEX32(byte),
+      version: "1",
+      source_epoch: 0,
+      locators: [],
+    };
+  }
+
+  function mediaClient(
+    downloads: AgentControlMediaRef[],
+    opts: { fail?: boolean } = {},
+  ): MarmotDispatchClient {
+    return {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo(accountIdHex: string, groupIdHex: string) {
+        return {
+          type: "group_info",
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          member_count: 5,
+          is_direct: false,
+          subject: null,
+        };
+      },
+      async downloadMedia(_account: string, _group: string, media: AgentControlMediaRef) {
+        downloads.push(media);
+        if (opts.fail) {
+          throw new AgentControlError("download failed", { code: "io_error" });
+        }
+        return {
+          type: "media_downloaded",
+          path: `/tmp/marmot-dl/${media.file_name}`,
+          media_type: media.media_type,
+          file_name: media.file_name,
+          size_bytes: 10,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+  }
+
+  function makeDispatch(client: MarmotDispatchClient) {
+    return createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: mediaRuntime(),
+      client,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+  }
+
+  it("downloads inbound media and passes local file facts into the context builder", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const ref = imageRef("e1");
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "look",
+      media: [ref],
+    });
+
+    expect(downloads).toEqual([ref]);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: unknown };
+    // The fact path is the OpenClaw media-store staged path (allowlisted for both
+    // native vision and the agent's `image` tool), not the raw dm-agent temp path.
+    expect(ctxArg.media).toEqual([
+      {
+        path: `/oc/media/inbound/${ref.file_name}`,
+        contentType: "image/png",
+        kind: "image",
+        messageId: HEX32("dd"),
+      },
+    ]);
+  });
+
+  it("classifies non-image media types and omits failed downloads", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const ok = imageRef("e2", "application/pdf");
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "doc",
+      media: [ok],
+    });
+
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: Array<{ kind?: string }> };
+    expect(ctxArg.media?.[0]?.kind).toBe("document");
+  });
+
+  it("omits the media field entirely when every download fails", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const dispatch = makeDispatch(mediaClient(downloads, { fail: true }));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "broken",
+      media: [imageRef("e3")],
+    });
+
+    expect(downloads).toHaveLength(1);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect("media" in ctxArg).toBe(false);
+  });
+
+  it("does not call downloadMedia for a message with no media", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "no media",
+    });
+
+    expect(downloads).toHaveLength(0);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect("media" in ctxArg).toBe(false);
   });
 });

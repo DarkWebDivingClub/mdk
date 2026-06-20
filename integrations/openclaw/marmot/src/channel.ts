@@ -6,6 +6,11 @@
 // reply threading. Outbound (durable send + live preview) flows through the
 // message adapter; inbound is driven by src/inbound-runtime.ts.
 
+import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
+import type {
+  ChannelMessageActionAdapter,
+  ChannelMessageActionContext,
+} from "openclaw/plugin-sdk/channel-contract";
 import {
   createChatChannelPlugin,
   type OpenClawConfig,
@@ -109,8 +114,83 @@ async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<Marmo
   };
 }
 
+/** Dependencies the channel-owned `delete` action adapter needs. */
+export interface MarmotDeleteActionDeps {
+  /** Resolve a sent message id to its group from the send-time cache. */
+  deleteByMessageId: (
+    targetMessageIdHex: string,
+    resolveCtx: { cfg: unknown; accountId?: string | null },
+  ) => Promise<boolean>;
+  /** Resolve the dm-agent client + Marmot account for the explicit-group fallback. */
+  resolveTarget: (
+    cfg: unknown,
+    accountId?: string | null,
+  ) => Promise<{ client: MarmotMessageDeleteClient; marmotAccountIdHex: string }>;
+}
+
+/** Narrow view of the control client used by the explicit-group delete fallback. */
+export interface MarmotMessageDeleteClient {
+  deleteMessage: (
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+  ) => Promise<unknown>;
+}
+
+/**
+ * Channel-owned `delete` action for the shared `message` tool: the agent's
+ * `message(action:"delete", messageId, to)` reaches `handleAction`. Prefer the
+ * send-time cache (no extra round-trip); fall back to an explicit `to` group.
+ */
+export function createMarmotDeleteActionAdapter(
+  deps: MarmotDeleteActionDeps,
+): ChannelMessageActionAdapter {
+  return {
+    describeMessageTool: () => ({ actions: ["delete"] }),
+    handleAction: async (ctx: ChannelMessageActionContext) => {
+      if (ctx.action !== "delete") {
+        return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });
+      }
+      const messageId = typeof ctx.params.messageId === "string" ? ctx.params.messageId : "";
+      if (!messageId) {
+        return jsonResult({ ok: false, error: "messageId required" });
+      }
+      if (await deps.deleteByMessageId(messageId, { cfg: ctx.cfg, accountId: ctx.accountId })) {
+        return jsonResult({ ok: true, deleted: true });
+      }
+      const to = typeof ctx.params.to === "string" ? ctx.params.to : undefined;
+      if (to) {
+        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId ?? null);
+        await client.deleteMessage(marmotAccountIdHex, to, messageId);
+        return jsonResult({ ok: true, deleted: true });
+      }
+      return jsonResult({ ok: false, error: "could not resolve group for this message id" });
+    },
+  };
+}
+
 /** Build the Marmot channel plugin for registration with OpenClaw. */
 export function createMarmotChannelPlugin() {
+  // Resolve the dm-agent client + Marmot agent account for an outbound send or
+  // an agent-invoked action (e.g. delete). Hoisted so both the message adapter
+  // and the action adapter share one resolver.
+  const resolveTarget = async (cfg: unknown, accountId?: string | null) => {
+    const resolved = resolveMarmotChannelAccount(cfg as OpenClawConfig, accountId);
+    const client = clientForAccount(resolved);
+    const marmotAccountIdHex =
+      resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
+    return { client, marmotAccountIdHex };
+  };
+
+  // The durable/live message adapter. Captured in a const so the action adapter
+  // can reuse its send-time conversation cache via `deleteByMessageId`.
+  const messageAdapter = createMarmotMessageAdapter({ resolveTarget });
+
+  const actions = createMarmotDeleteActionAdapter({
+    deleteByMessageId: messageAdapter.deleteByMessageId,
+    resolveTarget,
+  });
+
   return createChatChannelPlugin<ResolvedMarmotAccount>({
     base: {
       id: MARMOT_CHANNEL_ID,
@@ -125,8 +205,11 @@ export function createMarmotChannelPlugin() {
       capabilities: {
         chatTypes: ["direct", "group"],
         reply: true,
-        media: false,
+        media: true,
         blockStreaming: true,
+        // Marmot supports deleting (unsending) a previously-sent message; gates
+        // the agent-facing `delete` message action's visibility.
+        unsend: true,
       },
       configSchema: marmotChannelConfigSchema(),
       config: {
@@ -149,15 +232,8 @@ export function createMarmotChannelPlugin() {
         buildAccountSnapshot: ({ account, runtime, probe }) =>
           accountSnapshot(account, runtime, probe),
       },
-      message: createMarmotMessageAdapter({
-        resolveTarget: async (cfg, accountId) => {
-          const resolved = resolveMarmotChannelAccount(cfg as OpenClawConfig, accountId);
-          const client = clientForAccount(resolved);
-          const marmotAccountIdHex =
-            resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
-          return { client, marmotAccountIdHex };
-        },
-      }),
+      message: messageAdapter,
+      actions,
     },
     security: {
       dm: {

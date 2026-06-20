@@ -89,6 +89,9 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
+| `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
+| `groupActivation` | `MARMOT_GROUP_ACTIVATION` | `mention` (reply only when addressed in 3+ member groups; `always` replies to every message) |
+| `mentionPatterns` | `MARMOT_MENTION_PATTERNS` | — (extra case-insensitive trigger phrases; the configured agent name is always a trigger) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -107,9 +110,54 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   received Marmot message (`chatId` = Marmot group id, `userId` = sender) into
   OpenClaw's turn kernel via `runChannelInboundEvent` + `dispatchReplyWithBufferedBlockDispatcher`,
   **modeled on the bundled Telegram channel**. The agent's reply is delivered
-  back through the message adapter.
+  back through the message adapter and threads to the triggering message.
+  Dispatch is serialized per group (distinct groups run concurrently, each group
+  stays FIFO), so a slow turn in one group never blocks inbound for others; set
+  `debounceMs` to coalesce rapid same-sender bursts into one turn.
+- **Activation gating**: in a multi-party group the agent replies only when
+  addressed — it is `p`-tag mentioned, the text matches a `mentionPatterns`
+  trigger (or the agent name), or the conversation is an effective DM (exactly
+  two members, resolved via the `group_info` control op). Set
+  `groupActivation: "always"` to reply to every message. Effective DMs always
+  reply. Membership is queried lazily (only for otherwise-unaddressed messages)
+  and fails open, so a lookup error never silently drops a message.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
-  the adapter never merges or rewrites text across sends.
+  the adapter never merges or rewrites text across sends. Each durable reply is
+  **idempotent + retried**: the sink generates one `idempotency_key` per reply
+  and retries the send a few times (with a short backoff) on retryable errors,
+  reusing the same key so `dm-agent` dedups instead of double-posting. A repeated
+  key returns the original message ids without a second send, so a retry after a
+  post-write timeout cannot double-post an unrecallable encrypted message.
+  (Follow-up: `stream_finalize` is not yet idempotent.)
+- **Message deletion**: the control client can retract a prior message via
+  `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
+  kind-5 deletions from other members surface as a `message_deleted` event,
+  routed to the agent as quiet ambient context (below). The agent-facing *delete
+  trigger* is scaffolded — the message adapter records a `messageId → {account,
+  group}` map at send time and exposes `deleteByMessageId(...)` — but wiring the
+  agent's `delete` message-action requires the larger `base.actions`
+  message-tool surface (`ChannelMessageActionAdapter`), which is typed but
+  runtime-unvalidated and left as a follow-up.
+- **Group state changes**: durable, MLS-authenticated changes (member
+  add/remove/leave, admin grant/revoke, rename/avatar) surface as a
+  `group_state_changed` event carrying only a coarse `change` kind and, for a
+  rename, the new group display name — never a member pubkey.
+- **Ambient context** (`index.ts` ambient surfacer): `message_deleted` and
+  `group_state_changed` are surfaced to the agent's session as quiet,
+  next-turn context via `api.runtime.system.enqueueSystemEvent(text, {
+  sessionKey, contextKey })` (sessionKey from `resolveAgentRoute`). It is
+  feature-detected (no-ops on a runtime without the system-event surface). The
+  agent sees the event as context without being forced to reply; confirmed on
+  the docker harness.
+- **Media**: inbound — an `inbound_message` carries non-secret `media` refs
+  (the `imeta` mirror); on dispatch the connector calls `download_media` to get
+  a host-local decrypted path and passes it to the turn as an OpenClaw
+  `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
+  base64-encodes for a vision model. Outbound — the message adapter declares
+  `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
+  `mediaReadFile` when needed) onto `send_media` (`dm-agent` encrypts + uploads
+  to Blossom; the content key never leaves it). The vision model actually
+  receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +

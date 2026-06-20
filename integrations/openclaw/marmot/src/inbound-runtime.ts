@@ -10,6 +10,9 @@
 // `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
 // dm-agent's per-account allowlist so configured welcomers are accepted.
 
+import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
+import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+
 import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
@@ -51,7 +54,63 @@ function resolveAccount(api: InboundPluginApi): ResolvedMarmotAccount {
   );
 }
 
+/**
+ * Map a coarse group-state change kind to a short, privacy-safe sentence for
+ * ambient agent context. NEVER includes a member pubkey; the only detail
+ * surfaced is the new group name on a rename (already non-secret group metadata).
+ */
+function groupStateChangeSentence(change: string, detail?: string | null): string {
+  switch (change) {
+    case "member_added":
+      return "A member was added to the group.";
+    case "member_removed":
+      return "A member was removed from the group.";
+    case "member_left":
+      return "A member left the group.";
+    case "admin_added":
+      return "A member was made a group admin.";
+    case "admin_removed":
+      return "A member is no longer a group admin.";
+    case "group_renamed":
+      return detail && detail.trim().length > 0
+        ? `The group was renamed to "${detail.trim()}".`
+        : "The group was renamed.";
+    case "group_avatar_changed":
+      return "The group avatar was changed.";
+    default:
+      return "The group state changed.";
+  }
+}
+
+/** Merge a debounce batch of same-key inbound messages into one turn (newline-joined text). */
+function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMessage {
+  const last = items[items.length - 1]!;
+  if (items.length === 1) {
+    return last;
+  }
+  const text = items
+    .map((item) => item.text)
+    .filter((part) => part.length > 0)
+    .join("\n");
+  return { ...last, text };
+}
+
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
+
+/**
+ * A passive ambient event surfaced to the agent as next-turn context (no reply
+ * is triggered). `groupIdHex` selects the agent session; `text` is a short,
+ * privacy-safe sentence; `contextKey` dedupes repeated surfacings of the same
+ * fact. Built in `index.ts` over the full plugin api (it needs
+ * `api.runtime.system`/`api.runtime.channel`, which the narrowed
+ * `InboundPluginApi` does not expose) and passed in here.
+ */
+export type MarmotAmbientSurfacer = (event: {
+  accountIdHex: string;
+  groupIdHex: string;
+  text: string;
+  contextKey?: string;
+}) => void | Promise<void>;
 
 export interface StartMarmotInboundOptions {
   signal?: AbortSignal;
@@ -62,6 +121,11 @@ export interface StartMarmotInboundOptions {
    * a name is present, it is inherited and published instead of asking in-chat.
    */
   configuredAgentName?: string | null;
+  /**
+   * Surface passive group events (a deletion, a membership/rename change) to the
+   * agent as quiet next-turn context. When omitted, those events are only logged.
+   */
+  surfaceAmbientEvent?: MarmotAmbientSurfacer;
 }
 
 // The gateway can full-load the plugin in more than one in-process context
@@ -128,6 +192,61 @@ export function startMarmotInbound(
       return;
     }
     let readyLogged = false;
+
+    // Per-group serialization: distinct groups dispatch concurrently while each
+    // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
+    // dispatch for every other group (the previous inline `await dispatch` did).
+    const dispatchQueue = new KeyedAsyncQueue();
+    const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
+      if (onboardingStore) {
+        const intercepted = await maybeHandleProfileOnboardingInbound({
+          store: onboardingStore,
+          client,
+          message: {
+            accountIdHex: message.accountIdHex,
+            groupIdHex: message.groupIdHex,
+            messageIdHex: message.messageIdHex,
+            text: message.text,
+          },
+          configuredName: options.configuredAgentName ?? null,
+          logger: api.logger,
+        }).catch(() => false); // never block dispatch on an onboarding error
+        if (intercepted) {
+          return;
+        }
+      }
+      api.logger.info("marmot: inbound message received; dispatching agent turn");
+      await dispatch(message);
+    };
+    const runQueued = (message: MarmotInboundMessage): void => {
+      void dispatchQueue
+        .enqueue(message.groupIdHex, () => handleInbound(message))
+        .catch(() => api.logger.warn("marmot: inbound dispatch task failed"));
+    };
+    // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
+    const debouncer =
+      resolved.debounceMs > 0
+        ? createInboundDebouncer<MarmotInboundMessage>({
+            debounceMs: resolved.debounceMs,
+            buildKey: (message) =>
+              `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
+            onFlush: async (items) => {
+              if (items.length > 0) {
+                runQueued(coalesceInboundMessages(items));
+              }
+            },
+          })
+        : null;
+    const submitInbound = (message: MarmotInboundMessage): void => {
+      if (debouncer) {
+        void debouncer
+          .enqueue(message)
+          .catch(() => api.logger.warn("marmot: inbound debounce failed"));
+      } else {
+        runQueued(message);
+      }
+    };
+
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
@@ -140,27 +259,45 @@ export function startMarmotInbound(
         );
         readyLogged = true;
       },
-      onMessage: async (message) => {
+      onMessage: (message) => {
+        // Non-blocking: record receipt, then hand off to the per-group queue so the
+        // inbound loop keeps reading (enables cross-group concurrency). Dedupe in
+        // MarmotInboundBridge.handle() already ran synchronously before this.
         markMarmotInboundReceived(statusAccountId);
-        if (onboardingStore) {
-          const intercepted = await maybeHandleProfileOnboardingInbound({
-            store: onboardingStore,
-            client,
-            message: {
-              accountIdHex: message.accountIdHex,
-              groupIdHex: message.groupIdHex,
-              messageIdHex: message.messageIdHex,
-              text: message.text,
-            },
-            configuredName: options.configuredAgentName ?? null,
-            logger: api.logger,
-          }).catch(() => false); // never block dispatch on an onboarding error
-          if (intercepted) {
-            return;
-          }
-        }
-        api.logger.info("marmot: inbound message received; dispatching agent turn");
-        await dispatch(message);
+        submitInbound(message);
+      },
+      onMessageDeleted: (deletion) => {
+        // A peer retracted a message. Surface it to the agent as quiet ambient
+        // (next-turn) context when a surfacer is wired; always recorded + logged
+        // privacy-safely (no ids/pubkeys in the log).
+        markMarmotInboundReceived(statusAccountId);
+        api.logger.info("marmot: inbound message deletion observed");
+        void Promise.resolve(
+          options.surfaceAmbientEvent?.({
+            accountIdHex: deletion.accountIdHex,
+            groupIdHex: deletion.groupIdHex,
+            text: "A message was deleted.",
+            contextKey: `marmot:message_deleted:${deletion.groupIdHex}:${deletion.targetMessageIdHex}`,
+          }),
+        ).catch(() => api.logger.warn("marmot: failed to surface message deletion to the agent"));
+      },
+      onGroupStateChanged: (change) => {
+        // A durable group-state change (membership/admin/rename/avatar) was
+        // observed. The change kind contents are NOT logged; they ARE surfaced to
+        // the agent as quiet ambient context (via the surfacer) when wired. The
+        // mapped sentence never carries a member pubkey.
+        markMarmotInboundReceived(statusAccountId);
+        api.logger.info("marmot: inbound group state change observed");
+        void Promise.resolve(
+          options.surfaceAmbientEvent?.({
+            accountIdHex: change.accountIdHex,
+            groupIdHex: change.groupIdHex,
+            text: groupStateChangeSentence(change.change, change.detail),
+            contextKey: `marmot:group_state_changed:${change.groupIdHex}:${change.change}`,
+          }),
+        ).catch(() =>
+          api.logger.warn("marmot: failed to surface group state change to the agent"),
+        );
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {

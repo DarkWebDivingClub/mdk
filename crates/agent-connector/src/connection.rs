@@ -109,6 +109,13 @@ impl AgentConnector {
                 account_id_hex,
                 welcomer_account_id_hex,
             } => self.allowlist_remove_response(&account_id_hex, &welcomer_account_id_hex),
+            AgentControlRequest::GroupInfo {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.group_info_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
             AgentControlRequest::DebugInjectInbound {
                 account_id_hex,
                 group_id_hex,
@@ -128,14 +135,24 @@ impl AgentConnector {
                 group_id_hex,
                 text,
                 reply_to_message_id_hex,
+                idempotency_key,
             } => {
                 self.send_final_response(
                     &account_id_hex,
                     &group_id_hex,
                     text,
                     reply_to_message_id_hex,
+                    idempotency_key,
                 )
                 .await
+            }
+            AgentControlRequest::DeleteMessage {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+            } => {
+                self.delete_message_response(&account_id_hex, &group_id_hex, &target_message_id_hex)
+                    .await
             }
             AgentControlRequest::StreamBegin {
                 account_id_hex,
@@ -275,6 +292,23 @@ impl AgentConnector {
                     data,
                 )
                 .await
+            }
+            AgentControlRequest::SendMedia {
+                account_id_hex,
+                group_id_hex,
+                attachments,
+                caption,
+            } => {
+                self.send_media_response(&account_id_hex, &group_id_hex, attachments, caption)
+                    .await
+            }
+            AgentControlRequest::DownloadMedia {
+                account_id_hex,
+                group_id_hex,
+                media,
+            } => {
+                self.download_media_response(&account_id_hex, &group_id_hex, media)
+                    .await
             }
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),

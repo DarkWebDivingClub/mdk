@@ -137,7 +137,7 @@ pub use ids::{
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference,
     MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
-    MediaUploadRequest, MediaUploadResult,
+    MediaUploadRequest, MediaUploadResult, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{

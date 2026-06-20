@@ -15,6 +15,15 @@ export const AGENT_CONTROL_PROTOCOL_V1 = "marmot.agent-control.v1";
 export const MAX_AGENT_CONTROL_FRAME_BYTES = 1024 * 1024;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// Live-preview side-channel ops (stream begin/append/status/progress/cancel) are
+// best-effort: they only drive the QUIC typing preview, while the durable kind-9
+// is committed separately via send_final / stream_finalize. Bounding them well
+// below the full request timeout means a wedged broker abandons the preview in a
+// few seconds instead of pinning the agent turn — and the shared execution-lane
+// slot it holds — for the full 30s per op. The durable ops keep
+// DEFAULT_REQUEST_TIMEOUT_MS so a slow-but-live commit is never abandoned into a
+// duplicate send.
+const DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS = 8_000;
 
 export class AgentControlError extends Error {
   readonly code: string;
@@ -75,11 +84,67 @@ export interface AllowlistResponse {
   welcomer_account_ids_hex: string[];
 }
 
+export interface GroupInfoResponse {
+  type: "group_info";
+  account_id_hex: string;
+  group_id_hex: string;
+  member_count: number;
+  /** True when the group has exactly two members (effective DM; always reply). */
+  is_direct: boolean;
+  subject?: string | null;
+}
+
 export interface ProfilePublishedResponse {
   type: "profile_published";
   account_id_hex: string;
   name: string;
   display_name: string | null;
+}
+
+/** A single fetch locator for an encrypted media reference. */
+export interface AgentControlMediaLocator {
+  kind: string;
+  value: string;
+}
+
+/**
+ * Faithful, non-secret mirror of the Rust `MediaAttachmentReference`. Carries
+ * everything needed to fetch + authenticate an encrypted blob EXCEPT the content
+ * key, which never leaves `dm-agent`. Pass it back to {@link MarmotAgentControlClient.downloadMedia}.
+ */
+export interface AgentControlMediaRef {
+  media_type: string;
+  file_name: string;
+  ciphertext_sha256: string;
+  plaintext_sha256: string;
+  nonce_hex: string;
+  version: string;
+  source_epoch: number;
+  locators: AgentControlMediaLocator[];
+  dim?: string | null;
+  thumbhash?: string | null;
+}
+
+/**
+ * A local file for {@link MarmotAgentControlClient.sendMedia} to encrypt + upload
+ * as an attachment. `dm-agent` reads the bytes from `path` on its own host; the
+ * control plane never carries plaintext or a content key.
+ */
+export interface AgentControlMediaUpload {
+  path: string;
+  media_type: string;
+  file_name: string;
+  dim?: string | null;
+  thumbhash?: string | null;
+}
+
+export interface MediaDownloadedResponse {
+  type: "media_downloaded";
+  /** Host-local path on the `dm-agent` machine where the plaintext was written. */
+  path: string;
+  media_type: string;
+  file_name: string;
+  size_bytes: number;
 }
 
 export type AgentControlEvent =
@@ -90,6 +155,34 @@ export type AgentControlEvent =
       message_id_hex: string;
       sender_account_id_hex: string;
       text: string;
+      /** True when the receiving agent's account is mentioned (`p`-tagged). */
+      mentions_self?: boolean;
+      /** The message id this message replies to (`e` tag), when present. */
+      reply_to_message_id_hex?: string | null;
+      /** Sender's directory display name, when resolvable. */
+      sender_display_name?: string | null;
+      /** Encrypted media references (`imeta` tags) on this message, if any. */
+      media?: AgentControlMediaRef[];
+    }
+  | {
+      type: "message_deleted";
+      account_id_hex: string;
+      group_id_hex: string;
+      target_message_id_hex: string;
+      sender_account_id_hex: string;
+    }
+  | {
+      type: "group_state_changed";
+      account_id_hex: string;
+      group_id_hex: string;
+      /**
+       * Coarse change kind: "member_added" | "member_removed" | "member_left" |
+       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+       * Privacy: never carries a member pubkey.
+       */
+      change: string;
+      /** New group display name for "group_renamed"; absent otherwise. */
+      detail?: string | null;
     }
   | {
       type: "group_invite";
@@ -116,6 +209,13 @@ export interface MarmotAgentControlClientOptions {
   socketPath: string;
   authToken?: string | undefined;
   requestTimeoutMs?: number;
+  /**
+   * Timeout for best-effort live-preview ops (stream begin/append/status/progress/
+   * cancel). Defaults to {@link DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS}; kept short so a
+   * wedged preview broker abandons the preview quickly rather than holding the agent
+   * turn open. Durable ops (send_final, stream_finalize) always use requestTimeoutMs.
+   */
+  previewRequestTimeoutMs?: number;
 }
 
 interface RequestOptions {
@@ -155,12 +255,15 @@ export class MarmotAgentControlClient {
   readonly socketPath: string;
   private readonly authToken: string | null;
   private readonly requestTimeoutMs: number;
+  private readonly previewRequestTimeoutMs: number;
 
   constructor(options: MarmotAgentControlClientOptions) {
     this.socketPath = options.socketPath;
     const token = options.authToken?.trim();
     this.authToken = token ? token : null;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.previewRequestTimeoutMs =
+      options.previewRequestTimeoutMs ?? DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS;
   }
 
   // --- typed request helpers --------------------------------------------------
@@ -187,13 +290,32 @@ export class MarmotAgentControlClient {
     groupIdHex: string,
     text: string,
     replyToMessageIdHex?: string | null,
+    idempotencyKey?: string,
   ): Promise<FinalSentResponse> {
+    const key = idempotencyKey?.trim();
     return (await this.request({
       type: "send_final",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       text: String(text ?? ""),
       reply_to_message_id_hex: optionalHex(replyToMessageIdHex, "reply_to_message_id_hex"),
+      // Additive, v1-compatible: only sent when supplied, so the connector dedups
+      // a retry that reuses the same key instead of double-posting.
+      ...(key ? { idempotency_key: key } : {}),
+    })) as unknown as FinalSentResponse;
+  }
+
+  /** Delete (retract) a previously-sent group message; emits a kind-5 deletion. */
+  async deleteMessage(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+  ): Promise<FinalSentResponse> {
+    return (await this.request({
+      type: "delete_message",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
     })) as unknown as FinalSentResponse;
   }
 
@@ -205,37 +327,49 @@ export class MarmotAgentControlClient {
     const quicCandidates = [...(options.quicCandidates ?? [])]
       .map((candidate) => String(candidate).trim())
       .filter((candidate) => candidate.length > 0);
-    return (await this.request({
-      type: "stream_begin",
-      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
-      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
-      stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
-      quic_candidates: quicCandidates,
-    })) as unknown as StreamBegunResponse;
+    return (await this.request(
+      {
+        type: "stream_begin",
+        account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+        group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+        stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
+        quic_candidates: quicCandidates,
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    )) as unknown as StreamBegunResponse;
   }
 
   async streamAppend(streamIdHex: string, appendText: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_append",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      append_text: String(appendText ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_append",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        append_text: String(appendText ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamStatus(streamIdHex: string, status: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_status",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      status: String(status ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_status",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        status: String(status ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamProgress(streamIdHex: string, text: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_progress",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      text: String(text ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_progress",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        text: String(text ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamFinalize(
@@ -244,6 +378,9 @@ export class MarmotAgentControlClient {
     transcriptHashHex: string,
     chunkCount: number,
   ): Promise<StreamFinalizedResponse> {
+    // Durable commit: keep the full request timeout. Abandoning a live finalize
+    // early could re-send via send_final and duplicate the kind-9, so this op is
+    // intentionally not bounded by previewRequestTimeoutMs.
     return (await this.request({
       type: "stream_finalize",
       stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
@@ -254,11 +391,14 @@ export class MarmotAgentControlClient {
   }
 
   async streamCancel(streamIdHex: string, reason?: string | null): Promise<Envelope> {
-    return this.request({
-      type: "stream_cancel",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      reason: reason == null ? null : String(reason),
-    });
+    return this.request(
+      {
+        type: "stream_cancel",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        reason: reason == null ? null : String(reason),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async allowlistList(accountIdHex: string): Promise<AllowlistResponse> {
@@ -266,6 +406,15 @@ export class MarmotAgentControlClient {
       type: "allowlist_list",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
     })) as unknown as AllowlistResponse;
+  }
+
+  /** Group membership for activation policy (member count, is_direct, subject). */
+  async groupInfo(accountIdHex: string, groupIdHex: string): Promise<GroupInfoResponse> {
+    return (await this.request({
+      type: "group_info",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+    })) as unknown as GroupInfoResponse;
   }
 
   async allowlistAdd(
@@ -327,6 +476,45 @@ export class MarmotAgentControlClient {
       duration_ms: event.durationMs == null ? null : Math.trunc(event.durationMs),
       reply_to_message_id_hex: optionalHex(event.replyToMessageIdHex, "reply_to_message_id_hex"),
     })) as unknown as AppEventSentResponse;
+  }
+
+  /**
+   * Encrypt + upload local files as encrypted media and send them as a kind-9
+   * message in the group. `dm-agent` reads each file's bytes from its host by
+   * `path`; the control plane never carries plaintext or a content key. Returns
+   * the durable message ids (`final_sent`).
+   */
+  async sendMedia(
+    accountIdHex: string,
+    groupIdHex: string,
+    attachments: AgentControlMediaUpload[],
+    caption?: string | null,
+  ): Promise<FinalSentResponse> {
+    return (await this.request({
+      type: "send_media",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      attachments,
+      caption: caption == null ? null : String(caption),
+    })) as unknown as FinalSentResponse;
+  }
+
+  /**
+   * Fetch + decrypt an inbound media reference and write the plaintext to a temp
+   * file on the `dm-agent` host. The content key stays in `dm-agent`; the reply
+   * carries only the host-local path and metadata (`media_downloaded`).
+   */
+  async downloadMedia(
+    accountIdHex: string,
+    groupIdHex: string,
+    media: AgentControlMediaRef,
+  ): Promise<MediaDownloadedResponse> {
+    return (await this.request({
+      type: "download_media",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      media,
+    })) as unknown as MediaDownloadedResponse;
   }
 
   // --- inbound subscription ---------------------------------------------------

@@ -10,14 +10,19 @@
 // end-to-end against the `openclaw-gateway` docker harness (it needs a running
 // gateway + a model). The MarmotReplySink mapping below is unit-tested.
 
+import { randomUUID } from "node:crypto";
+import { readFile, unlink } from "node:fs/promises";
+
 import {
   buildChannelInboundEventContext,
   runChannelInboundEvent,
+  type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
+import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
-import type { MarmotAgentControlClient } from "./client.js";
-import type { StreamMode } from "./config.js";
+import { isRetryable, type MarmotAgentControlClient } from "./client.js";
+import type { GroupActivation, StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
@@ -303,13 +308,34 @@ export class MarmotReplySink {
 
   private async sendFinal(text: string): Promise<void> {
     this.log(`marmot: sending durable final (${text.length} chars)`);
-    await this.options.client.sendFinal(
-      this.options.accountIdHex,
-      this.options.groupIdHex,
-      text,
-      this.options.replyToMessageIdHex ?? null,
-    );
-    this.log("marmot: durable final sent");
+    // One idempotency key for all attempts of THIS durable reply: a retry after a
+    // post-write timeout reuses the key so the connector dedups instead of
+    // double-posting an unrecallable encrypted message. Bounded retries with a
+    // tiny backoff cover the transient/timeout window; non-retryable errors fail
+    // fast and the last error is rethrown.
+    const idempotencyKey = randomUUID();
+    const backoffMs = [100, 300];
+    let attempt = 0;
+    for (;;) {
+      try {
+        await this.options.client.sendFinal(
+          this.options.accountIdHex,
+          this.options.groupIdHex,
+          text,
+          this.options.replyToMessageIdHex ?? null,
+          idempotencyKey,
+        );
+        this.log("marmot: durable final sent");
+        return;
+      } catch (err) {
+        if (attempt >= backoffMs.length || !isRetryable(err)) {
+          throw err;
+        }
+        this.log(`marmot: durable final send failed; retrying (attempt ${attempt + 1})`);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs[attempt]));
+        attempt += 1;
+      }
+    }
   }
 
   async deliver(payload: ReplyPayloadLike, info: ReplyDelivery): Promise<void> {
@@ -435,20 +461,142 @@ export interface OpenClawChannelRuntime {
   };
 }
 
+/**
+ * Dispatcher client: the reply sink surface plus the group-info read for
+ * gating and the media download used to surface inbound images to the agent.
+ */
+export type MarmotDispatchClient = MarmotSinkClient &
+  Pick<MarmotAgentControlClient, "groupInfo" | "downloadMedia">;
+
 export interface MarmotDispatchDeps {
   /** Full OpenClaw config (`api.config`). */
   cfg: unknown;
   /** `api.runtime.channel`. */
   runtimeChannel: OpenClawChannelRuntime;
-  client: MarmotSinkClient;
+  client: MarmotDispatchClient;
   /** OpenClaw channel account id ("default" or a configured account key), not the Marmot account hex. */
   channelAccountId?: string | null;
   streamMode: StreamMode;
   blockStreaming: boolean;
   quicCandidates: string[];
   chunkBytes?: number;
+  /** When to reply in a multi-party group ("mention" gates; "always" replies to all). */
+  groupActivation: GroupActivation;
+  /** Case-insensitive trigger phrases that count as addressing the agent. */
+  mentionPatterns: string[];
   /** Optional privacy-safe lifecycle logger. */
   log?: (message: string) => void;
+}
+
+/** Whether the message text contains any configured trigger phrase. */
+function matchesMentionPattern(text: string, patterns: string[]): boolean {
+  if (patterns.length === 0) {
+    return false;
+  }
+  const haystack = text.toLowerCase();
+  return patterns.some((pattern) => {
+    const needle = pattern.trim().toLowerCase();
+    return needle.length > 0 && haystack.includes(needle);
+  });
+}
+
+/**
+ * Decide whether an inbound group message should run an agent turn. Always reply
+ * when addressed (agent p-tagged, a trigger matches) or in an effective DM
+ * (exactly two members). Membership is queried lazily — only when the message is
+ * otherwise unaddressed — to avoid a round-trip on the common addressed case.
+ * Fails open (replies) if membership can't be resolved, so a lookup error never
+ * silently drops a user's message.
+ */
+async function shouldRunTurn(
+  deps: MarmotDispatchDeps,
+  message: MarmotInboundMessage,
+): Promise<boolean> {
+  if (deps.groupActivation === "always") {
+    return true;
+  }
+  if (message.mentionsSelf) {
+    return true;
+  }
+  if (matchesMentionPattern(message.text, deps.mentionPatterns)) {
+    return true;
+  }
+  try {
+    const info = await deps.client.groupInfo(message.accountIdHex, message.groupIdHex);
+    return info.is_direct;
+  } catch {
+    deps.log?.("marmot: group membership lookup failed; responding (fail-open)");
+    return true;
+  }
+}
+
+/** Map a media MIME type onto the OpenClaw inbound media `kind` enum. */
+function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kind"]> {
+  const type = mediaType.trim().toLowerCase();
+  if (type.startsWith("image/")) {
+    return "image";
+  }
+  if (type.startsWith("video/")) {
+    return "video";
+  }
+  if (type.startsWith("audio/")) {
+    return "audio";
+  }
+  if (type.length === 0) {
+    return "unknown";
+  }
+  return "document";
+}
+
+/**
+ * Best-effort: download each inbound media ref to a local path on the dm-agent
+ * host, then re-stage the decrypted bytes through OpenClaw's official media store
+ * so the resulting path is under an allowlisted media root. Native vision trusts
+ * the path directly, but the agent's `image` tool enforces an allowlist
+ * (`assertLocalMediaAllowed`) whose roots are OpenClaw's media dir — the raw
+ * dm-agent temp path is not under them, so the tool would reject it. Building the
+ * `InboundMediaFacts` from the staged path keeps both paths working. The dm-agent
+ * temp file is unlinked (best-effort) once re-staged. A ref that fails is skipped
+ * (privacy-safe log) so one broken attachment never drops the whole turn. Returns
+ * `undefined` when the message carries no media so the context builder omits the
+ * field entirely.
+ */
+async function downloadInboundMedia(
+  deps: Pick<MarmotDispatchClient, "downloadMedia">,
+  message: MarmotInboundMessage,
+  log?: (message: string) => void,
+): Promise<InboundMediaFacts[] | undefined> {
+  const refs = message.media ?? [];
+  if (refs.length === 0) {
+    return undefined;
+  }
+  const facts: InboundMediaFacts[] = [];
+  for (const ref of refs) {
+    // Captured so the dm-agent temp file is unlinked even if readFile or
+    // saveMediaBuffer throws after a successful download.
+    let tempPath: string | undefined;
+    try {
+      const res = await deps.downloadMedia(message.accountIdHex, message.groupIdHex, ref);
+      tempPath = res.path;
+      const buffer = await readFile(res.path);
+      const saved = await saveMediaBuffer(buffer, res.media_type, "inbound", undefined, res.file_name);
+      facts.push({
+        path: saved.path,
+        contentType: res.media_type,
+        kind: inboundMediaKind(res.media_type),
+        messageId: message.messageIdHex,
+      });
+    } catch {
+      log?.("marmot: inbound media download failed; skipping attachment");
+    } finally {
+      // The dm-agent temp file is redundant once re-staged (or unusable on a
+      // mid-stage failure); drop it (best-effort).
+      if (tempPath !== undefined) {
+        await unlink(tempPath).catch(() => undefined);
+      }
+    }
+  }
+  return facts.length > 0 ? facts : undefined;
 }
 
 /**
@@ -460,6 +608,11 @@ export function createMarmotInboundDispatcher(
   deps: MarmotDispatchDeps,
 ): (message: MarmotInboundMessage) => Promise<void> {
   return async (message) => {
+    // Activation gating: in a multi-party group, only run a turn when addressed.
+    if (!(await shouldRunTurn(deps, message))) {
+      deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
+      return;
+    }
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
       cfg: deps.cfg,
@@ -468,20 +621,32 @@ export function createMarmotInboundDispatcher(
       peer: { kind: "group", id: message.groupIdHex },
     });
 
+    // Surface any inbound encrypted media to the agent: download each ref to a
+    // local path (dm-agent decrypts; the content key never leaves it) and hand
+    // the local file facts to OpenClaw, which reads + base64-encodes them.
+    const media = await downloadInboundMedia(deps.client, message, deps.log);
+
     const ctxPayload = buildChannelInboundEventContext({
       channel: "marmot",
       accountId: channelAccountId,
       messageId: message.messageIdHex,
       from: message.senderAccountIdHex,
-      sender: { id: message.senderAccountIdHex },
+      sender: {
+        id: message.senderAccountIdHex,
+        ...(message.senderDisplayName ? { name: message.senderDisplayName } : {}),
+      },
       conversation: { kind: "group", id: message.groupIdHex },
       route: {
         agentId: route.agentId,
         accountId: route.accountId,
         routeSessionKey: route.sessionKey,
       },
-      reply: { to: message.groupIdHex },
+      reply: {
+        to: message.groupIdHex,
+        ...(message.replyToMessageIdHex ? { replyToId: message.replyToMessageIdHex } : {}),
+      },
       message: { rawBody: message.text, bodyForAgent: message.text },
+      ...(media ? { media } : {}),
     });
 
     const storePath = deps.runtimeChannel.session.resolveStorePath();
@@ -490,6 +655,10 @@ export function createMarmotInboundDispatcher(
       client: deps.client,
       accountIdHex: message.accountIdHex,
       groupIdHex: message.groupIdHex,
+      // Thread the reply to the triggering message (channel declares
+      // topLevelReplyToMode "reply"). Honored by the durable send_final path;
+      // the streaming finalize path threads in a later phase.
+      replyToMessageIdHex: message.messageIdHex,
       streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,
       chunkBytes: deps.chunkBytes,

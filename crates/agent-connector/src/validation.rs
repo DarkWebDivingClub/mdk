@@ -103,6 +103,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
     match request {
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
         AgentControlRequest::SendFinal { .. } => "send_final",
+        AgentControlRequest::DeleteMessage { .. } => "delete_message",
         AgentControlRequest::StreamBegin { .. } => "stream_begin",
         AgentControlRequest::StreamAppend { .. } => "stream_append",
         AgentControlRequest::StreamStatus { .. } => "stream_status",
@@ -116,11 +117,14 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
+        AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::AllowlistList { .. } => "allowlist_list",
         AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
         AgentControlRequest::DebugInjectInbound { .. } => "debug_inject_inbound",
         AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
+        AgentControlRequest::SendMedia { .. } => "send_media",
+        AgentControlRequest::DownloadMedia { .. } => "download_media",
     }
 }
 
