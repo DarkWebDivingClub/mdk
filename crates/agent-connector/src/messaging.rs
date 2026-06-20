@@ -333,6 +333,17 @@ impl AgentConnector {
     /// Encrypt + upload local files as encrypted media and send them as a kind-9
     /// message. The plaintext bytes are read from the connector host by path and
     /// never crossed the control plane; the content key stays in the runtime.
+    ///
+    /// Trust boundary: the connector reads `attachment.path` verbatim and is the
+    /// generic glue serving every control-plane gateway (OpenClaw, Hermes), so it
+    /// cannot know which paths a given deployment considers safe. Confining the
+    /// path to an allowlisted media root is therefore the caller's responsibility
+    /// — e.g. the OpenClaw channel adapter validates the resolved local path with
+    /// `assertLocalMediaAllowed` before issuing `send_media`, mirroring the
+    /// inbound model where downloaded media is re-staged under an allowlisted
+    /// root. A gateway that forwards an unconstrained, tool-influenced path would
+    /// let a prompt-injected agent read an arbitrary connector-host file; that
+    /// must be prevented gateway-side, not here.
     pub(crate) async fn send_media_response(
         &self,
         account_id_hex: &str,

@@ -19,6 +19,10 @@ import {
   type MessageReceipt,
   type MessageReceiptPart,
 } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  assertLocalMediaAllowed,
+  getDefaultLocalRoots,
+} from "openclaw/plugin-sdk/media-runtime";
 
 import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
 
@@ -170,16 +174,42 @@ export interface ResolvedOutboundMediaUpload {
 }
 
 /**
+ * Resolve the allowlist of local roots an outbound local-path send is confined
+ * to. OpenClaw hands the channel the approved roots on the send ctx
+ * (`mediaLocalRoots`, or `mediaAccess.localRoots`); when neither is present we
+ * fall back to OpenClaw's default media-store roots. We never honor a `"any"`
+ * sentinel here: the connector reads the resolved path verbatim, so an
+ * unrestricted root would reintroduce the arbitrary-file-read this guard exists
+ * to close. An empty configured allowlist means "nothing is allowed".
+ */
+function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly string[] {
+  const configured = ctx.mediaLocalRoots ?? ctx.mediaAccess?.localRoots;
+  return configured ?? getDefaultLocalRoots();
+}
+
+/**
  * Resolve `ctx.mediaUrl` to a local `AgentControlMediaUpload` the connector can
  * read by path. Handles two cases the ctx can express with the real SDK types:
  *
- * 1. A local filesystem path or `file://` URL — used directly (no cleanup).
+ * 1. A local filesystem path or `file://` URL — validated against the send's
+ *    allowlisted media roots (`assertLocalMediaAllowed`) and then used directly
+ *    (no cleanup). The connector reads this path verbatim, so without the guard
+ *    an agent-influenced `mediaUrl` (e.g. `~/.ssh/id_rsa`) would let a prompt-
+ *    injected agent exfiltrate any connector-host file into a group. This
+ *    mirrors the inbound trust model, where downloaded media is re-staged under
+ *    an allowlisted root before the agent's image tool can read it.
  * 2. A non-local URL with a `mediaReadFile` host accessor — the bytes are read
- *    and written to a temp file so the connector still gets a path, and a
- *    `cleanup` is returned to remove that temp file+dir after the send.
+ *    through that already-authorized host reader and written to a temp file so
+ *    the connector still gets a path, and a `cleanup` is returned to remove that
+ *    temp file+dir after the send. No path allowlist applies because the path is
+ *    one we just minted under our own temp dir, not a caller-supplied path.
  *
  * Returns `null` when the ctx provides only a remote URL and no buffer accessor;
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
+ *
+ * Throws `LocalMediaAccessError` (from the SDK) when a local path escapes the
+ * allowlist; the caller surfaces that as a failed send rather than reading the
+ * file.
  */
 async function resolveOutboundMediaUpload(
   ctx: ChannelMessageSendMediaContext,
@@ -188,6 +218,10 @@ async function resolveOutboundMediaUpload(
   const { mediaUrl } = ctx;
   if (isLocalMediaUrl(mediaUrl)) {
     const localPath = mediaUrl.startsWith("file://") ? fileURLToPath(mediaUrl) : mediaUrl;
+    // Defense against exfiltration via a tool/prompt-influenced path: the
+    // connector reads this path unconditionally, so confine it to the send's
+    // allowlisted media roots before handing it over. Throws on violation.
+    await assertLocalMediaAllowed(localPath, resolveAllowedMediaRoots(ctx));
     const fileName = basename(localPath) || "attachment";
     return {
       upload: { path: localPath, media_type: mimeFromExtension(fileName), file_name: fileName },

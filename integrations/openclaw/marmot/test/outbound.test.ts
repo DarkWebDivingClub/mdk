@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import type {
   ChannelMessageSendMediaContext,
@@ -212,6 +216,125 @@ describe("createMarmotMessageAdapter", () => {
 
     await expect(adapter.send!.media!(ctx)).rejects.toThrow(/local path/);
     expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("rejects a local path outside the allowlist (no file read, no send)", async () => {
+    // The exfiltration vector from the issue: a prompt-influenced mediaUrl
+    // pointing at an arbitrary connector-host file (e.g. an ssh key). The guard
+    // must reject it before the connector reads any bytes.
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    const ctx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "exfil",
+      // Outside OpenClaw's default media roots; no explicit mediaLocalRoots.
+      mediaUrl: "/home/victim/.ssh/id_rsa",
+    } as unknown as ChannelMessageSendMediaContext;
+
+    await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+      name: "LocalMediaAccessError",
+    });
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("rejects a file:// url that escapes the allowlist", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    const ctx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "exfil",
+      mediaUrl: "file:///etc/passwd",
+    } as unknown as ChannelMessageSendMediaContext;
+
+    await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+      name: "LocalMediaAccessError",
+    });
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("rejects a local path outside an explicit ctx.mediaLocalRoots allowlist", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    const ctx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "exfil",
+      mediaUrl: "/var/data/secret.png",
+      // OpenClaw confines the send to this root; the path is outside it.
+      mediaLocalRoots: ["/srv/openclaw/media"],
+    } as unknown as ChannelMessageSendMediaContext;
+
+    await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+      name: "LocalMediaAccessError",
+    });
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("allows a local path under an explicit ctx.mediaLocalRoots allowlist", async () => {
+    // OpenClaw can hand the channel a non-default approved root; a path under it
+    // must be accepted (the guard honors the send's own allowlist, not only the
+    // SDK defaults).
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const filePath = join(tmpRoot, "photo.png");
+      await writeFile(filePath, Buffer.from("png-bytes"));
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "look",
+        mediaUrl: filePath,
+        mediaLocalRoots: [tmpRoot],
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await adapter.send!.media!(ctx);
+
+      expect(calls.sendMedia).toHaveLength(1);
+      expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
+        path: filePath,
+        media_type: "image/png",
+        file_name: "photo.png",
+      });
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("honors ctx.mediaAccess.localRoots when mediaLocalRoots is absent", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const filePath = join(tmpRoot, "clip.mp4");
+      await writeFile(filePath, Buffer.from("mp4-bytes"));
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "clip",
+        mediaUrl: filePath,
+        mediaAccess: { localRoots: [tmpRoot] },
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await adapter.send!.media!(ctx);
+
+      expect(calls.sendMedia).toHaveLength(1);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).toBe(filePath);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("records sent ids in the cache and a delete resolves the group from it", async () => {
