@@ -38,6 +38,10 @@ TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
 TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
+# Bounded backoff (seconds) for durable send_final retries. One idempotency key
+# is reused across these attempts so a retry after a post-write timeout dedups at
+# the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
+SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
@@ -349,16 +353,22 @@ class MarmotAgentControlClient:
         group_id_hex: str,
         text: str,
         reply_to_message_id_hex: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "send_final",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
-                "text": str(text or ""),
-                "reply_to_message_id_hex": reply_to_message_id_hex,
-            }
-        )
+        key = idempotency_key.strip() if idempotency_key else None
+        payload: Dict[str, Any] = {
+            "type": "send_final",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            "text": str(text or ""),
+            "reply_to_message_id_hex": reply_to_message_id_hex,
+        }
+        # Additive, v1-compatible: only sent when supplied so an old connector's
+        # frame stays unchanged. When present, the connector dedups a retry that
+        # reuses the same key instead of double-posting an unrecallable message.
+        if key:
+            payload["idempotency_key"] = key
+        return await self.request(payload)
 
     async def stream_begin(
         self,
@@ -1001,25 +1011,49 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         reply_to_message_id_hex: Optional[str] = None,
     ) -> SendResult:
-        try:
-            account_id = await self._ensure_account_id()
-            response = await self.client.send_final(
-                account_id,
-                chat_id,
-                content,
-                reply_to_message_id_hex=reply_to_message_id_hex,
-            )
-            message_ids = tuple(response.get("message_ids_hex") or ())
-            message_id = message_ids[-1] if message_ids else None
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response=response,
-                continuation_message_ids=message_ids[:-1],
-            )
-        except Exception as exc:
-            logger.debug("Marmot send_final failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+        # One idempotency key for every attempt of THIS durable reply: a retry
+        # after a post-write timeout reuses the key so the connector dedups
+        # instead of double-posting an unrecallable encrypted message. Bounded
+        # retries with a tiny backoff cover the transient/timeout window;
+        # non-retryable errors fail fast. Mirrors OpenClaw dispatch.ts.
+        idempotency_key = uuid.uuid4().hex
+        last_exc: BaseException | None = None
+        for attempt in range(len(SEND_FINAL_RETRY_BACKOFF_S) + 1):
+            try:
+                account_id = await self._ensure_account_id()
+                response = await self.client.send_final(
+                    account_id,
+                    chat_id,
+                    content,
+                    reply_to_message_id_hex=reply_to_message_id_hex,
+                    idempotency_key=idempotency_key,
+                )
+                message_ids = tuple(response.get("message_ids_hex") or ())
+                message_id = message_ids[-1] if message_ids else None
+                return SendResult(
+                    success=True,
+                    message_id=message_id,
+                    raw_response=response,
+                    continuation_message_ids=message_ids[:-1],
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < len(SEND_FINAL_RETRY_BACKOFF_S) and is_retryable(exc):
+                    logger.debug(
+                        "Marmot send_final failed; retrying (attempt %d): %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(SEND_FINAL_RETRY_BACKOFF_S[attempt])
+                    continue
+                logger.debug("Marmot send_final failed: %s", exc)
+                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+        # Unreachable: the loop returns on success or on the final attempt.
+        return SendResult(
+            success=False,
+            error=str(last_exc) if last_exc else "Marmot send_final failed",
+            retryable=is_retryable(last_exc) if last_exc else False,
+        )
 
     async def _send_tool_progress_events(
         self,

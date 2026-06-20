@@ -181,6 +181,38 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
         self.assertEqual(requests[0]["group_id_hex"], "22" * 32)
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
+        # Additive, v1-compatible: the key is omitted from the wire when not
+        # supplied so an old connector's frame stays byte-identical.
+        self.assertNotIn("idempotency_key", requests[0])
+
+    async def test_send_final_includes_idempotency_key_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["aa"],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.send_final("11" * 32, "22" * 32, "hello", idempotency_key="key-1")
+        # Blank/whitespace keys are treated as absent so they never serialize.
+        await client.send_final("11" * 32, "22" * 32, "hello", idempotency_key="   ")
+        await client.send_final("11" * 32, "22" * 32, "hello")
+
+        self.assertEqual(requests[0]["idempotency_key"], "key-1")
+        self.assertNotIn("idempotency_key", requests[1])
+        self.assertNotIn("idempotency_key", requests[2])
 
     async def test_auth_token_is_written_when_configured(self):
         requests = []
@@ -554,7 +586,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.calls.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {
                     "type": "final_sent",
@@ -591,7 +623,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["44" * 32],
                 }
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
 
@@ -637,7 +669,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["44" * 32],
                 }
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
 
@@ -975,7 +1007,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 for event in events:
                     yield event
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
 
@@ -1034,7 +1066,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "display_name": display_name,
                 }
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
 
@@ -1338,7 +1370,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["77" * 32],
                 }
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {
                     "type": "final_sent",
@@ -1575,7 +1607,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["77" * 32],
                 }
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
 
@@ -1633,7 +1665,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
 
@@ -1693,7 +1725,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {
                     "type": "final_sent",
@@ -1723,6 +1755,99 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             fake_client.final_sends,
             [("11" * 32, "22" * 32, "Based on my search", None)],
         )
+
+
+class SendFinalIdempotencyRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def _adapter(self, fake_client):
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+    async def test_send_final_reuses_one_idempotency_key_across_bounded_retries(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.keys = []
+
+            async def send_final(
+                self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None
+            ):
+                self.keys.append(idempotency_key)
+                # Fail the first two attempts with a retryable error, then succeed.
+                if len(self.keys) < 3:
+                    raise adapter_module.AgentControlError(
+                        "transient", code="socket_io", retryable=True
+                    )
+                return {"type": "final_sent", "message_ids_hex": ["aa", "bb"]}
+
+        fake_client = FakeClient()
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(chat_id="22" * 32, content="pong", reply_to="33" * 32)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "bb")
+        # Three attempts (2 retries) — the retry budget mirrors OpenClaw [100, 300]ms.
+        self.assertEqual(len(fake_client.keys), 3)
+        # One key, reused unchanged across every attempt, so the connector dedups
+        # instead of double-posting an unrecallable encrypted message.
+        self.assertTrue(fake_client.keys[0])
+        self.assertEqual(len(set(fake_client.keys)), 1)
+
+    async def test_send_final_retry_budget_is_bounded(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.keys = []
+
+            async def send_final(
+                self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None
+            ):
+                self.keys.append(idempotency_key)
+                raise adapter_module.AgentControlError("down", code="socket_io", retryable=True)
+
+        fake_client = FakeClient()
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(chat_id="22" * 32, content="pong")
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        # Initial attempt + the two bounded backoff retries, then it gives up.
+        self.assertEqual(len(fake_client.keys), 3)
+        self.assertEqual(len(set(fake_client.keys)), 1)
+
+    async def test_send_final_non_retryable_error_fails_fast_without_retry(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.keys = []
+
+            async def send_final(
+                self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None
+            ):
+                self.keys.append(idempotency_key)
+                raise adapter_module.AgentControlError(
+                    "bad request", code="invalid_hex", retryable=False
+                )
+
+        fake_client = FakeClient()
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(chat_id="22" * 32, content="pong")
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        # A non-retryable error fails fast: exactly one attempt, no backoff loop.
+        self.assertEqual(len(fake_client.keys), 1)
 
 
 if __name__ == "__main__":
