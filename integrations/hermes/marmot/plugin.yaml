@@ -30,3 +30,6 @@ optional_env:
   - name: MARMOT_HOME_CHANNEL
     description: "Default Marmot group id for Hermes cron/home delivery"
     password: false
+  - name: MARMOT_DEBOUNCE_MS
+    description: "Optional inbound debounce window in ms; coalesces rapid same-sender/group messages into one turn (0 or absent = disabled)"
+    password: false

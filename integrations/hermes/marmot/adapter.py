@@ -45,6 +45,10 @@ SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
+DEFAULT_RECONNECT_DELAY_MS = 1000
+DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
+DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
+DEFAULT_AMBIENT_CONTEXT_WINDOW = 2048
 MAX_PROFILE_NAME_CHARS = 80
 PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
@@ -159,18 +163,132 @@ class KeyedAsyncQueue:
         self._tails.clear()
 
 
+class _RecentKeys:
+    """Bounded, insertion-ordered set for recent-id/-context dedupe.
+
+    Mirrors the OpenClaw ``RecentIds`` (inbound.ts): FIFO eviction once the
+    window is exceeded so a long-running subscription cannot grow unbounded.
+    """
+
+    def __init__(self, max_size: int):
+        self.max_size = int(max_size)
+        self._keys: "OrderedDict[str, None]" = OrderedDict()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._keys
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def add(self, key: str) -> None:
+        self._keys[key] = None
+        while len(self._keys) > self.max_size:
+            self._keys.popitem(last=False)
+
+
+def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge a debounce batch of same-key inbound events into one (mirrors
+    inbound-runtime.ts ``coalesceInboundMessages``).
+
+    Keeps the LAST event's ids (message_id, reply_to, sender) as the
+    representative, but carries merged text/mentions/media:
+    - text: newline-joined, skipping empty parts;
+    - ``mentions_self``: OR across the batch (true if ANY message mentions self);
+    - ``media``: CONCATENATED across the batch (never dropped — the explicit
+      OpenClaw coalescing bug to avoid).
+    """
+    last = items[-1]
+    if len(items) == 1:
+        return last
+
+    merged = dict(last)
+    text_parts = [str(item.get("text") or "") for item in items]
+    merged["text"] = "\n".join(part for part in text_parts if part)
+    merged["mentions_self"] = any(bool(item.get("mentions_self")) for item in items)
+    media: list[Any] = []
+    for item in items:
+        item_media = item.get("media")
+        if isinstance(item_media, (list, tuple)):
+            media.extend(item_media)
+    if media:
+        merged["media"] = media
+    return merged
+
+
+def reconnect_backoff_ms(
+    attempt: int,
+    base_ms: float,
+    cap_ms: float,
+    rand: Any = None,
+) -> float:
+    """Reconnect backoff with jitter: a delay in
+    ``[base_ms, min(cap_ms, base_ms * 2**attempt)]``.
+
+    Faithful port of inbound.ts ``reconnectBackoffMs`` (lines 87-101): attempt 0
+    returns exactly ``base_ms`` (ceiling == base) so the first reconnect is as
+    prompt as the old flat delay; later attempts grow geometrically toward the
+    cap. The jitter spreads retries so a persistent failure does not spin at a
+    fixed cadence. ``rand`` defaults to :func:`random.random` and may be injected
+    for deterministic tests.
+    """
+    if base_ms <= 0:
+        return 0
+    if rand is None:
+        import random
+
+        rand = random.random
+    ceiling = min(cap_ms, base_ms * 2 ** max(0, attempt))
+    if ceiling <= base_ms:
+        return base_ms
+    return round(base_ms + rand() * (ceiling - base_ms))
+
+
+def group_state_change_sentence(change: str, detail: Optional[str] = None) -> str:
+    """Map a coarse group-state change kind to a short, privacy-safe sentence
+    for ambient agent context. NEVER includes a member pubkey; the only detail
+    surfaced is the new group name on a rename (mirrors inbound-runtime.ts
+    ``groupStateChangeSentence`` lines 62-83)."""
+    if change == "member_added":
+        return "A member was added to the group."
+    if change == "member_removed":
+        return "A member was removed from the group."
+    if change == "member_left":
+        return "A member left the group."
+    if change == "admin_added":
+        return "A member was made a group admin."
+    if change == "admin_removed":
+        return "A member is no longer a group admin."
+    if change == "group_renamed":
+        trimmed = str(detail or "").strip()
+        return f'The group was renamed to "{trimmed}".' if trimmed else "The group was renamed."
+    if change == "group_avatar_changed":
+        return "The group avatar was changed."
+    return "The group state changed."
+
+
 class AppendOnlyTextState:
     """Tracks the latest visible stream text and returns safe suffix deltas."""
 
     def __init__(self):
         self.text = ""
 
-    def suffix_for(self, next_text: str) -> str:
+    def pending_suffix_for(self, next_text: str) -> str:
+        """Validate that ``next_text`` extends the current text and return the
+        append-only suffix WITHOUT advancing ``self.text``. The caller commits
+        the advance with :meth:`commit` only after the remote append succeeds, so
+        a failed append can be retried with the same text without diverging from
+        the connector's transcript (mirrors live.ts ``update()``)."""
         next_text = str(next_text or "")
         if not next_text.startswith(self.text):
             raise NonAppendOnlyUpdate("Marmot stream update is not append-only")
-        suffix = next_text[len(self.text):]
-        self.text = next_text
+        return next_text[len(self.text):]
+
+    def commit(self, next_text: str) -> None:
+        self.text = str(next_text or "")
+
+    def suffix_for(self, next_text: str) -> str:
+        suffix = self.pending_suffix_for(next_text)
+        self.commit(next_text)
         return suffix
 
 
@@ -310,17 +428,36 @@ class AgentTextStreamTranscript:
 class MarmotAgentControlClient:
     """Small NDJSON client for ``crates/agent-control``."""
 
-    def __init__(self, socket_path: str | Path, *, request_timeout: float = 30.0, auth_token: Optional[str] = None):
+    def __init__(
+        self,
+        socket_path: str | Path,
+        *,
+        request_timeout: float = 30.0,
+        preview_request_timeout: float = 8.0,
+        auth_token: Optional[str] = None,
+    ):
         self.socket_path = str(Path(socket_path).expanduser())
         self.request_timeout = float(request_timeout)
+        # Best-effort live-preview ops use a short timeout so a wedged preview
+        # broker abandons the preview in a few seconds instead of pinning the
+        # agent turn for the full request_timeout per op (mirrors client.ts
+        # DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS).
+        self.preview_request_timeout = float(preview_request_timeout)
         self.auth_token = str(auth_token).strip() if auth_token else None
 
-    async def request(self, payload: Dict[str, Any], *, request_id: Optional[str] = None) -> Dict[str, Any]:
+    async def request(
+        self,
+        payload: Dict[str, Any],
+        *,
+        request_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
+        effective_timeout = self.request_timeout if timeout is None else float(timeout)
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         try:
-            await self._write_envelope(writer, payload, request_id=request_id)
-            response = await self._read_envelope(reader)
+            await self._write_envelope(writer, payload, request_id=request_id, timeout=effective_timeout)
+            response = await self._read_envelope(reader, timeout=effective_timeout)
             self._validate_response_id(response, request_id)
             self._raise_if_error(response)
             return response
@@ -385,7 +522,8 @@ class MarmotAgentControlClient:
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex") if stream_id_hex else None,
                 "quic_candidates": [str(candidate).strip() for candidate in quic_candidates if str(candidate).strip()],
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_append(self, stream_id_hex: str, append_text: str) -> Dict[str, Any]:
@@ -394,7 +532,8 @@ class MarmotAgentControlClient:
                 "type": "stream_append",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "append_text": str(append_text or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_status(self, stream_id_hex: str, status: str) -> Dict[str, Any]:
@@ -403,16 +542,18 @@ class MarmotAgentControlClient:
                 "type": "stream_status",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "status": str(status or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
-    async def stream_tool(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
+    async def stream_progress(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
         return await self.request(
             {
-                "type": "stream_tool",
+                "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "text": str(text or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_finalize(
@@ -438,7 +579,8 @@ class MarmotAgentControlClient:
                 "type": "stream_cancel",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "reason": reason,
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def send_agent_activity(
@@ -543,7 +685,14 @@ class MarmotAgentControlClient:
         finally:
             await _close_writer(writer)
 
-    async def _write_envelope(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, request_id: str) -> None:
+    async def _write_envelope(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: Dict[str, Any],
+        *,
+        request_id: str,
+        timeout: Optional[float] = None,
+    ) -> None:
         envelope = {
             "marmot_agent_control": PROTOCOL,
             "id": request_id,
@@ -555,8 +704,9 @@ class MarmotAgentControlClient:
         if len(frame) > MAX_FRAME_BYTES:
             raise AgentControlError("agent control frame is too large", code="frame_too_large")
         writer.write(frame)
+        write_timeout = self.request_timeout if timeout is None else float(timeout)
         try:
-            await asyncio.wait_for(writer.drain(), timeout=self.request_timeout)
+            await asyncio.wait_for(writer.drain(), timeout=write_timeout)
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while writing agent control request",
@@ -664,11 +814,16 @@ class MarmotLiveStream:
         )
 
     async def append_replacement(self, next_text: str) -> None:
-        suffix = self.text.suffix_for(next_text)
+        next_text = str(next_text or "")
+        suffix = self.text.pending_suffix_for(next_text)
         if not suffix:
             return
+        # Commit local transcript/append-only state only AFTER the remote append
+        # succeeds, so a failed append leaves the stream consistent and the same
+        # text re-appendable (mirrors live.ts update() lines 99-116).
         await self.client.stream_append(self.stream_id_hex, suffix)
         self.transcript.append_text(suffix)
+        self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
         await self.client.stream_status(self.stream_id_hex, status)
@@ -709,6 +864,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.quic_candidates = resolve_quic_candidates(extra)
         self.stream_chunk_bytes = int(extra.get("stream_chunk_bytes") or DEFAULT_STREAM_CHUNK_BYTES)
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
+        self.debounce_ms = resolve_debounce_ms(extra)
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
@@ -723,6 +879,28 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Client-side inbound dedupe: dm-agent can re-emit the same inbound
+        # message (rapid catch-up after subscribe, or across a reconnect); drop
+        # ids already seen so the same user message is not dispatched twice.
+        self._recent_inbound_ids = _RecentKeys(DEFAULT_INBOUND_DEDUPE_WINDOW)
+        # Dedupe repeated ambient surfacings (deletion / group-state change) by a
+        # context key (mirror inbound.ts contextKeys).
+        self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
+        # Pending quiet next-turn ambient context, keyed by group id. Ambient
+        # events (a deletion, a group-state change) are NOT reply triggers: they
+        # are buffered here and prepended to the next real inbound message for
+        # that group as channel_context, so the agent sees the fact on its next
+        # turn without an ambient event spuriously starting an agent turn of its
+        # own. Mirrors OpenClaw's quiet-next-turn surfacer (inbound-runtime.ts);
+        # when no message follows, the fact is only logged (also OpenClaw parity).
+        self._pending_ambient_context: Dict[str, list[str]] = {}
+        # Optional inbound debounce: coalesce rapid same-(account,group,sender)
+        # bursts into one turn. Disabled when debounce_ms <= 0.
+        self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
+        self._debounce_tasks: Dict[str, asyncio.Task] = {}
+        # Set true once the current subscription yields/acks (healthy); used by
+        # the reconnect-backoff loop to reset its attempt counter.
+        self._inbound_established = False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -759,9 +937,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._listener_task = None
         await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
+        self._cancel_debounce_tasks()
+        self._pending_ambient_context.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._mark_disconnected()
+
+    def _cancel_debounce_tasks(self) -> None:
+        for task in self._debounce_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._debounce_tasks.clear()
+        self._debounce_pending.clear()
 
     async def send(
         self,
@@ -1288,24 +1475,53 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             code="ambiguous_account",
         )
 
-    async def _consume_inbound_loop(self) -> None:
+    async def _consume_inbound_loop(self, *, rand: Any = None) -> None:
+        base_ms = float(DEFAULT_RECONNECT_DELAY_MS)
+        cap_ms = float(DEFAULT_MAX_RECONNECT_DELAY_MS)
+        # Clamp the base to the cap so the delay never goes above the cap when a
+        # ceiling collapses to the base (mirrors inbound.ts line 157).
+        effective_base_ms = min(base_ms, cap_ms)
+        # Consecutive reconnect attempts that have not (re)established a healthy
+        # subscription. Reset to 0 once a subscription yields/acks so a healthy
+        # connection always reconnects promptly, while a persistent failure backs
+        # off geometrically instead of spinning at a flat cadence.
+        attempt = 0
         while True:
             try:
-                await self._consume_inbound_once()
+                await self._consume_inbound_once(on_established=lambda: None)
             except asyncio.CancelledError:
                 raise
             except _ResyncRequired as exc:
                 # The connector could not auto-replay the messages dropped on broadcast lag and
                 # asked us to re-sync. Tear down and reopen the subscription: a fresh subscription
                 # re-runs the connector's catch_up_accounts() and a fresh storage-backed replay,
-                # which recovers the missed inbound messages we would otherwise never see.
+                # which recovers the missed inbound messages we would otherwise never see. A
+                # resync is just another reconnect reason and uses the same backoff.
                 logger.warning("Marmot inbound resync requested, reconnecting: %s", exc)
-                await asyncio.sleep(0.5)
             except Exception as exc:
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
-                await asyncio.sleep(2.0)
+            else:
+                # A clean return means the subscription was dropped (the connector
+                # closed the inbound stream with a normal EOF rather than an error).
+                # That is still a reconnect, NOT a success: fall through to the same
+                # backoff path as an error so a socket that accepts-acks-then-closes
+                # cannot pin us in a hot resubscribe loop (mirrors OpenClaw's
+                # MarmotInboundBridge.run(), which backs off after stream completion
+                # too). The _inbound_established check below keeps an established-then-
+                # idle subscription reconnecting promptly.
+                logger.debug("Marmot inbound subscription closed cleanly, reconnecting")
+            # Reset the attempt counter whenever the subscription was healthy
+            # (it established and yielded/acked at least once) so the next failure
+            # starts the backoff fresh; a subscription that never established (e.g.
+            # an immediate clean EOF) backs off geometrically instead of spinning.
+            if self._inbound_established:
+                attempt = 0
+            delay_ms = reconnect_backoff_ms(attempt, effective_base_ms, cap_ms, rand=rand)
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
+            attempt += 1
 
-    async def _consume_inbound_once(self, *, drain: bool = False) -> None:
+    async def _consume_inbound_once(self, *, drain: bool = False, on_established: Any = None) -> None:
         # Per-group serialization (mirrors OpenClaw's KeyedAsyncQueue): a slow/hung turn in one
         # group must not block inbound dispatch for every other group. We enqueue each inbound
         # message onto a per-group FIFO queue and keep pulling events instead of awaiting the
@@ -1318,11 +1534,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # every later group) hostage — the exact head-of-line blocking #513 fixes. So production
         # never drains on stream end; only an explicit shutdown (cancel_all) or a test asking to
         # observe completion (drain=True) waits on in-flight work.
+        self._inbound_established = False
         try:
             async for event in self.client.inbound_events(
                 account_id_hex=self.account_id_hex,
                 group_id_hex=self.group_id_hex,
             ):
+                # A yielded event means the subscription was acked and is healthy;
+                # mark it established so the reconnect loop resets its backoff
+                # attempt counter (a healthy-then-dropped subscription reconnects
+                # promptly; one that never establishes backs off geometrically).
+                if not self._inbound_established:
+                    self._inbound_established = True
+                    if callable(on_established):
+                        on_established()
                 await self._handle_control_event(event)
         finally:
             if drain:
@@ -1347,8 +1572,29 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if event_type == "resync_required":
             await self._handle_resync_required(event)
             return
+        if event_type == "message_deleted":
+            await self._handle_message_deleted(event)
+            return
+        if event_type == "group_state_changed":
+            await self._handle_group_state_changed(event)
+            return
         if event_type != "inbound_message":
             logger.debug("Ignoring Marmot control event type %s", event_type)
+            return
+
+        message_id_hex = event["message_id_hex"]
+        # Client-side dedupe: the connector can re-emit the same inbound message
+        # (rapid catch-up after subscribe, or across a reconnect). Drop a repeat
+        # silently so the same user message is not dispatched twice. Record the id
+        # BEFORE dispatching (an agent turn takes long enough that record-after
+        # would let a duplicate start a second concurrent turn). Dedupe the id
+        # once regardless of whether onboarding intercepts the message.
+        if message_id_hex in self._recent_inbound_ids:
+            return
+        self._recent_inbound_ids.add(message_id_hex)
+
+        if self.debounce_ms > 0:
+            self._enqueue_debounced(event)
             return
 
         # Hand the turn off to the per-group queue and return immediately so the consume loop
@@ -1364,15 +1610,25 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
             message_id_hex = event["message_id_hex"]
+            # Profile-name onboarding runs inside the queued (per-group) unit so the
+            # one-time prompt claim is serialized per group: two concurrent first
+            # messages in distinct groups race only across groups, and the loser of
+            # the claim falls through to a normal turn instead of double-prompting.
             if await self._maybe_handle_profile_name_onboarding(event):
                 return
+
+            sender_display_name = str(event.get("sender_display_name") or "").strip()
+            user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"
 
             source = self.build_source(
                 chat_id=group_id_hex,
                 chat_name=f"Marmot {group_id_hex[:12]}",
                 chat_type="group",
                 user_id=sender_account_id_hex,
-                user_name=f"Marmot {sender_account_id_hex[:12]}",
+                user_name=user_name,
+                # The durable reply threads on source.message_id, so set it to the
+                # inbound message id: the agent's reply threads to the message it is
+                # replying to (mirrors dispatch.ts replyToMessageIdHex = inbound id).
                 message_id=message_id_hex,
             )
             hermes_event = MessageEvent(
@@ -1382,6 +1638,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 raw_message=event,
                 message_id=message_id_hex,
             )
+            # Attach any buffered quiet ambient context (a deletion / group-state
+            # change observed since the last turn) as channel_context. The runner
+            # prepends channel_context to the trigger text as context without it
+            # being a trigger itself, so the fact reaches the agent on this turn.
+            # Set via setattr so the adapter stays compatible with a MessageEvent
+            # build that predates the channel_context field.
+            ambient = self._take_pending_ambient_context(group_id_hex)
+            if ambient and hasattr(hermes_event, "channel_context"):
+                hermes_event.channel_context = ambient
             await self.handle_message(hermes_event)
         except asyncio.CancelledError:
             raise
@@ -1389,6 +1654,99 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # A failed turn in one group must not tear down the dispatcher or the queue; log
             # privacy-safely (no ids/payloads) and let other groups keep flowing.
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
+
+    def _debounce_key(self, event: Dict[str, Any]) -> str:
+        # Mirror inbound-runtime.ts buildKey: account:group:sender.
+        return (
+            f"{event.get('account_id_hex') or ''}:"
+            f"{event.get('group_id_hex') or ''}:"
+            f"{event.get('sender_account_id_hex') or ''}"
+        )
+
+    def _enqueue_debounced(self, event: Dict[str, Any]) -> None:
+        key = self._debounce_key(event)
+        self._debounce_pending.setdefault(key, []).append(event)
+        existing = self._debounce_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._debounce_tasks[key] = loop.create_task(self._debounce_flush_after(key))
+
+    async def _debounce_flush_after(self, key: str) -> None:
+        try:
+            await asyncio.sleep(self.debounce_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        await self._flush_debounced(key)
+
+    async def _flush_debounced(self, key: str) -> None:
+        items = self._debounce_pending.pop(key, [])
+        self._debounce_tasks.pop(key, None)
+        if not items:
+            return
+        # Route the coalesced turn through the per-group queue too, so a debounced
+        # batch stays FIFO-ordered with non-debounced messages in the same group
+        # and a slow turn does not block the debounce-flush task (mirrors the
+        # direct-dispatch path's per-group serialization).
+        merged = _coalesce_inbound_events(items)
+        group_id_hex = merged["group_id_hex"]
+        self._inbound_queue.enqueue(
+            group_id_hex,
+            lambda evt=merged: self._dispatch_inbound_message(evt),
+        )
+
+    async def _handle_message_deleted(self, event: Dict[str, Any]) -> None:
+        # A peer retracted a message. Surface it to the agent as quiet ambient
+        # (next-turn) context, never a triggered reply. Privacy-safe log: no ids.
+        logger.debug("Marmot inbound message deletion observed")
+        group_id_hex = str(event.get("group_id_hex") or "")
+        target_message_id_hex = str(event.get("target_message_id_hex") or "")
+        context_key = f"marmot:message_deleted:{group_id_hex}:{target_message_id_hex}"
+        await self._surface_ambient_context(event, "A message was deleted.", context_key)
+
+    async def _handle_group_state_changed(self, event: Dict[str, Any]) -> None:
+        # A durable group-state change (membership/admin/rename/avatar). Surfaced
+        # to the agent as quiet ambient context; the mapped sentence never carries
+        # a member pubkey. Privacy-safe log: no change contents.
+        logger.debug("Marmot inbound group state change observed")
+        change = str(event.get("change") or "")
+        group_id_hex = str(event.get("group_id_hex") or "")
+        sentence = group_state_change_sentence(change, event.get("detail"))
+        context_key = f"marmot:group_state_changed:{group_id_hex}:{change}"
+        await self._surface_ambient_context(event, sentence, context_key)
+
+    async def _surface_ambient_context(
+        self,
+        event: Dict[str, Any],
+        text: str,
+        context_key: str,
+    ) -> None:
+        # Dedupe repeated surfacings of the same fact.
+        if context_key in self._recent_ambient_keys:
+            return
+        self._recent_ambient_keys.add(context_key)
+
+        group_id_hex = str(event.get("group_id_hex") or "")
+        # Quiet next-turn context: an ambient event is NEVER a reply trigger, so
+        # do NOT route it through handle_message() (which would start/queue an
+        # agent turn). Hermes' BasePlatformAdapter has no system-event surface
+        # (unlike OpenClaw's api.runtime.system.enqueueSystemEvent), so we mirror
+        # OpenClaw's quiet-context behavior by buffering the sentence per group
+        # and prepending it to the NEXT real inbound message's channel_context.
+        # If no message ever follows, the fact is only logged — matching
+        # OpenClaw's "when omitted, those events are only logged" degraded mode.
+        self._pending_ambient_context.setdefault(group_id_hex, []).append(text)
+
+    def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
+        # Drain and join the buffered ambient sentences for a group. Returns None
+        # when nothing is pending so callers can leave channel_context unset.
+        pending = self._pending_ambient_context.pop(group_id_hex, None)
+        if not pending:
+            return None
+        return "\n".join(pending)
 
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding
@@ -1629,6 +1987,25 @@ def resolve_quic_candidates(extra: Dict[str, Any]) -> list[str]:
     if configured is None:
         configured = os.getenv("MARMOT_QUIC_CANDIDATES") or os.getenv("MARMOT_QUIC_CANDIDATE")
     return [candidate for candidate in _split_config_list(configured) if candidate.startswith("quic://")]
+
+
+def resolve_debounce_ms(extra: Dict[str, Any]) -> int:
+    """Resolve the optional inbound debounce window in milliseconds.
+
+    Reads ``MARMOT_DEBOUNCE_MS`` env or the ``debounce_ms`` extra config. A
+    non-negative integer; 0 or absent means disabled (current behavior). A
+    negative or non-integer value is clamped to 0 (disabled).
+    """
+    configured = os.getenv("MARMOT_DEBOUNCE_MS")
+    if configured is None or str(configured).strip() == "":
+        configured = extra.get("debounce_ms")
+    if configured is None or str(configured).strip() == "":
+        return 0
+    try:
+        value = int(str(configured).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
 
 
 def resolve_profile_name_onboarding_enabled(extra: Dict[str, Any]) -> bool:
