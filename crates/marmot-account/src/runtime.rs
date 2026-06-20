@@ -394,15 +394,23 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        // Mirror `publish_group_created`'s exposure-aware resolution
+        // (darkmatter#483): a message that any endpoint accepted has already
+        // propagated to peers, so rolling it back here would leave the sender's
+        // row falsely `local_publish_failed` while recipients have the message —
+        // a resend then produces a real in-group duplicate, and convergence
+        // retry is a no-op because the commit was rolled back. Treat unreached
+        // endpoints as recoverable: confirm/keep when at least one endpoint
+        // accepted, and roll back only when nothing was accepted at all.
         let mut all_published = true;
+        let mut any_accepted = false;
         for message in messages {
-            all_published &= self
-                .publish_one(message, output, context.clone())
-                .await?
-                .met_required_acks;
+            let status = self.publish_one(message, output, context.clone()).await?;
+            any_accepted |= status.accepted_by_any_endpoint;
+            all_published &= status.met_required_acks;
         }
 
-        if all_published {
+        if all_published || any_accepted {
             let effects = self.session.confirm_published(pending).await?;
             output
                 .pending

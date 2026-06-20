@@ -7,6 +7,7 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -17,8 +18,8 @@ use cgka_traits::transport::{
 };
 use cgka_traits::{
     MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportEndpointReceipt, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest,
+    TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
+    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
@@ -148,6 +149,15 @@ fn session(
     key: &SqlCipherKey,
     identity: &[u8],
 ) -> AccountDeviceSession {
+    session_with_registry(path, key, identity, FeatureRegistry::new())
+}
+
+fn session_with_registry(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+    registry: FeatureRegistry,
+) -> AccountDeviceSession {
     let keys = deterministic_nostr_keys(identity);
     AccountDeviceSession::open(
         SessionConfig::new(
@@ -157,9 +167,26 @@ fn session(
             Box::new(MockPeeler),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
-        .feature_registry(FeatureRegistry::new()),
+        .feature_registry(registry),
     )
     .unwrap()
+}
+
+/// MIP-03 self-remove feature registration, mirroring the cgka-session
+/// lifecycle test. Sending `SendIntent::Leave` as a non-last-admin produces a
+/// remove **proposal**; when the admin ingests it, the engine auto-commits the
+/// removal and emits a `PublishWork::AutoPublish` carrying a real pending ref.
+fn selfremove_registry() -> FeatureRegistry {
+    let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03",
+        },
+    );
+    registry
 }
 
 #[derive(Clone, Default)]
@@ -928,4 +955,126 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
         "quarantine event should not replay on a second drain: {:?}",
         drained_again.events
     );
+}
+
+// darkmatter#483 regression: an auto-published commit (here, the admin's
+// auto-commit of a peer self-remove proposal) that a relay *accepted* but that
+// did not meet `required_acks` must be CONFIRMED, not rolled back. Rolling it
+// back leaves the sender's local row falsely failed while peers already have
+// the message — a resend then duplicates it in-group and convergence retry is a
+// no-op. This mirrors the welcome-exposure handling already covered by
+// `create_group_confirms_pending_when_welcome_was_partially_exposed`, but for
+// the `PublishWork::AutoPublish` path through `publish_pending`.
+#[tokio::test]
+async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot auto publish partial key").unwrap();
+
+    // Build alice (admin) and bob with the MIP-03 self-remove feature so a
+    // `Leave` from bob becomes a remove *proposal* that alice auto-commits.
+    let mut alice = session_with_registry(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        selfremove_registry(),
+    );
+    let mut bob = session_with_registry(
+        dir.path().join("bob.sqlite"),
+        &key,
+        b"bob",
+        selfremove_registry(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    // Create the group through the raw session and confirm the welcome so alice
+    // is at a clean, settled epoch before the proposal arrives.
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "auto publish partial".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (create_pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    // Bob leaves -> remove proposal that alice will auto-commit on ingest.
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let proposal = match &leave.publish[0] {
+        PublishWork::Proposal { msg } => msg.clone(),
+        other => panic!("expected proposal publish work, got {other:?}"),
+    };
+
+    // Wrap alice's session in a runtime whose adapter accepts the auto-published
+    // commit on only ONE of the group's two endpoints, with required_acks=2.
+    // That is "accepted by a relay but below the ack threshold": the bug rolled
+    // this back; the fix must confirm it.
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(1);
+    let alice_id = alice.self_id();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .required_acks(2)
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![
+                    TransportEndpoint("wss://group-a.example".into()),
+                    TransportEndpoint("wss://group-b.example".into()),
+                ],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let delivery = TransportDelivery {
+        account_id: alice_id,
+        group_id_hint: Some(group_id.clone()),
+        message: proposal,
+        received_at: Timestamp(0),
+        source: TransportDeliverySource {
+            transport: TransportSource("marmot-account-test".into()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+        },
+    };
+
+    let ingested = runtime.ingest_delivery(delivery).await.unwrap();
+
+    // The auto-published commit was accepted by a relay but missed required_acks
+    // — it must be confirmed (kept), not rolled back.
+    assert_eq!(ingested.effects.pending.len(), 1);
+    assert!(
+        matches!(
+            ingested.effects.pending[0],
+            PendingResolution::Confirmed { .. }
+        ),
+        "relay-accepted auto-publish must be confirmed, got {:?}",
+        ingested.effects.pending[0]
+    );
+    // The commit publish was attempted and reported under-threshold acceptance.
+    assert_eq!(ingested.effects.reports.len(), 1);
+    assert_eq!(ingested.effects.reports[0].accepted_count(), 1);
+    assert!(!ingested.effects.reports[0].met_required_acks());
+    // The removal was applied locally: epoch advanced and bob is gone.
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
 }
