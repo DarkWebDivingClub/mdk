@@ -143,7 +143,7 @@ impl AgentConnector {
             auth_token: config.auth_token,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
-            idempotency: SendIdempotencyStore::default(),
+            idempotency: SendIdempotencyStore::new(&config.home),
             streams: StreamSessionStore::default(),
             app,
             runtime,

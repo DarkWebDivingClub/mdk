@@ -1,12 +1,16 @@
 //! Active agent text-stream compose sessions, the debug final-send recorder, and idle sweeping.
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::AgentControlDebugFinalSend;
 use agent_stream_compose::StreamComposeCommand;
 use cgka_traits::GroupId;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -43,44 +47,77 @@ impl DebugFinalSendStore {
 /// comfortably covering any plausible in-flight retry window.
 const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
 
+/// Relative path under the connector home for persisted `send_final` idempotency
+/// records (`$MARMOT_HOME/dev/send-idempotency.json`).
+pub(crate) const SEND_IDEMPOTENCY_FILE: &str = "dev/send-idempotency.json";
+
+/// On-disk schema version for [`SEND_IDEMPOTENCY_FILE`].
+const SEND_IDEMPOTENCY_FILE_VERSION: u8 = 1;
+
 /// Bounded FIFO map from a client-supplied idempotency key to a server-derived
 /// request fingerprint plus the durable message ids produced by the first
 /// successful `send_final` for that key.
-///
-/// In-process `send_final` idempotency cache (1024-entry FIFO).
 ///
 /// A retry that reuses the same key AND matches the recorded fingerprint returns
 /// the cached ids without re-sending, so a retry after a post-write timeout cannot
 /// double-post an unrecallable encrypted message. A reused key whose fingerprint
 /// differs (a different request body under the same key) is treated as a cache
 /// miss, so it can never return ids belonging to an unrelated send. Keys are
-/// evicted oldest-first once the capacity is reached.
+/// evicted oldest-first once the capacity is reached and the eviction is mirrored
+/// to disk.
 ///
-/// This store is **process-local only**: a connector restart clears the cache, so
-/// a retry that spans a restart can still double-post. Persisted idempotency is
-/// tracked separately in #548.
-#[derive(Clone, Default)]
+/// Records are persisted under [`SEND_IDEMPOTENCY_FILE`] with crash-safe atomic
+/// renames so a connector restart can still dedup a bounded retry window. The
+/// store is connector-local (single-host) by design.
+#[derive(Clone)]
 pub(crate) struct SendIdempotencyStore {
+    path: PathBuf,
+    lock: Arc<Mutex<()>>,
     inner: Arc<Mutex<SendIdempotencyInner>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedSendIdempotencyEntry {
+    key: String,
+    fingerprint: String,
+    message_ids_hex: Vec<String>,
+    recorded_at: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedSendIdempotencyFile {
+    version: u8,
+    entries: Vec<PersistedSendIdempotencyEntry>,
 }
 
 #[derive(Default)]
 struct SendIdempotencyInner {
     order: std::collections::VecDeque<String>,
-    seen: HashMap<String, (u64, Vec<String>)>,
+    seen: HashMap<String, (String, Vec<String>)>,
+    recorded_at: HashMap<String, u64>,
 }
 
 impl SendIdempotencyStore {
+    pub(crate) fn new(home: &Path) -> Self {
+        let store = Self {
+            path: home.join(SEND_IDEMPOTENCY_FILE),
+            lock: Arc::new(Mutex::new(())),
+            inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
+        };
+        store.load_from_disk();
+        store
+    }
+
     /// The message ids recorded for `key` by an earlier successful send, but only
     /// when the recorded request `fingerprint` matches. A key hit with a different
     /// fingerprint returns `None` (treated as a cache miss).
-    pub(crate) fn get(&self, key: &str, fingerprint: u64) -> Option<Vec<String>> {
+    pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
         self.inner
             .lock()
             .expect("send idempotency lock poisoned")
             .seen
             .get(key)
-            .filter(|(recorded, _)| *recorded == fingerprint)
+            .filter(|(recorded, _)| recorded == fingerprint)
             .map(|(_, ids)| ids.clone())
     }
 
@@ -88,19 +125,163 @@ impl SendIdempotencyStore {
     /// `key`. A repeat record for an existing key keeps the original entry (the
     /// first successful send wins); otherwise the key is appended and the oldest
     /// is evicted once at capacity.
-    pub(crate) fn record(&self, key: String, fingerprint: u64, message_ids: Vec<String>) {
-        let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
-        if inner.seen.contains_key(&key) {
-            return;
+    pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
+        let should_persist = {
+            let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
+            if inner.seen.contains_key(&key) {
+                return;
+            }
+            if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
+                && let Some(evicted) = inner.order.pop_front()
+            {
+                inner.seen.remove(&evicted);
+                inner.recorded_at.remove(&evicted);
+            }
+            inner.seen.insert(key.clone(), (fingerprint, message_ids));
+            inner.recorded_at.insert(key.clone(), unix_timestamp_secs());
+            inner.order.push_back(key);
+            true
+        };
+        if should_persist && let Err(err) = self.persist_to_disk() {
+            tracing::warn!(
+                target: "agent_connector",
+                method = "send_idempotency_persist",
+                error_code = "persist_failed",
+                error = %err,
+                "failed to persist send idempotency record"
+            );
+        }
+    }
+
+    fn load_from_disk(&self) {
+        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return,
+            Err(err) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "send_idempotency_load",
+                    error_code = "read_failed",
+                    error = %err,
+                    "failed to read send idempotency file; starting empty"
+                );
+                return;
+            }
+        };
+        match serde_json::from_slice::<PersistedSendIdempotencyFile>(&bytes) {
+            Ok(file) if file.version == SEND_IDEMPOTENCY_FILE_VERSION => {
+                *self.inner.lock().expect("send idempotency lock poisoned") =
+                    inner_from_persisted(file.entries);
+            }
+            Ok(_unsupported) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "send_idempotency_load",
+                    error_code = "unsupported_version",
+                    "ignoring send idempotency file with unsupported version; starting empty"
+                );
+            }
+            Err(_err) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "send_idempotency_load",
+                    error_code = "corrupt_record",
+                    "ignoring corrupt send idempotency file; starting empty"
+                );
+            }
+        }
+    }
+
+    fn persist_to_disk(&self) -> Result<(), ConnectorError> {
+        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
+        let inner = self.inner.lock().expect("send idempotency lock poisoned");
+        let entries = inner
+            .order
+            .iter()
+            .filter_map(|key| {
+                let (fingerprint, message_ids_hex) = inner.seen.get(key)?;
+                Some(PersistedSendIdempotencyEntry {
+                    key: key.clone(),
+                    fingerprint: fingerprint.clone(),
+                    message_ids_hex: message_ids_hex.clone(),
+                    recorded_at: *inner.recorded_at.get(key).unwrap_or(&0),
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(inner);
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let temp_path = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&PersistedSendIdempotencyFile {
+            version: SEND_IDEMPOTENCY_FILE_VERSION,
+            entries,
+        })?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        if let Err(err) = std::fs::rename(&temp_path, &self.path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn temp_path(&self) -> PathBuf {
+        self.path.with_extension("json.tmp")
+    }
+}
+
+fn inner_from_persisted(entries: Vec<PersistedSendIdempotencyEntry>) -> SendIdempotencyInner {
+    let mut inner = SendIdempotencyInner::default();
+    for entry in entries {
+        if inner.seen.contains_key(&entry.key) {
+            continue;
         }
         if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
             && let Some(evicted) = inner.order.pop_front()
         {
             inner.seen.remove(&evicted);
+            inner.recorded_at.remove(&evicted);
         }
-        inner.seen.insert(key.clone(), (fingerprint, message_ids));
-        inner.order.push_back(key);
+        inner.seen.insert(
+            entry.key.clone(),
+            (entry.fingerprint, entry.message_ids_hex),
+        );
+        inner
+            .recorded_at
+            .insert(entry.key.clone(), entry.recorded_at);
+        inner.order.push_back(entry.key);
     }
+    inner
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Clone, Default)]

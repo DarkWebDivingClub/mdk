@@ -15,6 +15,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::engine::GroupStateChange;
+use crate::types::{GroupId, MemberId};
+
 /// Nostr `kind` values used as Marmot inner app events.
 pub const MARMOT_APP_EVENT_KIND_DELETE: u64 = 5;
 pub const MARMOT_APP_EVENT_KIND_REACTION: u64 = 7;
@@ -51,6 +54,17 @@ pub const GROUP_SYSTEM_TYPE_ADMIN_ADDED: &str = "admin_added";
 pub const GROUP_SYSTEM_TYPE_ADMIN_REMOVED: &str = "admin_removed";
 pub const GROUP_SYSTEM_TYPE_GROUP_RENAMED: &str = "group_renamed";
 pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
+
+/// Human-readable fallback `text` for kind-1210 group system rows. These strings
+/// feed `content` → `id_preimage` → `canonical_event_id`, so they must stay in
+/// lockstep across every caller that synthesizes or dedups group-system rows.
+pub const GROUP_SYSTEM_TEXT_MEMBER_ADDED: &str = "Member added";
+pub const GROUP_SYSTEM_TEXT_MEMBER_REMOVED: &str = "Member removed";
+pub const GROUP_SYSTEM_TEXT_MEMBER_LEFT: &str = "Member left";
+pub const GROUP_SYSTEM_TEXT_ADMIN_ADDED: &str = "Admin added";
+pub const GROUP_SYSTEM_TEXT_ADMIN_REMOVED: &str = "Admin removed";
+pub const GROUP_SYSTEM_TEXT_GROUP_RENAMED: &str = "Group renamed";
+pub const GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED: &str = "Group avatar changed";
 
 /// Keys inside the kind-1210 `data` object. Values are lowercase-hex pubkeys
 /// (`actor`/`subject`) or a UTF-8 string (`name`), so renderers can resolve
@@ -254,6 +268,132 @@ impl GroupSystemEvent {
     }
 }
 
+/// Material for a locally synthesized kind-1210 group system row: deterministic
+/// storage id plus the encoded row body and Nostr-shaped metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSystemEventMaterial {
+    pub message_id_hex: String,
+    pub group_id_hex: String,
+    pub sender: String,
+    pub content: String,
+    pub tags: Vec<Vec<String>>,
+}
+
+fn group_system_projection_parts(
+    change: &GroupStateChange,
+) -> (&'static str, Option<&MemberId>, Option<&str>, &'static str) {
+    match change {
+        GroupStateChange::MemberAdded { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            Some(member),
+            None,
+            GROUP_SYSTEM_TEXT_MEMBER_ADDED,
+        ),
+        GroupStateChange::MemberRemoved { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            Some(member),
+            None,
+            GROUP_SYSTEM_TEXT_MEMBER_REMOVED,
+        ),
+        GroupStateChange::MemberLeft { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+            Some(member),
+            None,
+            GROUP_SYSTEM_TEXT_MEMBER_LEFT,
+        ),
+        GroupStateChange::AdminAdded { member } => (
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            Some(member),
+            None,
+            GROUP_SYSTEM_TEXT_ADMIN_ADDED,
+        ),
+        GroupStateChange::AdminRemoved { member } => (
+            GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            Some(member),
+            None,
+            GROUP_SYSTEM_TEXT_ADMIN_REMOVED,
+        ),
+        GroupStateChange::GroupRenamed { name } => (
+            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            None,
+            Some(name.as_str()),
+            GROUP_SYSTEM_TEXT_GROUP_RENAMED,
+        ),
+        GroupStateChange::GroupAvatarChanged => (
+            GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
+            None,
+            None,
+            GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED,
+        ),
+    }
+}
+
+/// Build the canonical storage row id and encoded kind-1210 body for one
+/// authenticated [`GroupStateChange`]. The id is deterministic over
+/// `(group_id, epoch, actor, change)` so re-processing the same change upserts
+/// instead of duplicating.
+pub fn group_system_event_material(
+    group_id: &GroupId,
+    epoch: u64,
+    actor: Option<&MemberId>,
+    change: &GroupStateChange,
+) -> Result<GroupSystemEventMaterial, MarmotAppEventError> {
+    let (system_type, subject, name, text) = group_system_projection_parts(change);
+    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
+    let mut data = serde_json::Map::new();
+    if let Some(actor_hex) = actor_hex.as_ref() {
+        data.insert(
+            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
+            Value::String(actor_hex.clone()),
+        );
+    }
+    if let Some(subject) = subject {
+        data.insert(
+            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
+            Value::String(hex::encode(subject.as_slice())),
+        );
+    }
+    if let Some(name) = name {
+        data.insert(
+            GROUP_SYSTEM_DATA_NAME.to_owned(),
+            Value::String(name.to_owned()),
+        );
+    }
+    let data = (!data.is_empty()).then_some(Value::Object(data));
+    let content = GroupSystemEvent::new(system_type, text, data).to_content()?;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let tags = vec![vec![
+        GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        system_type.to_owned(),
+    ]];
+    let sender = actor_hex.unwrap_or_default();
+    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
+    let message_id_hex = canonical_event_id(
+        &sender,
+        epoch,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        &tags,
+        &id_preimage,
+    );
+    Ok(GroupSystemEventMaterial {
+        message_id_hex,
+        group_id_hex,
+        sender,
+        content,
+        tags,
+    })
+}
+
+/// Canonical storage row id for one authenticated [`GroupStateChange`].
+pub fn group_system_canonical_id(
+    group_id: &GroupId,
+    epoch: u64,
+    actor: Option<&MemberId>,
+    change: &GroupStateChange,
+) -> Result<String, MarmotAppEventError> {
+    Ok(group_system_event_material(group_id, epoch, actor, change)?.message_id_hex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,7 +402,7 @@ mod tests {
     fn group_system_event_round_trips() {
         let event = GroupSystemEvent::new(
             GROUP_SYSTEM_TYPE_MEMBER_ADDED,
-            "Member added",
+            GROUP_SYSTEM_TEXT_MEMBER_ADDED,
             Some(serde_json::json!({
                 GROUP_SYSTEM_DATA_ACTOR: "aa".repeat(32),
                 GROUP_SYSTEM_DATA_SUBJECT: "bb".repeat(32),
@@ -362,5 +502,112 @@ mod tests {
         // A duplicate object key MUST be rejected (here a second `content`).
         let with_dup = valid.replacen('{', "{\"content\":\"x\",", 1);
         assert!(MarmotAppEvent::decode(with_dup.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn group_system_canonical_id_pins_every_state_change_variant() {
+        let group_id = GroupId::new(vec![0x22; 32]);
+        let member = MemberId::new(vec![0xbb; 32]);
+        let actor = MemberId::new(vec![0xaa; 32]);
+        let epoch = 3;
+
+        let cases: [(&str, GroupStateChange, Option<&MemberId>); 7] = [
+            (
+                "member_added",
+                GroupStateChange::MemberAdded {
+                    member: member.clone(),
+                },
+                Some(&actor),
+            ),
+            (
+                "member_removed",
+                GroupStateChange::MemberRemoved {
+                    member: member.clone(),
+                },
+                Some(&actor),
+            ),
+            (
+                "member_left",
+                GroupStateChange::MemberLeft {
+                    member: member.clone(),
+                },
+                Some(&member),
+            ),
+            (
+                "admin_added",
+                GroupStateChange::AdminAdded {
+                    member: member.clone(),
+                },
+                Some(&actor),
+            ),
+            (
+                "admin_removed",
+                GroupStateChange::AdminRemoved {
+                    member: member.clone(),
+                },
+                Some(&actor),
+            ),
+            (
+                "group_renamed",
+                GroupStateChange::GroupRenamed {
+                    name: "Team".to_owned(),
+                },
+                Some(&actor),
+            ),
+            (
+                "group_avatar_changed",
+                GroupStateChange::GroupAvatarChanged,
+                Some(&actor),
+            ),
+        ];
+
+        let expected = [
+            (
+                "member_added",
+                "71b369c949fcb272ef975b2969b2efb426143bc70fe8e1c9c56f6c7f6cde4495",
+            ),
+            (
+                "member_removed",
+                "ec9c74bcfc1d543c9498c385c102dea2ebe55c7eaa6fc00f7f3ba6e97324b8eb",
+            ),
+            (
+                "member_left",
+                "dcc38e2561ad0a495aa40e9486d2babe7db08d1aa7d4dd45a2ffc9d9dfef6cd6",
+            ),
+            (
+                "admin_added",
+                "54cb4ff424fea5a914d07ad0df99493709cb384834631f5f0c61cf047fddf306",
+            ),
+            (
+                "admin_removed",
+                "5ce9dbac3ea01eeefd8d735ac691595f8f772e9f882fb9857c3fa28f296b2c5b",
+            ),
+            (
+                "group_renamed",
+                "f6015ee8d6088f23d679bbc3e85ce02d43af85fed350cecca3d11adf5077b883",
+            ),
+            (
+                "group_avatar_changed",
+                "db1158ef961902a3f979dc2d8cdf2aba51b1d2568b83e12820490b853188dc40",
+            ),
+        ];
+
+        for ((label, change, actor), (expected_label, expected_id)) in
+            cases.iter().zip(expected.iter())
+        {
+            assert_eq!(label, expected_label);
+            let id = group_system_canonical_id(&group_id, epoch, *actor, change).unwrap();
+            assert_eq!(id, *expected_id, "{label}: pinned canonical id drifted");
+            assert_eq!(
+                group_system_canonical_id(&group_id, epoch, *actor, change).unwrap(),
+                id,
+                "{label}: id must be stable across calls"
+            );
+            let material = group_system_event_material(&group_id, epoch, *actor, change).unwrap();
+            assert_eq!(
+                material.message_id_hex, id,
+                "{label}: material id must match"
+            );
+        }
     }
 }

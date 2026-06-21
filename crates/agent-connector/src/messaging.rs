@@ -14,30 +14,30 @@ use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
 
-/// Server-derived fingerprint of a `send_final` request: a stable hash over the
-/// destination (account + group), message text, and optional reply target. Used
-/// so a reused idempotency key only short-circuits when it identifies the same
-/// request; a different body under the same key is a cache miss rather than a
-/// wrong-id return.
+/// Current schema version for persisted `send_final` request fingerprints.
+pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
+
+/// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
+/// over the destination (account + group), message text, and optional reply target.
+/// The digest is stable across Rust/toolchain releases and is safe to persist on
+/// disk for connector-restart dedup.
 pub(crate) fn send_final_fingerprint(
     account_id_hex: &str,
     group_id_hex: &str,
     text: &str,
     reply_to_message_id_hex: Option<&str>,
-) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    account_id_hex.hash(&mut hasher);
-    group_id_hex.hash(&mut hasher);
-    text.hash(&mut hasher);
-    match reply_to_message_id_hex {
-        None => 0u8.hash(&mut hasher),
-        Some(reply_to) => {
-            1u8.hash(&mut hasher);
-            reply_to.hash(&mut hasher);
-        }
-    }
-    hasher.finish()
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let preimage = serde_json::json!([
+        SEND_FINAL_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        text,
+        reply_to_message_id_hex,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("send_final fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Map a control-plane media reference (the non-secret mirror) back into the
@@ -109,7 +109,7 @@ impl AgentConnector {
         // return the original message ids without re-sending so a retry after a
         // post-write timeout cannot double-post an unrecallable message.
         if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, fingerprint)
+            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
         {
             return Ok(AgentControlResponse::FinalSent { message_ids_hex });
         }

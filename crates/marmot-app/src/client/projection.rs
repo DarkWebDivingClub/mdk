@@ -312,116 +312,22 @@ fn build_group_system_projection(
     recorded_at: u64,
     origin_commit_id: Option<String>,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
-    use cgka_traits::app_event::{
-        GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
-        GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-        GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-        GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, GroupSystemEvent,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, canonical_event_id,
-    };
-    use cgka_traits::engine::GroupStateChange;
-    use cgka_traits::types::MemberId;
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
 
-    let (system_type, subject, name, text): (&str, Option<&MemberId>, Option<&str>, &str) =
-        match change {
-            GroupStateChange::MemberAdded { member } => (
-                GROUP_SYSTEM_TYPE_MEMBER_ADDED,
-                Some(member),
-                None,
-                "Member added",
-            ),
-            GroupStateChange::MemberRemoved { member } => (
-                GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
-                Some(member),
-                None,
-                "Member removed",
-            ),
-            GroupStateChange::MemberLeft { member } => (
-                GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-                Some(member),
-                None,
-                "Member left",
-            ),
-            GroupStateChange::AdminAdded { member } => (
-                GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-                Some(member),
-                None,
-                "Admin added",
-            ),
-            GroupStateChange::AdminRemoved { member } => (
-                GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-                Some(member),
-                None,
-                "Admin removed",
-            ),
-            GroupStateChange::GroupRenamed { name } => (
-                GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-                None,
-                Some(name.as_str()),
-                "Group renamed",
-            ),
-            GroupStateChange::GroupAvatarChanged => (
-                GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
-                None,
-                None,
-                "Group avatar changed",
-            ),
-        };
-
-    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
-    let mut data = serde_json::Map::new();
-    if let Some(actor_hex) = actor_hex.as_ref() {
-        data.insert(
-            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
-            serde_json::Value::String(actor_hex.clone()),
-        );
-    }
-    if let Some(subject) = subject {
-        data.insert(
-            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
-            serde_json::Value::String(hex::encode(subject.as_slice())),
-        );
-    }
-    if let Some(name) = name {
-        data.insert(
-            GROUP_SYSTEM_DATA_NAME.to_owned(),
-            serde_json::Value::String(name.to_owned()),
-        );
-    }
-    let data = (!data.is_empty()).then_some(serde_json::Value::Object(data));
-    let content = GroupSystemEvent::new(system_type, text, data).to_content()?;
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let tags = vec![vec![
-        GROUP_SYSTEM_TYPE_TAG.to_owned(),
-        system_type.to_owned(),
-    ]];
-    let sender = actor_hex.unwrap_or_default();
-    // Deterministic, local-only id. `epoch` (not the wall-clock `recorded_at`)
-    // anchors it so the same change yields the same id on every pass; `group_id`
-    // is folded in so the same change in two groups can't collide (the canonical
-    // id is also used by message-id-keyed ops like reactions/invalidation).
-    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
-    let message_id_hex = canonical_event_id(
-        &sender,
-        epoch,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-        &tags,
-        &id_preimage,
-    );
+    let material = group_system_event_material(group_id, epoch, actor, change)?;
 
     Ok(AppMessageProjection {
-        message_id_hex,
+        message_id_hex: material.message_id_hex,
         // Synthesized rows carry no source: several rows can come from one
         // commit, which would collide on the partial unique source index, and
         // commit ids are never targeted by source-based invalidation anyway.
         source_message_id_hex: None,
         direction: "system".to_owned(),
-        group_id_hex,
-        sender,
-        plaintext: content,
+        group_id_hex: material.group_id_hex,
+        sender: material.sender,
+        plaintext: material.content,
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-        tags,
+        tags: material.tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
         // Non-unique link to the origin commit so a losing-branch rollback can

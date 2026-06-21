@@ -9,14 +9,13 @@ use agent_control::{
     AgentControlMediaRef,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
-    GROUP_SYSTEM_EVENT_VERSION, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    EVENT_REF_TAG, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_EVENT_VERSION,
+    GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
     GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, GroupSystemEvent,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, STREAM_TAG,
-    canonical_event_id,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    STREAM_TAG, group_system_canonical_id,
 };
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
@@ -294,101 +293,7 @@ fn group_state_change_replay_id(
     actor: Option<&cgka_traits::MemberId>,
     change: &GroupStateChange,
 ) -> Option<String> {
-    let (system_type, subject, name, text) = group_system_projection_parts(change);
-    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
-    let mut data = serde_json::Map::new();
-    if let Some(actor_hex) = actor_hex.as_ref() {
-        data.insert(
-            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
-            serde_json::Value::String(actor_hex.clone()),
-        );
-    }
-    if let Some(subject) = subject {
-        data.insert(
-            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
-            serde_json::Value::String(hex::encode(subject.as_slice())),
-        );
-    }
-    if let Some(name) = name {
-        data.insert(
-            GROUP_SYSTEM_DATA_NAME.to_owned(),
-            serde_json::Value::String(name.to_owned()),
-        );
-    }
-    let data = (!data.is_empty()).then_some(serde_json::Value::Object(data));
-    let content = GroupSystemEvent::new(system_type, text, data)
-        .to_content()
-        .ok()?;
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let tags = vec![vec![
-        GROUP_SYSTEM_TYPE_TAG.to_owned(),
-        system_type.to_owned(),
-    ]];
-    let sender = actor_hex.unwrap_or_default();
-    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
-    Some(canonical_event_id(
-        &sender,
-        epoch,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-        &tags,
-        &id_preimage,
-    ))
-}
-
-fn group_system_projection_parts(
-    change: &GroupStateChange,
-) -> (
-    &'static str,
-    Option<&cgka_traits::MemberId>,
-    Option<&str>,
-    &'static str,
-) {
-    // The `text` values are part of the canonical storage row id preimage. Keep these in lockstep
-    // with marmot_app's group-system projection until the shared derivation is extracted.
-    match change {
-        GroupStateChange::MemberAdded { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
-            Some(member),
-            None,
-            "Member added",
-        ),
-        GroupStateChange::MemberRemoved { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
-            Some(member),
-            None,
-            "Member removed",
-        ),
-        GroupStateChange::MemberLeft { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-            Some(member),
-            None,
-            "Member left",
-        ),
-        GroupStateChange::AdminAdded { member } => (
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            Some(member),
-            None,
-            "Admin added",
-        ),
-        GroupStateChange::AdminRemoved { member } => (
-            GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-            Some(member),
-            None,
-            "Admin removed",
-        ),
-        GroupStateChange::GroupRenamed { name } => (
-            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-            None,
-            Some(name.as_str()),
-            "Group renamed",
-        ),
-        GroupStateChange::GroupAvatarChanged => (
-            GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
-            None,
-            None,
-            "Group avatar changed",
-        ),
-    }
+    group_system_canonical_id(group_id, epoch, actor, change).ok()
 }
 
 fn group_system_control_parts(event: &GroupSystemEvent) -> Option<(&'static str, Option<String>)> {

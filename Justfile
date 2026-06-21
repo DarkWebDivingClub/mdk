@@ -216,4 +216,8 @@ coverage-conformance-html:
 dead-code-audit:
     @rg -n '#\[allow\(([^]]*dead_code|dead_code)' crates docs plans Cargo.toml || true
 
+# Fast local pre-push gate: mechanical/static checks only. GitHub CI runs the
+# full `just ci` suite (including the workspace test matrix).
+fast-ci: fmt-check check clippy
+
 ci: fmt-check check clippy test

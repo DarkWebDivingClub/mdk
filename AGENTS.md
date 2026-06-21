@@ -66,7 +66,24 @@ This repo owns the candidate CGKA engine workspace:
 
 ## Verification
 
-Use the smallest command that covers the change, then widen before checkpointing cross-crate work:
+Run `just fast-ci` before pushing; let GitHub CI run the full `just ci` test matrix.
+
+`just fast-ci` covers formatting, compile-time checks, and clippy across the workspace (including OTLP feature builds). It intentionally skips `just test`, which is the slow part of CI.
+
+For crate-local changes, add targeted tests on top of `just fast-ci`:
+
+```sh
+just fast-ci
+cargo test -p <crate-you-touched>
+```
+
+Full local parity with GitHub CI (slow):
+
+```sh
+just ci
+```
+
+Individual gates:
 
 ```sh
 just fmt-check
