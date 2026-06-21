@@ -1465,13 +1465,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return self.account_id_hex
         response = await self.client.account_list()
         accounts = list(response.get("accounts") or [])
-        if len(accounts) == 1:
-            self.account_id_hex = _normalize_hex(accounts[0]["account_id_hex"], "account_id_hex")
+        signing_accounts = [account for account in accounts if account.get("local_signing")]
+        if len(signing_accounts) == 1:
+            self.account_id_hex = _normalize_hex(signing_accounts[0]["account_id_hex"], "account_id_hex")
             return self.account_id_hex
-        if not accounts:
-            raise AgentControlError("dm-agent has no local Marmot accounts; create one first", code="no_accounts")
+        if not signing_accounts:
+            raise AgentControlError(
+                "dm-agent has no local-signing Marmot account; run `dm-agent bootstrap` first",
+                code="no_accounts",
+            )
         raise AgentControlError(
-            "dm-agent has multiple accounts; set MARMOT_ACCOUNT_ID_HEX",
+            "dm-agent hosts multiple local-signing accounts; set MARMOT_ACCOUNT_ID_HEX",
             code="ambiguous_account",
         )
 

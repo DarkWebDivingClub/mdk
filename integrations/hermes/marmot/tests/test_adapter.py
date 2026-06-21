@@ -569,6 +569,59 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 client=object(),
             )
 
+    async def test_auto_selects_sole_local_signing_account(self):
+        class FakeClient:
+            async def account_list(self):
+                return {
+                    "type": "account_list",
+                    "accounts": [
+                        {"account_id_hex": "aa" * 32, "label": "mirror", "local_signing": False},
+                        {"account_id_hex": "bb" * 32, "label": "agent", "local_signing": True},
+                    ],
+                }
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(self.config_cls(extra={}), client=FakeClient())
+
+        account_id = await adapter._ensure_account_id()
+
+        self.assertEqual(account_id, "bb" * 32)
+        self.assertEqual(adapter.account_id_hex, "bb" * 32)
+
+    async def test_auto_select_rejects_non_signing_only_account(self):
+        class FakeClient:
+            async def account_list(self):
+                return {
+                    "type": "account_list",
+                    "accounts": [
+                        {"account_id_hex": "aa" * 32, "label": "mirror", "local_signing": False},
+                    ],
+                }
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(self.config_cls(extra={}), client=FakeClient())
+
+        with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+            await adapter._ensure_account_id()
+
+        self.assertEqual(raised.exception.code, "no_accounts")
+
+    async def test_auto_select_rejects_multiple_signing_accounts(self):
+        class FakeClient:
+            async def account_list(self):
+                return {
+                    "type": "account_list",
+                    "accounts": [
+                        {"account_id_hex": "aa" * 32, "label": "agent-1", "local_signing": True},
+                        {"account_id_hex": "bb" * 32, "label": "agent-2", "local_signing": True},
+                    ],
+                }
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(self.config_cls(extra={}), client=FakeClient())
+
+        with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+            await adapter._ensure_account_id()
+
+        self.assertEqual(raised.exception.code, "ambiguous_account")
+
     async def test_adapter_reads_auth_token_file_for_control_client(self):
         with tempfile.TemporaryDirectory() as tempdir:
             token_file = Path(tempdir) / "control.token"
