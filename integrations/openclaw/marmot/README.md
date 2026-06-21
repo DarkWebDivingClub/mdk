@@ -16,8 +16,14 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Install (release)
 
-Versioned `dm-agent` builds and this plugin are published as `dm-agent-v*`
+Versioned `dm-agent` builds and this plugin are published as [`dm-agent-v*`](https://github.com/marmot-protocol/darkmatter/releases)
 GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH`.
+
+Prerequisites:
+
+- OpenClaw **2026.6.8** or compatible (this plugin pins `openclaw@2026.6.8`)
+- Node ≥ 22.19
+- Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
 DM_AGENT_VERSION=0.1.0
@@ -26,8 +32,9 @@ curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-a
 curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap
 ```
 
-The installer puts `dm-agent` in `~/.local/bin`, downloads the plugin tarball,
-runs `openclaw plugins install`, and enables the `marmot` channel.
+The installer puts `dm-agent` in `~/.local/bin`, downloads and verifies the plugin
+tarball, runs `openclaw plugins install`, and enables the `marmot` channel.
+Supported platforms match the Hermes installer.
 
 Then start the connector and bootstrap (same public relays as the phone app):
 

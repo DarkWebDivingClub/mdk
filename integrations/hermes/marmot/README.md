@@ -24,7 +24,7 @@ Prerequisites:
 
 - Hermes Agent installed and working locally
 - Dark Matter phone app pointed at the same public relay set
-- Linux x86_64 or macOS Apple Silicon
+- Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 One-line install:
 
@@ -49,6 +49,9 @@ dm-agent --version
 The installer puts `dm-agent` in `~/.local/bin`, extracts the plugin to
 `~/.hermes/plugins/marmot`, and runs `hermes plugins enable marmot` when the
 `hermes` launcher is on `PATH`.
+
+Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel.
+Both install scripts verify SHA256 checksums for downloaded release assets.
 
 After a normal install, start the connector and bootstrap the agent account:
 
@@ -289,6 +292,28 @@ export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agent/control.token"
 `MARMOT_AGENT_AUTH_TOKEN` is also supported for launcher-managed secrets. Prefer
 `MARMOT_AGENT_AUTH_TOKEN_FILE` for shell and service-manager setups so the token
 does not appear in process environments by default.
+
+### Group activation (multi-party groups)
+
+By default the adapter only runs an agent turn in a multi-party group when the
+agent is addressed (`groupActivation=mention`). Set `MARMOT_GROUP_ACTIVATION=always`
+to reply to every message. Trigger phrases come from `MARMOT_MENTION_PATTERNS`
+(comma-separated) plus optional `MARMOT_AGENT_NAME`. Effective DMs (exactly two
+members) always reply.
+
+### Welcomer allowlist
+
+On connect, `MARMOT_WELCOMER_ALLOWLIST` (or `MARMOT_DM_ALLOW_FROM`) mirrors
+configured hex account ids into `dm-agent`'s welcomer allowlist so approved
+inviters are accepted. Non-hex entries are ignored. When unset, the adapter
+does not touch an allowlist managed directly on `dm-agent`.
+
+### Media trust model
+
+Inbound attachments are downloaded through `dm-agent`, re-staged under
+`$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
+and the dm-agent temp file is removed. Outbound local-path sends must stay
+within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
 
 ## Behavior
 

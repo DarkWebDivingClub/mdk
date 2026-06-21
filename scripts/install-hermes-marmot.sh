@@ -79,9 +79,11 @@ detect_platform() {
     arch="$(uname -m)"
     case "$os-$arch" in
         linux-x86_64 | linux-amd64) echo "linux-x86_64" ;;
+        linux-aarch64 | linux-arm64) echo "linux-aarch64" ;;
         darwin-arm64 | darwin-aarch64) echo "darwin-aarch64" ;;
+        darwin-x86_64) echo "darwin-x86_64" ;;
         *)
-            echo "error: unsupported platform: $os/$arch (supported: linux/x86_64, darwin/arm64)" >&2
+            echo "error: unsupported platform: $os/$arch (supported: linux/x86_64, linux/arm64, darwin/arm64, darwin/x86_64)" >&2
             exit 1
             ;;
     esac
@@ -189,12 +191,19 @@ install_plugin() {
 }
 
 enable_hermes_plugin() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would run: hermes plugins enable marmot"
+        return 0
+    fi
     if ! command -v hermes >/dev/null 2>&1; then
         log "hermes not found on PATH; skipping 'hermes plugins enable marmot'"
         return 0
     fi
-    run hermes plugins enable marmot
-    log "enabled Hermes plugin: marmot"
+    if run hermes plugins enable marmot; then
+        log "enabled Hermes plugin: marmot"
+    else
+        log "could not auto-enable; run 'hermes plugins enable marmot'"
+    fi
 }
 
 ensure_path() {
@@ -215,7 +224,7 @@ ensure_path() {
 
 run_bootstrap() {
     ensure_path
-    if ! command -v dm-agent >/dev/null 2>&1; then
+    if [ "$DRY_RUN" -eq 0 ] && ! command -v dm-agent >/dev/null 2>&1; then
         echo "error: dm-agent not found on PATH after install" >&2
         exit 1
     fi
@@ -279,7 +288,6 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --bootstrap)
             INSTALL_BOOTSTRAP=1
-            START_DM_AGENT=1
             shift
             ;;
         --no-start-dm-agent)

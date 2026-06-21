@@ -1,6 +1,10 @@
 /target
 .DS_Store
 
+# Python bytecode (Hermes plugin tests, etc.)
+__pycache__/
+*.py[cod]
+
 # Rust build outputs at any workspace depth
 target/
 

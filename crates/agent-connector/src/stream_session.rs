@@ -47,12 +47,18 @@ const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
 /// request fingerprint plus the durable message ids produced by the first
 /// successful `send_final` for that key.
 ///
+/// In-process `send_final` idempotency cache (1024-entry FIFO).
+///
 /// A retry that reuses the same key AND matches the recorded fingerprint returns
 /// the cached ids without re-sending, so a retry after a post-write timeout cannot
 /// double-post an unrecallable encrypted message. A reused key whose fingerprint
 /// differs (a different request body under the same key) is treated as a cache
 /// miss, so it can never return ids belonging to an unrelated send. Keys are
 /// evicted oldest-first once the capacity is reached.
+///
+/// This store is **process-local only**: a connector restart clears the cache, so
+/// a retry that spans a restart can still double-post. Persisted idempotency is
+/// tracked separately in #548.
 #[derive(Clone, Default)]
 pub(crate) struct SendIdempotencyStore {
     inner: Arc<Mutex<SendIdempotencyInner>>,

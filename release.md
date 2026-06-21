@@ -184,8 +184,12 @@ The release job creates these assets:
 
 - `dm-agent-linux-x86_64-<version>.tar.gz`
 - `dm-agent-linux-x86_64-<version>.tar.gz.sha256`
+- `dm-agent-linux-aarch64-<version>.tar.gz`
+- `dm-agent-linux-aarch64-<version>.tar.gz.sha256`
 - `dm-agent-darwin-aarch64-<version>.tar.gz`
 - `dm-agent-darwin-aarch64-<version>.tar.gz.sha256`
+- `dm-agent-darwin-x86_64-<version>.tar.gz`
+- `dm-agent-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`

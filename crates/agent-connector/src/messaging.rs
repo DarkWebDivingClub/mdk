@@ -15,15 +15,28 @@ use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
 
 /// Server-derived fingerprint of a `send_final` request: a stable hash over the
-/// destination (account + group) and message text. Used so a reused idempotency
-/// key only short-circuits when it identifies the same request; a different body
-/// under the same key is a cache miss rather than a wrong-id return.
-fn send_final_fingerprint(account_id_hex: &str, group_id_hex: &str, text: &str) -> u64 {
+/// destination (account + group), message text, and optional reply target. Used
+/// so a reused idempotency key only short-circuits when it identifies the same
+/// request; a different body under the same key is a cache miss rather than a
+/// wrong-id return.
+pub(crate) fn send_final_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    text: &str,
+    reply_to_message_id_hex: Option<&str>,
+) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     account_id_hex.hash(&mut hasher);
     group_id_hex.hash(&mut hasher);
     text.hash(&mut hasher);
+    match reply_to_message_id_hex {
+        None => 0u8.hash(&mut hasher),
+        Some(reply_to) => {
+            1u8.hash(&mut hasher);
+            reply_to.hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -85,7 +98,12 @@ impl AgentConnector {
         // circuits when the request it identifies is the same one. A reused key
         // carrying a different request body is a cache miss, so dedup can never
         // return ids belonging to an unrelated send.
-        let fingerprint = send_final_fingerprint(account_id_hex, group_id_hex, &text);
+        let fingerprint = send_final_fingerprint(
+            account_id_hex,
+            group_id_hex,
+            &text,
+            reply_to_message_id_hex.as_deref(),
+        );
 
         // Idempotent durable send: if this key already committed a matching send,
         // return the original message ids without re-sending so a retry after a
@@ -402,7 +420,7 @@ impl AgentConnector {
             .runtime
             .download_media(&account.label, &group_id, reference)
             .await?;
-        let dir = std::env::temp_dir().join("marmot-media").join(&subdir);
+        let dir = crate::media_temp::media_download_root().join(&subdir);
         tokio::fs::create_dir_all(&dir).await?;
         // The file name comes from the (decrypted) sender-controlled media
         // reference, so write under a sanitized basename: a crafted value like

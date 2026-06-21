@@ -8,6 +8,7 @@ mod error;
 mod event_projection;
 mod inbound;
 mod invite_policy;
+mod media_temp;
 mod messaging;
 mod quic;
 mod socket;
@@ -63,6 +64,11 @@ pub(crate) const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
 pub(crate) const STREAM_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the background sweeper scans for idle stream compose sessions.
 pub(crate) const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Maximum age of a decrypted inbound media temp directory before the sweeper
+/// removes the whole per-blob dir under `$TMPDIR/marmot-media/`.
+pub(crate) const MEDIA_TEMP_MAX_AGE: Duration = Duration::from_secs(3600);
+/// How often the background sweeper scans for stale inbound media temp dirs.
+pub(crate) const MEDIA_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Capacity of the per-subscription delivered-inbound-id cursor used to dedup storage-backed
 /// replay after broadcast lag. Comfortably larger than the runtime broadcast channel depth
 /// (1024) so every message that could be re-queried after a single overflow is still tracked.
@@ -156,6 +162,7 @@ impl AgentConnector {
         self.runtime.start().await?;
         self.spawn_invite_policy_worker();
         self.spawn_stream_session_sweeper();
+        self.spawn_media_temp_sweeper();
         self.ensure_agent_accounts_ready().await?;
         Ok(())
     }

@@ -35,7 +35,10 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account welcomer allowlist persistence.
-- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession` and the `DebugFinalSendStore` recorder.
+- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the in-process
+  `SendIdempotencyStore`, and the `DebugFinalSendStore` recorder.
+- `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
+  `$TMPDIR/marmot-media/`.
 - `src/quic.rs` — QUIC broker candidate parsing, address resolution, and trust selection.
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
   `InboundCatchUpDriver`.

@@ -22,6 +22,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/live.ts` — live-preview state machine → `stream_begin`/`append`/`finalize`/`cancel`.
 - `src/inbound.ts` — inbound subscription bridge (reconnect, dedupe, resync).
 - `src/inbound-runtime.ts` — `registerFull` wiring + the inbound→agent dispatch seam.
+- `src/bounded-keyed-async-queue.ts` — per-group inbound dispatch with a depth cap.
 - `src/outbound.ts` — `defineChannelMessageAdapter` durable send → `send_final`.
 - `src/config.ts` — channel config schema + `MARMOT_*` resolution.
 - `src/account.ts` — single agent-account resolution (`account_list`).

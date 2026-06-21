@@ -2766,3 +2766,45 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
         "a key within the retained window must still be cached"
     );
 }
+
+#[test]
+fn send_final_fingerprint_includes_reply_to_target() {
+    use crate::messaging::send_final_fingerprint;
+
+    let without_reply = send_final_fingerprint("aa", "bb", "hello", None);
+    let with_reply = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
+    assert_ne!(
+        without_reply, with_reply,
+        "reply target must participate in the request fingerprint"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        with_reply,
+        "the same reply target must hash consistently"
+    );
+    assert_ne!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        send_final_fingerprint("aa", "bb", "hello", Some("")),
+        "missing reply target must not collide with an empty reply target"
+    );
+}
+
+#[tokio::test]
+async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale-blob");
+    tokio::fs::create_dir_all(&stale).await.unwrap();
+    let cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 1,
+        "directories older than the cutoff must be removed"
+    );
+    assert!(!stale.exists(), "stale media dir must be deleted");
+}
