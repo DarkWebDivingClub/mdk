@@ -12,8 +12,8 @@ use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendR
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::peeler::GroupMessageMetadata;
-use cgka_traits::storage::StorageProvider;
-use cgka_traits::transport::EncryptedPayload;
+use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
+use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::MlsGroup;
 use openmls::prelude::{BasicCredential, MlsMessageOut};
@@ -455,6 +455,57 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     async fn do_send_leave(&mut self, group_id: GroupId) -> Result<SendResult, EngineError> {
+        let mut existing = self.load_leave_request_state(&group_id)?;
+        let requested_at_ms = existing.as_ref().map_or_else(
+            || self.convergence_now_ms(),
+            |request| request.requested_at_ms,
+        );
+        let current_epoch = self
+            .storage
+            .get_group(&group_id)
+            .map_err(|e| match e {
+                StorageError::NotFound => EngineError::UnknownGroup(group_id.clone()),
+                other => EngineError::Storage(other),
+            })?
+            .epoch;
+        if existing
+            .as_ref()
+            .and_then(|request| request.last_proposed_epoch)
+            == Some(current_epoch)
+        {
+            self.leaving_groups.insert(group_id.clone());
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Leaving",
+                    to: "Leave",
+                    reason: "leave already requested for current epoch",
+                },
+            ));
+        }
+
+        let (msg, proposal_bytes, proposed_epoch) =
+            self.prepare_self_remove_proposal(&group_id).await?;
+        let request = existing.get_or_insert_with(|| LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms,
+            last_proposed_epoch: None,
+        });
+        request.last_proposed_epoch = Some(proposed_epoch);
+        self.record_sent_openmls_message_with_leave_request(
+            &msg,
+            proposal_bytes.as_slice(),
+            &group_id,
+            proposed_epoch,
+            request,
+        )?;
+
+        Ok(SendResult::Proposal { msg })
+    }
+
+    pub(crate) async fn prepare_self_remove_proposal(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(TransportMessage, Vec<u8>, EpochId), EngineError> {
         // MIP-03 SelfRemove only. The legacy Remove-self flow is not exposed
         // by this engine.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -466,7 +517,7 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
-        if let Some(state) = self.epoch_manager.state(&group_id)
+        if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
             return Err(EngineError::InvalidTransition(
@@ -513,18 +564,68 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
-        self.record_sent_openmls_message(
-            &wrapped,
-            bytes.as_slice(),
-            &group_id,
-            EpochId(mls_group.epoch().as_u64()),
-        )?;
 
-        // SelfRemove is a proposal — the leaver's epoch doesn't advance
-        // until some other member (per MIP-03 §144, the lowest-index
-        // remaining in our implementation) commits it. No state transition
-        // on the leaver's side here.
-        Ok(SendResult::Proposal { msg: wrapped })
+        Ok((wrapped, bytes, EpochId(mls_group.epoch().as_u64())))
+    }
+
+    pub(crate) async fn try_auto_repropose_leave_request(&mut self, group_id: &GroupId) {
+        if let Err(err) = self.auto_repropose_leave_request(group_id).await {
+            tracing::warn!(
+                target: "cgka_engine::leave_request",
+                method = "try_auto_repropose_leave_request",
+                error_kind = crate::audit_helpers::engine_error_kind(&err),
+                "failed to re-propose durable leave request"
+            );
+        }
+    }
+
+    async fn auto_repropose_leave_request(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        let Some(mut request) = self.load_leave_request_state(group_id)? else {
+            self.leaving_groups.remove(group_id);
+            return Ok(false);
+        };
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => {
+                self.clear_leave_request_state(group_id)?;
+                return Ok(false);
+            }
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
+        if !group
+            .members
+            .iter()
+            .any(|member| &member.id == self.identity.self_id())
+        {
+            self.clear_leave_request_state(group_id)?;
+            return Ok(false);
+        }
+        self.leaving_groups.insert(group_id.clone());
+
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !state.is_stable()
+        {
+            return Ok(false);
+        }
+        if request.last_proposed_epoch == Some(group.epoch) {
+            return Ok(false);
+        }
+
+        let (msg, proposal_bytes, proposed_epoch) =
+            self.prepare_self_remove_proposal(group_id).await?;
+        request.last_proposed_epoch = Some(proposed_epoch);
+        self.record_sent_openmls_message_with_leave_request(
+            &msg,
+            proposal_bytes.as_slice(),
+            group_id,
+            proposed_epoch,
+            &request,
+        )?;
+        self.auto_proposal_buf.push_back(msg);
+        Ok(true)
     }
 
     async fn do_send_app_message(

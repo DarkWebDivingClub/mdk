@@ -28,6 +28,8 @@ mod migration_0013_app_event_kind_order_index;
 mod migration_0014_message_timeline_reply_lookup_index;
 #[path = "migrations/0015_member_validation_cache.rs"]
 mod migration_0015_member_validation_cache;
+#[path = "migrations/0016_leave_requests.rs"]
+mod migration_0016_leave_requests;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -114,6 +116,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "0015_member_validation_cache",
         apply: migration_0015_member_validation_cache::apply,
+    },
+    Migration {
+        version: 16,
+        name: "0016_leave_requests",
+        apply: migration_0016_leave_requests::apply,
     },
 ];
 

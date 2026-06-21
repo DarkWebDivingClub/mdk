@@ -34,6 +34,14 @@ impl AppClient {
         }
     }
 
+    fn remember_pending_convergence_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        self.pending_convergence_groups
+            .extend(effects.pending_convergence.iter().cloned());
+    }
+
     pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {
         let rebuild_since = self
             .relay_plane
@@ -253,6 +261,7 @@ impl AppClient {
         let effects = self.runtime.ingest_delivery(delivery).await?;
         fail_if_publish_failed(&effects.effects)?;
         self.remember_buffered_convergence_outcome(&effects.outcome);
+        self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(source_recorded_at);
         self.observe_account_device_effects(
             &effects.effects,
@@ -272,6 +281,7 @@ impl AppClient {
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
+        self.remember_pending_convergence_effects(&effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
 

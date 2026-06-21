@@ -22,8 +22,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -31,12 +32,16 @@ use marmot_forensics::{
     AuditEngineContext, AuditEventContext, AuditEventKind, AuditGroupContext, AuditRecord,
     ForensicRecorder, NoopRecorder,
 };
+use openmls::prelude::{
+    MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolMessage,
+};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
+use tls_codec::Deserialize as _;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -72,6 +77,14 @@ pub(crate) struct PendingGroupStateChange {
     pub(crate) change: GroupStateChange,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledSelfRemoveAutoCommit {
+    pub(crate) group_id: GroupId,
+    pub(crate) proposal_id: MessageId,
+    pub(crate) source_epoch: EpochId,
+    pub(crate) due_at_ms: u64,
+}
+
 pub struct Engine<S: StorageProvider> {
     pub(crate) storage: S,
     pub(crate) crypto: RustCrypto,
@@ -91,6 +104,9 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
+    /// Standalone proposal messages produced by engine-maintained lifecycle
+    /// work. Unlike `auto_publish_buf`, these do not have a pending commit ref.
+    pub(crate) auto_proposal_buf: VecDeque<TransportMessage>,
     /// Group-state changes effected by a locally staged commit, with the actor
     /// to attribute each to. Buffered here because publish-before-apply defers
     /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
@@ -105,6 +121,27 @@ pub struct Engine<S: StorageProvider> {
     /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
     /// bounces back via ingest before we filter it client-side.
     pub(crate) sent_message_ids: HashSet<MessageId>,
+
+    /// Durable leave requests keyed by group. This is the source of truth for
+    /// a user's request to leave across epoch changes and restarts.
+    pub(crate) leave_requests: HashMap<GroupId, LeaveRequest>,
+
+    /// Fast runtime gate for groups where the local member must not produce
+    /// further outbound group traffic while a leave request is outstanding.
+    pub(crate) leaving_groups: HashSet<GroupId>,
+
+    /// Delayed SelfRemove auto-commit attempts keyed by the standalone
+    /// proposal's content-derived message id. These are re-checked against live
+    /// storage before staging so unrelated commits can invalidate them without
+    /// producing a commit storm.
+    pub(crate) scheduled_self_remove_auto_commits:
+        HashMap<MessageId, ScheduledSelfRemoveAutoCommit>,
+
+    /// Groups the application should feed through its convergence timer even
+    /// when the triggering input was processed (for example, a delayed
+    /// SelfRemove auto-commit schedule) rather than returned as
+    /// `IngestOutcome::Buffered`.
+    pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
@@ -258,9 +295,14 @@ impl<S: StorageProvider> EngineBuilder<S> {
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
+            auto_proposal_buf: VecDeque::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: HashSet::new(),
             sent_message_ids: HashSet::new(),
+            leave_requests: HashMap::new(),
+            leaving_groups: HashSet::new(),
+            scheduled_self_remove_auto_commits: HashMap::new(),
+            pending_convergence_groups: HashSet::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
@@ -432,10 +474,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// **Member-removing commits are deliberately left untouched.** A surviving
     /// pending commit is NOT a reliable crash signal on its own: a deferred
-    /// SelfRemove auto-commit (the MIP-03 leave path) legitimately persists a
-    /// staged commit across process boundaries — the proposer's device stages
-    /// the lowest-index commit, projects the departing member out of the Marmot
-    /// record *forward*, and a later run publishes + confirms it. Rolling that
+    /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
+    /// staged commit across process boundaries — a remaining member stages the
+    /// commit, projects the departing member out of the Marmot record
+    /// *forward*, and a later run publishes + confirms it. Rolling that
     /// back re-derives the record from the pre-stage MLS state and so re-adds a
     /// member who already left, forking convergence (the remaining members
     /// advance past the leave while this device silently rewinds it). Clearing
@@ -575,8 +617,160 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
+        if let Some(request) = self
+            .leave_request_to_restore_on_hydrate(group_id, &mut mls_group, &group, &provider)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+        {
+            self.leave_requests.insert(group_id.clone(), request);
+            self.leaving_groups.insert(group_id.clone());
+        } else {
+            self.leave_requests.remove(group_id);
+            self.leaving_groups.remove(group_id);
+        }
+
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
         Ok(group.epoch)
+    }
+
+    fn leave_request_to_restore_on_hydrate(
+        &self,
+        group_id: &GroupId,
+        mls_group: &mut openmls::group::MlsGroup,
+        group: &Group,
+        provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+    ) -> Result<Option<LeaveRequest>, StorageError> {
+        let self_is_still_member = group
+            .members
+            .iter()
+            .any(|member| &member.id == self.identity.self_id());
+        if !self_is_still_member {
+            self.storage.clear_leave_request(group_id)?;
+            return Ok(None);
+        }
+
+        if let Some(mut request) = self.storage.leave_request(group_id)? {
+            if request.last_proposed_epoch.is_none()
+                && self.sent_self_remove_leaving_gate_should_restore(
+                    group_id, mls_group, group, provider,
+                )?
+            {
+                request.last_proposed_epoch = Some(group.epoch);
+                self.storage.put_leave_request(&request)?;
+            }
+            return Ok(Some(request));
+        }
+
+        if self
+            .sent_self_remove_leaving_gate_should_restore(group_id, mls_group, group, provider)?
+        {
+            let request = LeaveRequest {
+                group_id: group_id.clone(),
+                requested_at_ms: self.convergence_now_ms(),
+                last_proposed_epoch: Some(group.epoch),
+            };
+            self.storage.put_leave_request(&request)?;
+            return Ok(Some(request));
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) fn load_leave_request_state(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<LeaveRequest>, StorageError> {
+        if let Some(request) = self.leave_requests.get(group_id) {
+            return Ok(Some(request.clone()));
+        }
+        let Some(request) = self.storage.leave_request(group_id)? else {
+            return Ok(None);
+        };
+        self.leave_requests
+            .insert(group_id.clone(), request.clone());
+        self.leaving_groups.insert(group_id.clone());
+        Ok(Some(request))
+    }
+
+    pub(crate) fn has_leave_send_gate(&mut self, group_id: &GroupId) -> Result<bool, StorageError> {
+        Ok(self.load_leave_request_state(group_id)?.is_some()
+            || self.leaving_groups.contains(group_id))
+    }
+
+    pub(crate) fn clear_leave_request_state(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), StorageError> {
+        self.storage.clear_leave_request(group_id)?;
+        self.leave_requests.remove(group_id);
+        self.leaving_groups.remove(group_id);
+        Ok(())
+    }
+
+    fn sent_self_remove_leaving_gate_should_restore(
+        &self,
+        group_id: &GroupId,
+        mls_group: &mut openmls::group::MlsGroup,
+        group: &Group,
+        provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+    ) -> Result<bool, cgka_traits::storage::StorageError> {
+        if !group
+            .members
+            .iter()
+            .any(|member| &member.id == self.identity.self_id())
+        {
+            return Ok(false);
+        }
+
+        for record in self.storage.list_messages(group_id, EpochId(0))? {
+            if record.state != MessageState::Sent {
+                continue;
+            }
+            let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            let Some(message) = stored_payload.as_openmls_wire() else {
+                continue;
+            };
+            let Ok(projection) = crate::openmls_projection::project_mls_message(&message.payload)
+            else {
+                continue;
+            };
+            if projection.kind != crate::openmls_projection::OpenMlsContentKind::Proposal {
+                continue;
+            }
+
+            let Ok(msg_in) = MlsMessageIn::tls_deserialize_exact(message.payload.as_slice()) else {
+                continue;
+            };
+            let protocol: ProtocolMessage = match msg_in.extract() {
+                MlsMessageBodyIn::PrivateMessage(private) => private.into(),
+                MlsMessageBodyIn::PublicMessage(public) => public.into(),
+                _ => continue,
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-hydrate-selfremove-probe/v1");
+            hasher.update(group_id.as_slice());
+            hasher.update(record.id.as_slice());
+            let digest = hasher.finalize();
+            let probe_snapshot = format!("hydrate-selfremove-probe-{}", hex::encode(&digest[..8]));
+            let guard = crate::snapshot_guard::SnapshotRollbackGuard::create(
+                &self.storage,
+                group_id.clone(),
+                probe_snapshot,
+            )?;
+            let processed = mls_group.process_message(provider, protocol);
+            guard.commit()?;
+            let Ok(processed) = processed else {
+                continue;
+            };
+            if let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
+                && matches!(queued.proposal(), Proposal::SelfRemove)
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     fn quarantine_stored_group_on_hydrate(
@@ -1002,6 +1196,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     fn drain_auto_publish(&mut self) -> Vec<AutoPublish> {
         self.auto_publish_buf.drain(..).collect()
+    }
+
+    fn drain_auto_proposals(&mut self) -> Vec<TransportMessage> {
+        self.auto_proposal_buf.drain(..).collect()
+    }
+
+    fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId> {
+        self.pending_convergence_groups.drain().collect()
     }
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {

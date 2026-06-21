@@ -167,6 +167,12 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     assert_eq!(consumed_refs, vec![proposal_ref]);
     assert_eq!(carol.epoch().0, 1, "probe replay rolls back live storage");
 
+    let carol_proposal_outcomes = carol.tick().await;
+    assert!(
+        carol_proposal_outcomes.iter().all(Result::is_ok),
+        "carol should still process the real proposal after probe: {carol_proposal_outcomes:?}"
+    );
+
     bus.deliver_all();
     let carol_outcomes = carol.tick().await;
     assert!(

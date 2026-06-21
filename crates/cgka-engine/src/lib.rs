@@ -28,7 +28,7 @@
 //! - [`fork_recovery`] - same-epoch commit rollback/replay support.
 //! - [`publish`] - publish-confirm and publish-failed lifecycle.
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
-//! - [`auto_committer`] - deterministic SelfRemove auto-commit policy.
+//! - [`auto_committer`] - SelfRemove auto-commit eligibility policy.
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
 
 pub mod account_identity_proof;

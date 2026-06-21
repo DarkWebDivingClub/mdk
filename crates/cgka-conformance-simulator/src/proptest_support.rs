@@ -37,8 +37,8 @@ use proptest::prelude::*;
 pub enum HarnessIntent {
     /// Encrypted application payload from `sender_idx`.
     Send { sender_idx: usize, payload: Vec<u8> },
-    /// `sender_idx` issues a SelfRemove proposal. The lowest-index
-    /// remaining non-target member auto-commits per MIP-03 §144.
+    /// `sender_idx` issues a SelfRemove proposal. A remaining non-target
+    /// member may auto-commit it per the SelfRemove flow.
     Leave { sender_idx: usize },
 }
 

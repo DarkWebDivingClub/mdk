@@ -2547,16 +2547,24 @@ async fn relay_app_runtime_publishes_member_leave() {
     assert_eq!(leave.published, 1);
 
     let alice_sync = alice.sync().await.unwrap();
-    assert!(alice_sync.events.iter().any(|event| matches!(
-        event,
-        cgka_traits::GroupEvent::GroupStateChanged {
-            group_id: removed_group,
-            change:
-                cgka_traits::GroupStateChange::MemberRemoved { .. }
-                | cgka_traits::GroupStateChange::MemberLeft { .. },
-            ..
-        } if removed_group == &group_id
-    )));
+    assert!(
+        !alice_sync.events.iter().any(|event| matches!(
+            event,
+            cgka_traits::GroupEvent::GroupStateChanged {
+                group_id: removed_group,
+                change:
+                    cgka_traits::GroupStateChange::MemberRemoved { .. }
+                    | cgka_traits::GroupStateChange::MemberLeft { .. },
+                ..
+            } if removed_group == &group_id
+        )),
+        "sync should observe the SelfRemove proposal and schedule convergence, not publish immediately"
+    );
+
+    sleep(Duration::from_millis(75)).await;
+    let convergence = alice.retry_group_convergence(&group_id).await.unwrap();
+    assert_eq!(convergence.published, 1);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 1);
 
     // The authenticated departure is synthesized into alice's timeline as a
     // durable kind-1210 group system row (no kind-1210 message is sent).

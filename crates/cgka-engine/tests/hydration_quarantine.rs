@@ -13,9 +13,9 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, MemberValidationCacheStorage, MessageStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -374,6 +374,18 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl LeaveRequestStorage for FlakyGroupRecordStorage {
+    fn put_leave_request(&self, request: &LeaveRequest) -> StorageResult<()> {
+        self.inner.put_leave_request(request)
+    }
+    fn leave_request(&self, group_id: &GroupId) -> StorageResult<Option<LeaveRequest>> {
+        self.inner.leave_request(group_id)
+    }
+    fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_leave_request(group_id)
     }
 }
 

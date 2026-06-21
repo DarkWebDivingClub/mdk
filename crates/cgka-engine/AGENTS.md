@@ -29,7 +29,7 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
   - **Open...:** `src/fork_recovery.rs` + `src/epoch_manager.rs::we_committed_from` + the `WrongEpoch` branch in
     `src/message_processor/ingest.rs`
 
-- **You want to...:** Figure out auto-commit policy
+- **You want to...:** Figure out SelfRemove auto-commit eligibility
   - **Open...:** `src/auto_committer.rs`
 
 - **You want to...:** Touch wire-format policy
@@ -44,7 +44,8 @@ Each module has a one-paragraph rustdoc at the top explaining its responsibility
 realises. Read those rustdocs as the source of truth — this table is just an index.
 
 - **Module:** `engine.rs`
-  - **Owns:** `Engine<S>` struct, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` queues
+  - **Owns:** `Engine<S>` struct, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` /
+    `drain_auto_proposals` queues
 
 - **Module:** `identity.rs`
   - **Owns:** local signer + credential bundle
@@ -92,8 +93,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
     (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here.
 
 - **Module:** `auto_committer.rs`
-  - **Owns:** the free function `decide_with_reason(mls_group, proposal) -> AutoCommitDecisionReport` — lowest-index
-    auto-commit policy for SelfRemove proposals (the report wraps an `AutoCommitDecision` plus a stable `reason` string)
+  - **Owns:** the free function `decide_with_reason(mls_group, proposal) -> AutoCommitDecisionReport` — SelfRemove
+    auto-commit eligibility for remaining non-target members (the report wraps an `AutoCommitDecision` plus a stable
+    `reason` string)
 
 - **Module:** `upgrade.rs`
   - **Owns:** `do_upgrade_group_capabilities` — promotes upgradeable MLS primitives through

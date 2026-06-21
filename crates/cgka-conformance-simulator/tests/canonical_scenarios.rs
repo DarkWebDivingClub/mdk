@@ -1316,8 +1316,9 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
 
 #[tokio::test]
 async fn add_then_self_remove_via_harness() {
-    // Alice creates with Bob and Carol; Bob, a non-admin, leaves; Alice,
-    // an admin, auto-commits the SelfRemove proposal.
+    // Alice creates with Bob and Carol; Bob, a non-admin, leaves; remaining
+    // members may both publish SelfRemove-only commits, and convergence handles
+    // the same-epoch race.
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .registry(selfremove_registry())
@@ -1342,13 +1343,28 @@ async fn add_then_self_remove_via_harness() {
     // Bob (non-admin) leaves.
     bob.leave().await;
     bus.deliver_all();
-    alice.tick().await; // ingests proposal + auto-commits
+    let alice_proposal_outcomes = alice.tick().await; // ingests proposal + auto-commits
+    let carol_proposal_outcomes = carol.tick().await; // same: no deterministic election
+    assert!(
+        alice_proposal_outcomes.iter().all(Result::is_ok),
+        "alice proposal outcomes: {alice_proposal_outcomes:?}"
+    );
+    assert!(
+        carol_proposal_outcomes.iter().all(Result::is_ok),
+        "carol proposal outcomes: {carol_proposal_outcomes:?}"
+    );
 
-    // Alice's auto-commit goes onto the bus.
+    // Both SelfRemove-only commits go onto the bus. Competing same-epoch
+    // commits are expected; convergence chooses the canonical one.
     bus.deliver_all();
     let bob_outcomes = bob.tick().await; // ingests alice's commit
+    let alice_outcomes = alice.tick().await;
     let carol_outcomes = carol.tick().await;
 
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice outcomes: {alice_outcomes:?}"
+    );
     assert_eq!(alice.epoch().0, 2);
     assert_eq!(alice.members().len(), 2);
     assert_eq!(bob.epoch().0, 2, "bob outcomes: {bob_outcomes:?}");

@@ -2372,6 +2372,24 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         carol_outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     ));
+    assert!(
+        carol.drain_auto_publish().is_empty(),
+        "carol should schedule before staging the SelfRemove-only commit"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = carol.advance_convergence(&group_id).await.unwrap();
+    assert!(advanced.is_empty());
+    let mut carol_auto = carol.drain_auto_publish();
+    assert_eq!(
+        carol_auto.len(),
+        1,
+        "carol should attempt a SelfRemove-only commit when she sees the proposal"
+    );
+    assert_message_state(&carol_storage, &proposal, MessageState::Created);
+    carol
+        .publish_failed(carol_auto.remove(0).pending)
+        .await
+        .unwrap();
     assert_message_state(&carol_storage, &proposal, MessageState::Created);
 
     let alice_outcome = alice.ingest(proposal.clone()).await.unwrap();
@@ -2379,6 +2397,9 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         alice_outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     ));
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(advanced.is_empty());
     let auto_commit = alice
         .drain_auto_publish()
         .into_iter()

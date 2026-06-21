@@ -606,9 +606,9 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
     // spec/protocol-core/group-messaging.md:46-53 shape (b): a SelfRemove-only
     // commit that processes a pending SelfRemove proposal by reference is
     // allowed for non-admins. We drive the engine's real auto-commit (bob, a
-    // non-admin, self-removes; the remaining lowest-index member stages a
-    // SelfRemove-only commit) and assert the allowlist classifies that staged
-    // commit as not-admin-required.
+    // non-admin, self-removes; a remaining member stages a SelfRemove-only
+    // commit) and assert the allowlist classifies that staged commit as
+    // not-admin-required.
     let (mut alice, alice_storage) = build_with_storage(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -651,9 +651,12 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
         },
         ..proposal
     };
-    // Alice ingests bob's SelfRemove and stages the (deferred) auto-commit.
+    // Alice ingests bob's SelfRemove and schedules the deferred auto-commit.
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(advanced.is_empty());
 
     // The staged commit on alice's group is a SelfRemove-only commit. The
     // allowlist must classify it as a shape a non-admin is permitted to make.

@@ -6,7 +6,7 @@ use crate::engine::Engine;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::storage::{StorageError, StorageProvider};
+use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
@@ -83,6 +83,57 @@ impl<S: StorageProvider> Engine<S> {
             ..msg.clone()
         };
         self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)
+    }
+
+    pub(crate) fn record_sent_openmls_message_with_leave_request(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        request: &LeaveRequest,
+    ) -> Result<(), EngineError> {
+        let openmls_msg = TransportMessage {
+            payload: mls_bytes.to_vec(),
+            ..msg.clone()
+        };
+        let payload = StoredMessagePayload::openmls_wire(openmls_msg)
+            .encode()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let record = MessageRecord {
+            id: msg.id.clone(),
+            group_id: group_id.clone(),
+            epoch,
+            state: MessageState::Sent,
+            payload,
+        };
+        let previous = match self.storage.get_message(&record.id) {
+            Ok(record) => Some(record),
+            Err(StorageError::NotFound) => None,
+            Err(err) => return Err(EngineError::Storage(err)),
+        };
+        self.storage.with_transaction(|storage| {
+            storage.put_message(&record)?;
+            storage.put_leave_request(request)?;
+            Ok::<_, EngineError>(())
+        })?;
+
+        self.sent_message_ids.insert(msg.id.clone());
+        self.sent_message_ids.insert(content_dedup_id(mls_bytes));
+        self.leaving_groups.insert(request.group_id.clone());
+        self.leave_requests
+            .insert(request.group_id.clone(), request.clone());
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::message_state_transition_event(
+                hex::encode(msg.id.as_slice()),
+                previous.map(|record| record.state),
+                MessageState::Sent,
+                Some(epoch),
+                "persist",
+            ),
+        );
+        Ok(())
     }
 
     pub(crate) fn persist_transport_message(

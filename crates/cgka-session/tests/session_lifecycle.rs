@@ -8,7 +8,7 @@ use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
-use cgka_traits::error::PeelerError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
@@ -373,7 +373,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
 }
 
 #[tokio::test]
-async fn session_ingest_drains_auto_publish_work() {
+async fn session_ingest_schedules_auto_publish_work() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("session auto publish key").unwrap();
     let mut alice = AccountDeviceSession::open(
@@ -421,14 +421,126 @@ async fn session_ingest_drains_auto_publish_work() {
         ingested.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     );
+    assert_eq!(
+        ingested.effects.pending_convergence,
+        vec![created.group_id.clone()]
+    );
     assert!(
-        ingested
+        !ingested
             .effects
             .publish
             .iter()
             .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
-        "expected auto publish work, got {:?}",
+        "auto publish work should wait for the convergence timer, got {:?}",
         ingested.effects.publish
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&created.group_id).await.unwrap();
+    assert!(
+        advanced
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
+        "expected delayed auto publish work, got {:?}",
+        advanced.publish
+    );
+}
+
+#[tokio::test]
+async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session selfremove reproposal key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(dir.path().join("alice.sqlite"), &key, b"alice")
+            .feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(dir.path().join("bob.sqlite"), &key, b"bob").feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-selfremove-reproposal".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: created.group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        leave
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        "initial leave should publish a SelfRemove proposal"
+    );
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: created.group_id.clone(),
+            name: Some("still includes bob".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match &rename.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let buffered = bob.ingest(route(commit, &created.group_id)).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+
+    bob.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+    let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+    assert!(
+        advanced
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        "expected auto SelfRemove re-proposal publish work, got {:?}",
+        advanced.publish
+    );
+
+    let blocked = bob
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&bob, b"still leaving"),
+        })
+        .await;
+    assert!(
+        matches!(
+            blocked,
+            Err(cgka_session::SessionError::Engine(
+                EngineError::InvalidTransition(_)
+            ))
+        ),
+        "durable leave request should block app sends after re-proposal; got {blocked:?}"
     );
 }
 

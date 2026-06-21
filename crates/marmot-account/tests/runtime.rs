@@ -1159,22 +1159,27 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     };
 
     let ingested = runtime.ingest_delivery(delivery).await.unwrap();
+    assert_eq!(ingested.effects.pending_convergence, vec![group_id.clone()]);
+    assert!(
+        ingested.effects.pending.is_empty(),
+        "ingest should schedule the delayed auto-commit, not publish it immediately"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = runtime.advance_convergence(&group_id).await.unwrap();
 
     // The auto-published commit was accepted by a relay but missed required_acks
     // — it must be confirmed (kept), not rolled back.
-    assert_eq!(ingested.effects.pending.len(), 1);
+    assert_eq!(advanced.pending.len(), 1);
     assert!(
-        matches!(
-            ingested.effects.pending[0],
-            PendingResolution::Confirmed { .. }
-        ),
+        matches!(advanced.pending[0], PendingResolution::Confirmed { .. }),
         "relay-accepted auto-publish must be confirmed, got {:?}",
-        ingested.effects.pending[0]
+        advanced.pending[0]
     );
     // The commit publish was attempted and reported under-threshold acceptance.
-    assert_eq!(ingested.effects.reports.len(), 1);
-    assert_eq!(ingested.effects.reports[0].accepted_count(), 1);
-    assert!(!ingested.effects.reports[0].met_required_acks());
+    assert_eq!(advanced.reports.len(), 1);
+    assert_eq!(advanced.reports[0].accepted_count(), 1);
+    assert!(!advanced.reports[0].met_required_acks());
     // The removal was applied locally: epoch advanced and bob is gone.
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);

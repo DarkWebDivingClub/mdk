@@ -80,8 +80,9 @@ pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState, StoredMessagePayload};
 pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
 pub use storage::{
-    CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
+    WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,

@@ -145,6 +145,7 @@ async fn empty_engine_methods_return_typed_results() {
     // Drain methods return empty before any events are emitted.
     assert!(engine.drain_events().is_empty());
     assert!(engine.drain_auto_publish().is_empty());
+    assert!(engine.drain_auto_proposals().is_empty());
 
     // Sending to an unknown group returns a typed error, not a panic.
     let res = engine

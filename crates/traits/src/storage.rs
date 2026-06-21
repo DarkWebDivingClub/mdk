@@ -116,6 +116,27 @@ pub trait OutboundIntentStorage {
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()>;
 }
 
+// ── LeaveRequestStorage ────────────────────────────────────────────────────
+
+/// Durable user intent to leave a group.
+///
+/// MLS SelfRemove proposals are epoch-bound, but the product intent is not:
+/// once a user asks to leave, the engine keeps trying until a commit actually
+/// removes the local member or a future explicit cancel/recovery flow clears
+/// the request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveRequest {
+    pub group_id: GroupId,
+    pub requested_at_ms: u64,
+    pub last_proposed_epoch: Option<EpochId>,
+}
+
+pub trait LeaveRequestStorage {
+    fn put_leave_request(&self, request: &LeaveRequest) -> StorageResult<()>;
+    fn leave_request(&self, group_id: &GroupId) -> StorageResult<Option<LeaveRequest>>;
+    fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()>;
+}
+
 // ── WelcomeStorage ──────────────────────────────────────────────────────────
 
 pub trait WelcomeStorage {
@@ -221,6 +242,7 @@ pub trait StorageProvider:
     GroupStorage
     + MessageStorage
     + OutboundIntentStorage
+    + LeaveRequestStorage
     + WelcomeStorage
     + CapabilityStorage
     + ConvergencePolicyStorage

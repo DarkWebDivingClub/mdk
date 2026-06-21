@@ -126,11 +126,15 @@ pub struct SessionEffects {
     pub events: Vec<GroupEvent>,
     pub publish: Vec<PublishWork>,
     pub queued: Vec<QueuedIntentRef>,
+    pub pending_convergence: Vec<GroupId>,
 }
 
 impl SessionEffects {
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty() && self.publish.is_empty() && self.queued.is_empty()
+        self.events.is_empty()
+            && self.publish.is_empty()
+            && self.queued.is_empty()
+            && self.pending_convergence.is_empty()
     }
 }
 
@@ -600,6 +604,7 @@ impl AccountDeviceSession {
             events: self.engine.drain_events(),
             publish: Vec::new(),
             queued: Vec::new(),
+            pending_convergence: self.engine.drain_pending_convergence_groups(),
         };
         for result in results {
             match result {
@@ -634,6 +639,12 @@ impl AccountDeviceSession {
                 pending: auto.pending,
             });
         }
+        for msg in self.engine.drain_auto_proposals() {
+            effects.publish.push(PublishWork::Proposal { msg });
+        }
+        effects
+            .pending_convergence
+            .extend(self.engine.drain_pending_convergence_groups());
         effects.events.extend(self.engine.drain_events());
         tracing::trace!(
             target: TRACE_TARGET,

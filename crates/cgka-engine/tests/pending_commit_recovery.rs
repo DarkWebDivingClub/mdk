@@ -293,9 +293,9 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 /// Regression for the auto-commit leave path (darkmatter#150 follow-up).
 ///
 /// A deferred SelfRemove auto-commit legitimately persists a staged commit
-/// across a process boundary: the proposer's device stages the lowest-index
-/// commit, projects the departing member out of the Marmot record *forward*,
-/// and a later run publishes + confirms it. The crash-recovery clear at
+/// across a process boundary: a remaining member stages the commit, projects
+/// the departing member out of the Marmot record *forward*, and a later run
+/// publishes + confirms it. The crash-recovery clear at
 /// hydrate must NOT fire on this surviving commit — rolling it back re-derives
 /// the record from the pre-stage MLS state and re-adds the member who already
 /// left, forking convergence (the CLI `groups_leave_publishes_self_remove`
@@ -312,8 +312,8 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
     let bob_member_id;
 
     // ── Phase 1: create + confirm a 3-member group, then ingest bob's
-    //    SelfRemove so alice stages an auto-commit, and "crash" before
-    //    resolving the publish. ─────────────────────────────────────────────
+    //    SelfRemove so alice schedules then stages an auto-commit, and "crash"
+    //    before resolving the publish. ─────────────────────────────────────
     {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
         let bob_store = SqliteAccountStorage::in_memory().unwrap();
@@ -363,9 +363,8 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
             other => panic!("expected Proposal, got {other:?}"),
         };
 
-        // Alice ingests it — she is the lowest-index non-target admin, so the
-        // auto-committer stages a commit and projects bob out of the record
-        // immediately (epoch advances to the projected value, bob dropped).
+        // Alice ingests it — she is a remaining non-target member, so the
+        // auto-committer schedules a delayed commit.
         let routed = TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
@@ -374,6 +373,12 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         };
         let outcome = alice.ingest(routed).await.unwrap();
         assert!(matches!(outcome, IngestOutcome::Processed));
+        assert!(alice.drain_auto_publish().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let advanced = alice.advance_convergence(&group_id).await.unwrap();
+        assert!(advanced.is_empty());
+        // Once the delayed auto-commit is staged, bob is projected out of the
+        // record (epoch advances to the projected value, bob dropped).
         assert_eq!(
             alice.members(&group_id).unwrap().len(),
             2,

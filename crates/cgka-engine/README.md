@@ -16,8 +16,8 @@ rules, and returns typed outcomes for every ingest path.
   without polluting convergence replay.
 - Retains a small, configurable OpenMLS past-epoch window for delayed application messages.
 - Maintains a per-leaf capability cache so `feature_status` lookups do not walk the ratchet tree.
-- Picks a deterministic auto-committer for MIP-03 SelfRemove proposals and returns that work as publish-before-apply
-  obligations.
+- Stages SelfRemove-only commits for eligible remaining members and returns that work as publish-before-apply
+  obligations; keeps durable local leave requests gated and re-proposes stale SelfRemove proposals for newer epochs.
 
 ## What it does _not_ do
 

@@ -1730,6 +1730,8 @@ impl AppClient {
     }
 
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        self.pending_convergence_groups
+            .extend(effects.pending_convergence.iter().cloned());
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
             remember_seen_event(&mut self.state, event_id);

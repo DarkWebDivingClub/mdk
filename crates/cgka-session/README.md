@@ -33,6 +33,7 @@ Those live above this crate.
 - welcome ingest producing `GroupJoined`;
 - app-message ingest producing `MessageReceived`;
 - auto-publish work after SelfRemove proposal ingest, including the pending ref callers must confirm or fail;
+- auto-proposal work when a durable SelfRemove leave request has to be re-proposed for a newer epoch;
 - convergence advancement releasing queued outbound app messages.
 
 `tests/nostr_stack.rs` covers the production-shaped non-relay stack:

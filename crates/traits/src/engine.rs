@@ -6,9 +6,9 @@
 //!
 //! ### Signature note
 //!
-//! `drain_events` and `drain_auto_publish` are explicit drains. They are
-//! simple to reason about in a single-threaded coordinator loop and do not
-//! force the engine to hold a broadcast channel.
+//! `drain_events`, `drain_auto_publish`, and `drain_auto_proposals` are
+//! explicit drains. They are simple to reason about in a single-threaded
+//! coordinator loop and do not force the engine to hold a broadcast channel.
 //!
 //! ### `#[async_trait]` vs. native AFIT
 //!
@@ -490,12 +490,26 @@ pub trait CgkaEngine: Send + Sync {
     fn drain_events(&mut self) -> Vec<GroupEvent>;
 
     /// Drain group evolution the engine produced as a side effect of `ingest`
-    /// (e.g. auto-committing a received SelfRemove proposal per the
-    /// lowest-index rule). These are not tied to a `SendIntent`, but they are
-    /// still publish-before-apply obligations: the application must publish
-    /// each message and then call [`Self::confirm_published`] or
+    /// (e.g. a SelfRemove-only commit for a received SelfRemove proposal).
+    /// These are not tied to a `SendIntent`, but they are still
+    /// publish-before-apply obligations: the application must publish each
+    /// message and then call [`Self::confirm_published`] or
     /// [`Self::publish_failed`] with its pending reference.
     fn drain_auto_publish(&mut self) -> Vec<AutoPublish>;
+
+    /// Drain standalone proposals the engine produced as a side effect of
+    /// lifecycle repair (for example, re-proposing a durable local SelfRemove
+    /// request after a later accepted commit made the prior proposal stale).
+    /// These messages do not carry a pending reference: the application only
+    /// needs to publish the proposal bytes.
+    fn drain_auto_proposals(&mut self) -> Vec<TransportMessage>;
+
+    /// Drain groups that need a future convergence tick even though the last
+    /// ingest outcome was fully processed. Used for delayed lifecycle work such
+    /// as jittered SelfRemove auto-commit attempts: applications should schedule
+    /// these groups through the same convergence timer they use for
+    /// [`IngestOutcome::Buffered`].
+    fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId>;
 
     // ── Outbound ────────────────────────────────────────────────────────────
 

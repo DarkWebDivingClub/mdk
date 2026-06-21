@@ -1,16 +1,9 @@
-//! Lowest-index auto-committer policy.
+//! SelfRemove auto-commit policy.
 //!
 //! Per MIP-03 §144+§147 and RFC 9420 §12.2: when a SelfRemove proposal lands
-//! in the pending queue, the committer MUST NOT be the leaver. To avoid
-//! forks from multiple remaining members concurrently committing, Marmot
-//! picks a deterministic committer: the **lowest-index remaining member
-//! that isn't the target of the SelfRemove**.
-//!
-//! This function implements the first deterministic SelfRemove round from
-//! `spec/protocol-core/member-departure.md`: the lowest-index eligible member
-//! commits promptly. The spec also allows later deterministic fallback rounds
-//! after quiescence if the earlier committer cannot publish; scheduling those
-//! later rounds is outside this stateless decision helper.
+//! in the pending queue, the committer MUST NOT be the leaver. Marmot lets any
+//! remaining authorized member attempt the SelfRemove-only commit; competing
+//! commits are ordinary same-epoch races for convergence to resolve.
 //!
 //! ## Scope
 //!
@@ -35,7 +28,7 @@ use openmls::prelude::{LeafNodeIndex, Proposal, QueuedProposal};
 pub(crate) enum AutoCommitDecision {
     /// This client should commit the named proposal.
     Commit,
-    /// Some other client is responsible (or we're the target).
+    /// We are not allowed to commit this proposal.
     Observe,
 }
 
@@ -53,11 +46,9 @@ pub(crate) struct AutoCommitDecisionReport {
 ///    target — if we were, we'd produce an invalid commit and OpenMLS
 ///    would reject it. Enforcing here gives a clean typed early exit
 ///    instead of an opaque MLS error.
-/// 3. We are the lowest-index remaining non-target member.
-///
-/// Admin checks are partly enforced by send-time guards and partly here:
-/// if the leaver is the only admin, this policy observes instead of
-/// committing.
+/// 3. Admin checks are partly enforced by send-time guards and partly here:
+///    if the leaver is the only admin, this policy observes instead of
+///    committing.
 ///
 /// Not enforced here:
 /// - **§151 remove-beats-self-remove**: a precedence rule when both a
@@ -99,20 +90,7 @@ pub(crate) fn decide_with_reason(
         };
     }
 
-    // (3) We are the lowest-index remaining non-target member.
-    let lowest = mls_group
-        .members()
-        .map(|m| m.index)
-        .filter(|i| *i != leaver_idx)
-        .min();
-    if lowest != Some(own) {
-        return AutoCommitDecisionReport {
-            decision: AutoCommitDecision::Observe,
-            reason: "not_lowest_remaining_member",
-        };
-    }
-
-    // (4) member-departure.md:23-26 — an admin must leave the admin set before
+    // (3) member-departure.md:23-26 — an admin must leave the admin set before
     //     SelfRemove. Refuse to auto-commit any SelfRemove whose sender is
     //     still an active admin in the prior epoch.
     //
@@ -147,7 +125,7 @@ pub(crate) fn decide_with_reason(
 
     AutoCommitDecisionReport {
         decision: AutoCommitDecision::Commit,
-        reason: "self_remove_lowest_remaining_member",
+        reason: "self_remove_remaining_member",
     }
 }
 

@@ -409,6 +409,10 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         for member_id in previous_ids.difference(&current_ids) {
+            if member_id == self.identity.self_id() {
+                self.clear_leave_request_state(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            }
             self.push_group_state_change(
                 group_id,
                 selected_tip,
@@ -418,6 +422,22 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 origin_commit_id.clone(),
             );
+        }
+        if current_ids.contains(self.identity.self_id()) {
+            if self
+                .load_leave_request_state(group_id)
+                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+                .is_some()
+            {
+                // The selected branch advanced without consuming our
+                // SelfRemove. The proposal is epoch-bound, but the durable
+                // leave request is not; keep the send gate so the async
+                // convergence wrapper can publish a fresh proposal.
+                self.leaving_groups.insert(group_id.clone());
+            } else if self.leaving_groups.contains(group_id) {
+                // Compatibility cleanup for a pre-durable in-memory gate.
+                self.leaving_groups.remove(group_id);
+            }
         }
 
         Ok(())
