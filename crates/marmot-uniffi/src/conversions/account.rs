@@ -2,7 +2,7 @@
 
 use marmot_app::{
     AccountKeyPackageRecord, AccountUnread, GroupLeaveFailure, LocalCleanupReport, RelayFailure,
-    SendSummary, UserProfileMetadata, WipeOutcome,
+    SendSummary, SignOutOutcome, UserProfileMetadata, WipeOutcome,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -10,6 +10,7 @@ pub struct AccountSummaryFfi {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub signed_out: bool,
     pub running: bool,
 }
 
@@ -158,6 +159,22 @@ pub struct LocalCleanupReportFfi {
     pub reason: Option<String>,
 }
 
+/// Structured result of the non-destructive `signOut`. The account's local
+/// state is kept on device; only the relay-published KeyPackages are cleaned
+/// up (when requested), so the app can render the same per-relay
+/// partial-failure sheet as a wipe and show a "will retry on next sign-in" hint.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct SignOutOutcomeFfi {
+    /// Relay-published KeyPackage events successfully deleted. `0` when
+    /// `deleteKeyPackages` was `false`.
+    pub key_packages_deleted: u32,
+    /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort.
+    pub key_package_failures: Vec<RelayFailureFfi>,
+    /// Local teardown (worker shutdown, subscription deactivation, in-memory
+    /// cache eviction) result. Never removes on-disk state.
+    pub local_cleanup: LocalCleanupReportFfi,
+}
+
 impl From<WipeOutcome> for WipeOutcomeFfi {
     fn from(value: WipeOutcome) -> Self {
         Self {
@@ -201,6 +218,20 @@ impl From<LocalCleanupReport> for LocalCleanupReportFfi {
         Self {
             completed: value.completed,
             reason: value.reason,
+        }
+    }
+}
+
+impl From<SignOutOutcome> for SignOutOutcomeFfi {
+    fn from(value: SignOutOutcome) -> Self {
+        Self {
+            key_packages_deleted: value.key_packages_deleted,
+            key_package_failures: value
+                .key_package_failures
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            local_cleanup: value.local_cleanup.into(),
         }
     }
 }

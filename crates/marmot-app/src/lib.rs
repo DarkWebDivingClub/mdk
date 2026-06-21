@@ -96,8 +96,8 @@ pub use runtime::{
     RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
     RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
     RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
-    TimelineWindowHandle, WipeOutcome,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
+    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};

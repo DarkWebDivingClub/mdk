@@ -210,6 +210,55 @@ fn account_home_can_use_an_injected_secret_store() {
 }
 
 #[test]
+fn account_home_persists_reversible_sign_out_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let created = home.create_nostr_account().unwrap();
+    assert!(!created.signed_out);
+    assert!(created.is_active_local_signing());
+
+    let signed_out = home
+        .set_account_signed_out(&created.account_id_hex, true)
+        .unwrap();
+    assert!(signed_out.signed_out);
+    assert!(!signed_out.is_active_local_signing());
+
+    let reopened = AccountHome::open(dir.path());
+    let persisted = reopened.account(&created.account_id_hex).unwrap();
+    assert!(persisted.signed_out);
+    assert!(!persisted.is_active_local_signing());
+    assert_eq!(
+        reopened
+            .load_signing_keys(&created.account_id_hex)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        created.account_id_hex
+    );
+
+    let reactivated = reopened
+        .set_account_signed_out(&created.account_id_hex, false)
+        .unwrap();
+    assert!(!reactivated.signed_out);
+    assert!(reactivated.is_active_local_signing());
+}
+
+#[test]
+fn account_home_deserializes_legacy_account_records_as_signed_in() {
+    let account_id_hex = "00".repeat(32);
+    let legacy = serde_json::json!({
+        "label": "alice",
+        "account_id_hex": account_id_hex,
+        "local_signing": true,
+    });
+
+    let account: AccountSummary = serde_json::from_value(legacy).unwrap();
+    assert!(!account.signed_out);
+    assert!(account.is_active_local_signing());
+}
+
+#[test]
 fn account_home_keychain_rejects_second_label_for_same_account_id() {
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
@@ -294,6 +343,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
         label: "label-two".to_owned(),
         account_id_hex: account_id.clone(),
         local_signing: true,
+        signed_out: false,
     };
     let twin_dir = dir.path().join("accounts").join(&twin.label);
     std::fs::create_dir_all(&twin_dir).unwrap();

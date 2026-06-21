@@ -23,6 +23,7 @@ impl Marmot {
                 label: m.label,
                 account_id_hex: m.account_id_hex,
                 local_signing: m.local_signing,
+                signed_out: m.signed_out,
                 running: m.running,
             })
             .collect())
@@ -65,6 +66,32 @@ impl Marmot {
         Ok(self.runtime.sign_out_and_wipe(&account_ref).await?.into())
     }
 
+    /// Non-destructive sign-out: deactivate the account on this device and,
+    /// when `delete_key_packages` is `true` (the default behavior in the UI),
+    /// publish kind:5 deletions for its relay-published KeyPackages so
+    /// strangers cannot gift-wrap a Welcome into a new group while it is signed
+    /// out.
+    ///
+    /// Unlike [`sign_out_and_wipe`](Self::sign_out_and_wipe) /
+    /// [`remove_account`](Self::remove_account), this keeps ALL local state on
+    /// device — the SQLCipher session database (MLS state + projections), cached
+    /// media/secrets, the SQL account record, and the secret-store nsec — so the
+    /// same identity can be signed back in from the account picker with its
+    /// groups, message history, and drafts intact. The account ref stays valid
+    /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
+    /// KeyPackage cleanup failures so the app can show a "will retry on next
+    /// sign-in" hint (darkmatter#477).
+    pub async fn sign_out(
+        &self,
+        account_ref: String,
+        delete_key_packages: bool,
+    ) -> Result<conversions::SignOutOutcomeFfi, MarmotKitError> {
+        let options = marmot_app::SignOutOptions {
+            delete_key_packages,
+        };
+        Ok(self.runtime.sign_out(&account_ref, options).await?.into())
+    }
+
     /// Create a brand-new Nostr identity, store its secret in the platform
     /// keychain, and publish initial relay lists + key package.
     pub async fn create_identity(
@@ -84,6 +111,7 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            signed_out: result.account.signed_out,
             running: true,
         })
     }
@@ -109,7 +137,26 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            signed_out: result.account.signed_out,
             running: true,
+        })
+    }
+
+    /// Re-activate a non-destructively signed-out local account. This clears
+    /// the durable signed-out marker and starts the account worker again; relay
+    /// list/key-package repair can still be driven by the existing publish
+    /// commands after sign-in.
+    pub async fn sign_in_account(
+        &self,
+        account_ref: String,
+    ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        let account = self.runtime.sign_in_account(&account_ref).await?;
+        Ok(AccountSummaryFfi {
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+            local_signing: account.local_signing,
+            signed_out: account.signed_out,
+            running: account.running,
         })
     }
 

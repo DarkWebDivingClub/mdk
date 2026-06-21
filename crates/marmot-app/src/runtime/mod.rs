@@ -9,7 +9,7 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
-use marmot_account::{AccountHomeError, AccountSummary};
+use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -532,6 +532,7 @@ pub struct ManagedAccount {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub signed_out: bool,
     pub running: bool,
 }
 
@@ -592,6 +593,57 @@ pub struct LocalCleanupReport {
     pub completed: bool,
     /// Failure summary when `completed` is `false`. Privacy-safe.
     pub reason: Option<String>,
+}
+
+/// Options for the non-destructive sign-out path
+/// ([`MarmotAppRuntime::sign_out`]).
+///
+/// Unlike the destructive [`MarmotAppRuntime::sign_out_and_wipe`], a plain
+/// sign-out keeps the encrypted local databases (app SQL + MLS state) and the
+/// secret-store nsec on device so the same identity can be re-activated from
+/// the account picker with its groups, history, and drafts intact
+/// (darkmatter#477, parent darkmatter-android#347).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignOutOptions {
+    /// Publish kind:5 deletions for every relay-published KeyPackage of this
+    /// account so strangers cannot pull a stale KeyPackage and gift-wrap a
+    /// Welcome into a group while the account is signed out. Defaults to
+    /// `true`; the app exposes it as a toggle in the sign-out sheet.
+    pub delete_key_packages: bool,
+}
+
+impl Default for SignOutOptions {
+    fn default() -> Self {
+        // Relay key-package hygiene is on by default per the issue spec; the
+        // app may still surface a toggle to turn it off.
+        Self {
+            delete_key_packages: true,
+        }
+    }
+}
+
+/// Structured result of the non-destructive [`MarmotAppRuntime::sign_out`].
+///
+/// `local_cleanup` reports the always-run teardown of the managed worker,
+/// active subscriptions, and in-memory caches — it does NOT remove the account
+/// directory, MLS state DB, or secret-store nsec (that is the destructive
+/// [`WipeOutcome`] path). The KeyPackage-deletion counters mirror the wipe
+/// outcome's shape so the app can render the same per-relay partial-failure
+/// sheet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignOutOutcome {
+    /// Number of relay-published KeyPackage events successfully deleted. Always
+    /// `0` when `delete_key_packages` was `false`.
+    pub key_packages_deleted: u32,
+    /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort: a
+    /// failure here never blocks local cleanup, and the app can show a
+    /// "will retry on next sign-in" hint.
+    pub key_package_failures: Vec<RelayFailure>,
+    /// Result of the always-run local teardown (worker shutdown, subscription
+    /// deactivation, in-memory cache eviction). Unlike a wipe this never
+    /// deletes on-disk state, so `completed` is `true` whenever the teardown
+    /// ran; `reason` carries a privacy-safe summary on the rare failure.
+    pub local_cleanup: LocalCleanupReport,
 }
 
 /// Map an [`AppError`] to a stable, privacy-safe failure category for the
@@ -852,6 +904,10 @@ impl MarmotAppRuntime {
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
         self.accounts.restart_account(account_id_hex).await
+    }
+
+    pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        self.accounts.sign_in_account(account_ref).await
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
@@ -1676,6 +1732,128 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Non-destructive sign-out: deactivate the account on this device and
+    /// (optionally) clean up its relay-published KeyPackages, while keeping all
+    /// local state so the same identity can be signed back in later.
+    ///
+    /// This is the reversible counterpart to [`sign_out_and_wipe`]. It
+    /// implements the engine half of the "Sign Out" action in
+    /// darkmatter#477 / parent darkmatter-android#347.
+    ///
+    /// Steps:
+    /// 1. **Local teardown (always).** Shut the managed account worker down
+    ///    (which deactivates its transport subscriptions) and evict the
+    ///    account's in-memory storage/directory caches. This mirrors what
+    ///    today's logout already does. It does **NOT** call `remove_account`,
+    ///    so the SQLCipher session database (MLS state + projections), the
+    ///    cached media/source-epoch secrets, the on-disk KeyPackage material,
+    ///    the SQL account record, and the secret-store nsec all stay on disk.
+    ///    The account remains a live record in the picker and can be
+    ///    re-activated with its groups, message history, and drafts intact.
+    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Enumerate every
+    ///    relay-published KeyPackage for this account and publish a kind:5
+    ///    deletion to each one's source relays, mirroring the
+    ///    [`delete_key_package`](Self::delete_key_package) path. This stops
+    ///    strangers from pulling a stale KeyPackage and gift-wrapping a Welcome
+    ///    into a new group while the account is signed out.
+    ///
+    /// # Invariants
+    /// - The MLS state DB is never touched — that is the "sign back in and
+    ///   resume" contract.
+    /// - KeyPackage cleanup is best-effort and per-relay: a failure is recorded
+    ///   in [`SignOutOutcome::key_package_failures`] (so the app can show a
+    ///   "will retry on next sign-in" hint) and never blocks the local teardown.
+    /// - A discovery failure (could not enumerate KeyPackages) is recorded as a
+    ///   single failure with an empty `event_id_hex`, not silently treated as
+    ///   "no KeyPackages".
+    /// - The KeyPackage step runs **before** the worker teardown so it can use
+    ///   the account's live state; neither step depends on a running worker for
+    ///   the publish itself.
+    /// - The account ref stays valid after this returns (unlike a wipe).
+    ///
+    /// [`sign_out_and_wipe`]: Self::sign_out_and_wipe
+    pub async fn sign_out(
+        &self,
+        account_ref: &str,
+        options: SignOutOptions,
+    ) -> Result<SignOutOutcome, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        if !account.local_signing {
+            // Publishing kind:5 KeyPackage deletions requires signing with this
+            // account's key, which a tracked-only (npub) account cannot do.
+            // Surface the same error the worker path uses. (A tracked account
+            // also never published KeyPackages from this device, so there is
+            // nothing remote to clean up.)
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+        }
+
+        let mut outcome = SignOutOutcome::default();
+
+        // Step 1 (KeyPackage hygiene): delete every relay-published KeyPackage
+        // before tearing the worker down, while the account is still fully
+        // live. Discovery itself is network-bound; a discovery failure is
+        // recorded as a single failure (no event id) and must not abort the
+        // sign-out. This mirrors stage 2 of `sign_out_and_wipe`.
+        if options.delete_key_packages {
+            match self.account_key_packages(account_ref, Vec::new()).await {
+                Ok(packages) => {
+                    for package in packages {
+                        if !package.relay {
+                            continue;
+                        }
+                        let event_id_hex = package.key_package_event_id.clone();
+                        let relays = package
+                            .source_relays
+                            .iter()
+                            .cloned()
+                            .map(TransportEndpoint)
+                            .collect::<Vec<_>>();
+                        match self
+                            .delete_key_package(account_ref, &event_id_hex, relays)
+                            .await
+                        {
+                            Ok(_) => outcome.key_packages_deleted += 1,
+                            Err(err) => outcome.key_package_failures.push(RelayFailure {
+                                event_id_hex,
+                                reason: wipe_failure_reason(&err),
+                            }),
+                        }
+                    }
+                }
+                Err(err) => outcome.key_package_failures.push(RelayFailure {
+                    event_id_hex: String::new(),
+                    reason: format!(
+                        "key package discovery failed: {}",
+                        wipe_failure_reason(&err)
+                    ),
+                }),
+            }
+        }
+
+        // Step 2 (local teardown): shut the worker down (deactivating its
+        // subscriptions) and drop in-memory caches. Crucially this does NOT
+        // remove the account directory, so all on-disk state survives for a
+        // later sign-in. Teardown is treated as completed whenever it runs; the
+        // rare error path records a privacy-safe reason without aborting.
+        match self.accounts.deactivate_account(account_ref).await {
+            Ok(()) => {
+                outcome.local_cleanup = LocalCleanupReport {
+                    completed: true,
+                    reason: None,
+                };
+            }
+            Err(err) => {
+                outcome.local_cleanup = LocalCleanupReport {
+                    completed: false,
+                    reason: Some(wipe_failure_reason(&err)),
+                };
+            }
+        }
+
+        Ok(outcome)
+    }
+
     /// Destructive sign-out: fully remove the account's footprint from this
     /// device and from the relays the engine controls publishing to.
     ///
@@ -2173,6 +2351,7 @@ impl AccountManager {
                 label: account.label,
                 account_id_hex: account.account_id_hex,
                 local_signing: account.local_signing,
+                signed_out: account.signed_out,
             })
             .collect())
     }
@@ -2205,6 +2384,62 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Non-destructive deactivation of an account on this device: persist a
+    /// signed-out marker, shut its managed worker down (which deactivates the
+    /// worker's transport subscriptions), and evict its in-memory
+    /// storage/directory caches, but leave every byte of on-disk state in place.
+    ///
+    /// This is the teardown half of [`MarmotAppRuntime::sign_out`]. Unlike
+    /// [`remove_account`](Self::remove_account) it does **not** call
+    /// `account_home().remove_account`, so the account directory — the
+    /// SQLCipher session database (MLS state + projections), cached
+    /// media/source-epoch secrets, on-disk KeyPackage material, the SQL account
+    /// record, and the secret-store nsec — survives. The durable signed-out
+    /// marker prevents later [`reconcile`](Self::reconcile) /
+    /// [`restart_account`](Self::restart_account) calls from recreating the
+    /// worker until an explicit sign-in clears it.
+    ///
+    /// Dropping the in-memory caches is harmless when the directory is kept: a
+    /// later sign-in simply re-warms them from the unchanged on-disk database.
+    pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.app.account_home().account(account_ref)?;
+        // Hold the worker-map lock across the signed-out marker write,
+        // shutdown, and cache eviction so reconcile() cannot recreate this
+        // account's worker mid-teardown.
+        let mut workers = self.workers.lock().await;
+        self.app
+            .account_home()
+            .set_account_signed_out(&account.label, true)?;
+        if let Some(worker) = workers.remove(&account.account_id_hex) {
+            worker.shutdown().await;
+        }
+        self.app.drop_account_caches(&account.label);
+        Ok(())
+    }
+
+    /// Explicitly re-activate a reversibly signed-out local account.
+    pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self
+            .app
+            .account_home()
+            .set_account_signed_out(account_ref, false)?;
+        self.reconcile().await?;
+        let running = self
+            .workers
+            .lock()
+            .await
+            .contains_key(&account.account_id_hex);
+        Ok(ManagedAccount {
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+            local_signing: account.local_signing,
+            signed_out: account.signed_out,
+            running,
+        })
+    }
+
     pub async fn reconcile(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
         let result = async {
@@ -2214,7 +2449,7 @@ impl AccountManager {
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| account.local_signing)
+                .filter(|account| account.is_active_local_signing())
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -2484,6 +2719,9 @@ impl AccountManager {
         if !account.local_signing {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
         self.reconcile().await?;
         let workers = self.workers.lock().await;
         workers
@@ -2504,10 +2742,15 @@ impl AccountManager {
         let imports_private_key = request.identity.as_deref().is_some_and(is_nostr_secret);
         let creates_new_private_key = request.identity.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        let account = match self.create_nostr_account(request.identity.clone()) {
-            Ok(account) => account,
-            Err(err) => return Err(err),
+        let mut account = match request.identity.as_deref() {
+            Some(identity) => match self.signed_out_account_for_identity(identity)? {
+                Some(account) => account,
+                None => self.create_nostr_account(request.identity.clone())?,
+            },
+            None => self.create_nostr_account(None)?,
         };
+        let reactivating_existing = account.signed_out;
+        let rollback_on_setup_failure = !reactivating_existing;
 
         let relay_lists = match self
             .setup_relay_lists_for_account(
@@ -2520,7 +2763,10 @@ impl AccountManager {
         {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
-                return self.rollback_account_after_setup_failure(&account.label, err);
+                if rollback_on_setup_failure {
+                    return self.rollback_account_after_setup_failure(&account.label, err);
+                }
+                return Err(err);
             }
         };
 
@@ -2532,7 +2778,10 @@ impl AccountManager {
             {
                 Ok(profile) => Some(profile),
                 Err(err) => {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
+                    if rollback_on_setup_failure {
+                        return self.rollback_account_after_setup_failure(&account.label, err);
+                    }
+                    return Err(err);
                 }
             }
         } else {
@@ -2544,7 +2793,10 @@ impl AccountManager {
             match self.publish_initial_key_package_for_account(&account).await {
                 Ok(bytes) => Some(bytes),
                 Err(err) => {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
+                    if rollback_on_setup_failure {
+                        return self.rollback_account_after_setup_failure(&account.label, err);
+                    }
+                    return Err(err);
                 }
             }
         } else {
@@ -2559,6 +2811,12 @@ impl AccountManager {
                 directory_bootstrap_relays.clone(),
             )
             .await;
+        if account.signed_out {
+            account = self
+                .app
+                .account_home()
+                .set_account_signed_out(&account.label, false)?;
+        }
         self.reconcile().await?;
 
         Ok(AccountSetupResult {
@@ -2689,6 +2947,23 @@ impl AccountManager {
         let mut client = self.app.client(&account.label).await?;
         let key_package = client.publish_key_package().await?;
         Ok(key_package.bytes().len())
+    }
+
+    fn signed_out_account_for_identity(
+        &self,
+        identity: &str,
+    ) -> Result<Option<AccountSummary>, AppError> {
+        let account_id = if is_nostr_secret(identity) {
+            AccountHome::account_id_for_secret(identity)?
+        } else {
+            AccountHome::account_id_for_public_key(identity)?
+        };
+        match self.app.account_home().account(&account_id) {
+            Ok(account) if account.local_signing && account.signed_out => Ok(Some(account)),
+            Ok(_) => Ok(None),
+            Err(AccountHomeError::UnknownAccount(_)) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn create_nostr_account(&self, identity: Option<String>) -> Result<AccountSummary, AppError> {

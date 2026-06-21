@@ -622,7 +622,7 @@ impl MarmotApp {
             self.account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| account.local_signing)
+                .filter(|account| account.is_active_local_signing())
                 .map(|account| account.account_id_hex),
         );
         Ok(DirectorySyncPlan::from_known_users(
@@ -984,7 +984,7 @@ impl MarmotApp {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.local_signing)
+            .filter(|account| account.is_active_local_signing())
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)?;
 
@@ -1075,7 +1075,7 @@ impl MarmotApp {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.local_signing)
+            .filter(|account| account.is_active_local_signing())
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)
     }

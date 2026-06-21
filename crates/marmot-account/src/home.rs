@@ -64,6 +64,18 @@ pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    /// Durable local runtime state for reversible sign-out. A signed-out
+    /// account keeps its local signing secret and account directory but must not
+    /// be auto-started by runtime reconciliation until an explicit sign-in
+    /// clears this flag.
+    #[serde(default)]
+    pub signed_out: bool,
+}
+
+impl AccountSummary {
+    pub fn is_active_local_signing(&self) -> bool {
+        self.local_signing && !self.signed_out
+    }
 }
 
 impl AccountHome {
@@ -142,6 +154,7 @@ impl AccountHome {
             label: account_id_hex.clone(),
             account_id_hex,
             local_signing: false,
+            signed_out: false,
         };
         self.write_account_record(&account)?;
         Ok(account)
@@ -203,6 +216,31 @@ impl AccountHome {
         }
         accounts.sort_by(|a: &AccountSummary, b| a.account_id_hex.cmp(&b.account_id_hex));
         Ok(accounts)
+    }
+
+    /// Persist the reversible sign-out marker for a local-signing account.
+    ///
+    /// This deliberately does not touch the signing secret or account directory:
+    /// it only controls whether runtimes should auto-start the account worker.
+    pub fn set_account_signed_out(
+        &self,
+        account_ref: &str,
+        signed_out: bool,
+    ) -> AccountHomeResult<AccountSummary> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self.account(account_ref)?;
+        if !account.local_signing {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
+        }
+        if account.signed_out == signed_out {
+            return Ok(account);
+        }
+        account.signed_out = signed_out;
+        self.write_account_record(&account)?;
+        Ok(account)
     }
 
     /// Remove an account's entire local footprint: its on-disk account
@@ -374,6 +412,7 @@ impl AccountHome {
             label,
             account_id_hex,
             local_signing: true,
+            signed_out: false,
         };
         self.secret_store.write_secret(&account, keys)?;
         if let Err(err) = self.write_account_record(&account) {

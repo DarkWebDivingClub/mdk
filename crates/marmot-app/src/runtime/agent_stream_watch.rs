@@ -134,7 +134,7 @@ impl MarmotAppRuntime {
         };
 
         for account in accounts {
-            if !account.local_signing {
+            if !account.is_active_local_signing() {
                 continue;
             }
             let app = self.accounts.app.clone();

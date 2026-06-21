@@ -299,7 +299,7 @@ impl AccountManager {
         // spawned worker may already hold the pre-archive snapshot and would
         // later re-persist it, reverting the flag again.
         let account = self.resolve(account_ref)?;
-        if !account.local_signing {
+        if !account.is_active_local_signing() {
             let group_id_hex = hex::encode(group_id.as_slice());
             return self
                 .app
