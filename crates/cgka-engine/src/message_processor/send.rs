@@ -367,14 +367,25 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_remove_members_commit",
         );
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
         let (commit_out, _welcome_opt, _gi) = mls_group
             .remove_members(&provider, &self.identity.signer, &leaf_indices)
             .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
+        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+            &mls_group,
+            &group_id,
+            staged_commit,
+        )?;
+        let commit_priority =
+            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
+        self.epoch_manager
+            .record_committed_from(&group_id, pre_commit_epoch);
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -406,10 +417,6 @@ impl<S: StorageProvider> Engine<S> {
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());

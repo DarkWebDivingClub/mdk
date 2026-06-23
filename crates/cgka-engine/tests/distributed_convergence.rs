@@ -8,7 +8,9 @@ use cgka_engine::canonicalization::{
 use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsProjectionError, project_mls_message};
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::provider::EngineOpenMlsProvider;
+use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
@@ -21,14 +23,22 @@ use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::component::ComponentData;
+use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::prelude::BasicCredential;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
+use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
@@ -76,6 +86,24 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn encode_admin_policy_for_test(admins: &[MemberId]) -> Vec<u8> {
+    let mut admins = admins
+        .iter()
+        .map(|admin| admin.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    admins.sort();
+    admins.dedup();
+    let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+    for admin in admins {
+        assert_eq!(admin.len(), 32);
+        admin_bytes.extend_from_slice(&admin);
+    }
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    out
 }
 
 #[async_trait]
@@ -273,6 +301,148 @@ fn build_client_with_max_past_epochs(
         .unwrap()
 }
 
+fn raw_remove_members_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    targets: &[MemberId],
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let mut leaf_indices = Vec::new();
+    for member in mls_group.members() {
+        let credential =
+            BasicCredential::try_from(member.credential).expect("member uses BasicCredential");
+        if targets
+            .iter()
+            .any(|target| target.as_slice() == credential.identity())
+        {
+            leaf_indices.push(member.index);
+        }
+    }
+    assert_eq!(
+        leaf_indices.len(),
+        targets.len(),
+        "raw test commit must find every removal target"
+    );
+
+    let (commit, _welcome, _group_info) = mls_group
+        .remove_members(&provider, &signer, &leaf_indices)
+        .expect("raw OpenMLS remove commit");
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw remove commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-remove".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn raw_remove_members_commit_with_admin_policy(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    targets: &[MemberId],
+    resulting_admins: &[MemberId],
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let mut leaf_indices = Vec::new();
+    for member in mls_group.members() {
+        let credential =
+            BasicCredential::try_from(member.credential).expect("member uses BasicCredential");
+        if targets
+            .iter()
+            .any(|target| target.as_slice() == credential.identity())
+        {
+            leaf_indices.push(member.index);
+        }
+    }
+    assert_eq!(
+        leaf_indices.len(),
+        targets.len(),
+        "raw test commit must find every removal target"
+    );
+
+    let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        encode_admin_policy_for_test(resulting_admins),
+    )));
+    let mut builder = mls_group
+        .commit_builder()
+        .propose_removals(leaf_indices)
+        .add_proposal(admin_update)
+        .load_psks(provider.storage())
+        .expect("load PSKs");
+    let mut app_data = builder.app_data_dictionary_updater();
+    for proposal in builder.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            app_data.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    builder.with_app_data_dictionary_updates(app_data.changes());
+    let commit_bundle = builder
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("build raw remove+admin-policy commit")
+        .stage_commit(&provider)
+        .expect("stage raw remove+admin-policy commit");
+    let (commit, _welcome, _group_info) = commit_bundle.into_contents();
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw remove+admin-policy commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-remove-admin-policy".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
 #[tokio::test]
 async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -402,6 +572,194 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .expect("repeated convergence after applying is a no-op");
     assert!(repeated.accepted_commits.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+}
+
+#[tokio::test]
+async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
+    // Regression coverage for the admin-policy resulting-epoch invariant on the
+    // stored convergence replay path. Bob is a co-admin; his raw OpenMLS Remove
+    // commit removes Alice's last member leaf but leaves the signed admin-policy
+    // component as {Alice, Bob}. Direct ingest already rejects this shape before
+    // merge. Stored convergence must classify the same commit as invalid rather
+    // than materializing epoch 2 with an orphan admin key.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let alice_id = alice.self_id();
+    let carol_id = carol.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "convergence-orphan-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invalid_remove = route(
+        raw_remove_members_commit(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice_id),
+        ),
+        &group_id,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, invalid_remove.clone(), 1_000)
+        .expect("invalid remove commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "orphan-admin remove must not be accepted: {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(&invalid_remove)
+        }),
+        "expected invalid remove dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
+    assert_eq!(stored_group.epoch, EpochId(1));
+    assert_eq!(
+        stored_group.members.len(),
+        3,
+        "invalid convergence commit must not change stored member count"
+    );
+    let projected_members = carol.members(&group_id).expect("members projected");
+    assert_eq!(
+        projected_members.len(),
+        3,
+        "invalid convergence commit must not change projected member count"
+    );
+    for expected in [&alice_id, &bob_id, &carol_id] {
+        assert!(
+            projected_members
+                .iter()
+                .any(|member| member.id == *expected),
+            "projected members should still contain {expected:?}: {projected_members:?}"
+        );
+    }
+    assert_message_state(
+        &carol_storage,
+        &invalid_remove,
+        MessageState::EpochInvalidated,
+    );
+}
+
+#[tokio::test]
+async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
+    // Positive control for the same invariant: a commit may remove an admin's
+    // last member leaf if the same resulting epoch's signed admin-policy drops
+    // that admin key. This proves the convergence check accepts the legal
+    // Remove+AppDataUpdate shape instead of rejecting removals broadly.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let alice_id = alice.self_id();
+    let carol_id = carol.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "convergence-valid-admin-removal".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let valid_remove = route(
+        raw_remove_members_commit_with_admin_policy(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice_id),
+            std::slice::from_ref(&bob_id),
+        ),
+        &group_id,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, valid_remove.clone(), 1_000)
+        .expect("valid remove commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&valid_remove)]);
+    assert!(
+        result.dropped_messages.is_empty(),
+        "valid remove should not drop messages: {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
+    assert_eq!(stored_group.epoch, EpochId(2));
+    assert_eq!(stored_group.members.len(), 2);
+    let projected_members = carol.members(&group_id).expect("members projected");
+    assert_eq!(projected_members.len(), 2);
+    assert!(!projected_members.iter().any(|member| member.id == alice_id));
+    for expected in [&bob_id, &carol_id] {
+        assert!(
+            projected_members
+                .iter()
+                .any(|member| member.id == *expected),
+            "projected members should contain {expected:?}: {projected_members:?}"
+        );
+    }
+    let bob_admin: [u8; 32] = bob_id
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys");
+    assert_eq!(carol.admin_pubkeys(&group_id).unwrap(), vec![bob_admin]);
+    assert_message_state(&carol_storage, &valid_remove, MessageState::Processed);
 }
 
 /// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses

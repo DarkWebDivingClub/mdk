@@ -615,6 +615,65 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
     );
 }
 
+#[tokio::test]
+async fn remove_co_admin_without_admin_policy_update_is_rejected() {
+    // admin-policy-v1.md: a commit that removes an account's last member leaf
+    // MUST also remove that account's key from `admins` in the same resulting
+    // epoch. The public RemoveMembers path cannot currently carry that
+    // admin-policy rewrite, so removing a listed co-admin must be rejected
+    // before staging a local commit.
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "remove-co-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    match create {
+        SendResult::GroupCreated { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    }
+
+    let result = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob_id.clone()],
+        })
+        .await;
+
+    match result {
+        Err(EngineError::Other(message)) => assert!(
+            message.contains("admin key has no member leaf"),
+            "unexpected error text: {message}"
+        ),
+        Err(other) => panic!("expected admin/leaf coupling error, got {other:?}"),
+        Ok(_) => panic!("removing a listed co-admin without updating admin policy must fail"),
+    }
+
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    assert!(
+        alice
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob_id),
+        "failed remove must leave bob in the local member projection"
+    );
+}
+
 /// Regression for darkmatter#557: re-adding a previously removed member to the
 /// SAME group must produce a fresh Welcome the receiver decrypts and acts on,
 /// with no special-casing between "first add" and "re-add after removal".
