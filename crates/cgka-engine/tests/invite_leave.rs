@@ -623,9 +623,9 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
 /// merged the staged commit but left B's stale OpenMLS group state in storage.
 /// A later re-add Welcome was staged on top of that corrupt leftover state, so B
 /// never ended up with a usable group — the silent no-op the issue describes.
-/// The fix tears down all local state for a group when WE are removed (and
-/// defensively before a re-join Welcome restages), so the re-add lands as a
-/// clean first-join.
+/// The fix preserves B's tombstoned Marmot/convergence state and clears only
+/// stale live OpenMLS state before a re-join Welcome restages, so the re-add
+/// lands as a clean first-join.
 #[tokio::test]
 async fn readd_after_remove_produces_fresh_welcome_join() {
     let mut alice = build_client(b"alice");

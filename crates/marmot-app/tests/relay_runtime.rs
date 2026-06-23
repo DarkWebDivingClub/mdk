@@ -1674,6 +1674,157 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "readd after remove",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let first_pending = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(first_pending.pending_confirmation);
+    let first_welcome_id = first_pending.via_welcome_message_id_hex.clone();
+    runtime
+        .accept_group_invite(&bob_id, &group_id)
+        .await
+        .unwrap();
+    let accepted = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(!accepted.pending_confirmation);
+    assert!(!accepted.archived);
+    assert!(
+        runtime
+            .group_members(&bob_id, &group_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|member| member.member_id_hex == bob_id),
+        "bob should be an active member after accepting the first invite"
+    );
+
+    runtime
+        .remove_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupEvent(group_event)
+                if group_event.account_id_hex == bob_id
+                    && matches!(
+                        &group_event.event,
+                        cgka_traits::engine::GroupEvent::GroupStateChanged {
+                            group_id: changed_group,
+                            change:
+                                cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                                | cgka_traits::engine::GroupStateChange::MemberLeft { member },
+                            ..
+                        } if changed_group == &group_id
+                            && hex::encode(member.as_slice()) == bob_id
+                    )
+        )
+    })
+    .await;
+    assert!(
+        !runtime
+            .group_members(&bob_id, &group_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|member| member.member_id_hex == bob_id),
+        "bob should be absent from his retained tombstoned record after removal"
+    );
+
+    runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let readded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(readded.pending_confirmation);
+    assert!(!readded.archived);
+    assert_eq!(
+        readded.welcomer_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    assert_ne!(
+        readded.via_welcome_message_id_hex, first_welcome_id,
+        "a genuine re-add should carry a fresh Welcome id"
+    );
+    assert!(
+        app.visible_groups(&bob_label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex),
+        "the re-added group should be visible instead of stuck in the removed state"
+    );
+    let bob_members = runtime.group_members(&bob_id, &group_id).await.unwrap();
+    assert!(
+        bob_members
+            .iter()
+            .any(|member| member.member_id_hex == bob_id),
+        "bob should be a member again after the re-add; got {bob_members:?}"
+    );
+
+    runtime
+        .accept_group_invite(&bob_id, &group_id)
+        .await
+        .unwrap();
+    runtime
+        .send_message(&bob_id, &group_id, b"hello after re-add".to_vec())
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == alice_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "hello after re-add"
+        )
+    })
+    .await;
+
+    runtime.shutdown().await;
+}
+
 // Regression test for darkmatter#178: an external `set_group_archived` must not
 // be reverted by the long-lived account worker's stale in-memory snapshot when
 // the next inbound delivery re-persists the worker's `AccountState`.
