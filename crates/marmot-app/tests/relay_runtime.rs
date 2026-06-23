@@ -15,8 +15,9 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime, MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest,
-    MediaUploadRequest, NotificationWakeSource, PushPlatform, RuntimeMessageUpdate, SignOutOptions,
-    TimelineMessageQuery, TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
+    MediaUploadRequest, MissingRelayListKind, NotificationWakeSource, PushPlatform,
+    RuntimeMessageUpdate, SignOutOptions, TimelineMessageQuery, TimelinePagination,
+    UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -3522,7 +3523,10 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
         .unwrap();
 
     assert!(!missing_from_seed_b.complete);
-    assert_eq!(missing_from_seed_b.missing, vec!["nip65", "inbox"]);
+    assert_eq!(
+        missing_from_seed_b.missing,
+        vec![MissingRelayListKind::Nip65, MissingRelayListKind::Inbox]
+    );
     assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
 }
 

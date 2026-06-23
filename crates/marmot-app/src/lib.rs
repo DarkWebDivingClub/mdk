@@ -316,11 +316,37 @@ pub struct AppDatabaseStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountRelayListStatus {
     pub complete: bool,
-    pub missing: Vec<String>,
+    pub missing: Vec<MissingRelayListKind>,
     pub default_relays: Vec<String>,
     pub bootstrap_relays: Vec<String>,
     pub nip65: AccountRelayListState,
     pub inbox: AccountRelayListState,
+}
+
+/// A relay list the account is missing. Typed so FFI clients can localize
+/// each kind without parsing protocol-jargon strings (darkmatter#565).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MissingRelayListKind {
+    /// NIP-65 relay list (kind 10002) — where this account publishes
+    /// ("outbox"/write-side). Missing when the account has no NIP-65 relays.
+    #[serde(rename = "nip65")]
+    Nip65,
+    /// Marmot inbox relay list (kind 10050) — where this account receives
+    /// ("inbox"/read-side). Missing when the account has no inbox relays.
+    #[serde(rename = "inbox")]
+    Inbox,
+}
+
+impl MissingRelayListKind {
+    /// Stable lowercase token, kept for the existing CLI `--json` / plain
+    /// output contract (`"missing": ["nip65","inbox"]`). NOT a localization
+    /// key — clients localize from the enum variant, not this string.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Nip65 => "nip65",
+            Self::Inbox => "inbox",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,10 +402,10 @@ impl AccountRelayListStatus {
         self.default_relays = self.nip65.relays.clone();
         self.missing = Vec::new();
         if self.nip65.relays.is_empty() {
-            self.missing.push("nip65".into());
+            self.missing.push(MissingRelayListKind::Nip65);
         }
         if self.inbox.relays.is_empty() {
-            self.missing.push("inbox".into());
+            self.missing.push(MissingRelayListKind::Inbox);
         }
         self.complete = self.missing.is_empty();
     }
@@ -881,10 +907,9 @@ impl MarmotApp {
         let missing = current
             .missing
             .iter()
-            .filter_map(|name| match name.as_str() {
-                "nip65" => Some(NostrAccountRelayListKind::Nip65),
-                "inbox" => Some(NostrAccountRelayListKind::Inbox),
-                _ => None,
+            .map(|kind| match kind {
+                MissingRelayListKind::Nip65 => NostrAccountRelayListKind::Nip65,
+                MissingRelayListKind::Inbox => NostrAccountRelayListKind::Inbox,
             })
             .collect::<Vec<_>>();
         if missing.is_empty() {
@@ -1701,7 +1726,9 @@ impl MarmotApp {
             }
         }
         if relay_lists.nip65.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
         }
         let source_relays = relay_lists
             .nip65
@@ -1751,7 +1778,9 @@ impl MarmotApp {
             endpoints = self.key_package_endpoints(&relay_lists);
         }
         if endpoints.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
         }
 
         let event = NostrTransportEvent::new_unsigned(
@@ -1828,7 +1857,9 @@ impl MarmotApp {
         let account_id_hex = keys.public_key().to_hex();
         let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
         if relay_lists.nip65.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
         }
         let publisher = AppKeyPackagePublisher {
             app: self.clone(),

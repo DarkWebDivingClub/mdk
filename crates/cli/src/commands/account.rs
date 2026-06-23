@@ -3,7 +3,8 @@
 use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AppError, AppStatus, MarmotApp,
+    AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AppError, AppStatus,
+    MarmotApp, MissingRelayListKind,
 };
 use serde_json::{Value, json};
 
@@ -228,7 +229,7 @@ pub(crate) fn map_account_setup_error(err: AppError) -> DmError {
     err.into()
 }
 
-fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayListStatus {
+fn missing_relay_list_status(missing: Vec<MissingRelayListKind>) -> AccountRelayListStatus {
     AccountRelayListStatus {
         complete: false,
         missing,
@@ -353,7 +354,15 @@ fn relay_setup_plain(status: &AccountRelayListStatus) -> String {
     if status.complete {
         "complete".to_owned()
     } else {
-        format!("missing:{}", status.missing.join(","))
+        format!(
+            "missing:{}",
+            status
+                .missing
+                .iter()
+                .map(|k| k.token())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     }
 }
 

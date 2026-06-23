@@ -42,7 +42,7 @@ use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as Relay
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListBootstrap, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
-    KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, ReceivedMessage,
+    KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
     push_unique_strings, relays_from_relay_list_event, remove_sqlite_file_set,
 };
@@ -254,7 +254,9 @@ impl MarmotApp {
         }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
         if relay_lists.nip65.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
         }
 
         let source_relays = relay_lists

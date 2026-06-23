@@ -1,8 +1,8 @@
 //! Relay telemetry, relay-list, and relay-health FFI conversions.
 
 use marmot_app::{
-    AccountRelayListState, AccountRelayListStatus, RelayPlaneHealth, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AccountRelayListState, AccountRelayListStatus, MissingRelayListKind, RelayPlaneHealth,
+    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -86,10 +86,29 @@ impl From<AccountRelayListState> for RelayListFfi {
     }
 }
 
+/// A relay list the account is missing, as a stable typed variant clients
+/// localize without parsing strings (darkmatter#565).
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum MissingRelayListKindFfi {
+    /// NIP-65 relay list — where this account publishes (outbox/write-side).
+    Nip65,
+    /// Marmot inbox relay list — where this account receives (inbox/read-side).
+    Inbox,
+}
+
+impl From<MissingRelayListKind> for MissingRelayListKindFfi {
+    fn from(value: MissingRelayListKind) -> Self {
+        match value {
+            MissingRelayListKind::Nip65 => Self::Nip65,
+            MissingRelayListKind::Inbox => Self::Inbox,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountRelayListsFfi {
     pub complete: bool,
-    pub missing: Vec<String>,
+    pub missing: Vec<MissingRelayListKindFfi>,
     pub default_relays: Vec<String>,
     pub bootstrap_relays: Vec<String>,
     pub nip65: RelayListFfi,
@@ -100,7 +119,7 @@ impl From<AccountRelayListStatus> for AccountRelayListsFfi {
     fn from(value: AccountRelayListStatus) -> Self {
         Self {
             complete: value.complete,
-            missing: value.missing,
+            missing: value.missing.into_iter().map(Into::into).collect(),
             default_relays: value.default_relays,
             bootstrap_relays: value.bootstrap_relays,
             nip65: value.nip65.into(),

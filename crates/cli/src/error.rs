@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
 use marmot_account::{AccountError, AccountHomeError};
-use marmot_app::{AccountRelayListStatus, AppError};
+use marmot_app::{AccountRelayListStatus, AppError, MissingRelayListKind};
 use serde_json::{Value, json};
 
 use crate::relay_lists_json;
@@ -98,7 +98,7 @@ pub(crate) enum DmError {
         reason: &'static str,
     },
     #[error("missing account relay lists: {0:?}")]
-    MissingRelayLists(Vec<String>, Box<AccountRelayListStatus>),
+    MissingRelayLists(Vec<MissingRelayListKind>, Box<AccountRelayListStatus>),
     #[error(
         "cannot safely update {list} replaceable list for {account_id}: no current list event found on the selected relays"
     )]
@@ -130,7 +130,7 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
         DmError::MissingRelayLists(missing, status) => json!({
             "code": "missing_relay_lists",
             "message": "account is missing required relay lists",
-            "missing": missing,
+            "missing": missing.iter().map(|k| k.token()).collect::<Vec<_>>(),
             "relay_lists": relay_lists_json(status.as_ref().clone()),
             "repair": {
                 "requires": "--default-relays",
@@ -467,7 +467,7 @@ fn app_error_json(err: &AppError) -> Value {
         AppError::MissingRelayLists(missing) => json!({
             "code": "missing_relay_lists",
             "message": err.to_string(),
-            "missing": missing,
+            "missing": missing.iter().map(|k| k.token()).collect::<Vec<_>>(),
         }),
         AppError::RelayDirectory(reason) => json!({
             "code": "relay_directory_failed",

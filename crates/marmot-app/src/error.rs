@@ -1,6 +1,8 @@
 use cgka_traits::{TransportAdapterError, storage::StorageError};
 use marmot_account::{AccountError, AccountHomeError};
 
+use crate::MissingRelayListKind;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -40,7 +42,7 @@ pub enum AppError {
     #[error("default relays are required to publish account relay lists")]
     MissingDefaultRelays,
     #[error("missing account relay lists: {0:?}")]
-    MissingRelayLists(Vec<String>),
+    MissingRelayLists(Vec<MissingRelayListKind>),
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     #[error("invalid Nostr public key")]
