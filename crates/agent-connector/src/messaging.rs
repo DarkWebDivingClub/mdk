@@ -420,8 +420,7 @@ impl AgentConnector {
             .runtime
             .download_media(&account.label, &group_id, reference)
             .await?;
-        let dir = crate::media_temp::media_download_root().join(&subdir);
-        tokio::fs::create_dir_all(&dir).await?;
+        let dir = crate::media_temp::create_media_download_dir(&subdir).await?;
         // The file name comes from the (decrypted) sender-controlled media
         // reference, so write under a sanitized basename: a crafted value like
         // "../../x" must not let a download escape the per-blob temp dir.
