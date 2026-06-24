@@ -378,8 +378,11 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if trace.observations.len() >= 2 {
         let first_epoch = trace.observations[0].epoch;
         let first_member_count = trace.observations[0].member_count;
+        let first_group_name = &trace.observations[0].group_name;
         if trace.observations.iter().all(|observation| {
-            observation.epoch == first_epoch && observation.member_count == first_member_count
+            observation.epoch == first_epoch
+                && observation.member_count == first_member_count
+                && &observation.group_name == first_group_name
         }) {
             behaviors.insert(OracleBehavior::ClientConvergence);
         }
@@ -585,5 +588,72 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::ReplayDeduplication,
         ],
         ScenarioStimulus::PublishLifecycle => vec![OracleBehavior::PublishLifecycleChecked],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClientEventCounts, ClientObservation};
+
+    fn observation(
+        client: &str,
+        epoch: u64,
+        member_count: usize,
+        group_name: &str,
+    ) -> ClientObservation {
+        ClientObservation {
+            client: client.into(),
+            epoch,
+            member_count,
+            group_name: group_name.into(),
+            event_counts: ClientEventCounts::default(),
+            received_payloads: Vec::new(),
+            added_members: Vec::new(),
+            removed_members: Vec::new(),
+            epoch_changes: Vec::new(),
+            app_invalidations: Vec::new(),
+            recoveries: Vec::new(),
+        }
+    }
+
+    fn trace(observations: Vec<ClientObservation>) -> ScenarioTrace {
+        ScenarioTrace {
+            name: "oracle-convergence".into(),
+            pending_resolutions: Vec::new(),
+            errors: Vec::new(),
+            admin_policies: Vec::new(),
+            observations,
+        }
+    }
+
+    #[test]
+    fn trace_behaviors_rejects_group_data_branch_fork_as_client_convergence() {
+        let observed = trace(vec![
+            observation("alice", 2, 21, "alice branch"),
+            observation("bob", 2, 21, "bob branch"),
+        ]);
+
+        let behaviors = trace_behaviors(&observed);
+
+        assert!(
+            !behaviors.contains(&OracleBehavior::ClientConvergence),
+            "same epoch/member_count with different group names is a branch fork, not convergence: {behaviors:#?}"
+        );
+    }
+
+    #[test]
+    fn trace_behaviors_accepts_shared_group_name_as_client_convergence() {
+        let observed = trace(vec![
+            observation("alice", 2, 21, "winner branch"),
+            observation("bob", 2, 21, "winner branch"),
+        ]);
+
+        let behaviors = trace_behaviors(&observed);
+
+        assert!(
+            behaviors.contains(&OracleBehavior::ClientConvergence),
+            "same epoch/member_count/group_name should count as convergence: {behaviors:#?}"
+        );
     }
 }

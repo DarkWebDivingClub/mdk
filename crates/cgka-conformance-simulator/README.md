@@ -266,6 +266,8 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 Reports are written as one file per case, for example
 `target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`. Generated family runs also write fixture
 candidates such as `target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.
+Pass `--strict-oracle` when a report run should fail on oracle coverage problems (`weak_oracle_warnings` or
+`missing_observed_behaviors`) instead of treating them as advisory metadata.
 
 ## When to use the harness vs. integration tests
 

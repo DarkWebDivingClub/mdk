@@ -18,6 +18,7 @@ fn parse_defaults_to_send_leave_family() {
                 cases: 1,
             },
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
+            strict_oracle: false,
         })
     );
 }
@@ -45,6 +46,7 @@ fn parse_custom_report_args() {
                 cases: 3,
             },
             out: PathBuf::from("target/custom"),
+            strict_oracle: false,
         })
     );
 }
@@ -66,6 +68,30 @@ fn parse_vector_fixture_report_args() {
                 paths: vec![PathBuf::from("crates/cgka-conformance-simulator/vectors")],
             },
             out: PathBuf::from("target/vector-reports"),
+            strict_oracle: false,
+        })
+    );
+}
+
+#[test]
+fn parse_strict_oracle_report_args() {
+    let command = parse_report_command([
+        "--family".into(),
+        "send-leave/v1".into(),
+        "--strict-oracle".into(),
+    ])
+    .expect("strict oracle args parse");
+
+    assert_eq!(
+        command,
+        ReportCommand::Run(ReportArgs {
+            input: ReportInput::GeneratedFamily {
+                family: "send-leave/v1".into(),
+                seed: 0,
+                cases: 1,
+            },
+            out: PathBuf::from("target/cgka-conformance-simulator-reports"),
+            strict_oracle: true,
         })
     );
 }
@@ -140,6 +166,7 @@ async fn report_runner_writes_send_leave_json_reports() {
             cases: 2,
         },
         out: out_dir.clone(),
+        strict_oracle: false,
     })
     .await
     .expect("runner writes reports");
@@ -170,6 +197,40 @@ async fn report_runner_writes_send_leave_json_reports() {
 }
 
 #[tokio::test]
+async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
+    let out_dir = std::env::temp_dir().join(format!(
+        "darkmatter-cgka-strict-oracle-report-test-{}",
+        std::process::id()
+    ));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).expect("remove stale output dir");
+    }
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedFamily {
+            family: "send-leave/v1".into(),
+            seed: 42,
+            cases: 1,
+        },
+        out: out_dir.clone(),
+        strict_oracle: true,
+    })
+    .await
+    .expect("strict runner writes reports");
+
+    assert_eq!(summary.total(), 1);
+    assert_eq!(summary.failed(), 1);
+    assert!(
+        summary.scenarios[0]
+            .failures
+            .iter()
+            .any(|failure| failure.kind == "weak_oracle_warning")
+    );
+
+    fs::remove_dir_all(out_dir).expect("clean output dir");
+}
+
+#[tokio::test]
 async fn report_runner_writes_convergence_delivery_json_reports() {
     let out_dir = std::env::temp_dir().join(format!(
         "darkmatter-cgka-convergence-delivery-report-test-{}",
@@ -186,6 +247,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
             cases: 2,
         },
         out: out_dir.clone(),
+        strict_oracle: false,
     })
     .await
     .expect("runner writes convergence delivery reports");
@@ -236,6 +298,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
             cases: 2,
         },
         out: out_dir.clone(),
+        strict_oracle: false,
     })
     .await
     .expect("runner writes convergence chaos reports");
@@ -325,6 +388,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
             paths: vec![vectors_dir],
         },
         out: out_dir.clone(),
+        strict_oracle: false,
     })
     .await
     .expect("runner writes vector reports");

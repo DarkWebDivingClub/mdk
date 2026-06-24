@@ -12,6 +12,7 @@ use crate::{
 pub struct ReportArgs {
     pub input: ReportInput,
     pub out: PathBuf,
+    pub strict_oracle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +107,47 @@ pub struct ReportFailureSummary {
     pub message: String,
 }
 
+fn scenario_report_failures(
+    report: &ScenarioReport,
+    strict_oracle: bool,
+) -> Vec<ReportFailureSummary> {
+    let mut failures = report
+        .expectation_failures
+        .iter()
+        .map(|failure| ReportFailureSummary {
+            kind: failure.kind.clone(),
+            message: failure.message.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    if !strict_oracle {
+        return failures;
+    }
+
+    failures.extend(report.oracle.weak_oracle_warnings.iter().map(|warning| {
+        ReportFailureSummary {
+            kind: "weak_oracle_warning".into(),
+            message: format!(
+                "{}; expected one of {:?}",
+                warning.message, warning.expected_any_of
+            ),
+        }
+    }));
+
+    failures.extend(
+        report
+            .oracle
+            .missing_observed_behaviors
+            .iter()
+            .map(|behavior| ReportFailureSummary {
+                kind: "missing_observed_behavior".into(),
+                message: format!("expected oracle behavior {behavior:?} was not observed"),
+            }),
+    );
+
+    failures
+}
+
 pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn Error>> {
     std::fs::create_dir_all(&args.out)?;
 
@@ -114,9 +156,12 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
             family,
             seed,
             cases,
-        } => run_generated_family_reports(family, *seed, *cases, &args.out).await?,
+        } => {
+            run_generated_family_reports(family, *seed, *cases, &args.out, args.strict_oracle)
+                .await?
+        }
         ReportInput::VectorFixtures { paths } => {
-            run_vector_fixture_reports(paths, &args.out).await?
+            run_vector_fixture_reports(paths, &args.out, args.strict_oracle).await?
         }
     };
 
@@ -137,6 +182,7 @@ async fn run_generated_family_reports(
     seed: u64,
     cases: usize,
     out: &Path,
+    strict_oracle: bool,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     let cases = match family {
         "send-leave/v1" => generate_send_leave_family(seed, cases),
@@ -165,21 +211,16 @@ async fn run_generated_family_reports(
         std::fs::write(&fixture_output, serde_json::to_string_pretty(&fixture)?)?;
         let source = case.family_name.clone();
         let coverage = coverage_matrix_entry(source.clone(), &report);
+        let failures = scenario_report_failures(&report, strict_oracle);
+        let failure_count = failures.len();
         summaries.push(ScenarioReportSummary {
             scenario_name: report.metadata.scenario_name.clone(),
             source,
             output,
             expectation_count: report.expected_trace.iter().count()
                 + report.expected_outcomes.len(),
-            failure_count: report.expectation_failures.len(),
-            failures: report
-                .expectation_failures
-                .iter()
-                .map(|failure| ReportFailureSummary {
-                    kind: failure.kind.clone(),
-                    message: failure.message.clone(),
-                })
-                .collect(),
+            failure_count,
+            failures,
             coverage,
         });
     }
@@ -212,6 +253,7 @@ fn generated_fixture_candidate(
 async fn run_vector_fixture_reports(
     paths: &[PathBuf],
     out: &Path,
+    strict_oracle: bool,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     let fixture_paths = collect_vector_fixture_paths(paths)?;
     let mut summaries = Vec::with_capacity(fixture_paths.len());
@@ -225,21 +267,16 @@ async fn run_vector_fixture_reports(
         std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
         let source = path.display().to_string();
         let coverage = coverage_matrix_entry(source.clone(), &report);
+        let failures = scenario_report_failures(&report, strict_oracle);
+        let failure_count = failures.len();
         summaries.push(ScenarioReportSummary {
             scenario_name: fixture.scenario_name.clone(),
             source,
             output,
             expectation_count: fixture.expected_trace.iter().count()
                 + fixture.expected_outcomes.len(),
-            failure_count: report.expectation_failures.len(),
-            failures: report
-                .expectation_failures
-                .iter()
-                .map(|failure| ReportFailureSummary {
-                    kind: failure.kind.clone(),
-                    message: failure.message.clone(),
-                })
-                .collect(),
+            failure_count,
+            failures,
             coverage,
         });
     }
@@ -297,6 +334,7 @@ pub fn parse_report_command(
     let mut cases = 1usize;
     let mut vectors = Vec::new();
     let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
+    let mut strict_oracle = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -306,6 +344,7 @@ pub fn parse_report_command(
             "--cases" => cases = next_value(&mut args, "--cases")?.parse()?,
             "--vectors" => vectors.push(PathBuf::from(next_value(&mut args, "--vectors")?)),
             "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
+            "--strict-oracle" => strict_oracle = true,
             "--help" | "-h" => return Ok(ReportCommand::Help),
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -321,7 +360,11 @@ pub fn parse_report_command(
         ReportInput::VectorFixtures { paths: vectors }
     };
 
-    Ok(ReportCommand::Run(ReportArgs { input, out }))
+    Ok(ReportCommand::Run(ReportArgs {
+        input,
+        out,
+        strict_oracle,
+    }))
 }
 
 fn next_value(
@@ -333,5 +376,79 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR]"
+    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--strict-oracle]"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BehaviorEvidenceSummary, OracleBehavior, OracleCoverageWarning, ScenarioOracleReport,
+        ScenarioReportMetadata, ScenarioSpec, ScenarioStimulus,
+    };
+
+    fn report_with_oracle(oracle: ScenarioOracleReport) -> ScenarioReport {
+        ScenarioReport {
+            metadata: ScenarioReportMetadata {
+                scenario_name: "oracle-summary-test".into(),
+                spec_version: "1".into(),
+                step_count: 0,
+                generated: None,
+                fixture: None,
+            },
+            scenario: ScenarioSpec {
+                name: "oracle-summary-test".into(),
+                spec_version: "1".into(),
+                clients: Vec::new(),
+                steps: Vec::new(),
+            },
+            expected_trace: None,
+            expected_outcomes: Vec::new(),
+            observed_trace: None,
+            oracle,
+            step_log: Vec::new(),
+            pending_resolution_observations: Vec::new(),
+            recovery_observations: Vec::new(),
+            epoch_change_observations: Vec::new(),
+            app_invalidation_observations: Vec::new(),
+            expectation_failures: Vec::new(),
+            invariant_failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scenario_report_failures_include_oracle_coverage_failures() {
+        let report = report_with_oracle(ScenarioOracleReport {
+            stimuli: vec![ScenarioStimulus::CommitStorm],
+            oracle_behaviors: vec![OracleBehavior::ForkRecovered],
+            observed_behaviors: Vec::new(),
+            missing_observed_behaviors: vec![OracleBehavior::ForkRecovered],
+            evidence: BehaviorEvidenceSummary::default(),
+            weak_oracle_warnings: vec![OracleCoverageWarning {
+                stimulus: ScenarioStimulus::CommitStorm,
+                expected_any_of: vec![OracleBehavior::ForkRecovered],
+                message:
+                    "scenario includes CommitStorm but no expectation checks the matching behavior"
+                        .into(),
+            }],
+        });
+
+        let failures = scenario_report_failures(&report, true);
+
+        assert_eq!(
+            failures.len(),
+            2,
+            "oracle coverage failures should fail summaries"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.kind == "weak_oracle_warning")
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.kind == "missing_observed_behavior")
+        );
+    }
 }
