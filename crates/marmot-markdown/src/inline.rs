@@ -207,6 +207,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     let mut buf = String::with_capacity(raw.len());
     let mut delims: Vec<BracketDelim> = Vec::new();
     let mut i = 0;
+    let mut inline_math_closer_exhausted = false;
 
     // Try a "consume an Inline or fall back to a literal byte" recognizer.
     // Used for the recognizers whose only failure mode is "didn't match —
@@ -265,7 +266,26 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i = end;
                 }
             }
-            b'$' => try_or_literal!('$', try_inline_math(bytes, i), Inline::Math),
+            b'$' if inline_math_closer_exhausted => {
+                buf.push('$');
+                i += 1;
+            }
+            b'$' => match try_inline_math(bytes, i) {
+                InlineMathScan::Matched { content, end } => {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::Math(content));
+                    i = end;
+                }
+                InlineMathScan::NoMatch => {
+                    buf.push('$');
+                    i += 1;
+                }
+                InlineMathScan::NoCloserInSuffix => {
+                    inline_math_closer_exhausted = true;
+                    buf.push('$');
+                    i += 1;
+                }
+            },
             b'&' => match entity::decode(bytes, i) {
                 Some((decoded, end)) => {
                     // Entities decode straight into the text buffer (no
@@ -580,18 +600,24 @@ fn normalize_code_span(b: &[u8]) -> String {
 /// Try to consume a single-`$` inline math span. Boundary rule: opening `$`
 /// must not be followed by whitespace; closing `$` must not be preceded by
 /// whitespace.
-fn try_inline_math(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+fn try_inline_math(bytes: &[u8], i: usize) -> InlineMathScan {
     debug_assert_eq!(bytes[i], b'$');
     // Reject `$$` (block math) and dollar runs of 2+.
     if bytes.get(i + 1) == Some(&b'$') {
-        return None;
+        return InlineMathScan::NoMatch;
     }
-    let next = *bytes.get(i + 1)?;
+    let Some(next) = bytes.get(i + 1).copied() else {
+        return InlineMathScan::NoMatch;
+    };
     if next == b' ' || next == b'\t' || next == b'\n' {
-        return None;
+        return InlineMathScan::NoMatch;
     }
     // Scan for a closing `$` not preceded by whitespace, not preceded by
-    // backslash escape.
+    // backslash escape. If this valid-looking opener reaches EOF without a
+    // close, no later opener in the same suffix can succeed either: the close
+    // predicate depends only on the candidate `$`, not on the opener. Tell the
+    // tokenizer to stop rescanning that suffix so hostile `$x ` repeats stay
+    // linear instead of O(number_of_$ × input_len).
     let mut k = i + 1;
     while k < bytes.len() {
         let c = bytes[k];
@@ -613,12 +639,26 @@ fn try_inline_math(bytes: &[u8], i: usize) -> Option<(String, usize)> {
                 k += 1;
                 continue;
             }
-            let content = std::str::from_utf8(&bytes[i + 1..k]).ok()?.to_string();
-            return Some((content, k + 1));
+            let Some(content) = std::str::from_utf8(&bytes[i + 1..k])
+                .ok()
+                .map(str::to_string)
+            else {
+                return InlineMathScan::NoMatch;
+            };
+            return InlineMathScan::Matched {
+                content,
+                end: k + 1,
+            };
         }
         k += 1;
     }
-    None
+    InlineMathScan::NoCloserInSuffix
+}
+
+enum InlineMathScan {
+    Matched { content: String, end: usize },
+    NoMatch,
+    NoCloserInSuffix,
 }
 
 // ---------------------------------------------------------------------------

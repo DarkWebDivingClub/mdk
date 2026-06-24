@@ -3,6 +3,7 @@
 //! The parser crate owns the real AST. These records/enums keep the generated
 //! Swift/Kotlin surface stable and host-friendly.
 
+use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
@@ -11,10 +12,14 @@ use marmot_markdown::{
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
+const MAX_FFI_MARKDOWN_INPUT_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MarkdownDocumentFfi {
     pub blocks: Vec<MarkdownBlockFfi>,
+    /// True when the input exceeded the FFI Markdown safety cap and `blocks`
+    /// were parsed from a UTF-8-boundary prefix.
+    pub truncated: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -154,7 +159,33 @@ pub enum MarkdownNostrHrpFfi {
 }
 
 pub(crate) fn parse_markdown_document(text: &str) -> MarkdownDocumentFfi {
-    marmot_markdown::parse(text).into()
+    let input = markdown_input_within_ffi_limit(text);
+    let mut document: MarkdownDocumentFfi = marmot_markdown::parse(input.text).into();
+    document.truncated = input.truncated;
+    document
+}
+
+struct LimitedMarkdownInput<'a> {
+    text: &'a str,
+    truncated: bool,
+}
+
+fn markdown_input_within_ffi_limit(text: &str) -> LimitedMarkdownInput<'_> {
+    if text.len() <= MAX_FFI_MARKDOWN_INPUT_BYTES {
+        return LimitedMarkdownInput {
+            text,
+            truncated: false,
+        };
+    }
+
+    let mut end = MAX_FFI_MARKDOWN_INPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    LimitedMarkdownInput {
+        text: &text[..end],
+        truncated: true,
+    }
 }
 
 impl From<&MdDocument> for MarkdownDocumentFfi {
@@ -165,6 +196,7 @@ impl From<&MdDocument> for MarkdownDocumentFfi {
                 .iter()
                 .map(|block| markdown_block_from_md(block, 0))
                 .collect(),
+            truncated: false,
         }
     }
 }
@@ -408,6 +440,37 @@ mod tests {
     #[test]
     fn parses_empty_document() {
         assert_eq!(parse_markdown_document(""), MarkdownDocumentFfi::default());
+    }
+
+    #[test]
+    fn caps_markdown_input_at_plaintext_frame_limit() {
+        let input = "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16);
+        let capped = markdown_input_within_ffi_limit(&input);
+
+        assert_eq!(capped.text.len(), MAX_FFI_MARKDOWN_INPUT_BYTES);
+        assert!(capped.truncated);
+    }
+
+    #[test]
+    fn markdown_input_cap_preserves_utf8_boundary() {
+        let input = format!("{}🦫", "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+        let capped = markdown_input_within_ffi_limit(&input);
+
+        assert_eq!(capped.text, "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+        assert!(capped.truncated);
+    }
+
+    #[test]
+    fn parse_markdown_document_applies_input_cap() {
+        let document = parse_markdown_document(&"a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16));
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            &inlines[0],
+            MarkdownInlineFfi::Text { content } if content.len() == MAX_FFI_MARKDOWN_INPUT_BYTES
+        ));
+        assert!(document.truncated);
     }
 
     #[test]
