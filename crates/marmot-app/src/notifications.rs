@@ -168,9 +168,9 @@ pub struct NotificationUpdate {
     pub group_name: Option<String>,
     pub is_dm: bool,
     /// True when this notification's receiving account is mentioned by a NIP-27
-    /// pubkey-reference (`p`) tag or inline `nostr:` pubkey entity on the inbound
-    /// app event. This is computed from event semantics, not the rendered
-    /// preview text.
+    /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
+    /// `@npub1…` handle or an explicit `nostr:` URI) on the inbound app event.
+    /// This is computed from event semantics, not the rendered preview text.
     pub is_mention: bool,
     pub message_id_hex: Option<String>,
     pub sender: NotificationUser,
@@ -793,8 +793,9 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 /// Pure mention predicate over a timeline message's raw fields. A message
 /// mentions `account_id_hex` when it is a kind-9 chat that either carries a
 /// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
-/// `nostr:` pubkey entity referencing it. Shared with the chat-list unread
-/// projection so the @-badge reuses the exact notification classification.
+/// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
+/// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
+/// reuses the exact notification classification.
 pub(crate) fn message_text_mentions_account(
     kind: u64,
     plaintext: &str,

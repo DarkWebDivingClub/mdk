@@ -356,13 +356,20 @@ fn mention_classification_uses_inline_nip27_entities() {
     let npub = crate::npub_for_account_id(&receiver).unwrap();
     let nprofile = crate::nprofile_for_account_id(&receiver, &[]).unwrap();
 
-    for token in [receiver.as_str(), npub.as_str(), nprofile.as_str()] {
+    // NIP-27 `nostr:` URIs carry bech32 entities (npub/nprofile), which the
+    // markdown tokenizer renders as mentions.
+    for token in [npub.as_str(), nprofile.as_str()] {
         let message = received_chat(&format!("hi nostr:{token}"), Vec::new());
         assert!(
             message_mentions_account(&message, &receiver),
             "mention token form failed: {token}"
         );
     }
+
+    // `nostr:<raw-hex>` is not a NIP-21 URI, so the tokenizer leaves it as
+    // literal text and it is not classified as a mention (darkmatter#617).
+    let raw_hex = received_chat(&format!("hi nostr:{receiver}"), Vec::new());
+    assert!(!message_mentions_account(&raw_hex, &receiver));
 }
 
 #[test]
@@ -430,6 +437,25 @@ fn message_text_mentions_account_matches_message_mentions_account() {
         &[vec!["p".to_owned(), other]],
         &receiver,
     ));
+}
+
+#[test]
+fn mention_classification_covers_bare_npub_mention() {
+    // The form clients actually emit is the bare `@npub1…` handle (no
+    // `nostr:` scheme and no `p`-tag). It must still classify as a mention so
+    // `is_mention` / unread-mention surfaces fire. Regression for
+    // darkmatter#617.
+    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&receiver).unwrap();
+
+    let message = received_chat(&format!("hey @{npub} ping"), Vec::new());
+    assert!(message_mentions_account(&message, &receiver));
+
+    // A bare `@npub1…` for a different account is not a mention of `receiver`.
+    let other = nostr::Keys::generate().public_key().to_hex();
+    let other_npub = crate::npub_for_account_id(&other).unwrap();
+    let other_message = received_chat(&format!("hey @{other_npub} ping"), Vec::new());
+    assert!(!message_mentions_account(&other_message, &receiver));
 }
 
 #[test]

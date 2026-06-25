@@ -2593,6 +2593,7 @@ dependencies = [
  "hkdf",
  "marmot-account",
  "marmot-forensics",
+ "marmot-markdown",
  "nostr",
  "nostr-relay-builder",
  "nostr-sdk",

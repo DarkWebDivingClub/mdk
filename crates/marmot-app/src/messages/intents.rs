@@ -34,31 +34,88 @@ pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
     parse_account_id_hex(token).ok()
 }
 
-/// Extract pubkey mentions from inline NIP-27 `nostr:` entities in message
-/// content. Event/coordinate references and unparseable tokens are ignored.
+/// Extract pubkey mentions from inline nostr entities in message content.
+///
+/// Derived from the `marmot-markdown` tokenizer's mention/URI tokens, which
+/// recognize **both** bare `@npub1…` handles (`Inline::NostrMention`) and
+/// explicit `nostr:<hrp>1…` URIs (`Inline::NostrUri`) — the same display
+/// surface a client renders as a mention. Scanning the raw `"nostr:"`
+/// substring missed bare `@npub1…` mentions (the form clients actually emit),
+/// so those never got a `p`-tag on send or classified on receive
+/// (darkmatter#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
+/// unparseable tokens are ignored.
 pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
-    content
-        .match_indices("nostr:")
-        .filter_map(|(idx, _)| {
-            let rest = &content[idx + "nostr:".len()..];
-            let end = rest
-                .find(|c: char| !c.is_ascii_alphanumeric())
-                .unwrap_or(rest.len());
-            let token = &rest[..end];
-            if token.is_empty() {
-                None
-            } else {
-                mention_pubkey_hex(token)
-            }
-        })
-        .collect()
+    let mut hexes = Vec::new();
+    for block in &marmot_markdown::parse(content).blocks {
+        collect_block_mention_hexes(block, &mut hexes);
+    }
+    hexes
 }
 
-/// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline `nostr:` mentions in
-/// message content. Each distinct mentioned pubkey gets one tag (in first-seen
-/// order); event references and unparseable tokens are ignored. This is how a
-/// Marmot client makes a mention discoverable (a p-tag alongside the inline
-/// `nostr:` reference), per NIP-27.
+fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<String>) {
+    use marmot_markdown::Block;
+    match block {
+        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+            collect_inline_mention_hexes(inlines, out);
+        }
+        Block::BlockQuote { blocks } => {
+            for block in blocks {
+                collect_block_mention_hexes(block, out);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for block in &item.blocks {
+                    collect_block_mention_hexes(block, out);
+                }
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_inline_mention_hexes(&cell.inlines, out);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_inline_mention_hexes(&cell.inlines, out);
+                }
+            }
+        }
+        // Code blocks, math blocks, and thematic breaks carry no inline
+        // mentions.
+        Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
+    }
+}
+
+fn collect_inline_mention_hexes(inlines: &[marmot_markdown::Inline], out: &mut Vec<String>) {
+    use marmot_markdown::Inline;
+    for inline in inlines {
+        match inline {
+            Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
+                if let Some(hex) = mention_pubkey_hex(&entity.bech32) {
+                    out.push(hex);
+                }
+            }
+            Inline::Emph(children)
+            | Inline::Strong(children)
+            | Inline::Strikethrough(children)
+            | Inline::Link { children, .. } => collect_inline_mention_hexes(children, out),
+            Inline::Image { alt, .. } => collect_inline_mention_hexes(alt, out),
+            Inline::Text(_)
+            | Inline::SoftBreak
+            | Inline::HardBreak
+            | Inline::Code(_)
+            | Inline::Autolink { .. }
+            | Inline::Math(_) => {}
+        }
+    }
+}
+
+/// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline nostr mentions in
+/// message content (both bare `@npub1…` handles and explicit `nostr:<hrp>1…`
+/// URIs). Each distinct mentioned pubkey gets one tag (in first-seen order);
+/// event references and unparseable tokens are ignored. This is how a Marmot
+/// client makes a mention discoverable (a p-tag alongside the inline
+/// reference), per NIP-27.
 fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     let mut seen = std::collections::HashSet::new();
     let mut tags = Vec::new();
@@ -544,11 +601,13 @@ mod mention_tests {
     }
 
     #[test]
-    fn mention_p_tags_handles_npub_nprofile_and_hex() {
+    fn mention_p_tags_handles_nostr_uri_npub_and_nprofile() {
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
         let nprofile = nprofile_for_account_id(&hex, &[]).unwrap();
-        for token in [npub.as_str(), nprofile.as_str(), hex.as_str()] {
+        // NIP-27 `nostr:` URIs carry bech32 entities (npub/nprofile), which the
+        // markdown tokenizer renders as mentions.
+        for token in [npub.as_str(), nprofile.as_str()] {
             let content = format!("hey nostr:{token} how are you?");
             assert_eq!(
                 mention_p_tags(&content),
@@ -559,14 +618,36 @@ mod mention_tests {
     }
 
     #[test]
+    fn mention_p_tags_ignores_nostr_uri_with_raw_hex() {
+        // `nostr:<raw-hex>` is not a NIP-21 URI (those carry bech32 entities,
+        // never raw hex), so the markdown tokenizer leaves it as literal text
+        // and never renders it as a mention. p-tag derivation tracks that
+        // display surface, so it yields no p-tag (darkmatter#617).
+        let hex = valid_pubkey_hex();
+        assert!(mention_p_tags(&format!("hey nostr:{hex} how are you?")).is_empty());
+    }
+
+    #[test]
     fn mention_p_tags_dedups_same_pubkey_and_ignores_plain_text() {
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
-        // Same pubkey referenced twice (npub then hex) collapses to one p-tag.
-        let content = format!("ping nostr:{npub} ... and again nostr:{hex}");
+        // Same pubkey referenced twice (bare `@npub1…` then `nostr:npub1…`)
+        // collapses to one p-tag.
+        let content = format!("ping @{npub} ... and again nostr:{npub}");
         assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
         assert!(mention_p_tags("plain text, no mentions here").is_empty());
         assert!(mention_p_tags("a dangling nostr: with no token").is_empty());
+    }
+
+    #[test]
+    fn mention_p_tags_covers_bare_npub_mention() {
+        // Clients insert mentions as the bare `@npub1…` form (no `nostr:`),
+        // which the markdown tokenizer renders as a mention. That form must
+        // still get its NIP-27 `p`-tag on send. Regression for darkmatter#617.
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let content = format!("hey @{npub} how are you?");
+        assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
     }
 
     #[test]
