@@ -12,11 +12,43 @@ use crate::openmls_projection::{
     apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
     project_mls_message, retain_current_group_epoch_snapshot,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use marmot_forensics::{AuditConvergenceContext, AuditEventContext, ConvergencePhase};
+use sha2::{Digest, Sha256};
+
+/// Process-wide monotonic counter making each convergence run id unique even
+/// when two runs share a group and tip epoch.
+static CONVERGENCE_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Opaque, stable-per-run convergence run id. Salted hash so it never embeds the
+/// plaintext group id (mirrors the fork-recovery snapshot-name precedent).
+fn convergence_run_id(group_id: &GroupId, current_tip_epoch: u64) -> String {
+    let seq = CONVERGENCE_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(b"cgka-engine-convergence-run/v1");
+    hasher.update(group_id.as_slice());
+    hasher.update(current_tip_epoch.to_be_bytes());
+    hasher.update(seq.to_be_bytes());
+    format!("conv-{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+/// Build an audit context carrying the convergence run id and lifecycle phase.
+fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventContext {
+    AuditEventContext {
+        convergence: Some(AuditConvergenceContext {
+            run_id: run_id.to_string(),
+            phase: Some(phase),
+            inferred: None,
+        }),
+        ..AuditEventContext::default()
+    }
+}
 
 /// Admin pubkeys, avatar component bytes, and message retention snapshotted on
 /// either side of a convergence apply, for unattributed group-state-change diffs.
@@ -159,12 +191,22 @@ impl<S: StorageProvider> Engine<S> {
         // (spec/protocol-core/group-state.md:50-51,65). Report the halt and
         // leave canonical state untouched.
         if self.epoch_manager.is_unrecoverable(group_id) {
-            return Ok(unrecoverable_result(
-                self.epoch_manager
-                    .epoch(group_id)
-                    .map(|e| e.0)
-                    .unwrap_or_default(),
-            ));
+            let epoch = self
+                .epoch_manager
+                .epoch(group_id)
+                .map(|e| e.0)
+                .unwrap_or_default();
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Unrecoverable,
+                    current_tip_epoch: Some(epoch),
+                    retained_anchor_horizon: None,
+                    reason: Some("already_unrecoverable".to_string()),
+                    error_kind: None,
+                },
+            );
+            return Ok(unrecoverable_result(epoch));
         }
 
         let previous_group = self
@@ -203,6 +245,19 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let max_rewind_commits = policy.convergence.max_rewind_commits;
+        let run_id = convergence_run_id(group_id, previous_tip.0);
+        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
+        self.audit_group_with_context(
+            group_id,
+            convergence_run_context(&run_id, ConvergencePhase::Started),
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase: ConvergencePhase::Started,
+                current_tip_epoch: Some(previous_tip.0),
+                retained_anchor_horizon: Some(retained_anchor_epoch),
+                reason: None,
+                error_kind: None,
+            },
+        );
         let result = canonicalize_stored_openmls_messages(
             &self.storage,
             group_id,
@@ -211,27 +266,43 @@ impl<S: StorageProvider> Engine<S> {
             policy,
             now_ms,
         )?;
-        self.audit_group(
+        let error_kinds: Vec<String> = result
+            .errors
+            .iter()
+            .map(|error| canonicalization_error_tag(*error).to_string())
+            .collect();
+        self.audit_group_with_context(
             group_id,
-            marmot_forensics::AuditEventKind::ConvergenceDecision {
-                current_tip_epoch: previous_tip.0,
-                candidate_count: result.candidate_count,
-                eligible_count: result.eligible_count,
+            convergence_run_context(&run_id, ConvergencePhase::Evaluating),
+            crate::audit_helpers::convergence_decision_event(
+                previous_tip.0,
                 max_rewind_commits,
-                selected_branch_id: result.selected_branch_id.clone(),
-                selected_fork_epoch: result.selected_fork_epoch,
-                selected_tip_epoch: result.selected_tip,
-                error_kinds: result
-                    .errors
-                    .iter()
-                    .map(|error| canonicalization_error_tag(*error).to_string())
-                    .collect(),
-            },
+                result.selection_trace.as_ref(),
+                error_kinds.clone(),
+                full_data,
+            ),
         );
         if matches!(
             result.convergence_status,
             ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
         ) {
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Waiting),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Waiting,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: Some(
+                        match result.convergence_status {
+                            ConvergenceStatus::Resolving => "resolving",
+                            _ => "syncing",
+                        }
+                        .to_string(),
+                    ),
+                    error_kind: None,
+                },
+            );
             return Ok(result);
         }
 
@@ -263,9 +334,31 @@ impl<S: StorageProvider> Engine<S> {
             self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
                 group_id: group_id.clone(),
             });
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Unrecoverable),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Unrecoverable,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: None,
+                    error_kind: Some("missing_retained_anchor".to_string()),
+                },
+            );
             return Ok(result);
         }
         if result.convergence_status == ConvergenceStatus::Blocked {
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Blocked),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Blocked,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: Some("blocked".to_string()),
+                    error_kind: None,
+                },
+            );
             return Ok(result);
         }
 
@@ -315,6 +408,26 @@ impl<S: StorageProvider> Engine<S> {
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rolled_back_commits(group_id, &result)?;
+
+        // A selected branch reached the canonical state (Settled): the run is
+        // applied/stable. With no selected branch the pass simply settled with
+        // nothing to apply.
+        let applied_phase = if result.selected_tip.is_some() {
+            ConvergencePhase::Applied
+        } else {
+            ConvergencePhase::Stable
+        };
+        self.audit_group_with_context(
+            group_id,
+            convergence_run_context(&run_id, applied_phase),
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase: applied_phase,
+                current_tip_epoch: result.selected_tip.or(Some(previous_tip.0)),
+                retained_anchor_horizon: Some(retained_anchor_epoch),
+                reason: None,
+                error_kind: None,
+            },
+        );
 
         self.remember_canonicalization_result_messages(&result);
         Ok(result)
@@ -666,6 +779,7 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        selection_trace: None,
     }
 }
 

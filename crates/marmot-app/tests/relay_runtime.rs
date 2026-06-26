@@ -12,11 +12,11 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditLogSettings,
-    AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
-    MarmotAppRuntime, MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest,
-    MediaUploadRequest, MissingRelayListKind, NotificationWakeSource, PushPlatform,
-    RuntimeMessageUpdate, SignOutOptions, TimelineMessageQuery, TimelinePagination,
+    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditDataMode,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
+    MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
+    PushPlatform, RuntimeMessageUpdate, SignOutOptions, TimelineMessageQuery, TimelinePagination,
     UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
@@ -1099,8 +1099,11 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
 async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -1182,8 +1185,11 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
 async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -1248,8 +1254,11 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let bob_id = home.account("bob").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
     let mut bob_setup = app.client("bob").await.unwrap();
     bob_setup.publish_key_package().await.unwrap();
     drop(bob_setup);
@@ -1305,8 +1314,11 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
 async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -4917,6 +4929,85 @@ async fn app_runtime_sign_out_rejects_unknown_account() {
             .await
             .is_err()
     );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
+    // Requirement #4: switching the audit data mode on a running account
+    // rotates the live recorder so each file carries a single mode with a clear
+    // `audit_data_mode_changed` boundary.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    // Start in the default obfuscated posture, recording enabled.
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup).await.unwrap();
+
+    // The live worker is recording in obfuscated mode.
+    let before = app.audit_log_files().unwrap();
+    let alice_before = before
+        .iter()
+        .find(|file| file.account_ref == alice.account.label)
+        .expect("alice has a live audit file");
+    let obfuscated_body = std::fs::read_to_string(&alice_before.path).unwrap();
+    assert!(
+        obfuscated_body
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .all(|event| event["audit_data_mode"] == "obfuscated_sensitive_data"),
+        "every pre-toggle line is obfuscated"
+    );
+
+    // Toggle to full_data while recording stays on.
+    let stored = runtime
+        .set_audit_log_settings(AuditLogSettings {
+            enabled: true,
+            data_mode: AuditDataMode::FullData,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored.data_mode, AuditDataMode::FullData);
+
+    // The rotated file is entirely full_data and carries the boundary row.
+    let after = app.audit_log_files().unwrap();
+    let alice_after = after
+        .iter()
+        .find(|file| file.account_ref == alice.account.label)
+        .expect("alice still has a live audit file");
+    let events = std::fs::read_to_string(&alice_after.path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| event["audit_data_mode"] == "full_data"),
+        "the rotated file must be entirely full_data"
+    );
+    let boundary = events
+        .iter()
+        .find(|event| event["kind"]["type"] == "audit_data_mode_changed")
+        .expect("a mode-change boundary row is written on the fresh file");
+    assert_eq!(
+        boundary["kind"]["previous_mode"],
+        "obfuscated_sensitive_data"
+    );
+    assert_eq!(boundary["kind"]["new_mode"], "full_data");
+    assert_eq!(boundary["kind"]["recorder_restarted"], true);
 
     runtime.shutdown().await;
 }

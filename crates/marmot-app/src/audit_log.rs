@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::MemberId;
 use marmot_account::AccountSummary;
+use marmot_forensics::AuditDataMode;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,11 @@ pub struct AuditLogDeleteOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AuditLogSettings {
     pub enabled: bool,
+    /// Forensic audit data mode. Defaults to the safe
+    /// [`AuditDataMode::ObfuscatedSensitiveData`] posture; `full_data` is an
+    /// explicit opt-in. Changing this on a live account rotates the recorder so
+    /// each file has one mode (see [`MarmotAppRuntime::set_audit_log_settings`]).
+    pub data_mode: AuditDataMode,
 }
 
 /// One always-on key-reveal audit record (darkmatter#543). Privacy-safe: it
@@ -370,13 +376,48 @@ impl MarmotApp {
         // live-recorder match fail, so a delete would remove the visible file
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
-        let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
-        match marmot_forensics::JsonlRecorder::open_with_account_ref(
+        // Version the filename so a client that already has a pre-v2
+        // `audit-<engine_id>.jsonl` file keeps it untouched and we start a fresh
+        // v2 file rather than appending v2 lines onto a v1 file. We never read,
+        // migrate, or rewrite old v1 files — they are simply left in place (and
+        // remain deletable via `delete_audit_log_file`). The `audit-*.jsonl`
+        // glob still enumerates both.
+        let audit_path = account_dir.join(format!("audit-{engine_id_hex}-v2.jsonl"));
+        // Open in the persisted data mode so a recorder restored at session
+        // open already reflects the user's choice. A read failure falls back to
+        // the safe obfuscated default rather than blocking audit logging.
+        let data_mode = self
+            .audit_log_settings()
+            .map(|settings| settings.data_mode)
+            .unwrap_or_default();
+        match marmot_forensics::JsonlRecorder::open_with_data_mode(
             &audit_path,
             engine_id_hex,
             Some(account_ref_hex),
+            data_mode,
         ) {
-            Ok(recorder) => Some(Box::new(recorder)),
+            Ok(recorder) => {
+                // Emit a source_context row identifying the producing account.
+                // `account_label` is a safe opaque display string in both modes;
+                // the cleartext account pubkey is full-data only. Device /
+                // platform / app-version are supplied later via the upload
+                // tracker config and travel as upload headers.
+                use marmot_forensics::ForensicRecorder as _;
+                let account_pubkey_hex = (data_mode == marmot_forensics::AuditDataMode::FullData
+                    && account_id.as_slice().len() == 32)
+                    .then(|| hex::encode(account_id.as_slice()));
+                recorder.record(marmot_forensics::AuditRecord::new(
+                    None,
+                    marmot_forensics::AuditEventKind::SourceContext {
+                        source: marmot_forensics::AuditSourceContext {
+                            account_label: Some(label.to_string()),
+                            account_pubkey_hex,
+                            ..Default::default()
+                        },
+                    },
+                ));
+                Some(Box::new(recorder))
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "marmot_app",
@@ -646,16 +687,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
-        assert_eq!(
-            app.audit_log_settings().unwrap(),
-            AuditLogSettings::default()
-        );
+        let default = app.audit_log_settings().unwrap();
+        assert_eq!(default, AuditLogSettings::default());
+        // The default posture is the safe obfuscated mode.
+        assert_eq!(default.data_mode, AuditDataMode::ObfuscatedSensitiveData);
 
-        let stored = app
-            .set_audit_log_settings(AuditLogSettings { enabled: true })
-            .unwrap();
-
-        assert_eq!(stored, AuditLogSettings { enabled: true });
+        // Both the switch and the data mode persist through shared storage.
+        let settings = AuditLogSettings {
+            enabled: true,
+            data_mode: AuditDataMode::FullData,
+        };
+        let stored = app.set_audit_log_settings(settings.clone()).unwrap();
+        assert_eq!(stored, settings);
 
         let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         assert_eq!(reopened.audit_log_settings().unwrap(), stored);
@@ -740,6 +783,61 @@ mod tests {
                     .unwrap()
                     .as_path()
             )
+        );
+    }
+
+    #[test]
+    fn audit_recorder_writes_a_new_v2_file_and_leaves_v1_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        // Open the live recorder; the backing file is a versioned v2 file.
+        let recorder = app.build_audit_recorder("alice", true);
+        let v2_path = recorder
+            .audit_log_path()
+            .expect("file-backed recorder when enabled");
+        let v2_name = v2_path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            v2_name.ends_with("-v2.jsonl"),
+            "v2 recorder must use a versioned filename, got {v2_name}"
+        );
+
+        // A pre-v2 file at the legacy (unversioned) path for the same engine is
+        // a different file and is never read, migrated, or appended to.
+        let v1_path = v2_path.with_file_name(v2_name.replace("-v2.jsonl", ".jsonl"));
+        assert_ne!(v1_path, v2_path);
+        std::fs::write(
+            &v1_path,
+            b"{\"schema_version\":\"marmot-forensics-audit/v1\"}\n",
+        )
+        .unwrap();
+
+        // Reopening the v2 recorder appends only to the v2 file; the v1 file's
+        // bytes are left exactly as they were.
+        let reopened = app.build_audit_recorder("alice", true);
+        assert_eq!(
+            reopened.audit_log_path().as_deref(),
+            Some(v2_path.as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&v1_path).unwrap(),
+            "{\"schema_version\":\"marmot-forensics-audit/v1\"}\n"
+        );
+
+        // Both files coexist and are enumerable via the `audit-*.jsonl` glob.
+        let listed: Vec<String> = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .map(|file| file.file_name)
+            .collect();
+        assert!(listed.iter().any(|name| name == &v2_name));
+        assert!(
+            listed
+                .iter()
+                .any(|name| name == &v1_path.file_name().unwrap().to_string_lossy())
         );
     }
 

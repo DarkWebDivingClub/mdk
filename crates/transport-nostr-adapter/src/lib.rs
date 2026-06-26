@@ -20,13 +20,39 @@ use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
     TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportWireMetadata,
 };
 use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinSet;
-use transport_nostr_peeler::{NOSTR_SOURCE, NostrTransportEvent};
+use transport_nostr_peeler::{KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrTransportEvent};
+
+/// Build forensic wire metadata for an inbound relay event. The
+/// `transport_group_id` is read from the peeler-mapped envelope (the canonical
+/// `h`-tag extraction) rather than re-parsing tags here.
+fn inbound_wire_metadata(
+    event: &NostrTransportEvent,
+    envelope: &TransportEnvelope,
+) -> TransportWireMetadata {
+    let transport_group_id = match envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => {
+            Some(hex::encode(transport_group_id))
+        }
+        TransportEnvelope::Welcome { .. } => None,
+    };
+    let is_gift_wrap = event.kind == KIND_NIP59_GIFT_WRAP;
+    TransportWireMetadata {
+        wire_id: Some(event.id.clone()),
+        wire_kind: Some(event.kind),
+        wire_pubkey_hex: Some(event.pubkey.clone()),
+        transport_group_id,
+        // For a NIP-59 gift wrap the carrying event id is the gift-wrap id; the
+        // interior rumor (welcome) id is only known after peeling, so it is not
+        // surfaced on this inbound carrier.
+        gift_wrap_event_id: is_gift_wrap.then(|| event.id.clone()),
+    }
+}
 
 mod key_package;
 mod relay_list;
@@ -379,6 +405,7 @@ impl NostrTransportAdapter {
                         plane: route.plane,
                         endpoint: Some(relay_event.endpoint.clone()),
                         subscription_id: relay_event.subscription_id.clone(),
+                        wire: Some(inbound_wire_metadata(&relay_event.event, &message.envelope)),
                     },
                 })
                 .await
@@ -659,6 +686,9 @@ impl NostrTransportAdapter {
                             plane: route.plane,
                             endpoint: Some(endpoint.clone()),
                             subscription_id: Some("local-publish".to_owned()),
+                            // Local echo of our own publish: no inbound relay
+                            // wire event to attribute.
+                            wire: None,
                         },
                     })
                     .await

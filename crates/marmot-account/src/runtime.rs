@@ -14,12 +14,14 @@ use cgka_traits::engine::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EpochId, GroupId, Timestamp, TransportAccountActivation, TransportAdapter, TransportDelivery,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
-use marmot_forensics::{AuditEventContext, AuditEventKind, PublishRelayFailure};
+use marmot_forensics::{
+    AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
+};
 
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::{KeyPackagePublication, KeyPackagePublisher, NoopKeyPackagePublisher};
@@ -505,6 +507,18 @@ where
     ) -> AccountResult<PublishStatus> {
         let message_id = message.id.clone();
         let msg_id_hex = hex::encode(message_id.as_slice());
+        // Capture the outbound wire envelope before `message` is moved into the
+        // publish request. The post-wrap relay event id / ephemeral pubkey are
+        // produced inside the transport adapter and are not available here, so
+        // only the transport source and transport group id are recorded.
+        let wire = publish_wire_metadata(&message);
+        // A welcome is unambiguously a welcome; a group message could be a
+        // commit/proposal/app message, which is not distinguishable from the
+        // transport envelope alone, so it is left unattributed here.
+        let artifact_kind = match &message.envelope {
+            TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
+            TransportEnvelope::GroupMessage { .. } => None,
+        };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
         let target = match self.routing.publish_target(&message) {
@@ -515,10 +529,15 @@ where
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
                         msg_id: msg_id_hex,
+                        artifact_kind,
                         stage: "routing".into(),
                         target_kind: "unknown".into(),
+                        relay_url: None,
                         relay_urls: Vec::new(),
+                        required_acks: None,
                         reason: e.to_string(),
+                        detail: None,
+                        transport: Some(wire),
                     },
                 );
                 output.failures.push(PublishFailure {
@@ -537,9 +556,12 @@ where
             Some(publish_context.clone()),
             AuditEventKind::PublishAttempt {
                 msg_id: msg_id_hex.clone(),
+                artifact_kind,
                 target_kind: target_kind.clone(),
+                relay_url: None,
                 relay_urls: relay_urls.clone(),
                 required_acks: required_acks as u64,
+                transport: Some(wire.clone()),
             },
         );
         let report = match self
@@ -559,10 +581,15 @@ where
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
                         msg_id: msg_id_hex,
+                        artifact_kind,
                         stage: "adapter".into(),
                         target_kind,
+                        relay_url: None,
                         relay_urls,
+                        required_acks: Some(required_acks as u64),
                         reason: e.to_string(),
+                        detail: None,
+                        transport: Some(wire),
                     },
                 );
                 output.failures.push(PublishFailure {
@@ -579,7 +606,9 @@ where
             Some(publish_context.clone()),
             AuditEventKind::PublishOutcome {
                 msg_id: hex::encode(report.message_id.as_slice()),
+                artifact_kind,
                 target_kind: target_kind.clone(),
+                relay_url: None,
                 accepted_relay_urls: report
                     .accepted
                     .iter()
@@ -595,6 +624,7 @@ where
                     .collect(),
                 required_acks: report.required_acks as u64,
                 met_required_acks: published,
+                transport: Some(wire.clone()),
             },
         );
         if !published {
@@ -603,10 +633,15 @@ where
                 Some(publish_context),
                 AuditEventKind::PublishFailure {
                     msg_id: hex::encode(report.message_id.as_slice()),
+                    artifact_kind,
                     stage: "required_acks".into(),
                     target_kind,
+                    relay_url: None,
                     relay_urls,
+                    required_acks: Some(report.required_acks as u64),
                     reason: "insufficient publish acknowledgements".into(),
+                    detail: None,
+                    transport: Some(wire),
                 },
             );
             output.failures.push(PublishFailure {
@@ -619,6 +654,25 @@ where
             met_required_acks: published,
             accepted_by_any_endpoint,
         })
+    }
+}
+
+/// Build the outbound transport wire envelope for a publish, from the message's
+/// transport source and (for group messages) the transport-visible group id.
+/// Transport-generic: the post-wrap relay event id and ephemeral pubkey are
+/// produced inside the transport adapter and are intentionally not recorded
+/// here.
+fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
+    let transport_group_id = match &message.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => {
+            Some(hex::encode(transport_group_id))
+        }
+        TransportEnvelope::Welcome { .. } => None,
+    };
+    AuditTransportWire {
+        transport: Some(message.source.0.clone()),
+        transport_group_id,
+        ..Default::default()
     }
 }
 

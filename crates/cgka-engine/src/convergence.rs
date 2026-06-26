@@ -137,6 +137,207 @@ fn compare_scores(a: &BranchScore, b: &BranchScore) -> Ordering {
         .then_with(|| b.tip_digest.cmp(&a.tip_digest))
 }
 
+/// Stable string for a tip's commit-ordering priority, for audit traces.
+pub fn tip_priority_str(priority: CommitOrderingPriority) -> &'static str {
+    match priority {
+        CommitOrderingPriority::Ordinary => "ordinary",
+        CommitOrderingPriority::Privileged => "privileged",
+    }
+}
+
+/// Per-candidate evaluation captured during selection, for forensic audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateEvaluation {
+    pub branch_id: String,
+    pub fork_epoch: u64,
+    pub tip_epoch: u64,
+    pub tip_priority: CommitOrderingPriority,
+    pub tip_committer: Vec<u8>,
+    pub tip_digest: [u8; 32],
+    pub app_witnesses: Vec<AppWitness>,
+    pub eligible: bool,
+    pub rejection_reasons: Vec<String>,
+    pub score: BranchScore,
+}
+
+/// One selector-rule comparison between the winner and the runner-up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleEvaluation {
+    pub rule_name: &'static str,
+    pub winner_branch_id: String,
+    pub other_branch_id: String,
+    pub winner_value: String,
+    pub other_value: String,
+    pub decisive: bool,
+}
+
+/// The full audit trace of a branch-selection decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchSelectionTrace {
+    pub selected_branch_id: Option<String>,
+    pub candidates: Vec<CandidateEvaluation>,
+    pub rule_trace: Vec<RuleEvaluation>,
+    pub losing_branch_ids: Vec<String>,
+}
+
+/// Select the canonical branch and capture an audit trace: per-candidate scores
+/// and eligibility, the ordered rule-by-rule comparison between the winner and
+/// the runner-up (marking the decisive rule), and the losing branches. The
+/// selection itself is identical to [`select_canonical_branch`].
+pub fn select_canonical_branch_traced(
+    current_tip_epoch: u64,
+    candidates: &[BranchCandidate],
+    policy: &ConvergencePolicy,
+) -> BranchSelectionTrace {
+    // Order the trace by branch id so it is a pure function of the candidate
+    // *set*: distributed convergence must be input-order independent, and the
+    // trace is part of `CanonicalizationResult` equality. Branch ids are unique.
+    let mut ordered: Vec<&BranchCandidate> = candidates.iter().collect();
+    ordered.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let evaluations: Vec<CandidateEvaluation> = ordered
+        .iter()
+        .map(|candidate| {
+            let eligible = is_branch_eligible(current_tip_epoch, candidate, policy);
+            let mut rejection_reasons = Vec::new();
+            if !eligible {
+                rejection_reasons.push("beyond_rewind_horizon".to_string());
+            }
+            // Canonicalize witness order by (epoch, sender) so the trace stays a
+            // pure function of the candidate set, independent of message arrival
+            // order. The score already aggregates witnesses order-independently.
+            let mut app_witnesses = candidate.app_witnesses.clone();
+            app_witnesses
+                .sort_by(|a, b| a.epoch.cmp(&b.epoch).then_with(|| a.sender.cmp(&b.sender)));
+            CandidateEvaluation {
+                branch_id: candidate.id.clone(),
+                fork_epoch: candidate.fork_epoch,
+                tip_epoch: candidate.tip_epoch,
+                tip_priority: candidate.tip_priority,
+                tip_committer: candidate.tip_committer.clone(),
+                tip_digest: candidate.tip_digest,
+                app_witnesses,
+                eligible,
+                rejection_reasons,
+                score: candidate.score(policy),
+            }
+        })
+        .collect();
+
+    let selected = select_canonical_branch(current_tip_epoch, candidates, policy);
+    let selected_branch_id = selected.map(|branch| branch.id.clone());
+
+    let mut rule_trace = Vec::new();
+    if let Some(winner) = selected {
+        // Runner-up = the best eligible candidate other than the winner, drawn
+        // from the branch-id-ordered set so it is deterministic. The decisive
+        // rule is the first one where the winner's score differs.
+        let runner_up = ordered
+            .iter()
+            .copied()
+            .filter(|candidate| is_branch_eligible(current_tip_epoch, candidate, policy))
+            .filter(|candidate| candidate.id != winner.id)
+            .max_by(|a, b| compare_scores(&a.score(policy), &b.score(policy)));
+        if let Some(other) = runner_up {
+            rule_trace = build_rule_trace(
+                &winner.score(policy),
+                &other.score(policy),
+                &winner.id,
+                &other.id,
+            );
+        }
+    }
+
+    let losing_branch_ids = evaluations
+        .iter()
+        .filter(|evaluation| Some(&evaluation.branch_id) != selected_branch_id.as_ref())
+        .map(|evaluation| evaluation.branch_id.clone())
+        .collect();
+
+    BranchSelectionTrace {
+        selected_branch_id,
+        candidates: evaluations,
+        rule_trace,
+        losing_branch_ids,
+    }
+}
+
+/// Walk the `compare_scores` rules in order between the winner and runner-up,
+/// recording each rule's values and marking the first differentiator decisive.
+/// The orderings mirror `compare_scores` exactly (the last three rules favour
+/// the lexicographically smaller value, hence `other.cmp(winner)`).
+fn build_rule_trace(
+    winner: &BranchScore,
+    other: &BranchScore,
+    winner_id: &str,
+    other_id: &str,
+) -> Vec<RuleEvaluation> {
+    let entries: [(&'static str, Ordering, String, String); 7] = [
+        (
+            "effective_commit_depth",
+            winner
+                .effective_commit_depth
+                .cmp(&other.effective_commit_depth),
+            winner.effective_commit_depth.to_string(),
+            other.effective_commit_depth.to_string(),
+        ),
+        (
+            "witness_quorum_met",
+            winner.witness_quorum_met.cmp(&other.witness_quorum_met),
+            winner.witness_quorum_met.to_string(),
+            other.witness_quorum_met.to_string(),
+        ),
+        (
+            "valid_commit_depth",
+            winner.valid_commit_depth.cmp(&other.valid_commit_depth),
+            winner.valid_commit_depth.to_string(),
+            other.valid_commit_depth.to_string(),
+        ),
+        (
+            "app_witness_score",
+            winner.app_witness_score.cmp(&other.app_witness_score),
+            winner.app_witness_score.to_string(),
+            other.app_witness_score.to_string(),
+        ),
+        (
+            "tip_priority",
+            other.tip_priority.cmp(&winner.tip_priority),
+            tip_priority_str(winner.tip_priority).to_string(),
+            tip_priority_str(other.tip_priority).to_string(),
+        ),
+        (
+            "tip_committer",
+            other.tip_committer.cmp(&winner.tip_committer),
+            hex::encode(&winner.tip_committer),
+            hex::encode(&other.tip_committer),
+        ),
+        (
+            "tip_digest",
+            other.tip_digest.cmp(&winner.tip_digest),
+            hex::encode(winner.tip_digest),
+            hex::encode(other.tip_digest),
+        ),
+    ];
+    let mut decided = false;
+    entries
+        .into_iter()
+        .map(|(rule_name, ordering, winner_value, other_value)| {
+            let decisive = !decided && ordering != Ordering::Equal;
+            if decisive {
+                decided = true;
+            }
+            RuleEvaluation {
+                rule_name,
+                winner_branch_id: winner_id.to_string(),
+                other_branch_id: other_id.to_string(),
+                winner_value,
+                other_value,
+                decisive,
+            }
+        })
+        .collect()
+}
+
 fn witness_depth_boost(branch: &BranchCandidate, policy: &ConvergencePolicy) -> u64 {
     if witness_quorum_met(&branch.app_witnesses, policy) {
         policy.max_witness_override_depth

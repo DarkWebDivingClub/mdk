@@ -38,7 +38,17 @@ pub struct StoredRelayTelemetrySettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAuditLogSettings {
     pub enabled: bool,
+    /// Audit data-mode token, stored as the forensics enum's serde string
+    /// (`obfuscated_sensitive_data` | `full_data`). Kept as an opaque string at
+    /// this layer so storage does not depend on the forensics crate; the app
+    /// layer parses it. Unknown/legacy values map back to the safe default.
+    pub data_mode: String,
 }
+
+/// Canonical default audit data-mode token (the safe, obfuscated posture).
+/// Mirrors `marmot_forensics::AuditDataMode::ObfuscatedSensitiveData`'s serde
+/// string without taking a dependency on that crate.
+pub const AUDIT_DATA_MODE_DEFAULT: &str = "obfuscated_sensitive_data";
 
 impl SqliteSharedStorage {
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
@@ -120,6 +130,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 		CREATE TABLE IF NOT EXISTS audit_log_settings (
 		    id INTEGER PRIMARY KEY CHECK (id = 1),
 		    enabled INTEGER NOT NULL DEFAULT 0,
+		    data_mode TEXT NOT NULL DEFAULT 'obfuscated_sensitive_data',
 		    updated_at_ms INTEGER NOT NULL
 		);
 		CREATE TABLE IF NOT EXISTS telemetry_install (
@@ -131,9 +142,40 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         )
         .storage()?;
         Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
+        Self::ensure_audit_log_data_mode_column(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Additively add the `data_mode` column to a pre-existing
+    /// `audit_log_settings` table created before audit v2 (the table is created
+    /// with `CREATE TABLE IF NOT EXISTS`, so older databases keep the v1 shape
+    /// until this runs). New databases already have the column from the create
+    /// statement above; this is a no-op for them.
+    fn ensure_audit_log_data_mode_column(conn: &rusqlite::Connection) -> StorageResult<()> {
+        let has_column = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(audit_log_settings)")
+                .storage()?;
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+                .iter()
+                .any(|column| column == "data_mode")
+        };
+        if !has_column {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE audit_log_settings \
+                     ADD COLUMN data_mode TEXT NOT NULL DEFAULT '{AUDIT_DATA_MODE_DEFAULT}'"
+                ),
+                [],
+            )
+            .storage()?;
+        }
+        Ok(())
     }
 
     pub fn put_public_directory_user(
@@ -335,13 +377,14 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         self.ensure_audit_log_settings()?;
         self.lock()
             .query_row(
-                "SELECT enabled
+                "SELECT enabled, data_mode
                  FROM audit_log_settings
                  WHERE id = 1",
                 [],
                 |row| {
                     Ok(StoredAuditLogSettings {
                         enabled: row.get::<_, i64>(0)? != 0,
+                        data_mode: row.get::<_, String>(1)?,
                     })
                 },
             )
@@ -352,13 +395,18 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         self.lock()
             .execute(
                 "INSERT INTO audit_log_settings (
-                    id, enabled, updated_at_ms
+                    id, enabled, data_mode, updated_at_ms
                  )
-                 VALUES (1, ?1, ?2)
+                 VALUES (1, ?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
                     enabled = excluded.enabled,
+                    data_mode = excluded.data_mode,
                     updated_at_ms = excluded.updated_at_ms",
-                params![bool_i64(settings.enabled), unix_now_ms()],
+                params![
+                    bool_i64(settings.enabled),
+                    settings.data_mode,
+                    unix_now_ms()
+                ],
             )
             .storage()?;
         Ok(())
@@ -558,12 +606,60 @@ mod tests {
 
         assert_eq!(
             storage.audit_log_settings().unwrap(),
-            StoredAuditLogSettings { enabled: false }
+            StoredAuditLogSettings {
+                enabled: false,
+                data_mode: AUDIT_DATA_MODE_DEFAULT.to_owned(),
+            }
         );
 
-        let updated = StoredAuditLogSettings { enabled: true };
+        let updated = StoredAuditLogSettings {
+            enabled: true,
+            data_mode: "full_data".to_owned(),
+        };
         storage.set_audit_log_settings(&updated).unwrap();
 
         assert_eq!(storage.audit_log_settings().unwrap(), updated);
+    }
+
+    #[test]
+    fn audit_log_settings_data_mode_column_is_added_to_legacy_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+
+        // Simulate a pre-v2 database: an `audit_log_settings` table without the
+        // `data_mode` column, with audit logging already enabled.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO audit_log_settings (id, enabled, updated_at_ms)
+                 VALUES (1, 1, 0);",
+            )
+            .unwrap();
+        }
+
+        // Opening the shared storage migrates the column in additively and the
+        // pre-existing row keeps its enabled flag while defaulting the mode.
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        assert_eq!(
+            storage.audit_log_settings().unwrap(),
+            StoredAuditLogSettings {
+                enabled: true,
+                data_mode: AUDIT_DATA_MODE_DEFAULT.to_owned(),
+            }
+        );
+
+        // The migrated column round-trips a new value.
+        storage
+            .set_audit_log_settings(&StoredAuditLogSettings {
+                enabled: true,
+                data_mode: "full_data".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(storage.audit_log_settings().unwrap().data_mode, "full_data");
     }
 }

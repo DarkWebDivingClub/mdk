@@ -216,6 +216,7 @@ fn snapshot_transport_adapter_boundary_types() {
                 plane: TransportDeliveryPlane::Group,
                 endpoint: Some(TransportEndpoint("wss://group.example".into())),
                 subscription_id: Some("sub-1".into()),
+                wire: None,
             },
         }
     );

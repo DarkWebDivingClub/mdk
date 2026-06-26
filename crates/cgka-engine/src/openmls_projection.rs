@@ -636,6 +636,7 @@ fn missing_retained_anchor_result(
         queued_outbound_intents: outbound_intents,
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        selection_trace: None,
     }
 }
 

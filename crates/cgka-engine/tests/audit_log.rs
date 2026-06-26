@@ -21,7 +21,8 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{MemberId, MessageId};
 use marmot_forensics::{
-    AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, JsonlRecorder,
+    AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditTransportContext,
+    AuditTransportWire, JsonlRecorder,
 };
 use storage_sqlite::SqliteAccountStorage;
 
@@ -311,4 +312,95 @@ async fn engine_without_recorder_is_silent_and_does_not_crash() {
             reason: StaleReason::NotForThisClient
         }
     ));
+}
+
+#[tokio::test]
+async fn audit_log_records_transport_received_before_ingest_entry() {
+    // Requirement #8: when the transport layer supplies a wire envelope, the
+    // engine records a `transport_received` row carrying it before `ingest_entry`
+    // for the same message.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-wire".to_string()).unwrap();
+
+    let identity = valid_identity(b"self");
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(identity)
+        .account_identity_proof_signer(proof_signer(b"self"))
+        .peeler(Box::new(StubPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .expect("build engine with recorder");
+
+    let foreign = MemberId::new(vec![0x44; 32]);
+    let msg = synthetic_welcome_for(foreign, 0xbb);
+    let wire = AuditTransportWire {
+        transport: Some("nostr".into()),
+        delivery_plane: Some("account_inbox".into()),
+        wire_id: Some("a".repeat(64)),
+        wire_kind: Some("1059".into()),
+        wire_pubkey_hex: Some("b".repeat(64)),
+        relay_url: Some("wss://relay.example".into()),
+        subscription_id: Some("sub-xyz".into()),
+        nostr_event_id: Some("a".repeat(64)),
+        nostr_kind: Some(1059),
+        nostr_pubkey_hex: Some("b".repeat(64)),
+        gift_wrap_event_id: Some("a".repeat(64)),
+        ..Default::default()
+    };
+    let transport_context = AuditTransportContext {
+        transport_source: "nostr".into(),
+        delivery_plane: Some("account_inbox".into()),
+        relay_url: Some("wss://relay.example".into()),
+        subscription_id: Some("sub-xyz".into()),
+        wire: Some(wire),
+    };
+    engine
+        .ingest_with_audit_context(msg, Some(transport_context))
+        .await
+        .expect("ingest");
+    drop(engine);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .expect("read audit log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse audit event"))
+        .collect();
+
+    let received_idx = events
+        .iter()
+        .position(|e| matches!(e.kind, AuditEventKind::TransportReceived { .. }))
+        .expect("transport_received not recorded");
+    let entry_idx = events
+        .iter()
+        .position(|e| matches!(e.kind, AuditEventKind::IngestEntry { .. }))
+        .expect("ingest_entry not recorded");
+    assert!(
+        received_idx < entry_idx,
+        "transport_received must precede ingest_entry"
+    );
+
+    match &events[received_idx].kind {
+        AuditEventKind::TransportReceived {
+            msg_id,
+            transport,
+            payload_len,
+            payload_digest,
+        } => {
+            assert!(msg_id.is_some());
+            assert_eq!(transport.wire_kind.as_deref(), Some("1059"));
+            assert_eq!(transport.nostr_kind, Some(1059));
+            assert_eq!(
+                transport.nostr_event_id.as_deref(),
+                Some("a".repeat(64).as_str())
+            );
+            assert_eq!(
+                transport.gift_wrap_event_id.as_deref(),
+                Some("a".repeat(64).as_str())
+            );
+            assert_eq!(*payload_len, 4);
+            assert_eq!(payload_digest.len(), 64, "payload_digest is a SHA-256 hex");
+        }
+        _ => unreachable!(),
+    }
 }

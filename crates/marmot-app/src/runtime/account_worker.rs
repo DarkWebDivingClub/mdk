@@ -259,6 +259,11 @@ pub(crate) enum AccountWorkerCommand {
         enabled: bool,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    SetAuditDataMode {
+        mode: marmot_forensics::AuditDataMode,
+        reason: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
 }
 
 /// A command held back during the initial background catch-up, replayed in
@@ -1179,6 +1184,14 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::SetAuditRecording { enabled, respond } => {
             client.set_audit_recording(enabled);
+            let _ = respond.send(Ok(()));
+        }
+        AccountWorkerCommand::SetAuditDataMode {
+            mode,
+            reason,
+            respond,
+        } => {
+            client.set_audit_data_mode(mode, &reason);
             let _ = respond.send(Ok(()));
         }
     }

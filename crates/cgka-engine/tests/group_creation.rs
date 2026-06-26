@@ -965,3 +965,124 @@ async fn create_group_buffers_ingest_via_pending_state() {
     // We can't directly peek at EpochState from outside the crate; the
     // observable contract is that ingest buffers while PendingPublish is live.
 }
+
+#[tokio::test]
+async fn audit_log_records_welcome_recipient_expectation() {
+    // Requirement #9: a welcome targets only the added member, and the
+    // create_group outcome carries the welcome in its outbound inventory.
+    use marmot_forensics::{AuditEvent, AuditEventKind, MessageArtifactKind, RecipientScope};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder =
+        marmot_forensics::JsonlRecorder::open(&path, "test-engine-recip".to_string()).unwrap();
+
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .expect("build alice with recorder");
+    let mut bob = build_client(b"bob", FeatureRegistry::new());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (gid, result) = alice
+        .create_group_with_audit_context(
+            CreateGroupRequest {
+                name: "g".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            None,
+        )
+        .await
+        .expect("create group with bob");
+    match result {
+        SendResult::GroupCreated { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        _ => panic!("expected GroupCreated"),
+    }
+
+    // After create+confirm alice's projected roster includes bob, so an app
+    // message targets all OTHER current members (just bob).
+    let payload = app_payload_for(&alice, b"hello");
+    alice
+        .send_with_audit_context(
+            cgka_traits::engine::SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+            },
+            None,
+        )
+        .await
+        .expect("send app message");
+    drop(alice);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // The create_group outcome inventory holds exactly the welcome.
+    let outbound = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            AuditEventKind::CreateGroupOutcome {
+                outbound_messages, ..
+            } => Some(outbound_messages),
+            _ => None,
+        })
+        .expect("create_group_outcome recorded");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].artifact_kind, MessageArtifactKind::Welcome);
+
+    let expectations: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::RecipientExpectation { expectation, .. } => Some(expectation),
+            _ => None,
+        })
+        .collect();
+
+    // The welcome scopes to the added member only.
+    let welcome = expectations
+        .iter()
+        .find(|e| e.artifact_kind == MessageArtifactKind::Welcome)
+        .expect("welcome recipient_expectation recorded");
+    assert!(matches!(
+        welcome.recipient_scope,
+        RecipientScope::AddedMemberOnly
+    ));
+    assert_eq!(welcome.expected_count, Some(1));
+    assert_eq!(welcome.expected_member_refs.len(), 1);
+    assert_eq!(
+        welcome.expected_member_refs[0].len(),
+        32,
+        "member ref is 16-byte hex"
+    );
+
+    // The app message scopes to all OTHER current members (just bob).
+    let app_message = expectations
+        .iter()
+        .find(|e| e.artifact_kind == MessageArtifactKind::ApplicationMessage)
+        .expect("app message recipient_expectation recorded");
+    assert!(matches!(
+        app_message.recipient_scope,
+        RecipientScope::AllOtherCurrentGroupMembers
+    ));
+    assert_eq!(app_message.expected_count, Some(1));
+    assert_eq!(app_message.expected_member_refs.len(), 1);
+
+    // Obfuscated default posture: no full recipient pubkeys on any row.
+    assert!(
+        expectations
+            .iter()
+            .all(|e| e.expected_pubkeys_hex.is_empty())
+    );
+}

@@ -39,22 +39,22 @@ pub use markdown::{
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditLogDeleteResultFfi,
-    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogTrackerUpdateResultFfi,
-    AuditLogUploadResultFfi, AuditLogUploadSourceFfi, BackgroundNotificationCollectionFfi,
-    ChatListAvatarFfi, ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
-    ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
-    GroupSystemEventFfi, LocalPushRegistrationDebugFfi, MediaAttachmentReferenceFfi,
-    MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
-    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi, RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi,
-    RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
-    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
-    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
-    TimelineUserReactionFfi,
+    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditDataModeFfi,
+    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
+    AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
+    BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
+    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi,
+    GroupPushTokenDebugEntryFfi, GroupSystemEventFfi, LocalPushRegistrationDebugFfi,
+    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
+    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
+    MediaUploadResultFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
+    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
+    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
+    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
+    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

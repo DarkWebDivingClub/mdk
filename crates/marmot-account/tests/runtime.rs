@@ -1155,6 +1155,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
             plane: TransportDeliveryPlane::Group,
             endpoint: None,
             subscription_id: None,
+            wire: None,
         },
     };
 

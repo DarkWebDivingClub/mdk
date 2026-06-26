@@ -1,5 +1,6 @@
 use cgka_conformance_simulator::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
+    select_canonical_branch_traced,
 };
 use cgka_traits::CommitOrderingPriority;
 
@@ -299,4 +300,77 @@ fn committer_tiebreak_beats_digest_after_priority_tie() {
     let winner = select_canonical_branch(3, &candidates, &policy).expect("one branch should win");
 
     assert_eq!(winner.id, lower_committer_higher_digest.id);
+}
+
+#[test]
+fn traced_selection_records_decisive_rule_candidates_and_losers() {
+    let policy = ConvergencePolicy::default();
+    // Two eligible branches differing only in commit depth: the deeper branch
+    // wins, decided by the first rule (effective_commit_depth). A third branch
+    // forks too far back and is ineligible.
+    let deeper = BranchCandidate {
+        id: "deeper".into(),
+        fork_epoch: 4,
+        tip_epoch: 7,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: b"a".to_vec(),
+        tip_digest: digest(0x11),
+        app_witnesses: vec![],
+    };
+    let shallower = BranchCandidate {
+        id: "shallower".into(),
+        fork_epoch: 6,
+        tip_epoch: 7,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: b"a".to_vec(),
+        tip_digest: digest(0x22),
+        app_witnesses: vec![],
+    };
+    let too_old = BranchCandidate {
+        id: "too-old".into(),
+        fork_epoch: 0,
+        tip_epoch: 7,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: b"a".to_vec(),
+        tip_digest: digest(0x33),
+        app_witnesses: vec![],
+    };
+
+    let candidates = [deeper.clone(), shallower.clone(), too_old.clone()];
+    let trace = select_canonical_branch_traced(7, &candidates, &policy);
+
+    // The selection matches the untraced selector.
+    assert_eq!(
+        trace.selected_branch_id.as_deref(),
+        select_canonical_branch(7, &candidates, &policy).map(|b| b.id.as_str())
+    );
+    assert_eq!(trace.selected_branch_id.as_deref(), Some("deeper"));
+
+    // Every candidate is captured with eligibility; the far-back fork is out.
+    assert_eq!(trace.candidates.len(), 3);
+    let too_old_eval = trace
+        .candidates
+        .iter()
+        .find(|c| c.branch_id == "too-old")
+        .unwrap();
+    assert!(!too_old_eval.eligible);
+    assert!(
+        too_old_eval
+            .rejection_reasons
+            .contains(&"beyond_rewind_horizon".to_string())
+    );
+
+    // Losing branches exclude the winner.
+    assert!(trace.losing_branch_ids.contains(&"shallower".to_string()));
+    assert!(trace.losing_branch_ids.contains(&"too-old".to_string()));
+    assert!(!trace.losing_branch_ids.contains(&"deeper".to_string()));
+
+    // The rule trace records every rule and marks exactly the decisive one.
+    let decisive: Vec<_> = trace.rule_trace.iter().filter(|r| r.decisive).collect();
+    assert_eq!(decisive.len(), 1, "exactly one decisive rule");
+    assert_eq!(decisive[0].rule_name, "effective_commit_depth");
+    assert_eq!(decisive[0].winner_branch_id, "deeper");
+    assert_eq!(decisive[0].other_branch_id, "shallower");
+    // All seven comparison rules are present.
+    assert_eq!(trace.rule_trace.len(), 7);
 }

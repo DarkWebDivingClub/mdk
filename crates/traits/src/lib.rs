@@ -91,7 +91,7 @@ pub use transport_adapter::{
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,
 };
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;

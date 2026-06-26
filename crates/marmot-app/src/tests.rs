@@ -59,6 +59,7 @@ fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDel
             plane: cgka_traits::TransportDeliveryPlane::Group,
             endpoint: None,
             subscription_id: None,
+            wire: None,
         },
     }
 }

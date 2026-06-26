@@ -28,7 +28,7 @@ use cgka_traits::{
     SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditTransportContext, ForensicRecorder,
+    AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
@@ -591,6 +591,18 @@ impl AccountDeviceSession {
         self.engine.rotate_audit_recorder()
     }
 
+    /// Switch the live forensic recorder's audit data mode. A file-backed
+    /// recorder rotates on a real change so each file has one mode, writing an
+    /// `audit_data_mode_changed` boundary row. No-op when audit logging is off
+    /// or the mode is unchanged.
+    pub fn set_audit_data_mode(
+        &self,
+        mode: marmot_forensics::AuditDataMode,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        self.engine.set_audit_recorder_data_mode(mode, reason)
+    }
+
     /// Install or replace the forensic recorder on the live engine, e.g. when
     /// the audit-logging switch is toggled. Pass a `NoopRecorder` to stop
     /// recording; dropping the prior recorder flushes and closes any file it
@@ -688,11 +700,60 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
 }
 
 fn audit_transport_context(source: TransportDeliverySource) -> AuditTransportContext {
+    let TransportDeliverySource {
+        transport,
+        plane,
+        endpoint,
+        subscription_id,
+        wire,
+    } = source;
+    let transport_source = transport.0;
+    let delivery_plane = delivery_plane_label(plane).to_string();
+    let relay_url = endpoint.map(|endpoint| endpoint.0);
+    // The transport-layer wire identifiers are the same values Nostr surfaces as
+    // its event id/kind/pubkey, so mirror them into the `nostr_*` envelope
+    // fields for the only transport that exists today. Generic transports leave
+    // those unset.
+    let is_nostr = transport_source == "nostr";
+    let audit_wire = wire.map(|wire| {
+        let (nostr_event_id, nostr_kind, nostr_pubkey_hex) = if is_nostr {
+            (
+                wire.wire_id.clone(),
+                wire.wire_kind,
+                wire.wire_pubkey_hex.clone(),
+            )
+        } else {
+            (None, None, None)
+        };
+        AuditTransportWire {
+            transport: Some(transport_source.clone()),
+            delivery_plane: Some(delivery_plane.clone()),
+            wire_id: wire.wire_id,
+            // The audit envelope carries the wire kind as a string; the numeric
+            // Nostr kind stays on `nostr_kind`.
+            wire_kind: wire.wire_kind.map(|kind| kind.to_string()),
+            wire_pubkey_hex: wire.wire_pubkey_hex,
+            transport_group_id: wire.transport_group_id,
+            relay_url: relay_url.clone(),
+            subscription_id: subscription_id.clone(),
+            nostr_event_id,
+            nostr_kind,
+            nostr_pubkey_hex,
+            gift_wrap_event_id: wire.gift_wrap_event_id,
+            // Welcome rumor / key-package-tag ids are only known after peeling a
+            // gift wrap; the inbound carrier does not surface them here.
+            welcome_nostr_event_id: None,
+            welcome_rumor_event_id: None,
+            welcome_key_package_tag: None,
+            publish_result_id: None,
+        }
+    });
     AuditTransportContext {
-        transport_source: source.transport.0,
-        delivery_plane: Some(delivery_plane_label(source.plane).to_string()),
-        relay_url: source.endpoint.map(|endpoint| endpoint.0),
-        subscription_id: source.subscription_id,
+        transport_source,
+        delivery_plane: Some(delivery_plane),
+        relay_url,
+        subscription_id,
+        wire: audit_wire,
     }
 }
 

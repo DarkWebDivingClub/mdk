@@ -203,6 +203,25 @@ pub enum TransportDeliveryPlane {
     Ephemeral,
 }
 
+/// Transport wire identifiers for the event that carried a delivery, surfaced
+/// to forensic auditing. Diagnostic only, never consensus input. Optional and
+/// transport-generic: each field carries the wire-layer event metadata an
+/// adapter has (e.g. for Nostr: the event id, kind, ephemeral pubkey, and the
+/// `h`-tag transport group id). Never carries signatures, ciphertext, or keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportWireMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_kind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift_wrap_event_id: Option<String>,
+}
+
 /// Adapter-side delivery metadata. This is diagnostic/routing context, never
 /// consensus input.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +230,11 @@ pub struct TransportDeliverySource {
     pub plane: TransportDeliveryPlane,
     pub endpoint: Option<TransportEndpoint>,
     pub subscription_id: Option<String>,
+    /// Wire identifiers for the carrying event, for forensic audit only.
+    /// `None` for delivery paths with no inbound wire event (e.g. local
+    /// publish echo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<TransportWireMetadata>,
 }
 
 /// Account-scoped message delivered by a transport adapter.

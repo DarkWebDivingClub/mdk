@@ -432,6 +432,7 @@ impl<S: StorageProvider> Engine<S> {
         change: GroupStateChange,
         origin_commit_id: Option<MessageId>,
     ) {
+        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
         self.audit_group(
             group_id,
             crate::audit_helpers::group_state_changed_event(
@@ -439,6 +440,7 @@ impl<S: StorageProvider> Engine<S> {
                 actor.as_ref(),
                 &change,
                 origin_commit_id.as_ref(),
+                full_data,
             ),
         );
         self.events_buf.push_back(GroupEvent::GroupStateChanged {

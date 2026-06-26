@@ -175,6 +175,8 @@ impl<S: StorageProvider> Engine<S> {
                     &group_id,
                     marmot_forensics::AuditEventKind::PeelerOutcome {
                         msg_id: msg_id_hex.clone(),
+                        // Artifact kind is unknown until after the peel succeeds.
+                        artifact_kind: None,
                         outcome: raw_outcome,
                         fallback_snapshot_used: false,
                         fallback_snapshot_name: None,
@@ -206,6 +208,7 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
                                 msg_id: msg_id_hex.clone(),
+                                artifact_kind: None,
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
                                 fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
@@ -249,6 +252,7 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
                                 msg_id: msg_id_hex.clone(),
+                                artifact_kind: None,
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
                                 fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
@@ -601,6 +605,18 @@ impl<S: StorageProvider> Engine<S> {
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
+                    }
+                    // Full-data forensic mode: surface the decrypted app content
+                    // and authenticated author. Strictly gated — obfuscated mode
+                    // never decodes or logs plaintext/author identities.
+                    if self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData
+                        && let Some(decoded) = crate::audit_helpers::message_content_decoded_event(
+                            hex::encode(msg.id.as_slice()),
+                            &sender,
+                            &payload,
+                        )
+                    {
+                        self.audit_group(&group_id, decoded);
                     }
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),

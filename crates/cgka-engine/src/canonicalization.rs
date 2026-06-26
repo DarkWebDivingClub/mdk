@@ -7,7 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::convergence::{
-    AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
+    AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, is_branch_eligible,
+    select_canonical_branch, select_canonical_branch_traced,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
@@ -146,6 +147,10 @@ pub struct CanonicalizationResult {
     pub queued_outbound_intents: Vec<OutboundIntent>,
     pub publishable_outbound_messages: Vec<OutboundIntent>,
     pub errors: Vec<CanonicalizationError>,
+    /// Forensic audit trace of the branch-selection decision (per-candidate
+    /// scores, the rule-by-rule comparison, and the losing branches). `None`
+    /// when no selection was attempted (early-return result builders).
+    pub selection_trace: Option<BranchSelectionTrace>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -235,6 +240,11 @@ fn canonicalize_internal(
         &materialized_graph.candidates,
         &input.policy.convergence,
     );
+    let selection_trace = Some(select_canonical_branch_traced(
+        input.state.current_tip_epoch,
+        &materialized_graph.candidates,
+        &input.policy.convergence,
+    ));
     let candidate_count = materialized_graph.candidates.len();
     let eligible_count = materialized_graph
         .candidates
@@ -271,6 +281,7 @@ fn canonicalize_internal(
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        selection_trace,
     };
 
     if selected_branch_id.is_none() {

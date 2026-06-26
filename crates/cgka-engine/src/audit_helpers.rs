@@ -16,9 +16,18 @@ use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
-use marmot_forensics::{AuditEventKind, DigestHex, MemberRefHex, MessageRefHex};
+use marmot_forensics::{
+    AttachmentMetadata, AuditEventKind, ConvergenceAppWitness, ConvergenceCandidate,
+    ConvergenceRuleEvaluation, ConvergenceScore, DecodedApplicationEvent, DecodedPayload,
+    DigestHex, MemberRefHex, MembershipChangeSource, MessageArtifactKind, MessageAuthor,
+    MessageRefHex, OutboundMessage,
+};
 use sha2::{Digest, Sha256};
 
+use crate::convergence::{
+    AppWitness, BranchScore, BranchSelectionTrace, CandidateEvaluation, RuleEvaluation,
+    tip_priority_str,
+};
 use crate::epoch_manager::PendingKind;
 use openmls::prelude::Proposal;
 
@@ -100,13 +109,18 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
 }
 
 pub(crate) fn send_intent_group_ref(intent: &SendIntent) -> Option<String> {
+    Some(hex::encode(send_intent_group_id(intent).as_slice()))
+}
+
+/// The group a send intent targets. Every `SendIntent` variant is group-scoped.
+pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        | SendIntent::UpdateGroupData { group_id, .. } => group_id.clone(),
     }
 }
 
@@ -117,31 +131,6 @@ pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
         SendResult::GroupCreated { .. } => "group_created",
-    }
-}
-
-pub(crate) fn send_outbound_ids(
-    result: &SendResult,
-) -> (Option<MessageRefHex>, Vec<MessageRefHex>) {
-    match result {
-        SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
-            (Some(hex::encode(msg.id.as_slice())), Vec::new())
-        }
-        SendResult::GroupEvolution { msg, welcomes, .. } => (
-            Some(hex::encode(msg.id.as_slice())),
-            welcomes
-                .iter()
-                .map(|w| hex::encode(w.id.as_slice()))
-                .collect(),
-        ),
-        SendResult::GroupCreated { welcomes, .. } => (
-            None,
-            welcomes
-                .iter()
-                .map(|w| hex::encode(w.id.as_slice()))
-                .collect(),
-        ),
-        SendResult::Queued { .. } => (None, Vec::new()),
     }
 }
 
@@ -229,17 +218,24 @@ fn group_state_change_component_ids(change: &GroupStateChange) -> Vec<u16> {
     }
 }
 
-fn group_state_subject_member_ref(change: &GroupStateChange) -> Option<MemberRefHex> {
+fn group_state_subject_member(change: &GroupStateChange) -> Option<&MemberId> {
     match change {
         GroupStateChange::MemberAdded { member }
         | GroupStateChange::MemberRemoved { member }
         | GroupStateChange::MemberLeft { member }
         | GroupStateChange::AdminAdded { member }
-        | GroupStateChange::AdminRemoved { member } => Some(member_ref_hex(member)),
+        | GroupStateChange::AdminRemoved { member } => Some(member),
         GroupStateChange::GroupRenamed { .. }
         | GroupStateChange::GroupAvatarChanged
         | GroupStateChange::MessageRetentionChanged { .. } => None,
     }
+}
+
+/// Full member pubkey hex for `full_data` mode only. A `MemberId` in this engine
+/// is the 32-byte account identity; non-32-byte ids (test fixtures) are skipped
+/// so the output always matches the schema's pubkey pattern.
+fn member_pubkey_hex(member: &MemberId, full_data: bool) -> Option<String> {
+    (full_data && member.as_slice().len() == 32).then(|| hex::encode(member.as_slice()))
 }
 
 pub(crate) fn group_state_changed_event(
@@ -247,29 +243,59 @@ pub(crate) fn group_state_changed_event(
     actor: Option<&MemberId>,
     change: &GroupStateChange,
     origin_commit_id: Option<&MessageId>,
+    full_data: bool,
 ) -> AuditEventKind {
     let change_kind = group_state_change_kind_str(change);
-    let (value_digest, value_len) = match change {
-        GroupStateChange::GroupRenamed { name } => (
-            Some(value_digest_hex(change_kind, name.as_bytes())),
-            Some(name.len() as u64),
-        ),
-        GroupStateChange::MessageRetentionChanged { new_seconds, .. } => (
-            Some(value_digest_hex(change_kind, &new_seconds.to_be_bytes())),
-            Some(new_seconds.to_be_bytes().len() as u64),
-        ),
-        _ => (None, None),
+    // Always carry digest+len; the cleartext value (text/json) is full-data only.
+    let value = match change {
+        GroupStateChange::GroupRenamed { name } => Some(marmot_forensics::GroupStateValue {
+            digest: Some(value_digest_hex(change_kind, name.as_bytes())),
+            len: Some(name.len() as u64),
+            text: full_data.then(|| name.clone()),
+            json: None,
+            pubkeys_hex: Vec::new(),
+        }),
+        GroupStateChange::MessageRetentionChanged { new_seconds, .. } => {
+            Some(marmot_forensics::GroupStateValue {
+                digest: Some(value_digest_hex(change_kind, &new_seconds.to_be_bytes())),
+                len: Some(new_seconds.to_be_bytes().len() as u64),
+                text: None,
+                json: full_data.then(|| serde_json::json!(new_seconds)),
+                pubkeys_hex: Vec::new(),
+            })
+        }
+        _ => None,
+    };
+    let subject = group_state_subject_member(change);
+    // Attribute membership changes: a self-leave, an admin action (an actor is
+    // present), or — for a removal with no attributable actor — a
+    // convergence-resolved departure. Non-membership changes carry no source.
+    let membership_change_source = match change {
+        GroupStateChange::MemberLeft { .. } => Some(MembershipChangeSource::SelfLeave),
+        GroupStateChange::MemberRemoved { .. } => Some(if actor.is_some() {
+            MembershipChangeSource::AdminAction
+        } else {
+            MembershipChangeSource::Convergence
+        }),
+        GroupStateChange::MemberAdded { .. } => Some(if actor.is_some() {
+            MembershipChangeSource::AdminAction
+        } else {
+            MembershipChangeSource::RemoteCommit
+        }),
+        _ => None,
     };
     AuditEventKind::GroupStateChanged {
         epoch: epoch.0,
         change_kind: change_kind.to_string(),
+        membership_change_source,
         actor_member_ref: actor.map(member_ref_hex),
-        subject_member_ref: group_state_subject_member_ref(change),
+        actor_pubkey_hex: actor.and_then(|actor| member_pubkey_hex(actor, full_data)),
+        subject_member_ref: subject.map(member_ref_hex),
+        subject_pubkey_hex: subject.and_then(|subject| member_pubkey_hex(subject, full_data)),
         origin_commit_id: origin_commit_id.map(|id| hex::encode(id.as_slice())),
         fields: group_state_change_fields(change),
         component_ids: group_state_change_component_ids(change),
-        value_digest,
-        value_len,
+        value,
     }
 }
 
@@ -289,6 +315,100 @@ pub(crate) fn epoch_state_changed_event(
         pending_ref: pending_ref.map(PendingStateRef::as_u64),
         pending_kind: pending_kind.map(str::to_string),
     }
+}
+
+/// Build a `TransportReceived` event from an inbound transport message and the
+/// wire envelope captured by the transport layer. Emitted before `IngestEntry`
+/// so the wire identifiers are recorded ahead of engine ingest. The payload
+/// length and digest match `ingest_entry_event` for the same message.
+pub(crate) fn transport_received_event(
+    msg: &TransportMessage,
+    wire: marmot_forensics::AuditTransportWire,
+) -> AuditEventKind {
+    AuditEventKind::TransportReceived {
+        msg_id: Some(hex::encode(msg.id.as_slice())),
+        transport: wire,
+        payload_len: msg.payload.len() as u64,
+        payload_digest: hex::encode(Sha256::digest(&msg.payload)) as DigestHex,
+    }
+}
+
+/// Parse NIP-94-style `imeta` tags into attachment descriptors. Only non-secret
+/// metadata (mime, size, sha-256 digest, name) is captured — never bytes or keys.
+fn parse_imeta_attachments(tags: &[Vec<String>]) -> Vec<AttachmentMetadata> {
+    tags.iter()
+        .filter(|tag| tag.first().map(|name| name == "imeta").unwrap_or(false))
+        .map(|tag| {
+            let mut attachment = AttachmentMetadata::default();
+            for field in &tag[1..] {
+                let mut parts = field.splitn(2, ' ');
+                let (key, value) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                match key {
+                    "m" => attachment.content_type = Some(value.to_string()),
+                    "size" => attachment.byte_len = value.parse::<u64>().ok(),
+                    "name" => attachment.file_name = Some(value.to_string()),
+                    "x" if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                        attachment.digest = Some(value.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            attachment
+        })
+        .collect()
+}
+
+/// Build a `MessageContentDecoded` event from a decrypted application payload.
+///
+/// FULL-DATA ONLY: callers must gate this on
+/// [`marmot_forensics::AuditDataMode::FullData`]; it carries decrypted content
+/// and full author identities. Returns `None` when the payload is not a
+/// decodable Marmot app event.
+pub(crate) fn message_content_decoded_event(
+    msg_id_hex: MessageRefHex,
+    sender: &MemberId,
+    payload: &[u8],
+) -> Option<AuditEventKind> {
+    let event = cgka_traits::app_event::MarmotAppEvent::decode(payload).ok()?;
+    let raw = serde_json::json!({
+        "id": event.id,
+        "pubkey": event.pubkey,
+        "created_at": event.created_at,
+        "kind": event.kind,
+        "tags": event.tags,
+        "content": event.content,
+    });
+    let author = MessageAuthor {
+        member_ref: Some(member_ref_hex(sender)),
+        member_pubkey_hex: (sender.as_slice().len() == 32).then(|| hex::encode(sender.as_slice())),
+        account_pubkey_hex: (!event.pubkey.is_empty()).then(|| event.pubkey.clone()),
+        npub: None,
+    };
+    let decoded_app_event = DecodedApplicationEvent {
+        format: "marmot.app_event.v1".to_string(),
+        kind: Some(event.kind),
+        content: Some(event.content.clone()),
+        pubkey_hex: (!event.pubkey.is_empty()).then(|| event.pubkey.clone()),
+        tags: event.tags.clone(),
+        created_at_ms: Some(event.created_at.saturating_mul(1000)),
+        client_message_id: None,
+        reply_to_message_id: None,
+        thread_root_message_id: None,
+        attachments: parse_imeta_attachments(&event.tags),
+        raw: Some(raw.clone()),
+    };
+    Some(AuditEventKind::MessageContentDecoded {
+        msg_id: msg_id_hex,
+        artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
+        author,
+        decoded_payload: DecodedPayload {
+            content_type: "application/x-marmot-app-event+json".to_string(),
+            text: None,
+            json: Some(raw),
+            bytes_b64: None,
+        },
+        decoded_app_event: Some(decoded_app_event),
+    })
 }
 
 /// Build an `IngestEntry` event from an inbound transport message.
@@ -326,6 +446,7 @@ pub(crate) fn message_state_changed_event(
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
+        artifact_kind: None,
         previous_state: None,
         new_state: message_state_str(state).to_string(),
         epoch: None,
@@ -342,6 +463,7 @@ pub(crate) fn message_state_transition_event(
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
+        artifact_kind: None,
         previous_state: previous_state.map(message_state_str).map(str::to_string),
         new_state: message_state_str(state).to_string(),
         epoch: epoch.map(|epoch| epoch.0),
@@ -349,22 +471,62 @@ pub(crate) fn message_state_transition_event(
     }
 }
 
+/// Map a `SendResult` to its outbound message inventory (id + artifact kind).
+///
+/// Per-message recipient expectations are emitted as separate
+/// `recipient_expectation` rows (see `Engine::recipient_expectation_records`)
+/// because they need the engine's authenticated membership roster, which is not
+/// available from the `SendResult` alone.
+pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage> {
+    fn outbound(msg: &TransportMessage, artifact_kind: MessageArtifactKind) -> OutboundMessage {
+        OutboundMessage {
+            msg_id: hex::encode(msg.id.as_slice()),
+            artifact_kind,
+            transport: None,
+            recipient_expectation: None,
+        }
+    }
+    let mut messages = Vec::new();
+    match result {
+        SendResult::ApplicationMessage { msg } => {
+            messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
+        }
+        SendResult::Proposal { msg } => {
+            messages.push(outbound(msg, MessageArtifactKind::Proposal));
+        }
+        SendResult::GroupEvolution { msg, welcomes, .. } => {
+            messages.push(outbound(msg, MessageArtifactKind::Commit));
+            messages.extend(
+                welcomes
+                    .iter()
+                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+            );
+        }
+        SendResult::GroupCreated { welcomes, .. } => {
+            messages.extend(
+                welcomes
+                    .iter()
+                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+            );
+        }
+        SendResult::Queued { .. } => {}
+    }
+    messages
+}
+
 /// Build a `SendOutcome` event from a `SendResult`.
 pub(crate) fn send_outcome_event(intent_kind: String, result: &SendResult) -> AuditEventKind {
-    let (outbound_msg_id, outbound_welcome_msg_ids) = send_outbound_ids(result);
     AuditEventKind::SendOutcome {
         intent_kind,
         result_kind: send_result_kind_str(result).to_string(),
-        outbound_msg_id,
-        outbound_welcome_msg_ids,
+        outbound_messages: send_outbound_messages(result),
     }
 }
 
 pub(crate) fn create_group_outcome_event(result: &SendResult) -> AuditEventKind {
-    let (_outbound_msg_id, outbound_welcome_msg_ids) = send_outbound_ids(result);
     AuditEventKind::CreateGroupOutcome {
         result_kind: send_result_kind_str(result).to_string(),
-        outbound_welcome_msg_ids,
+        outbound_messages: send_outbound_messages(result),
     }
 }
 
@@ -417,6 +579,10 @@ pub(crate) fn epoch_confirmed_event(
         from_epoch: from_epoch.0,
         to_epoch: to_epoch.0,
         pending_kind: pending_kind.to_string(),
+        // The confirming commit's origin id is not threaded to this call site;
+        // the same commit is attributed on the accompanying group_state_changed
+        // row's origin_commit_id.
+        origin_commit_id: None,
     }
 }
 
@@ -430,5 +596,124 @@ pub(crate) fn epoch_rolled_back_event(
         pending_epoch: pending_epoch.0,
         restored_epoch: restored_epoch.0,
         pending_kind: pending_kind.to_string(),
+    }
+}
+
+/// Build a `ConvergenceDecision` audit event from a branch-selection trace.
+/// Full committer/witness pubkeys are included only in `full_data` mode; member
+/// refs (salted hashes) and digests are always emitted.
+pub(crate) fn convergence_decision_event(
+    current_tip_epoch: u64,
+    max_rewind_commits: u64,
+    trace: Option<&BranchSelectionTrace>,
+    error_kinds: Vec<String>,
+    full_data: bool,
+) -> AuditEventKind {
+    let Some(trace) = trace else {
+        return AuditEventKind::ConvergenceDecision {
+            current_tip_epoch,
+            max_rewind_commits,
+            candidates: Vec::new(),
+            rule_trace: Vec::new(),
+            selected_branch_id: None,
+            selected_fork_epoch: None,
+            selected_tip_epoch: None,
+            losing_branch_ids: Vec::new(),
+            error_kinds,
+        };
+    };
+    let selected = trace
+        .selected_branch_id
+        .as_ref()
+        .and_then(|id| trace.candidates.iter().find(|c| &c.branch_id == id));
+    AuditEventKind::ConvergenceDecision {
+        current_tip_epoch,
+        max_rewind_commits,
+        candidates: trace
+            .candidates
+            .iter()
+            .map(|candidate| convergence_candidate(candidate, full_data))
+            .collect(),
+        rule_trace: trace.rule_trace.iter().map(convergence_rule_eval).collect(),
+        selected_branch_id: trace.selected_branch_id.clone(),
+        selected_fork_epoch: selected.map(|c| c.fork_epoch),
+        selected_tip_epoch: selected.map(|c| c.tip_epoch),
+        losing_branch_ids: trace.losing_branch_ids.clone(),
+        error_kinds,
+    }
+}
+
+fn committer_ref(committer: &[u8]) -> Option<MemberRefHex> {
+    (!committer.is_empty()).then(|| member_ref_hex(&MemberId::new(committer.to_vec())))
+}
+
+fn committer_pubkey_hex(committer: &[u8], full_data: bool) -> Option<String> {
+    (full_data && committer.len() == 32).then(|| hex::encode(committer))
+}
+
+fn convergence_candidate(candidate: &CandidateEvaluation, full_data: bool) -> ConvergenceCandidate {
+    ConvergenceCandidate {
+        branch_id: candidate.branch_id.clone(),
+        fork_epoch: candidate.fork_epoch,
+        tip_epoch: candidate.tip_epoch,
+        commit_ids: Vec::new(),
+        commit_count: None,
+        // Per-candidate full MLS-state digest is intentionally not computed
+        // (materializing each branch's state is too costly for the hot path).
+        state_digest: None,
+        tip_digest: Some(hex::encode(candidate.tip_digest)),
+        tip_priority: Some(tip_priority_str(candidate.tip_priority).to_string()),
+        tip_committer_ref: committer_ref(&candidate.tip_committer),
+        tip_committer_pubkey_hex: committer_pubkey_hex(&candidate.tip_committer, full_data),
+        retained_anchor_status: None,
+        // Selector input timing is a per-run value carried on convergence_run_state,
+        // not duplicated per candidate.
+        last_input_time_ms: None,
+        eligible: Some(candidate.eligible),
+        rejection_reasons: candidate.rejection_reasons.clone(),
+        score: Some(convergence_score(&candidate.score, full_data)),
+        app_witnesses: candidate
+            .app_witnesses
+            .iter()
+            .map(|witness| convergence_app_witness(witness, full_data))
+            .collect(),
+    }
+}
+
+fn convergence_score(score: &BranchScore, full_data: bool) -> ConvergenceScore {
+    ConvergenceScore {
+        valid_commit_depth: Some(score.valid_commit_depth),
+        effective_commit_depth: Some(score.effective_commit_depth),
+        witness_quorum_met: Some(score.witness_quorum_met),
+        app_witness_score: Some(score.app_witness_score as u64),
+        tip_priority: Some(tip_priority_str(score.tip_priority).to_string()),
+        tip_committer_ref: committer_ref(&score.tip_committer),
+        tip_committer_pubkey_hex: committer_pubkey_hex(&score.tip_committer, full_data),
+        tip_digest: Some(hex::encode(score.tip_digest)),
+    }
+}
+
+fn convergence_app_witness(witness: &AppWitness, full_data: bool) -> ConvergenceAppWitness {
+    ConvergenceAppWitness {
+        epoch: witness.epoch,
+        sender_ref: committer_ref(&witness.sender),
+        sender_pubkey_hex: committer_pubkey_hex(&witness.sender, full_data),
+    }
+}
+
+fn convergence_rule_eval(rule: &RuleEvaluation) -> ConvergenceRuleEvaluation {
+    ConvergenceRuleEvaluation {
+        rule_name: rule.rule_name.to_string(),
+        scope: Some("candidate_pair".to_string()),
+        candidate_branch_id: Some(rule.winner_branch_id.clone()),
+        other_candidate_branch_id: Some(rule.other_branch_id.clone()),
+        inputs: None,
+        result: serde_json::json!({
+            "winner": rule.winner_value,
+            "other": rule.other_value,
+        }),
+        decisive: Some(rule.decisive),
+        selected_branch_id: rule.decisive.then(|| rule.winner_branch_id.clone()),
+        rejected_branch_id: rule.decisive.then(|| rule.other_branch_id.clone()),
     }
 }

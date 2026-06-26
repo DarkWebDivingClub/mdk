@@ -2189,8 +2189,14 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .ingest(route(commit, &group_id))
         .await
         .expect("commit is buffered by ingest");
+    // `carol` buffered these messages through `ingest`, which stamps the
+    // convergence input time with the engine's real monotonic clock
+    // (`convergence_now_ms`). Pass a logical `now_ms` far past the quiescence
+    // window (matching the other ingest-then-converge tests in this file) so the
+    // settle is deterministic: a small value like 2_000 races the real elapsed
+    // time under parallel load and only intermittently clears quiescence.
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("future app witness applies after selected commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -3705,5 +3711,205 @@ fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
     assert!(
         matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
         "expected InvalidPolicy, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn convergence_emits_run_state_and_decision_with_run_id_context() {
+    // Requirement #10: a convergence run emits a convergence_run_state(started)
+    // lifecycle row and a convergence_decision, correlated by a stable run_id on
+    // the convergence context.
+    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-conv".to_string()).unwrap();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage)
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "conv".into(),
+            description: "".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = create {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    alice
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("converge");
+    drop(alice);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let started = events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.kind,
+                AuditEventKind::ConvergenceRunState {
+                    phase: marmot_forensics::ConvergencePhase::Started,
+                    ..
+                }
+            )
+        })
+        .expect("convergence_run_state(started) recorded");
+    let decision = events
+        .iter()
+        .find(|e| matches!(e.kind, AuditEventKind::ConvergenceDecision { .. }))
+        .expect("convergence_decision recorded");
+
+    // Both rows carry the convergence run id, and it is the same run.
+    let run_id_of = |event: &AuditEvent| {
+        event
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.convergence.as_ref())
+            .map(|c| c.run_id.clone())
+    };
+    let started_run = run_id_of(started).expect("started carries a run_id");
+    let decision_run = run_id_of(decision).expect("decision carries a run_id");
+    assert_eq!(started_run, decision_run, "rows share one run_id");
+    assert!(started_run.starts_with("conv-"));
+}
+
+// --- Phase 6: full-data decoded message content (req #6, #7) -------------------
+
+async fn ingest_app_and_read_audit(
+    data_mode: marmot_forensics::AuditDataMode,
+    path: &std::path::Path,
+) -> Vec<marmot_forensics::AuditEvent> {
+    // Receiver (bob) records; sender (alice) does not need a recorder.
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_recorder = marmot_forensics::JsonlRecorder::open_with_data_mode(
+        path,
+        "bob-engine".into(),
+        None,
+        data_mode,
+    )
+    .unwrap();
+    let mut bob = EngineBuilder::new(bob_storage)
+        .identity(pad32(b"bob"))
+        .account_identity_proof_signer(proof_signer(b"bob"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(bob_recorder))
+        .build()
+        .unwrap();
+    let (mut alice, _alice_storage) = build_client(b"alice");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "decode".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let app_msg = send_app(&mut alice, &group_id, b"secret hello".to_vec()).await;
+    let outcome = bob.ingest(app_msg).await.expect("bob ingests app message");
+    assert!(matches!(outcome, IngestOutcome::Processed));
+    drop(bob);
+
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn full_data_ingest_logs_decoded_message_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let events = ingest_app_and_read_audit(marmot_forensics::AuditDataMode::FullData, &path).await;
+
+    let decoded = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            marmot_forensics::AuditEventKind::MessageContentDecoded {
+                author,
+                decoded_app_event,
+                ..
+            } => Some((author, decoded_app_event)),
+            _ => None,
+        })
+        .expect("full_data ingest records message_content_decoded");
+    let (author, decoded_app_event) = decoded;
+    // The decrypted content is present.
+    let app = decoded_app_event
+        .as_ref()
+        .expect("decoded app event present");
+    assert_eq!(app.content.as_deref(), Some("secret hello"));
+    // The authenticated author carries a full member pubkey in full-data mode.
+    assert!(author.member_ref.is_some());
+    assert!(
+        author.member_pubkey_hex.is_some(),
+        "full-data author has a full member pubkey"
+    );
+    // Every line is stamped full_data.
+    assert!(
+        events
+            .iter()
+            .all(|e| e.audit_data_mode == marmot_forensics::AuditDataMode::FullData)
+    );
+}
+
+#[tokio::test]
+async fn obfuscated_ingest_does_not_log_decoded_message_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let events = ingest_app_and_read_audit(
+        marmot_forensics::AuditDataMode::ObfuscatedSensitiveData,
+        &path,
+    )
+    .await;
+
+    // The message is still ingested (an ingest_outcome row exists)...
+    assert!(
+        events.iter().any(|e| matches!(
+            e.kind,
+            marmot_forensics::AuditEventKind::IngestOutcome { .. }
+        )),
+        "obfuscated ingest still records the ingest outcome"
+    );
+    // ...but decrypted content is never decoded or logged.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.kind,
+            marmot_forensics::AuditEventKind::MessageContentDecoded { .. }
+        )),
+        "obfuscated mode must not log decoded message content"
     );
 }
