@@ -42,7 +42,6 @@ struct CapturedAuditUpload {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
-    account_label: Option<String>,
     device_label: Option<String>,
     platform: Option<String>,
     app_version: Option<String>,
@@ -102,7 +101,6 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
         let path = parts.next().unwrap_or_default().to_owned();
         let authorization = header_value(&headers, "authorization");
         let content_type = header_value(&headers, "content-type");
-        let account_label = header_value(&headers, "x-goggles-account-label");
         let device_label = header_value(&headers, "x-goggles-device-label");
         let platform = header_value(&headers, "x-goggles-platform");
         let app_version = header_value(&headers, "x-goggles-app-version");
@@ -117,7 +115,6 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
             path,
             authorization,
             content_type,
-            account_label,
             device_label,
             platform,
             app_version,
@@ -655,7 +652,6 @@ async fn audit_log_binding_posts_tracker_update() {
         endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
         authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
         source: AuditLogUploadSourceFfi {
-            account_label: Some("Alice".to_owned()),
             device_label: Some("Alice iPhone".to_owned()),
             platform: Some("ios".to_owned()),
             app_version: Some("2026.6.8".to_owned()),
@@ -684,7 +680,6 @@ async fn audit_log_binding_posts_tracker_update() {
         captured.content_type.as_deref(),
         Some("application/x-ndjson")
     );
-    assert_eq!(captured.account_label.as_deref(), Some("Alice"));
     assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
     assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));

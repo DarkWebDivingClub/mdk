@@ -138,7 +138,6 @@ pub struct RelayTelemetryRuntimeConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuditLogUploadSource {
-    pub account_label: Option<String>,
     pub device_label: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
@@ -204,7 +203,6 @@ impl RelayTelemetryRuntimeConfig {
 
 impl AuditLogUploadSource {
     fn normalize(mut self) -> Self {
-        self.account_label = trim_optional(self.account_label);
         self.device_label = trim_optional(self.device_label);
         self.platform = trim_optional(self.platform);
         self.app_version = trim_optional(self.app_version);

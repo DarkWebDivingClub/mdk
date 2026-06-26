@@ -232,6 +232,55 @@ impl MarmotApp {
         Ok(settings)
     }
 
+    pub(crate) fn audit_log_tracker_config(&self) -> config::AuditLogTrackerConfig {
+        self.audit_log_tracker_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_audit_log_tracker_config(
+        &self,
+        config: config::AuditLogTrackerConfig,
+    ) -> Result<config::AuditLogTrackerConfig, AppError> {
+        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
+        *self
+            .audit_log_tracker_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
+        Ok(config)
+    }
+
+    fn audit_source_context_for_recorder(
+        &self,
+        label: &str,
+        account_id: &MemberId,
+        device_id_hex: &str,
+        data_mode: marmot_forensics::AuditDataMode,
+    ) -> marmot_forensics::AuditSourceContext {
+        let account_id_hex = hex::encode(account_id.as_slice());
+        let account_label = self
+            .display_name_for_account_id(&account_id_hex)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| label.to_owned());
+        let upload_source = self.audit_log_tracker_config().source;
+        let device_label = upload_source.device_label.clone();
+        let account_pubkey_hex = (data_mode == marmot_forensics::AuditDataMode::FullData
+            && account_id.as_slice().len() == 32)
+            .then(|| account_id_hex.clone());
+        marmot_forensics::AuditSourceContext {
+            account_label: Some(account_label),
+            device_label: device_label.clone(),
+            device_id: Some(device_id_hex.to_owned()),
+            device_name: device_label,
+            platform: upload_source.platform,
+            app_version: upload_source.app_version,
+            account_pubkey_hex,
+            ..Default::default()
+        }
+    }
+
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
         let mut files = Vec::new();
         for account in self.account_home().accounts()? {
@@ -315,9 +364,6 @@ impl MarmotApp {
         if let Some(token) = config.authorization_bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        if let Some(value) = config.source.account_label.as_deref() {
-            request = request.header("X-Goggles-Account-Label", value);
-        }
         if let Some(value) = config.source.device_label.as_deref() {
             request = request.header("X-Goggles-Device-Label", value);
         }
@@ -397,24 +443,18 @@ impl MarmotApp {
             data_mode,
         ) {
             Ok(recorder) => {
-                // Emit a source_context row identifying the producing account.
-                // `account_label` is a safe opaque display string in both modes;
-                // the cleartext account pubkey is full-data only. Device /
-                // platform / app-version are supplied later via the upload
-                // tracker config and travel as upload headers.
+                // Emit a source_context row identifying the producing account and
+                // the host-supplied device/client metadata from tracker config.
                 use marmot_forensics::ForensicRecorder as _;
-                let account_pubkey_hex = (data_mode == marmot_forensics::AuditDataMode::FullData
-                    && account_id.as_slice().len() == 32)
-                    .then(|| hex::encode(account_id.as_slice()));
+                let source = self.audit_source_context_for_recorder(
+                    label,
+                    account_id,
+                    &device_id_hex,
+                    data_mode,
+                );
                 recorder.record(marmot_forensics::AuditRecord::new(
                     None,
-                    marmot_forensics::AuditEventKind::SourceContext {
-                        source: marmot_forensics::AuditSourceContext {
-                            account_label: Some(label.to_string()),
-                            account_pubkey_hex,
-                            ..Default::default()
-                        },
-                    },
+                    marmot_forensics::AuditEventKind::SourceContext { source },
                 ));
                 Some(Box::new(recorder))
             }
@@ -633,7 +673,7 @@ mod tests {
 
     use marmot_account::AccountHome;
 
-    use crate::MarmotApp;
+    use crate::{AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp};
 
     #[test]
     fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
@@ -783,6 +823,47 @@ mod tests {
                     .unwrap()
                     .as_path()
             )
+        );
+    }
+
+    #[test]
+    fn audit_recorder_source_context_includes_tracker_config_and_account_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
+            source: AuditLogUploadSource {
+                device_label: Some("Jeff iPhone".to_owned()),
+                platform: Some("ios".to_owned()),
+                app_version: Some("2026.6.8".to_owned()),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+        let recorder = app.build_audit_recorder("alice", true);
+        let path = recorder
+            .audit_log_path()
+            .expect("file-backed recorder when enabled");
+        let contents = std::fs::read_to_string(path).unwrap();
+        let source_line = contents.lines().find_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).ok()?;
+            (event["kind"]["type"] == "source_context").then(|| line.to_owned())
+        });
+        let first_line = source_line.expect("source_context row");
+        let event: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(event["kind"]["type"], "source_context");
+        let source = &event["kind"]["source"];
+        assert_eq!(source["account_label"], "alice");
+        assert_eq!(source["device_label"], "Jeff iPhone");
+        assert_eq!(source["device_name"], "Jeff iPhone");
+        assert_eq!(source["platform"], "ios");
+        assert_eq!(source["app_version"], "2026.6.8");
+        assert!(
+            source["device_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
         );
     }
 

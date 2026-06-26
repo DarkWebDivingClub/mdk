@@ -196,7 +196,7 @@ impl Default for RuntimeSharedServices {
 impl RuntimeSharedServices {
     fn for_app(app: &MarmotApp) -> Self {
         let lifecycle = RuntimeLifecycle::new();
-        let audit_log_tracker_config = Arc::new(StdMutex::new(AuditLogTrackerConfig::default()));
+        let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
             audit_log_tracker_config.clone(),
@@ -284,13 +284,6 @@ impl RuntimeSharedServices {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-    }
-
-    fn set_audit_log_tracker_config(&self, config: AuditLogTrackerConfig) {
-        *self
-            .audit_log_tracker_config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
     fn stop_relay_telemetry_exporter(&self) {
@@ -1459,9 +1452,7 @@ impl MarmotAppRuntime {
         &self,
         config: AuditLogTrackerConfig,
     ) -> Result<AuditLogTrackerConfig, AppError> {
-        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
-        self.shared.set_audit_log_tracker_config(config.clone());
-        Ok(config)
+        self.accounts.app.set_audit_log_tracker_config(config)
     }
 
     pub async fn post_audit_log_tracker_update(

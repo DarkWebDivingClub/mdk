@@ -881,10 +881,13 @@ HTTP request:
 
 Optional source headers:
 
-- `X-Goggles-Account-Label`
 - `X-Goggles-Device-Label`
 - `X-Goggles-Platform`
 - `X-Goggles-App-Version`
+
+Account identity belongs in the uploaded JSONL file (`account_ref` on every row and a
+`source_context` row at recorder open with the human-readable account label). Do not send
+`X-Goggles-Account-Label`.
 
 `AuditLogUploadResult` fields:
 
@@ -905,7 +908,10 @@ Upload errors are normalized to safe messages such as `HTTP <status>`, `request 
 | --- | --- |
 | `endpoint` | Optional tracker endpoint override. If absent, the app can use the compiled/default endpoint. |
 | `authorization_bearer_token` | Bearer token supplied by the host app. |
-| `source` | Optional upload source labels. |
+| `source` | Optional upload client labels (`device_label`, `platform`, `app_version`). |
+
+At recorder open the app writes a `source_context` JSONL row with the account display label,
+stable `device_id`, and the same host-supplied client labels when tracker config is set.
 
 Compiled/default endpoint source:
 

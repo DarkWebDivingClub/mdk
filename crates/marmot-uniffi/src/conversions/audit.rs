@@ -129,7 +129,6 @@ impl From<AuditLogSettingsFfi> for AuditLogSettings {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogUploadSourceFfi {
-    pub account_label: Option<String>,
     pub device_label: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
@@ -138,7 +137,6 @@ pub struct AuditLogUploadSourceFfi {
 impl From<AuditLogUploadSourceFfi> for AuditLogUploadSource {
     fn from(value: AuditLogUploadSourceFfi) -> Self {
         Self {
-            account_label: value.account_label,
             device_label: value.device_label,
             platform: value.platform,
             app_version: value.app_version,
@@ -149,7 +147,6 @@ impl From<AuditLogUploadSourceFfi> for AuditLogUploadSource {
 impl From<AuditLogUploadSource> for AuditLogUploadSourceFfi {
     fn from(value: AuditLogUploadSource) -> Self {
         Self {
-            account_label: value.account_label,
             device_label: value.device_label,
             platform: value.platform,
             app_version: value.app_version,

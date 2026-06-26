@@ -264,6 +264,7 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
+    audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -767,6 +768,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
         }
     }
 
@@ -805,6 +807,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
         }
     }
 

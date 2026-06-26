@@ -1133,7 +1133,6 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
             authorization_bearer_token: Some("goggles_runtime_secret".to_owned()),
             source: AuditLogUploadSource {
-                account_label: Some("Alice".to_owned()),
                 device_label: Some("Alice iPhone".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
