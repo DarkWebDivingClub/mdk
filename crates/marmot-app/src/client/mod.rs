@@ -1948,9 +1948,16 @@ impl AppClient {
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
+        if effects.reports.is_empty() {
+            return;
+        }
+        // The publish path holds no parallel lookup set (unlike the inbound
+        // `next_event`/`sync_sdk_relay` hot path), so build one once for this
+        // small report batch and reuse the shared O(1) recorder for each id.
+        let mut seen: HashSet<String> = self.state.seen_events.iter().cloned().collect();
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
-            remember_seen_event(&mut self.state, event_id);
+            remember_seen_event(&mut seen, &mut self.state, event_id);
         }
     }
 }

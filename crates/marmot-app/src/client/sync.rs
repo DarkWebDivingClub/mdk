@@ -11,8 +11,8 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AppError, AppGroupAdminPolicyComponent, AppMessageProjection, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW,
-    refresh_seen_lookup_if_needed, remember_seen_event, unix_now_seconds,
+    SDK_FIRST_SYNC_WAIT, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event,
+    unix_now_seconds,
 };
 
 use super::AppClient;
@@ -183,9 +183,7 @@ impl AppClient {
             if seen.contains(&event_id) {
                 continue;
             }
-            seen.insert(event_id.clone());
-            remember_seen_event(&mut self.state, event_id);
-            refresh_seen_lookup_if_needed(&mut seen, &self.state);
+            remember_seen_event(&mut seen, &mut self.state, event_id);
 
             let mut summary = SyncSummary::default();
             self.ingest_delivery(delivery, &display_names, &mut summary)
@@ -239,9 +237,7 @@ impl AppClient {
             if seen.contains(&event_id) {
                 continue;
             }
-            seen.insert(event_id.clone());
-            remember_seen_event(&mut self.state, event_id);
-            refresh_seen_lookup_if_needed(&mut seen, &self.state);
+            remember_seen_event(&mut seen, &mut self.state, event_id);
             self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
         }

@@ -1042,23 +1042,49 @@ fn remembered_seen_events_are_bounded_in_memory() {
 
     for index in 0..(MAX_SEEN_EVENT_IDS + 2) {
         let event_id = format!("event-{index:05}");
-        seen.insert(event_id.clone());
-        remember_seen_event(&mut state, event_id);
-        refresh_seen_lookup_if_needed(&mut seen, &state);
+        remember_seen_event(&mut seen, &mut state, event_id);
     }
 
     assert_eq!(state.seen_events.len(), MAX_SEEN_EVENT_IDS);
+    // Pruning the oldest ids out of the ordered Vec must also drop them from
+    // the lookup set, so the two stay the same bounded size without rebuilding.
     assert_eq!(seen.len(), MAX_SEEN_EVENT_IDS);
     assert!(!seen.contains("event-00000"));
+    assert!(!seen.contains("event-00001"));
+    assert!(seen.contains("event-00002"));
     assert_eq!(
         state.seen_events.first().map(String::as_str),
         Some("event-00002")
     );
     let expected_last = format!("event-{:05}", MAX_SEEN_EVENT_IDS + 1);
+    assert!(seen.contains(expected_last.as_str()));
     assert_eq!(
         state.seen_events.last().map(String::as_str),
         Some(expected_last.as_str())
     );
+}
+
+#[test]
+fn remember_seen_event_deduplicates_via_lookup_set() {
+    let mut state = AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: Vec::new(),
+    };
+    let mut seen = HashSet::new();
+
+    remember_seen_event(&mut seen, &mut state, "dup".to_owned());
+    remember_seen_event(&mut seen, &mut state, "dup".to_owned());
+    remember_seen_event(&mut seen, &mut state, "other".to_owned());
+
+    assert_eq!(
+        state.seen_events,
+        vec!["dup".to_owned(), "other".to_owned()]
+    );
+    assert_eq!(seen.len(), 2);
+    assert!(seen.contains("dup"));
+    assert!(seen.contains("other"));
 }
 
 const SENDER_HEX: &str = "aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55";

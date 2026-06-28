@@ -473,24 +473,22 @@ pub struct AppProjectionUpdate {
     pub chat_list_trigger: ChatListUpdateTrigger,
 }
 
-fn remember_seen_event(state: &mut AccountState, event_id: String) {
-    if !state.seen_events.contains(&event_id) {
+/// Records `event_id` as seen, using the caller-held `seen` set for O(1)
+/// duplicate detection. The ordered `seen_events` Vec is kept only for pruning;
+/// when pruning drops the oldest ids it removes them from `seen` incrementally
+/// so the two stay in sync without rebuilding the set.
+fn remember_seen_event(seen: &mut HashSet<String>, state: &mut AccountState, event_id: String) {
+    if seen.insert(event_id.clone()) {
         state.seen_events.push(event_id);
-        prune_seen_events(&mut state.seen_events);
+        for pruned in prune_seen_events(&mut state.seen_events) {
+            seen.remove(&pruned);
+        }
     }
 }
 
-pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) {
+pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drain<'_, String> {
     let overflow = seen_events.len().saturating_sub(MAX_SEEN_EVENT_IDS);
-    if overflow > 0 {
-        seen_events.drain(0..overflow);
-    }
-}
-
-fn refresh_seen_lookup_if_needed(seen: &mut HashSet<String>, state: &AccountState) {
-    if seen.len() > MAX_SEEN_EVENT_IDS {
-        *seen = state.seen_events.iter().cloned().collect();
-    }
+    seen_events.drain(0..overflow)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
