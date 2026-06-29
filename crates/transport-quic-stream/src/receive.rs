@@ -79,8 +79,9 @@ impl QuicTextStreamReceiver {
         let mut transcript = None;
         let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
         let max_frame_len = frame_len_cap(Some(limits.max_plaintext_frame_len));
+        let mut next_record_timeout = limits.read_timeout;
 
-        while let Some(record) = read_record(&mut recv, max_frame_len, limits.read_timeout).await? {
+        while let Some(record) = read_record(&mut recv, max_frame_len, next_record_timeout).await? {
             limit_state.observe_wire_record()?;
             if record.seq <= high_water {
                 continue;
@@ -98,6 +99,11 @@ impl QuicTextStreamReceiver {
             };
             limit_state.observe(&record)?;
             high_water = record.seq;
+            // The first accepted in-order record completes direct-stream setup.
+            // Subsequent reads use the more generous quiet-gap deadline so
+            // long-running live agents can be silent between records without
+            // aborting a healthy preview.
+            next_record_timeout = limits.record_read_timeout;
 
             if let Some(existing) = &stream_id {
                 if existing != &record.stream_id {

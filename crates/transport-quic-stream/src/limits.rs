@@ -16,9 +16,13 @@ pub struct AgentTextStreamReceiveLimits {
     /// reject wire frames above this value plus the spec-pinned 1024-byte
     /// allowance; the app-profile constant is the ceiling and default.
     pub max_plaintext_frame_len: u32,
-    /// Application-level deadline for each inbound stream/read step. `0`
-    /// disables the deadline for tests or specialized callers.
+    /// Short setup deadline for accepting the peer's inbound stream and first
+    /// record. `0` disables the deadline for tests or specialized callers.
     pub read_timeout: Duration,
+    /// Application-level quiet-gap deadline for each record after setup. This
+    /// is intentionally more generous than the setup deadline because live
+    /// agents may go quiet between records during long tool calls.
+    pub record_read_timeout: Duration,
 }
 
 impl Default for AgentTextStreamReceiveLimits {
@@ -28,6 +32,7 @@ impl Default for AgentTextStreamReceiveLimits {
             max_plaintext_bytes: AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES,
             max_plaintext_frame_len: AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN,
             read_timeout: Duration::from_secs(15),
+            record_read_timeout: Duration::from_secs(120),
         }
     }
 }

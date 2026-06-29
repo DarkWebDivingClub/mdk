@@ -350,6 +350,16 @@ async fn raw_record_sender(
     server_cert: Vec<u8>,
     records: Vec<AgentTextStreamRecordV1>,
 ) {
+    raw_record_sender_with_inter_record_delay(server_addr, server_cert, records, Duration::ZERO)
+        .await;
+}
+
+async fn raw_record_sender_with_inter_record_delay(
+    server_addr: SocketAddr,
+    server_cert: Vec<u8>,
+    records: Vec<AgentTextStreamRecordV1>,
+    inter_record_delay: Duration,
+) {
     let endpoint = client_endpoint(ServerTrust::CertificateDer(server_cert), server_addr).unwrap();
     let connection = endpoint
         .connect(server_addr, "localhost")
@@ -357,8 +367,11 @@ async fn raw_record_sender(
         .await
         .unwrap();
     let mut send = connection.open_uni().await.unwrap();
-    for record in &records {
+    for (index, record) in records.iter().enumerate() {
         write_record(&mut send, record).await.unwrap();
+        if index + 1 < records.len() && !inter_record_delay.is_zero() {
+            sleep(inter_record_delay).await;
+        }
     }
     send.finish().unwrap();
     if timeout(SEND_CLOSE_WAIT, connection.closed()).await.is_err() {
@@ -472,6 +485,68 @@ async fn receiver_times_out_when_peer_stalls_before_first_frame() {
     let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
 
     stalled_uni_sender(server_addr, server_cert, Duration::from_millis(200)).await;
+
+    let err = receive.await.unwrap().unwrap_err();
+    assert!(matches!(err, QuicTextStreamError::ReadTimeout));
+}
+
+#[tokio::test]
+async fn receiver_allows_quiet_gap_after_first_record_longer_than_setup_deadline() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        read_timeout: Duration::from_millis(50),
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    raw_record_sender_with_inter_record_delay(
+        server_addr,
+        server_cert,
+        vec![
+            AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"hel".to_vec()),
+            AgentTextStreamRecordV1::text_delta(stream_id, 2, b"lo".to_vec()),
+        ],
+        Duration::from_millis(150),
+    )
+    .await;
+
+    let received = receive.await.unwrap().unwrap();
+    assert_eq!(received.text, "hello");
+    assert_eq!(received.chunk_count, 2);
+}
+
+#[tokio::test]
+async fn receiver_keeps_setup_deadline_after_discarded_initial_replay_record() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        read_timeout: Duration::from_millis(50),
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    let endpoint = client_endpoint(ServerTrust::CertificateDer(server_cert), server_addr).unwrap();
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    let discarded = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 0, b"dupe".to_vec());
+    write_record(&mut send, &discarded).await.unwrap();
+    sleep(Duration::from_millis(150)).await;
+    let accepted = AgentTextStreamRecordV1::text_delta(stream_id, 1, b"hel".to_vec());
+    let _ = write_record(&mut send, &accepted).await;
+    let _ = send.finish();
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
 
     let err = receive.await.unwrap().unwrap_err();
     assert!(matches!(err, QuicTextStreamError::ReadTimeout));
