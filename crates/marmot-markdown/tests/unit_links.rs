@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use marmot_markdown::{Block, Inline, parse};
 
 mod common;
@@ -16,6 +18,72 @@ fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
         title: title.map(|t| t.to_string()),
         alt,
     }
+}
+
+fn count_links(inlines: &[Inline]) -> usize {
+    inlines
+        .iter()
+        .map(|inline| match inline {
+            Inline::Link { children, .. } => 1 + count_links(children),
+            Inline::Image { alt, .. } => count_links(alt),
+            Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
+                count_links(children)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn count_images(inlines: &[Inline]) -> usize {
+    inlines
+        .iter()
+        .map(|inline| match inline {
+            Inline::Image { alt, .. } => 1 + count_images(alt),
+            Inline::Link { children, .. } => count_images(children),
+            Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
+                count_images(children)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn count_links_in_blocks(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Paragraph { inlines } | Block::Heading { inlines, .. } => count_links(inlines),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn parse_inlines_within(input: &str, max_elapsed: Duration) -> Vec<Inline> {
+    let started = Instant::now();
+    let parsed = parse_inlines(input);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= max_elapsed,
+        "markdown inline parse exceeded {:?} budget for {} bytes: {:?}",
+        max_elapsed,
+        input.len(),
+        elapsed
+    );
+    parsed
+}
+
+fn parse_blocks_within(input: &str, max_elapsed: Duration) -> Vec<Block> {
+    let started = Instant::now();
+    let blocks = parse(input).blocks;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= max_elapsed,
+        "markdown block parse exceeded {:?} budget for {} bytes: {:?}",
+        max_elapsed,
+        input.len(),
+        elapsed
+    );
+    blocks
 }
 
 // ----- Inline links ---------------------------------------------------
@@ -75,6 +143,69 @@ fn inline_link_with_emphasis_in_text() {
         parse_inlines("[*foo*](/u)"),
         vec![link("/u", None, vec![Inline::Emph(vec![t("foo")])])]
     );
+}
+
+#[test]
+fn many_emphasis_delimiters_interleaved_with_links_stay_bounded() {
+    // Regression for darkmatter#686: each link used to rescan the full
+    // delimiter stack just to deactivate earlier `[` openers, so unrelated
+    // accumulated `*` delimiters made `*[a](b)` repeated in one paragraph
+    // quadratic. The wall-clock budget is deliberately generous for CI, but a
+    // reintroduced quadratic at this size fails instead of silently burning CPU.
+    let links = 80_000;
+    let input = "*[a](b)".repeat(links);
+    let parsed = parse_inlines_within(&input, Duration::from_secs(5));
+
+    assert_eq!(count_links(&parsed), links);
+    assert!(matches!(parsed.first(), Some(Inline::Emph(_))));
+}
+
+#[test]
+fn many_emphasis_delimiters_with_emphasis_inside_links_stay_bounded() {
+    // The per-link emphasis pass must only process the current link-text
+    // suffix. Rebuilding all previous output for each `[*a*](b)` link made the
+    // same outer `*` accumulator quadratic with a much larger constant.
+    let links = 20_000;
+    let input = "*[*a*](b)".repeat(links);
+    let parsed = parse_inlines_within(&input, Duration::from_secs(5));
+
+    assert_eq!(count_links(&parsed), links);
+    assert!(matches!(parsed.first(), Some(Inline::Emph(_))));
+}
+
+#[test]
+fn nested_link_opener_chains_with_emphasis_stay_bounded() {
+    // Pin the bracket-chain deactivation path: closing the innermost link must
+    // deactivate earlier link openers without scanning unrelated `*` delimiters.
+    let links = 8_000;
+    let input = "*[a[b[c[d](e)](f)](g)](h)".repeat(links);
+    let parsed = parse_inlines_within(&input, Duration::from_secs(5));
+
+    assert_eq!(count_links(&parsed), links);
+}
+
+#[test]
+fn reference_link_variants_with_emphasis_stay_bounded() {
+    // Full, collapsed, and shortcut reference links all call absorb_link after
+    // resolving labels; keep each branch covered by the hostile shape.
+    let links = 8_000;
+    for unit in ["*[id][id]", "*[id][]", "*[id]"] {
+        let input = format!("{}\n\n[id]: /url", unit.repeat(links));
+        let blocks = parse_blocks_within(&input, Duration::from_secs(5));
+
+        assert_eq!(count_links_in_blocks(&blocks), links, "unit={unit}");
+    }
+}
+
+#[test]
+fn images_interleaved_with_emphasis_stay_bounded() {
+    // Images keep earlier link openers active, but still exercise the per-link
+    // process_emphasis call with an empty active window above stack_bottom.
+    let images = 80_000;
+    let input = "*![a](b)".repeat(images);
+    let parsed = parse_inlines_within(&input, Duration::from_secs(5));
+
+    assert_eq!(count_images(&parsed), images);
 }
 
 #[test]

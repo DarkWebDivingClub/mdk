@@ -180,10 +180,20 @@ struct BracketDelim {
     /// For runs: can this run open / close emphasis?
     can_open: bool,
     can_close: bool,
+    /// Previous active `[` delimiter index at the time this delimiter was
+    /// pushed. This lets link absorption deactivate earlier link openers by
+    /// following only the bracket chain, instead of rescanning an arbitrarily
+    /// large stack of unrelated emphasis delimiters.
+    prev_link_opener: Option<usize>,
 }
 
 impl BracketDelim {
-    fn bracket(kind: u8, out_pos: usize, input_pos: usize) -> Self {
+    fn bracket(
+        kind: u8,
+        out_pos: usize,
+        input_pos: usize,
+        prev_link_opener: Option<usize>,
+    ) -> Self {
         Self {
             kind,
             out_pos,
@@ -193,6 +203,7 @@ impl BracketDelim {
             len: 0,
             can_open: false,
             can_close: false,
+            prev_link_opener,
         }
     }
 }
@@ -206,6 +217,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     // reallocation chain (4→8→16→…) as the first text run accumulates.
     let mut buf = String::with_capacity(raw.len());
     let mut delims: Vec<BracketDelim> = Vec::new();
+    let mut last_active_link_opener: Option<usize> = None;
     let mut i = 0;
     let mut inline_math_closer_exhausted = false;
 
@@ -302,14 +314,26 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 flush_text(&mut out, &mut buf, &delims);
                 let out_pos = out.len();
                 out.push(Inline::Text("[".to_string()));
-                delims.push(BracketDelim::bracket(b'[', out_pos, i));
+                let delim_idx = delims.len();
+                delims.push(BracketDelim::bracket(
+                    b'[',
+                    out_pos,
+                    i,
+                    last_active_link_opener,
+                ));
+                last_active_link_opener = Some(delim_idx);
                 i += 1;
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
                 flush_text(&mut out, &mut buf, &delims);
                 let out_pos = out.len();
                 out.push(Inline::Text("![".to_string()));
-                delims.push(BracketDelim::bracket(b'!', out_pos, i + 1));
+                delims.push(BracketDelim::bracket(
+                    b'!',
+                    out_pos,
+                    i + 1,
+                    last_active_link_opener,
+                ));
                 i += 2;
             }
             b'*' | b'_' | b'~' => {
@@ -330,12 +354,20 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     len: run_len,
                     can_open,
                     can_close,
+                    prev_link_opener: None,
                 });
                 i += run_len;
             }
             b']' => {
                 flush_text(&mut out, &mut buf, &delims);
-                if let Some(end) = try_close_bracket(bytes, i, &mut out, &mut delims, refs) {
+                if let Some(end) = try_close_bracket(
+                    bytes,
+                    i,
+                    &mut out,
+                    &mut delims,
+                    refs,
+                    &mut last_active_link_opener,
+                ) {
                     i = end;
                 } else {
                     buf.push(']');
@@ -673,6 +705,7 @@ fn try_close_bracket(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     refs: &HashMap<String, LinkRef>,
+    last_active_link_opener: &mut Option<usize>,
 ) -> Option<usize> {
     // Find the most recent active opener (`[` or `![`).
     let opener_idx = delims
@@ -682,7 +715,7 @@ fn try_close_bracket(
 
     if !opener.active {
         // Inactive opener: drop it and emit literal `]`.
-        delims.remove(opener_idx);
+        remove_bracket_delim(delims, opener_idx, last_active_link_opener);
         return None;
     }
 
@@ -690,7 +723,14 @@ fn try_close_bracket(
     if bytes.get(i + 1) == Some(&b'(')
         && let Some((dest, title, end)) = parse_inline_link_suffix(bytes, i + 1)
     {
-        if absorb_link(out, delims, opener_idx, dest, title) {
+        if absorb_link(
+            out,
+            delims,
+            opener_idx,
+            dest,
+            title,
+            last_active_link_opener,
+        ) {
             return Some(end);
         }
         // Wrapping refused (depth cap): treat `]` as literal text.
@@ -705,7 +745,14 @@ fn try_close_bracket(
             && let Some(def) = refs.get(&crate::block::normalize_label(&label_raw))
         {
             let (dest, title) = (def.dest.clone(), def.title.clone());
-            if absorb_link(out, delims, opener_idx, dest, title) {
+            if absorb_link(
+                out,
+                delims,
+                opener_idx,
+                dest,
+                title,
+                last_active_link_opener,
+            ) {
                 return Some(end);
             }
             return None;
@@ -716,7 +763,14 @@ fn try_close_bracket(
             let label = label_text(bytes, opener.input_pos + 1, i);
             if let Some(def) = refs.get(&crate::block::normalize_label(&label)) {
                 let (dest, title) = (def.dest.clone(), def.title.clone());
-                if absorb_link(out, delims, opener_idx, dest, title) {
+                if absorb_link(
+                    out,
+                    delims,
+                    opener_idx,
+                    dest,
+                    title,
+                    last_active_link_opener,
+                ) {
                     return Some(end);
                 }
                 return None;
@@ -730,15 +784,33 @@ fn try_close_bracket(
         && let Some(def) = refs.get(&crate::block::normalize_label(&label))
     {
         let (dest, title) = (def.dest.clone(), def.title.clone());
-        if absorb_link(out, delims, opener_idx, dest, title) {
+        if absorb_link(
+            out,
+            delims,
+            opener_idx,
+            dest,
+            title,
+            last_active_link_opener,
+        ) {
             return Some(i + 1);
         }
         return None;
     }
 
     // No match — drop the opener and emit literal `]`.
-    delims.remove(opener_idx);
+    remove_bracket_delim(delims, opener_idx, last_active_link_opener);
     None
+}
+
+fn remove_bracket_delim(
+    delims: &mut Vec<BracketDelim>,
+    opener_idx: usize,
+    last_active_link_opener: &mut Option<usize>,
+) {
+    if delims[opener_idx].kind == b'[' && *last_active_link_opener == Some(opener_idx) {
+        *last_active_link_opener = delims[opener_idx].prev_link_opener;
+    }
+    delims.remove(opener_idx);
 }
 
 /// Parse `(dest "title")` starting at the `(`.
@@ -824,6 +896,7 @@ fn absorb_link(
     opener_idx: usize,
     dest: String,
     title: Option<String>,
+    last_active_link_opener: &mut Option<usize>,
 ) -> bool {
     // First, pair any emphasis runs strictly inside the link before
     // wrapping — emphasis inside link text DOES get processed (per spec).
@@ -862,15 +935,22 @@ fn absorb_link(
         });
     }
     // Pop all delimiters from opener_idx onward (any inner unclosed openers
-    // are now part of the link's children).
-    delims.truncate(opener_idx);
-    // Prevent nested links: deactivate any earlier `[` opener.
-    if !kind_is_image {
-        for d in delims.iter_mut() {
-            if d.kind == b'[' {
-                d.active = false;
-            }
+    // are now part of the link's children). For links, prevent nested links by
+    // deactivating earlier `[` openers through the link-opener chain. That is
+    // proportional to earlier brackets, not to unrelated emphasis delimiters
+    // that can accumulate around links.
+    let prev_link_opener = opener.prev_link_opener;
+    if kind_is_image {
+        delims.truncate(opener_idx);
+        *last_active_link_opener = prev_link_opener;
+    } else {
+        let mut cursor = prev_link_opener;
+        while let Some(idx) = cursor {
+            cursor = delims[idx].prev_link_opener;
+            delims[idx].active = false;
         }
+        delims.truncate(opener_idx);
+        *last_active_link_opener = None;
     }
     true
 }
@@ -1204,46 +1284,65 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
         return;
     }
 
-    // The CommonMark delimiter algorithm removes delimiter nodes and wraps
-    // inline ranges in its inner loop. Doing that with Vec::remove/drain/insert
-    // shifts the tail on every match, so an input like `*a* *a* ...` spends
-    // quadratic time moving both `out` and `delims`. Convert `out` to a tiny
-    // intrusive list for this pass: delimiter `out_pos` values become stable
-    // node ids, removals are pointer rewrites, and we only compact back to Vec
-    // once at the end.
-    let mut arena = InlineArena::from_items(std::mem::take(out));
-
-    // Stable delimiter links for the active slice. We keep `delims` itself in
-    // source order so existing indices remain usable for links/images outside
-    // this processing window.
-    let mut prev = vec![None; delims.len()];
-    let mut next = vec![None; delims.len()];
-    let mut last = None;
+    // Find the active delimiter window before allocating the link scratch.
+    // Per-link emphasis calls often have no active delimiter above
+    // `stack_bottom`; returning before `DelimLinks::new` keeps those empty
+    // windows allocation-free.
     let mut first = None;
-    for idx in stack_bottom..delims.len() {
-        if !delims[idx].active {
+    let mut arena_start = usize::MAX;
+    for (idx, delim) in delims.iter().enumerate().skip(stack_bottom) {
+        if !delim.active {
             continue;
         }
         if first.is_none() {
             first = Some(idx);
         }
-        prev[idx] = last;
+        arena_start = arena_start.min(delim.out_pos);
+    }
+    let Some(first) = first else {
+        return;
+    };
+
+    // Stable delimiter links for the active slice. We keep `delims` itself in
+    // source order so existing indices remain usable for links/images outside
+    // this processing window.
+    let mut links = DelimLinks::new(stack_bottom, delims.len());
+    let mut last = None;
+    for (idx, delim) in delims.iter().enumerate().skip(stack_bottom) {
+        if !delim.active {
+            continue;
+        }
+        links.set_prev(idx, last);
         if let Some(p) = last {
-            next[p] = Some(idx);
+            links.set_next(p, Some(idx));
         }
         last = Some(idx);
     }
+
+    // The CommonMark delimiter algorithm removes delimiter nodes and wraps
+    // inline ranges in its inner loop. Doing that with Vec::remove/drain/insert
+    // shifts the tail on every match, so an input like `*a* *a* ...` spends
+    // quadratic time moving both `out` and `delims`. Convert only the active
+    // output suffix for this delimiter window to a tiny intrusive list:
+    // delimiter `out_pos` values become stable node ids, removals are pointer
+    // rewrites, and we only compact back to Vec once at the end. For per-link
+    // emphasis processing, this avoids rebuilding all previously parsed output
+    // for every link in a hostile paragraph.
+    for d in delims.iter_mut().skip(stack_bottom).filter(|d| d.active) {
+        d.out_pos -= arena_start;
+    }
+    let mut arena = InlineArena::from_items(out.split_off(arena_start));
 
     // For each (delim_char, can_open, mod3) we track an "openers_bottom"
     // index — earlier than this we won't search for an opener again.
     use std::collections::HashMap;
     let mut openers_bottom: HashMap<(u8, bool, usize), usize> = HashMap::new();
 
-    let mut closer_cursor = first;
+    let mut closer_cursor = Some(first);
     while let Some(closer_idx) = closer_cursor {
         let closer = delims[closer_idx];
         if !is_run(closer.kind) || !closer.can_close || !closer.active {
-            closer_cursor = next[closer_idx];
+            closer_cursor = links.next(closer_idx);
             continue;
         }
         let key = (closer.kind, closer.can_open, closer.orig_len % 3);
@@ -1251,7 +1350,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
 
         // Walk back to find a compatible opener.
         let mut opener_pos: Option<usize> = None;
-        let mut k_cursor = prev[closer_idx];
+        let mut k_cursor = links.prev(closer_idx);
         while let Some(k) = k_cursor {
             if k < bottom {
                 break;
@@ -1264,16 +1363,16 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
                 break;
             }
             if !is_run(opener.kind) || !opener.active || opener.kind != closer.kind {
-                k_cursor = prev[k];
+                k_cursor = links.prev(k);
                 continue;
             }
             if !opener.can_open {
-                k_cursor = prev[k];
+                k_cursor = links.prev(k);
                 continue;
             }
             // Strikethrough only pairs runs of length ≥ 2 on both sides.
             if opener.kind == b'~' && (opener.len < 2 || closer.len < 2) {
-                k_cursor = prev[k];
+                k_cursor = links.prev(k);
                 continue;
             }
             // Rule of three (`*` and `_`; not `~` per the plan).
@@ -1283,7 +1382,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
                 let both_mod3 =
                     opener.orig_len.is_multiple_of(3) && closer.orig_len.is_multiple_of(3);
                 if both_can && sum_is_mod3 && !both_mod3 {
-                    k_cursor = prev[k];
+                    k_cursor = links.prev(k);
                     continue;
                 }
             }
@@ -1315,9 +1414,9 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
                 MAX_INLINE_NESTING_DEPTH,
             ) {
                 openers_bottom.insert(key, closer_idx);
-                let after_closer = next[closer_idx];
+                let after_closer = links.next(closer_idx);
                 if !closer.can_open {
-                    unlink_delim(delims, &mut prev, &mut next, closer_idx);
+                    unlink_delim(delims, &mut links, closer_idx);
                 }
                 closer_cursor = after_closer;
                 continue;
@@ -1349,9 +1448,9 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
             delims[closer_idx].len -= n;
             let drop_opener = delims[opener_idx].len == 0;
             let drop_closer = delims[closer_idx].len == 0;
-            let after_closer = next[closer_idx];
+            let after_closer = links.next(closer_idx);
 
-            unlink_delims_between(delims, &mut prev, &mut next, opener_idx, closer_idx);
+            unlink_delims_between(delims, &mut links, opener_idx, closer_idx);
             let resume = if !drop_opener {
                 Some(opener_idx)
             } else if !drop_closer {
@@ -1360,10 +1459,10 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
                 after_closer
             };
             if drop_opener {
-                unlink_delim(delims, &mut prev, &mut next, opener_idx);
+                unlink_delim(delims, &mut links, opener_idx);
             }
             if drop_closer {
-                unlink_delim(delims, &mut prev, &mut next, closer_idx);
+                unlink_delim(delims, &mut links, closer_idx);
             }
 
             closer_cursor = resume;
@@ -1371,21 +1470,21 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
         } else {
             // No opener found.
             openers_bottom.insert(key, closer_idx);
-            let after_closer = next[closer_idx];
+            let after_closer = links.next(closer_idx);
             if !closer.can_open {
                 // Drop this closer (it can't be an opener for later closers),
                 // but keep its text node in `out` as literal.
-                unlink_delim(delims, &mut prev, &mut next, closer_idx);
+                unlink_delim(delims, &mut links, closer_idx);
             }
             closer_cursor = after_closer;
         }
     }
 
     let (items, node_positions) = arena.into_items();
-    *out = items;
-    for d in delims.iter_mut().filter(|d| d.active) {
+    out.extend(items);
+    for d in delims.iter_mut().skip(stack_bottom).filter(|d| d.active) {
         if let Some(Some(pos)) = node_positions.get(d.out_pos) {
-            d.out_pos = *pos;
+            d.out_pos = arena_start + *pos;
         } else {
             d.active = false;
         }
@@ -1573,42 +1672,76 @@ fn depth_from_children_at_least(items: &[Inline], depth: usize, cap: usize) -> b
     false
 }
 
+struct DelimLinks {
+    stack_bottom: usize,
+    prev: Vec<Option<usize>>,
+    next: Vec<Option<usize>>,
+}
+
+impl DelimLinks {
+    fn new(stack_bottom: usize, delims_len: usize) -> Self {
+        let window_len = delims_len.saturating_sub(stack_bottom);
+        Self {
+            stack_bottom,
+            prev: vec![None; window_len],
+            next: vec![None; window_len],
+        }
+    }
+
+    fn slot(&self, idx: usize) -> usize {
+        debug_assert!(idx >= self.stack_bottom);
+        idx - self.stack_bottom
+    }
+
+    fn prev(&self, idx: usize) -> Option<usize> {
+        self.prev[self.slot(idx)]
+    }
+
+    fn set_prev(&mut self, idx: usize, value: Option<usize>) {
+        let slot = self.slot(idx);
+        self.prev[slot] = value;
+    }
+
+    fn next(&self, idx: usize) -> Option<usize> {
+        self.next[self.slot(idx)]
+    }
+
+    fn set_next(&mut self, idx: usize, value: Option<usize>) {
+        let slot = self.slot(idx);
+        self.next[slot] = value;
+    }
+}
+
 fn unlink_delims_between(
     delims: &mut [BracketDelim],
-    prev: &mut [Option<usize>],
-    next: &mut [Option<usize>],
+    links: &mut DelimLinks,
     opener_idx: usize,
     closer_idx: usize,
 ) {
-    let mut cursor = next[opener_idx];
+    let mut cursor = links.next(opener_idx);
     while let Some(idx) = cursor {
         if idx == closer_idx {
             break;
         }
-        cursor = next[idx];
-        unlink_delim(delims, prev, next, idx);
+        cursor = links.next(idx);
+        unlink_delim(delims, links, idx);
     }
 }
 
-fn unlink_delim(
-    delims: &mut [BracketDelim],
-    prev: &mut [Option<usize>],
-    next: &mut [Option<usize>],
-    idx: usize,
-) {
+fn unlink_delim(delims: &mut [BracketDelim], links: &mut DelimLinks, idx: usize) {
     if !delims[idx].active {
         return;
     }
-    let prev_idx = prev[idx];
-    let next_idx = next[idx];
+    let prev_idx = links.prev(idx);
+    let next_idx = links.next(idx);
     if let Some(prev_idx) = prev_idx {
-        next[prev_idx] = next_idx;
+        links.set_next(prev_idx, next_idx);
     }
     if let Some(next_idx) = next_idx {
-        prev[next_idx] = prev_idx;
+        links.set_prev(next_idx, prev_idx);
     }
-    prev[idx] = None;
-    next[idx] = None;
+    links.set_prev(idx, None);
+    links.set_next(idx, None);
     delims[idx].active = false;
 }
 
