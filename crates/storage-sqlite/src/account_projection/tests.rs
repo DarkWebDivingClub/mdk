@@ -160,6 +160,42 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    {
+        let conn = store.lock().unwrap();
+        // Seed tiny historical timestamps so the real save timestamp deterministically
+        // refreshes `repeat` to the newest row before the LRU prune runs.
+        conn.execute(
+            "INSERT INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
+            params!["repeat", 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
+            params!["stale-a", 2_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
+            params!["stale-b", 3_i64],
+        )
+        .unwrap();
+    }
+
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["repeat".to_owned()],
+        last_transport_timestamp: None,
+        groups: Vec::new(),
+    };
+    store.save_account_projection_state(&state, 2).unwrap();
+
+    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(restored.seen_events, vec!["stale-b", "repeat"]);
+}
+
+#[test]
 fn account_projection_state_deletes_groups_removed_from_snapshot() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {

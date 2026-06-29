@@ -258,8 +258,10 @@ impl SqliteAccountStorage {
             let retained_start = state.seen_events.len().saturating_sub(max_seen_events);
             for event_id in &state.seen_events[retained_start..] {
                 conn.execute(
-                    "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
-                     VALUES (?1, ?2)",
+                    "INSERT INTO seen_events (event_id, seen_at)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(event_id) DO UPDATE SET
+                        seen_at = excluded.seen_at",
                     params![event_id, now],
                 )
                 .storage()?;

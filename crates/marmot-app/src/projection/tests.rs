@@ -207,6 +207,38 @@ fn save_state_retains_only_recent_seen_events() {
 }
 
 #[test]
+fn save_state_refreshes_reseen_event_recency() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("test-key").unwrap();
+    let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
+            rusqlite::params!["repeat", 1_i64],
+        )
+        .unwrap();
+
+    let state = AccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["repeat".to_owned()],
+        last_transport_timestamp: Some(1_700_000_005),
+        groups: Vec::new(),
+    };
+
+    db.save_state(&state).unwrap();
+
+    let refreshed_seen_at: i64 = db
+        .conn
+        .query_row(
+            "SELECT seen_at FROM seen_events WHERE event_id = ?1",
+            rusqlite::params!["repeat"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(refreshed_seen_at > 1);
+}
+
+#[test]
 fn prune_group_messages_before_removes_only_expired_group_rows() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("test-key").unwrap();
