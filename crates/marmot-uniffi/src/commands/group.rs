@@ -152,8 +152,8 @@ fn ensure_can_promote_admin(
     group_id_hex: &str,
     member_ref: &str,
 ) -> Result<(), MarmotKitError> {
-    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
     ensure_group_admin(state, group_id_hex)?;
+    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
     if action.is_admin {
         Err(MarmotKitError::AlreadyAdmin {
             group_id_hex: group_id_hex.to_string(),
@@ -169,8 +169,8 @@ fn ensure_can_demote_admin(
     group_id_hex: &str,
     member_ref: &str,
 ) -> Result<(), MarmotKitError> {
-    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
     ensure_group_admin(state, group_id_hex)?;
+    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
     if !action.is_admin {
         return Err(MarmotKitError::NotAdmin {
             group_id_hex: group_id_hex.to_string(),
@@ -722,5 +722,26 @@ mod tests {
         let err = ensure_can_demote_admin(&state(false, false), &group_id_hex, member_id)
             .expect_err("non-admin caller should fail");
         assert!(matches!(err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn admin_mutation_preflight_checks_admin_before_membership() {
+        // A non-admin caller must not be able to distinguish "member exists" from
+        // "member absent" via error-variant differences (membership-existence
+        // oracle). Both promote and demote must short-circuit on caller admin
+        // status before resolving the target, even for a ref that is not in the
+        // group (darkmatter#667).
+        let group_id_hex = "01".repeat(32);
+        let absent_member = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+
+        let promote_err =
+            ensure_can_promote_admin(&state(false, false), &group_id_hex, absent_member)
+                .expect_err("non-admin promote should fail");
+        assert!(matches!(promote_err, MarmotKitError::NotGroupAdmin { .. }));
+
+        let demote_err =
+            ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
+                .expect_err("non-admin demote should fail");
+        assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
     }
 }
