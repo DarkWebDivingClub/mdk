@@ -106,7 +106,7 @@ impl AppClient {
                 fields: action.fields.clone(),
                 component_ids: action.component_ids.clone(),
                 target_count: action.target_count,
-                message_ids,
+                message_ids: schema_valid_message_ids(message_ids),
                 from_epoch,
                 to_epoch,
                 error_kind: None,
@@ -412,4 +412,51 @@ fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects
         .iter()
         .map(|report| hex::encode(report.message_id.as_slice()))
         .collect()
+}
+
+/// Keep only message ids that satisfy the forensic schema's `messageId`
+/// contract: a 64-character lowercase-or-uppercase hex digest (the SHA-256 of
+/// the MLS content bytes). Locally-originated events (drained session events,
+/// scheduled convergence) carry no inbound transport message, so their
+/// synthetic source id is an empty string; left in place that produced a
+/// `"message_ids": [""]` row that the analyzer rejects ("must be a list of 64
+/// hex characters"). Dropping non-conforming entries yields an empty vec, which
+/// `skip_serializing_if = "Vec::is_empty"` omits from the row entirely — the
+/// schema-valid representation of "no source message id".
+fn schema_valid_message_ids(message_ids: Vec<String>) -> Vec<String> {
+    message_ids
+        .into_iter()
+        .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_valid_message_ids;
+
+    const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn drops_empty_synthetic_source_id() {
+        // Locally-originated events (drain / convergence) feed an empty source
+        // id; it must not survive into the row as `[""]`.
+        assert!(schema_valid_message_ids(vec![String::new()]).is_empty());
+    }
+
+    #[test]
+    fn keeps_valid_64_hex_digests_and_drops_malformed() {
+        let upper = VALID.to_uppercase();
+        let ids = vec![
+            VALID.to_string(),    // valid lowercase
+            upper.clone(),        // valid uppercase
+            String::new(),        // empty
+            "abc".to_string(),    // too short
+            format!("{VALID}00"), // too long
+            "z".repeat(64),       // right length, non-hex
+        ];
+        assert_eq!(
+            schema_valid_message_ids(ids),
+            vec![VALID.to_string(), upper]
+        );
+    }
 }

@@ -91,8 +91,9 @@ impl AppClient {
         }
         let display_names = self.app.display_names_by_id()?;
         // Synthetic source identity: drained events have no inbound transport
-        // message. A zeroed id / now-timestamp keeps audit + observation happy
-        // without inventing a real delivery.
+        // message. The empty id signals "no source message"; the audit recorder
+        // drops it rather than emitting a schema-invalid `message_ids` entry
+        // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
         let source_recorded_at = unix_now_seconds();
         for event in &effects.events {
