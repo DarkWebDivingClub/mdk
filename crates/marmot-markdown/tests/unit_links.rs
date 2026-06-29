@@ -166,6 +166,27 @@ fn many_emphasis_delimiters_interleaved_with_links_stay_bounded() {
 }
 
 #[test]
+fn many_emphasis_delimiters_interleaved_with_unmatched_close_brackets_stay_bounded() {
+    // Regression for darkmatter#710, fixed in #712: every `*` pushes an
+    // emphasis delimiter, and every following unmatched `]` used to rescan the
+    // full mixed delimiter stack looking for a bracket/image opener that was
+    // never present. Keep the hostile single-paragraph `*]` shape under an
+    // explicit wall-clock budget so the test fails on quadratic behavior, not
+    // just on structural changes. The budget is calibrated for the default
+    // debug CI profile; optimized test profiles may leave extra headroom.
+    let pairs = 80_000;
+    let input = "*]".repeat(pairs);
+    let parsed = parse_inlines_within(&input, Duration::from_secs(5));
+
+    assert!(
+        parsed.len() >= pairs / 2,
+        "expected linear retained output for hostile `*]` shape: {} inlines for {pairs} pairs",
+        parsed.len()
+    );
+    assert!(matches!(parsed.first(), Some(Inline::Emph(_))));
+}
+
+#[test]
 fn many_emphasis_delimiters_with_emphasis_inside_links_stay_bounded() {
     // The per-link emphasis pass must only process the current link-text
     // suffix. Rebuilding all previous output for each `[*a*](b)` link made the
