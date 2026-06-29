@@ -1075,15 +1075,27 @@ fn reroute(
     msg
 }
 
+/// Result of replaying an intent schedule against the harness clients.
+struct DriveOutcome {
+    /// `still_member[i]` is true while client `i` is still in the group.
+    still_member: Vec<bool>,
+    /// `own_sent_payloads[i]` collects the raw app payloads client `i`
+    /// successfully published. Senders never receive their own messages as
+    /// `MessageReceived` events, so the convergence payload-set check must add
+    /// these back to be a fair comparison against the receivers' view.
+    own_sent_payloads: Vec<Vec<Vec<u8>>>,
+}
+
 async fn drive_intents(
     clients: &mut [HarnessClient],
     bus: &TransportBus,
     intents: &[HarnessIntent],
-) -> Vec<bool> {
+) -> DriveOutcome {
     let n = clients.len();
     let bus_ids: Vec<_> = clients.iter().map(|c| c.bus_id).collect();
     let group_ids: Vec<_> = clients.iter().map(|c| c.group_id()).collect();
     let mut still_member = vec![true; n];
+    let mut own_sent_payloads: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
     let mut app_event_seq = 0_u64;
 
     for intent in intents {
@@ -1112,6 +1124,7 @@ async fn drive_intents(
                     .checked_add(1)
                     .expect("app event sequence exhausted");
                 if let Ok(cgka_traits::engine::SendResult::ApplicationMessage { msg }) = res {
+                    own_sent_payloads[idx].push(payload.clone());
                     bus.send(bus_ids[idx], reroute(msg, &gid));
                 }
             }
@@ -1136,7 +1149,72 @@ async fn drive_intents(
             }
         }
     }
-    still_member
+    DriveOutcome {
+        still_member,
+        own_sent_payloads,
+    }
+}
+
+/// Assert that every still-member client converged on the same epoch, member
+/// set, group name, and application-payload set.
+///
+/// The module doc promises undisturbed clients converge on "the same epoch AND
+/// member set"; epoch equality alone would stay green under a membership or
+/// group-data branch fork, so this mirrors the richer `ClientsConverged`
+/// expectation in `vector.rs`:
+/// - **epoch** — scalar agreement, the original (and weakest) check;
+/// - **member fingerprint** — the full sorted member-id set, not just a count,
+///   so a membership-divergence fork is caught;
+/// - **group name** — branch-sensitive group-profile state that epoch and
+///   member equality cannot distinguish on a group-data fork;
+/// - **payload set** — each live client's received remote payloads unioned with
+///   its own accepted sends (which never come back as `MessageReceived`),
+///   compared as a sorted multiset so identical payloads still match.
+fn assert_live_clients_converged(clients: &mut [HarnessClient], outcome: &DriveOutcome) {
+    let live: Vec<usize> = (0..clients.len())
+        .filter(|i| outcome.still_member[*i])
+        .collect();
+    if live.len() < 2 {
+        return;
+    }
+
+    let fingerprint = |c: &mut HarnessClient, idx: usize| {
+        let epoch = c.epoch().0;
+        let mut member_ids: Vec<Vec<u8>> = c
+            .members()
+            .into_iter()
+            .map(|m| m.id.as_slice().to_vec())
+            .collect();
+        member_ids.sort();
+        let group_name = c.group_name();
+        let mut payloads = c.received_app_payloads();
+        payloads.extend(outcome.own_sent_payloads[idx].iter().cloned());
+        payloads.sort();
+        (epoch, member_ids, group_name, payloads)
+    };
+
+    let first_idx = live[0];
+    let (first_epoch, first_members, first_name, first_payloads) =
+        fingerprint(&mut clients[first_idx], first_idx);
+    for &idx in &live[1..] {
+        let (epoch, members, name, payloads) = fingerprint(&mut clients[idx], idx);
+        prop_assert(epoch, first_epoch, "live clients must agree on epoch");
+        prop_assert(
+            members,
+            first_members.clone(),
+            "live clients must agree on the member-id set",
+        );
+        prop_assert(
+            name,
+            first_name.clone(),
+            "live clients must agree on the converged group name",
+        );
+        prop_assert(
+            payloads,
+            first_payloads.clone(),
+            "live clients must agree on the converged app-payload set",
+        );
+    }
 }
 
 fn convergence_with_event_conservation(intents: Vec<HarnessIntent>) {
@@ -1144,7 +1222,7 @@ fn convergence_with_event_conservation(intents: Vec<HarnessIntent>) {
     rt().block_on(async {
         let bus = TransportBus::ordered();
         let mut clients = setup_group(n, &bus).await;
-        let still_member = drive_intents(&mut clients, &bus, &intents).await;
+        let outcome = drive_intents(&mut clients, &bus, &intents).await;
 
         // Drive to quiescence.
         for _ in 0..8 {
@@ -1157,19 +1235,9 @@ fn convergence_with_event_conservation(intents: Vec<HarnessIntent>) {
             }
         }
 
-        // Property (b) — every still-member client agrees on epoch.
-        let live_epochs: Vec<u64> = clients
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| still_member[*i])
-            .map(|(_, c)| c.epoch().0)
-            .collect();
-        if live_epochs.len() >= 2 {
-            let first = live_epochs[0];
-            for e in &live_epochs[1..] {
-                prop_assert(*e, first, "live clients must agree on epoch");
-            }
-        }
+        // Property (b) — every still-member client agrees on epoch, member set,
+        // group name, and the converged app-payload set.
+        assert_live_clients_converged(&mut clients, &outcome);
     });
 }
 
@@ -1196,7 +1264,7 @@ fn convergence_under_profile(intents: Vec<HarnessIntent>, profile: DeliveryProfi
         let policy: DeliveryPolicy = profile.into_policy();
         let bus = TransportBus::with_policy(policy);
         let mut clients = setup_group(n, &bus).await;
-        let still_member = drive_intents(&mut clients, &bus, &intents).await;
+        let outcome = drive_intents(&mut clients, &bus, &intents).await;
 
         // Quiesce.
         for _ in 0..16 {
@@ -1209,19 +1277,9 @@ fn convergence_under_profile(intents: Vec<HarnessIntent>, profile: DeliveryProfi
             }
         }
 
-        // Convergence assertion across live clients.
-        let live_epochs: Vec<u64> = clients
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| still_member[*i])
-            .map(|(_, c)| c.epoch().0)
-            .collect();
-        if live_epochs.len() >= 2 {
-            let first = live_epochs[0];
-            for e in &live_epochs[1..] {
-                prop_assert(*e, first, "live clients epoch convergence");
-            }
-        }
+        // Convergence assertion across live clients: epoch, member set, group
+        // name, and the converged app-payload set.
+        assert_live_clients_converged(&mut clients, &outcome);
     });
 }
 

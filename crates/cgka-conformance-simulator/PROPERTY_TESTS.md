@@ -68,14 +68,19 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
 ### `prop_convergence_under_send_leave_sequence`
 
 - Generates: three-client groups plus app sends and self-remove leaves under FIFO delivery.
-- Checks: every still-live member converges on the same epoch after the sequence drains.
-- Why: common user activity should converge across many generated histories.
+- Checks: every still-live member converges on the same epoch, member-id set, group name, and app-payload multiset after the
+  sequence drains. The payload multiset combines each client's received remote payloads with its own accepted sends, since
+  senders never receive their own messages back.
+- Why: common user activity should converge across many generated histories, and epoch equality alone would stay green
+  under a membership or group-data branch fork.
 
 ### `prop_convergence_under_varied_delivery`
 
 - Generates: send/leave intent sequences plus a delivery profile: FIFO, reverse, or seeded random.
-- Checks: still-live members converge on the same epoch under each delivery policy.
-- Why: the same logical history should survive realistic relay ordering differences.
+- Checks: still-live members converge on the same epoch, member-id set, group name, and app-payload multiset under each
+  delivery policy.
+- Why: the same logical history should survive realistic relay ordering differences without diverging on membership,
+  group metadata, or delivered payloads.
 
 ### `prop_stored_convergence_restart_equivalence`
 
