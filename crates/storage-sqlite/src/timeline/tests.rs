@@ -89,6 +89,37 @@ fn delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
     }
 }
 
+fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: "11".repeat(32),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: sender.to_owned(),
+        plaintext: plaintext.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_EDIT,
+        tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+    }
+}
+
+fn fail_on_timeline_delete(store: &SqliteAccountStorage) {
+    // This deliberately trips on any materialized-row delete. Use it only in
+    // tests that should upsert existing timeline rows, not remove targeted rows.
+    let conn = store.lock().unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER panic_message_timeline_delete
+         BEFORE DELETE ON message_timeline
+         BEGIN
+            SELECT RAISE(FAIL, 'unexpected full timeline delete');
+         END;",
+    )
+    .unwrap();
+}
+
 fn group_system(id: &str, system_type: &str, at: u64) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -494,17 +525,7 @@ fn recording_new_message_does_not_delete_existing_timeline_rows() {
     store
         .record_app_event(&chat("first", "alice", 1, "hello"))
         .unwrap();
-    {
-        let conn = store.lock().unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER panic_message_timeline_delete
-             BEFORE DELETE ON message_timeline
-             BEGIN
-                SELECT RAISE(FAIL, 'unexpected full timeline delete');
-             END;",
-        )
-        .unwrap();
-    }
+    fail_on_timeline_delete(&store);
 
     let update = store
         .record_app_event(&chat("second", "alice", 2, "again"))
@@ -524,6 +545,217 @@ fn recording_new_message_does_not_delete_existing_timeline_rows() {
             .collect::<Vec<_>>(),
         vec!["first", "second"]
     );
+}
+
+#[test]
+fn re_recording_message_does_not_delete_existing_timeline_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("message", "alice", 1, "hello"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&chat("message", "alice", 1, "hello"))
+        .unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::NewMessage,
+            message,
+        }] if message.message_id_hex == "message"
+    ));
+    assert_eq!(list(&store).len(), 1);
+}
+
+#[test]
+fn reaction_event_reprojects_target_without_full_timeline_rebuild() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("unrelated", "alice", 1, "keep me"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::ReactionAdded,
+            message,
+        }] if message.message_id_hex == "target"
+    ));
+}
+
+#[test]
+fn delete_event_reprojects_target_without_full_timeline_rebuild() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("unrelated", "alice", 1, "keep me"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&delete("delete-message", "alice", "target", 2))
+        .unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::MessageDeleted,
+            message,
+        }] if message.message_id_hex == "target" && message.deleted
+    ));
+}
+
+#[test]
+fn edit_event_reprojects_target_without_full_timeline_rebuild() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("unrelated", "alice", 1, "keep me"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&edit("edit-1", "alice", "target", 2, "edited"))
+        .unwrap();
+
+    let changed_ids = update
+        .changes
+        .iter()
+        .map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+            TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert!(changed_ids.contains(&"edit-1"));
+    assert!(changed_ids.contains(&"target"));
+}
+
+#[test]
+fn re_recording_reaction_does_not_full_rebuild() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::ReactionAdded,
+            message,
+        }] if message.message_id_hex == "target"
+    ));
+    assert_eq!(modifier_edge_count(&store, "reaction-1"), 1);
+}
+
+#[test]
+fn re_targeting_reaction_reprojects_old_and_new_targets() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("old-target", "alice", 1, "old"))
+        .unwrap();
+    store
+        .record_app_event(&chat("new-target", "alice", 1, "new"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "old-target", 2, "+"))
+        .unwrap();
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&reaction("reaction-1", "bob", "new-target", 3, "+"))
+        .unwrap();
+
+    let changed_ids = update
+        .changes
+        .iter()
+        .map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+            TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert!(changed_ids.contains(&"old-target"));
+    assert!(changed_ids.contains(&"new-target"));
+
+    let changed_triggers = update
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message } => {
+                Some((message.message_id_hex.as_str(), trigger))
+            }
+            TimelineMessageChange::Remove { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(changed_triggers.contains(&("old-target", &TimelineUpdateTrigger::ReactionRemoved)));
+    assert!(changed_triggers.contains(&("new-target", &TimelineUpdateTrigger::ReactionAdded)));
+
+    let messages = list(&store);
+    let old_target = messages
+        .iter()
+        .find(|message| message.message_id_hex == "old-target")
+        .unwrap();
+    assert!(old_target.reactions.user_reactions.is_empty());
+    let new_target = messages
+        .iter()
+        .find(|message| message.message_id_hex == "new-target")
+        .unwrap();
+    assert_eq!(new_target.reactions.user_reactions.len(), 1);
+}
+
+#[test]
+fn upserting_modifier_as_non_modifier_clears_stale_edges() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    assert_eq!(modifier_edge_count(&store, "reaction-1"), 1);
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&chat("reaction-1", "bob", 3, "not a reaction"))
+        .unwrap();
+
+    assert_eq!(modifier_edge_count(&store, "reaction-1"), 0);
+    let messages = list(&store);
+    let target = messages
+        .iter()
+        .find(|message| message.message_id_hex == "target")
+        .unwrap();
+    assert!(target.reactions.user_reactions.is_empty());
+    assert!(update.changes.iter().any(|change| {
+        matches!(
+            change,
+            TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::ReactionRemoved,
+                message,
+            } if message.message_id_hex == "target"
+        )
+    }));
 }
 
 #[test]

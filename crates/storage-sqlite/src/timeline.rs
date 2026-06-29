@@ -281,10 +281,36 @@ impl SqliteAccountStorage {
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
-            let can_incrementally_project =
-                !app_event_exists_tx(&conn, &event.group_id_hex, &event.message_id_hex)?
-                    && can_project_record_app_event_incrementally(event.kind);
+            let new_affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
+            // Upserting an existing app_event may change its kind/tags, so the
+            // incremental path must reproject both the old projection dependents
+            // and the new ones. Otherwise retargeting a reaction/delete/edit
+            // would leave the old target materialized with stale modifier state.
+            let existing_event = app_event_projection_parts_tx(
+                &conn,
+                &event.group_id_hex,
+                &event.message_id_hex,
+            )?;
+            let can_incrementally_project = can_project_record_app_event_incrementally(event.kind)
+                && existing_event
+                    .as_ref()
+                    .map(|(kind, _)| can_project_record_app_event_incrementally(*kind))
+                    .unwrap_or(true);
+            let existing_affected_message_ids = if let Some((existing_kind, existing_tags)) =
+                &existing_event
+            {
+                affected_timeline_message_ids_for_parts_tx(
+                    &conn,
+                    &event.group_id_hex,
+                    &event.message_id_hex,
+                    *existing_kind,
+                    existing_tags,
+                )?
+            } else {
+                BTreeSet::new()
+            };
+            let mut affected_message_ids = new_affected_message_ids.clone();
+            affected_message_ids.extend(existing_affected_message_ids.iter().cloned());
             conn.execute(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -322,11 +348,13 @@ impl SqliteAccountStorage {
             .storage()?;
             upsert_message_modifier_edges_tx(&conn, event)?;
             if can_incrementally_project {
-                upsert_message_timeline_projection_for_message_tx(
-                    &conn,
-                    &event.group_id_hex,
-                    &event.message_id_hex,
-                )?;
+                for message_id in &affected_message_ids {
+                    upsert_message_timeline_projection_for_message_tx(
+                        &conn,
+                        &event.group_id_hex,
+                        message_id,
+                    )?;
+                }
             } else {
                 rebuild_message_timeline_for_group_tx(&conn, &event.group_id_hex)?;
             }
@@ -339,6 +367,8 @@ impl SqliteAccountStorage {
                 &event.message_id_hex,
                 event.kind,
                 &event.tags,
+                existing_event.as_ref(),
+                &new_affected_message_ids,
                 &messages,
             );
             Ok(TimelineProjectionUpdate {
@@ -822,25 +852,36 @@ fn can_project_record_app_event_incrementally(kind: u64) -> bool {
             | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
             | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
             | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+            | MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_DELETE
+            | MARMOT_APP_EVENT_KIND_EDIT
     )
 }
 
-fn app_event_exists_tx(
+fn app_event_projection_parts_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<bool> {
-    let exists = tx
-        .query_row(
-            "SELECT 1
-             FROM app_events
-             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-            params![group_id_hex, message_id_hex],
-            |_| Ok(()),
-        )
-        .optional()
-        .storage()?;
-    Ok(exists.is_some())
+) -> StorageResult<Option<(u64, Vec<Vec<String>>)>> {
+    tx.query_row(
+        "SELECT kind, tags_json
+         FROM app_events
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+        params![group_id_hex, message_id_hex],
+        |row| {
+            let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
+            let tags = tags_from_json(row.get::<_, String>(1)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok((kind, tags))
+        },
+    )
+    .optional()
+    .storage()
 }
 
 fn upsert_message_timeline_projection_for_message_tx(
@@ -937,18 +978,18 @@ fn project_single_message_timeline_tx(
 /// so existing edges for this modifier are deleted first and re-inserted from
 /// the event's current tags, keeping edges consistent with any tag change.
 fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> StorageResult<()> {
-    if !matches!(
-        event.kind,
-        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE
-    ) {
-        return Ok(());
-    }
     tx.execute(
         "DELETE FROM message_modifier_edges
          WHERE group_id_hex = ?1 AND modifier_message_id_hex = ?2",
         params![&event.group_id_hex, &event.message_id_hex],
     )
     .storage()?;
+    if !matches!(
+        event.kind,
+        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE
+    ) {
+        return Ok(());
+    }
     let kind = u64_to_i64(event.kind)?;
     let recorded_at = u64_to_i64(event.recorded_at)?;
     for target in tag_values(&event.tags, EVENT_REF_TAG) {
@@ -1537,16 +1578,46 @@ fn timeline_changes_for_event(
     event_message_id_hex: &str,
     kind: u64,
     tags: &[Vec<String>],
+    previous_event: Option<&(u64, Vec<Vec<String>>)>,
+    new_affected_message_ids: &BTreeSet<String>,
     messages: &[TimelineMessageRecord],
 ) -> Vec<TimelineMessageChange> {
     messages
         .iter()
         .cloned()
         .map(|message| TimelineMessageChange::Upsert {
-            trigger: timeline_trigger_for_event_row(event_message_id_hex, kind, tags, &message),
+            trigger: timeline_trigger_for_recorded_event_row(
+                event_message_id_hex,
+                kind,
+                tags,
+                previous_event,
+                new_affected_message_ids,
+                &message,
+            ),
             message: Box::new(message),
         })
         .collect()
+}
+
+fn timeline_trigger_for_recorded_event_row(
+    event_message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    previous_event: Option<&(u64, Vec<Vec<String>>)>,
+    new_affected_message_ids: &BTreeSet<String>,
+    row: &TimelineMessageRecord,
+) -> TimelineUpdateTrigger {
+    if !new_affected_message_ids.contains(&row.message_id_hex)
+        && let Some((previous_kind, previous_tags)) = previous_event
+    {
+        return timeline_trigger_for_invalidation_row(
+            event_message_id_hex,
+            *previous_kind,
+            previous_tags,
+            row,
+        );
+    }
+    timeline_trigger_for_event_row(event_message_id_hex, kind, tags, row)
 }
 
 fn timeline_changes_for_invalidation(
