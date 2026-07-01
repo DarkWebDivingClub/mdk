@@ -28,7 +28,7 @@ use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
 use crate::media::media_imeta_tags_are_valid;
-use crate::{AccountState, AppError, ReceivedMessage, SendSummary, SyncSummary};
+use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary, SyncSummary};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
@@ -52,6 +52,10 @@ pub struct AppGroupRecord {
     pub archived: bool,
     #[serde(default)]
     pub pending_confirmation: bool,
+    /// Whether the local account is still a member of this group, and if not,
+    /// whether it left voluntarily (`Left`) or was removed (`Removed`).
+    #[serde(default)]
+    pub self_membership: SelfMembership,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcomer_account_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,6 +306,7 @@ impl AppGroupRecord {
             encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
             archived: false,
             pending_confirmation: false,
+            self_membership: SelfMembership::Member,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }

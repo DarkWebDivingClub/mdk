@@ -25,6 +25,7 @@ fn group(id: &str, name: &str) -> StoredAccountGroup {
         pending_confirmation: false,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
+        self_membership: SelfMembership::Member,
         components: vec![
             StoredAccountGroupComponent {
                 component_id: 0x8001,

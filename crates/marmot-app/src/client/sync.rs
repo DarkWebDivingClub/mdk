@@ -11,8 +11,8 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AppError, AppGroupAdminPolicyComponent, AppMessageProjection, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event,
-    unix_now_seconds,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW,
+    remember_seen_event, unix_now_seconds,
 };
 
 use super::AppClient;
@@ -479,12 +479,9 @@ impl AppClient {
                 self.sync_runtime_groups().await?;
             }
             if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id,
-                change:
-                    cgka_traits::engine::GroupStateChange::MemberRemoved { member }
-                    | cgka_traits::engine::GroupStateChange::MemberLeft { member },
-                ..
+                group_id, change, ..
             } = event
+                && let Some((member, membership)) = member_departure(change)
             {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let member_id_hex = hex::encode(member.as_slice());
@@ -494,7 +491,9 @@ impl AppClient {
                     &member_id_hex,
                 );
                 // Only the local account leaving / being removed suppresses our
-                // own unread aggregate for the group; a peer removal must not.
+                // own unread aggregate for the group; a peer departure must not.
+                // The recorded membership distinguishes a voluntary `Left` from
+                // an involuntary `Removed` so the chat list can tell them apart.
                 // This projection write is the source of truth for the account
                 // unread aggregate, so propagate its error (matching the nearby
                 // timeline/message projection writes) instead of swallowing it:
@@ -502,20 +501,26 @@ impl AppClient {
                 // `account_unread_total()` returning an inflated badge after a
                 // self-removal that sync otherwise reports as successful.
                 if member_id_hex.eq_ignore_ascii_case(&local_account_id_hex) {
-                    self.app
-                        .set_group_self_membership(&self.state.label, &group_id_hex, true)?;
+                    self.app.set_group_self_membership(
+                        &self.state.label,
+                        &group_id_hex,
+                        membership,
+                    )?;
                 }
             }
             // A (re-)join or create restores the local account's membership so a
             // re-add after removal un-suppresses the group's unread count. Same
-            // source-of-truth write as the removal path above: propagate the
+            // source-of-truth write as the departure path above: propagate the
             // error rather than swallow it.
             if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
             | cgka_traits::engine::GroupEvent::GroupCreated { group_id } = event
             {
                 let group_id_hex = hex::encode(group_id.as_slice());
-                self.app
-                    .set_group_self_membership(&self.state.label, &group_id_hex, false)?;
+                self.app.set_group_self_membership(
+                    &self.state.label,
+                    &group_id_hex,
+                    SelfMembership::Member,
+                )?;
             }
         }
         // Synthesize durable kind-1210 system rows from authenticated state
@@ -583,6 +588,63 @@ fn clamped_transport_cursor(
     current
         .map(|current| current.min(max_allowed).max(clamped))
         .unwrap_or(clamped)
+}
+
+/// Classify a group state change that ends a member's participation, returning
+/// the departing member alongside how that departure should be recorded for the
+/// member: a `MemberLeft` self-removal is a voluntary [`SelfMembership::Left`];
+/// a `MemberRemoved` eviction by another member is [`SelfMembership::Removed`].
+/// Returns `None` for changes that are not departures.
+fn member_departure(
+    change: &cgka_traits::engine::GroupStateChange,
+) -> Option<(&cgka_traits::MemberId, SelfMembership)> {
+    use cgka_traits::engine::GroupStateChange;
+    match change {
+        GroupStateChange::MemberLeft { member } => Some((member, SelfMembership::Left)),
+        GroupStateChange::MemberRemoved { member } => Some((member, SelfMembership::Removed)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod membership_change_tests {
+    use super::member_departure;
+    use crate::SelfMembership;
+    use cgka_traits::MemberId;
+    use cgka_traits::engine::GroupStateChange;
+
+    #[test]
+    fn member_departure_distinguishes_self_leave_from_eviction() {
+        let member = MemberId::new(vec![0xaa]);
+
+        // A SelfRemove proposal is a voluntary departure.
+        let left = GroupStateChange::MemberLeft {
+            member: member.clone(),
+        };
+        let (subject, membership) = member_departure(&left).expect("MemberLeft is a departure");
+        assert_eq!(subject, &member);
+        assert_eq!(membership, SelfMembership::Left);
+
+        // An eviction by another member is an involuntary removal.
+        let removed = GroupStateChange::MemberRemoved {
+            member: member.clone(),
+        };
+        let (subject, membership) =
+            member_departure(&removed).expect("MemberRemoved is a departure");
+        assert_eq!(subject, &member);
+        assert_eq!(membership, SelfMembership::Removed);
+    }
+
+    #[test]
+    fn member_departure_ignores_non_departures() {
+        let member = MemberId::new(vec![0xaa]);
+        let added = GroupStateChange::MemberAdded {
+            member: member.clone(),
+        };
+        let admin = GroupStateChange::AdminAdded { member };
+        assert!(member_departure(&added).is_none());
+        assert!(member_departure(&admin).is_none());
+    }
 }
 
 #[cfg(test)]

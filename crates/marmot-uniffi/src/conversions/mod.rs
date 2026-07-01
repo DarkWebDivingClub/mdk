@@ -74,9 +74,29 @@ mod tests {
             disappearing_message_secs: 0,
             archived: false,
             pending_confirmation: false,
+            self_membership: SelfMembershipFfi::Member,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
+    }
+
+    #[test]
+    fn self_membership_ffi_preserves_each_variant() {
+        use marmot_app::SelfMembership;
+        // The FFI enum mirrors the app enum 1:1; a swapped Left/Removed here
+        // would mislabel departures on the apps' chat list and group detail.
+        assert!(matches!(
+            SelfMembershipFfi::from(SelfMembership::Member),
+            SelfMembershipFfi::Member
+        ));
+        assert!(matches!(
+            SelfMembershipFfi::from(SelfMembership::Left),
+            SelfMembershipFfi::Left
+        ));
+        assert!(matches!(
+            SelfMembershipFfi::from(SelfMembership::Removed),
+            SelfMembershipFfi::Removed
+        ));
     }
 
     fn member(member_id_hex: &str, is_admin: bool, is_self: bool) -> GroupMemberDetailsFfi {

@@ -1,5 +1,8 @@
 use super::*;
-use crate::{StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppEvent};
+use crate::{
+    SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
+    StoredAppEvent,
+};
 use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GroupAvatarUrlV1,
     encode_group_avatar_url_v1,
@@ -28,6 +31,7 @@ fn group() -> StoredAccountGroup {
         pending_confirmation: false,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
+        self_membership: SelfMembership::Member,
         components: Vec::new(),
     }
 }
@@ -272,6 +276,73 @@ fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
 
     assert_eq!(row.title, "Renamed Lab");
     assert_eq!(row.group_name, "Renamed Lab");
+}
+
+#[test]
+fn ensure_chat_list_rows_repairs_drifted_self_membership() {
+    // A membership change writes `account_groups.self_membership` but does not
+    // itself rebuild the projection (and the 0022 migration leaves existing
+    // rows at the default 'member'). The open-path completeness check must
+    // treat a row whose denormalized membership disagrees with
+    // `account_groups` as stale and rebuild it.
+    let store = setup_store();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        store.chat_list_row(GROUP).unwrap().unwrap().self_membership,
+        SelfMembership::Member
+    );
+
+    // Flip only the source of truth, leaving the projection row stale.
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(row.self_membership, SelfMembership::Removed);
+}
+
+#[test]
+fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
+    // Forward-compat: a newer schema could persist a `self_membership` value
+    // this version doesn't know. `SelfMembership::from_storage` normalizes the
+    // unknown to `Member`, so a rebuild stores 'member'. The completeness check
+    // must compare against that same normalized value (like the sibling `title`
+    // CASE) — otherwise it sees 'member' != '<unknown>' forever and rebuilds the
+    // whole projection on every open.
+    let store = setup_store();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups SET self_membership = 'future_state' WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+        // A far-future timestamp makes a spurious rebuild observable: a rebuild
+        // resets `updated_at` to wall-clock now, which is in the past.
+        conn.execute(
+            "UPDATE chat_list_rows SET updated_at = 4000000000 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(row.self_membership, SelfMembership::Member);
+    assert_eq!(
+        row.updated_at, 4_000_000_000,
+        "an unknown membership normalizes to the stored 'member', so the \
+         completeness check must treat the row as fresh and not rebuild it"
+    );
 }
 
 #[test]
@@ -838,6 +909,21 @@ fn setup_store_with_one_unread() -> SqliteAccountStorage {
 }
 
 #[test]
+fn chat_list_row_reports_a_self_leave_as_left() {
+    let store = setup_store_with_one_unread();
+
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Left)
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.self_membership, SelfMembership::Left);
+}
+
+#[test]
 fn account_unread_total_suppresses_removed_self_membership_group() {
     let store = setup_store_with_one_unread();
 
@@ -846,9 +932,26 @@ fn account_unread_total_suppresses_removed_self_membership_group() {
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
 
-    store.set_group_self_membership(GROUP, true).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
 
     // Once the local account is known-removed, the group's unread is suppressed.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}
+
+#[test]
+fn account_unread_total_suppresses_left_self_membership_group() {
+    let store = setup_store_with_one_unread();
+
+    // A voluntary self-leave is also a terminal "no longer a member" state, so
+    // it suppresses the group's unread exactly like an involuntary removal.
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Left)
+        .unwrap();
+
     let total = store.account_unread_total().unwrap();
     assert_eq!(total, AccountUnreadTotal::default());
     assert!(!total.has_unread());
@@ -865,7 +968,9 @@ fn account_unread_total_preserves_member_self_membership_group() {
     assert_eq!(total.unread_conversations, 1);
 
     // Re-affirming 'member' (e.g. after a re-add) keeps the unread counted.
-    store.set_group_self_membership(GROUP, false).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Member)
+        .unwrap();
     let total = store.account_unread_total().unwrap();
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
@@ -875,14 +980,18 @@ fn account_unread_total_preserves_member_self_membership_group() {
 fn account_unread_total_unsuppresses_after_rejoin() {
     let store = setup_store_with_one_unread();
 
-    store.set_group_self_membership(GROUP, true).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
     assert_eq!(
         store.account_unread_total().unwrap(),
         AccountUnreadTotal::default()
     );
 
     // A re-add restores counting.
-    store.set_group_self_membership(GROUP, false).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Member)
+        .unwrap();
     let total = store.account_unread_total().unwrap();
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
@@ -917,7 +1026,9 @@ fn set_group_self_membership_survives_projection_resave() {
     // A routine projection re-save (profile/avatar metadata) must not clobber the
     // self_membership owned by the sync membership-change path.
     let store = setup_store_with_one_unread();
-    store.set_group_self_membership(GROUP, true).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
     assert_eq!(
         store.account_unread_total().unwrap(),
         AccountUnreadTotal::default()
@@ -970,21 +1081,27 @@ fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
     );
 
     // Once a row is flipped to 'removed' it drops out of the candidate set.
-    store.set_group_self_membership(GROUP, true).unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
     assert_eq!(
         store.account_group_ids_defaulting_to_member().unwrap(),
         vec!["22".to_owned()]
     );
 
     // Re-affirming 'member' keeps a row in the candidate set (still default).
-    store.set_group_self_membership("22", false).unwrap();
+    store
+        .set_group_self_membership("22", SelfMembership::Member)
+        .unwrap();
     assert_eq!(
         store.account_group_ids_defaulting_to_member().unwrap(),
         vec!["22".to_owned()]
     );
 
     // No defaulted rows left once every row is explicitly resolved.
-    store.set_group_self_membership("22", true).unwrap();
+    store
+        .set_group_self_membership("22", SelfMembership::Removed)
+        .unwrap();
     assert!(
         store
             .account_group_ids_defaulting_to_member()
@@ -1006,7 +1123,7 @@ fn set_group_self_membership_propagates_backend_errors() {
         conn.pragma_update(None, "foreign_keys", false).unwrap();
         conn.execute_batch("DROP TABLE account_groups;").unwrap();
     }
-    let result = store.set_group_self_membership(GROUP, true);
+    let result = store.set_group_self_membership(GROUP, SelfMembership::Removed);
     assert!(
         result.is_err(),
         "a failed self_membership projection write must return an error, not silently succeed"

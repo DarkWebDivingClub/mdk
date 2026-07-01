@@ -2,7 +2,7 @@
 
 use marmot_app::{ChatListAvatar, ChatListMessagePreview, ChatListRow, RuntimeChatListUpdate};
 
-use super::common::markdown_content_tokens;
+use super::common::{SelfMembershipFfi, markdown_content_tokens};
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -72,6 +72,9 @@ pub struct ChatListRowFfi {
     pub last_read_message_id_hex: Option<String>,
     pub last_read_timeline_at: Option<u64>,
     pub updated_at: u64,
+    /// Whether the local account is still a member of this group, and if not,
+    /// whether it left voluntarily or was removed.
+    pub self_membership: SelfMembershipFfi,
 }
 
 impl From<ChatListRow> for ChatListRowFfi {
@@ -93,6 +96,7 @@ impl From<ChatListRow> for ChatListRowFfi {
             last_read_message_id_hex: value.last_read_message_id_hex,
             last_read_timeline_at: value.last_read_timeline_at,
             updated_at: value.updated_at,
+            self_membership: value.self_membership.into(),
         }
     }
 }

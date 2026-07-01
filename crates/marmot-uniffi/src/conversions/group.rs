@@ -10,6 +10,7 @@ use marmot_app::{
 };
 
 use super::account::SendSummaryFfi;
+use super::common::SelfMembershipFfi;
 use crate::errors::MarmotKitError;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -32,6 +33,9 @@ pub struct AppGroupRecordFfi {
     pub disappearing_message_secs: u64,
     pub archived: bool,
     pub pending_confirmation: bool,
+    /// Whether the local account is still a member of this group, and if not,
+    /// whether it left voluntarily or was removed.
+    pub self_membership: SelfMembershipFfi,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
 }
@@ -64,6 +68,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             disappearing_message_secs,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
+            self_membership: value.self_membership.into(),
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
         }

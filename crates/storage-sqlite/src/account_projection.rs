@@ -7,6 +7,44 @@ use rusqlite::{
     Connection, OptionalExtension, params, params_from_iter,
     types::{Type, Value},
 };
+use serde::{Deserialize, Serialize};
+
+/// The local account's own membership in a projected group.
+///
+/// `Member` is the default and the fallback for unknown/forward-incompatible
+/// state: uncertainty must never hide a conversation. `Left` and `Removed` are
+/// both terminal "no longer a member" states that suppress the account's unread
+/// aggregate; they differ only in *why* membership ended — `Left` is a
+/// voluntary self-removal (including declining an invite), `Removed` is an
+/// eviction by another member.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelfMembership {
+    #[default]
+    Member,
+    Left,
+    Removed,
+}
+
+impl SelfMembership {
+    /// The persisted `account_groups.self_membership` text for this state.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SelfMembership::Member => "member",
+            SelfMembership::Left => "left",
+            SelfMembership::Removed => "removed",
+        }
+    }
+
+    /// Reads persisted membership text. Unknown values fall back to `Member` so
+    /// a row written by a newer schema never suppresses its unread here.
+    pub(crate) fn from_storage(value: &str) -> Self {
+        match value {
+            "left" => SelfMembership::Left,
+            "removed" => SelfMembership::Removed,
+            _ => SelfMembership::Member,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredAccountState {
@@ -32,6 +70,12 @@ pub struct StoredAccountGroup {
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
+    /// The local account's membership in this group. Read-only on this struct:
+    /// it is loaded from `account_groups` but owned exclusively by
+    /// [`SqliteAccountStorage::set_group_self_membership`], so the projection
+    /// save deliberately ignores it (a routine resave must not clobber a
+    /// membership change). New rows take the schema default `Member`.
+    pub self_membership: SelfMembership,
     pub components: Vec<StoredAccountGroupComponent>,
 }
 
@@ -124,6 +168,7 @@ struct RawStoredAccountGroup {
     pending_confirmation: bool,
     welcomer_account_id_hex: Option<String>,
     via_welcome_message_id_hex: Option<String>,
+    self_membership: SelfMembership,
 }
 
 impl SqliteAccountStorage {
@@ -179,7 +224,7 @@ impl SqliteAccountStorage {
                         image_hash_hex, image_key_hex, image_nonce_hex,
                         image_upload_key_hex, image_media_type, admin_keys_hex,
                         archived, pending_confirmation, welcomer_account_id_hex,
-                        via_welcome_message_id_hex
+                        via_welcome_message_id_hex, self_membership
                  FROM account_groups
                  ORDER BY updated_at, group_id_hex",
             )
@@ -201,6 +246,7 @@ impl SqliteAccountStorage {
                     pending_confirmation: row.get::<_, i64>(11)? != 0,
                     welcomer_account_id_hex: row.get(12)?,
                     via_welcome_message_id_hex: row.get(13)?,
+                    self_membership: SelfMembership::from_storage(&row.get::<_, String>(14)?),
                 })
             })
             .storage()?
@@ -226,6 +272,7 @@ impl SqliteAccountStorage {
                 pending_confirmation: raw.pending_confirmation,
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
+                self_membership: raw.self_membership,
                 components,
             });
         }
@@ -413,24 +460,23 @@ impl SqliteAccountStorage {
     }
 
     /// Record the local account's own membership in `group_id_hex` so the
-    /// removed-group-suppressed unread aggregate can exclude groups the account
-    /// has left or been removed from. `removed = true` marks the group
-    /// `'removed'` (suppress its unread); `removed = false` re-affirms `'member'`
+    /// chat list and removed-group-suppressed unread aggregate reflect whether
+    /// the account is still in the group and, if not, how it left. `Left` and
+    /// `Removed` both suppress the group's unread; `Member` re-affirms it
     /// (preserve / un-suppress on re-add). No-op when the group has no
     /// `account_groups` row yet, so this never resurrects pruned projection
     /// state.
     pub fn set_group_self_membership(
         &self,
         group_id_hex: &str,
-        removed: bool,
+        membership: SelfMembership,
     ) -> StorageResult<()> {
-        let self_membership = if removed { "removed" } else { "member" };
         self.lock()?
             .execute(
                 "UPDATE account_groups
                  SET self_membership = ?2
                  WHERE group_id_hex = ?1",
-                params![group_id_hex, self_membership],
+                params![group_id_hex, membership.as_str()],
             )
             .storage()?;
         Ok(())

@@ -16,8 +16,8 @@ use marmot_app::{
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
     MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
-    PushPlatform, RuntimeMessageUpdate, SignOutOptions, TimelineMessageQuery, TimelinePagination,
-    UserDirectorySearch, UserProfileMetadata, tag_value,
+    PushPlatform, RuntimeMessageUpdate, SelfMembership, SignOutOptions, TimelineMessageQuery,
+    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -3008,6 +3008,17 @@ async fn local_leave_suppresses_account_unread_total() {
         0,
         "a local leave must suppress the leaver's frozen account unread total"
     );
+
+    // The same leave records the chat-list row as a voluntary `Left` (not an
+    // involuntary `Removed`), end to end through the projection refresh, so the
+    // chat list can label the departure.
+    let bob_row = app
+        .chat_list("bob", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .expect("bob's chat-list row survives the leave");
+    assert_eq!(bob_row.self_membership, SelfMembership::Left);
 }
 
 #[tokio::test]

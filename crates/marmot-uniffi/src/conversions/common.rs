@@ -1,8 +1,30 @@
 //! Shared FFI helpers used across the conversion sub-modules.
 
 use cgka_traits::{GroupId, app_event::MARMOT_APP_EVENT_KIND_CHAT};
+use marmot_app::SelfMembership;
 
 use crate::markdown::{MarkdownDocumentFfi, parse_markdown_document};
+
+/// The local account's own membership in a group: an active `Member`, or a
+/// terminal state describing how it left — `Left` (a voluntary self-removal or
+/// declined invite) or `Removed` (evicted by another member). Surfaced on both
+/// the chat-list row and the group-detail record.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum SelfMembershipFfi {
+    Member,
+    Left,
+    Removed,
+}
+
+impl From<SelfMembership> for SelfMembershipFfi {
+    fn from(value: SelfMembership) -> Self {
+        match value {
+            SelfMembership::Member => SelfMembershipFfi::Member,
+            SelfMembership::Left => SelfMembershipFfi::Left,
+            SelfMembership::Removed => SelfMembershipFfi::Removed,
+        }
+    }
+}
 
 /// One Nostr tag from an inner Marmot app event, e.g. `["e", "<id>"]` or an
 /// `["imeta", …]` media descriptor. Host apps branch on the inner event `kind`

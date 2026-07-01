@@ -166,7 +166,7 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT,
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
     TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
 };
 pub use transport_nostr_adapter::{
@@ -1554,12 +1554,12 @@ impl MarmotApp {
         &self,
         account_ref: &str,
         group_id_hex: &str,
-        removed: bool,
+        membership: SelfMembership,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
-            .set_group_self_membership(group_id_hex, removed)?;
+            .set_group_self_membership(group_id_hex, membership)?;
         Ok(())
     }
 

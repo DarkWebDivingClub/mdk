@@ -40,7 +40,7 @@ use crate::{
     AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    SendSummary, remember_seen_event, unix_now_seconds,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -690,20 +690,21 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
         self.queue_own_group_system_projection_updates(&effects);
-        // A local leave / decline departs the group just like an observed
-        // self-removal does. The inbound `observe_account_device_effects` path
-        // suppresses the account unread aggregate for self-removal, but our own
-        // relay echoes are skipped, so the locally initiated departure must
-        // suppress here too. No-op if no `account_groups` row exists yet, so it
-        // never resurrects pruned projection state. This is the source-of-truth
-        // write for the account unread aggregate, so propagate its error (like
-        // the nearby projection writes) rather than swallow it: a silently
-        // failed update would leave `account_unread_total()` returning an
-        // inflated badge after a leave that otherwise reports success.
+        // A local leave / decline is a voluntary departure, recorded as `Left`
+        // so the chat list can distinguish it from an involuntary removal. The
+        // inbound `observe_account_device_effects` path records this for an
+        // observed self-removal, but our own relay echoes are skipped, so the
+        // locally initiated departure must record (and thereby suppress) here
+        // too. No-op if no `account_groups` row exists yet, so it never
+        // resurrects pruned projection state. This is the source-of-truth write
+        // for the account unread aggregate, so propagate its error (like the
+        // nearby projection writes) rather than swallow it: a silently failed
+        // update would leave `account_unread_total()` returning an inflated
+        // badge after a leave that otherwise reports success.
         self.app.set_group_self_membership(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
-            true,
+            SelfMembership::Left,
         )?;
         Ok(send_summary_from_effects(&effects))
     }
@@ -720,12 +721,19 @@ impl AppClient {
     /// For each row still carrying the default `'member'`, it asks the engine
     /// for the group's roster (`runtime.members`, sourced from the Marmot
     /// record's authoritative post-merge member set) and flips the row to
-    /// `'removed'` only when the call succeeds and the local account id is
+    /// `Removed` only when the call succeeds and the local account id is
     /// definitively absent. Engine errors / unknown groups are skipped so
     /// uncertainty never suppresses (matching the projection's existing
     /// invariant). The work is gated behind a once-only account-import marker,
     /// so subsequent opens are a single marker read and the hot path stays
     /// projection-only.
+    ///
+    /// A backfilled departure is recorded as `Removed`, not `Left`: roster
+    /// absence cannot tell us *why* the account is gone, and `Removed`
+    /// ("removed by someone") is the safer unknown bucket — claiming the user
+    /// voluntarily left a group an admin actually evicted them from is the more
+    /// misleading error. Both states suppress the unread aggregate identically,
+    /// so the choice only affects how the chat list labels the departure.
     pub(crate) fn backfill_self_membership_once(&self) -> Result<(), AppError> {
         if self
             .app
@@ -753,8 +761,11 @@ impl AppClient {
                 continue;
             };
             if local_account_removed_from_roster(&members, &local_account_id_hex) {
-                self.app
-                    .set_group_self_membership(&self.state.label, &group_id_hex, true)?;
+                self.app.set_group_self_membership(
+                    &self.state.label,
+                    &group_id_hex,
+                    SelfMembership::Removed,
+                )?;
             }
         }
         self.app.mark_account_import_complete(
