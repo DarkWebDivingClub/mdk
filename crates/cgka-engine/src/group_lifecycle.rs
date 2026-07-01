@@ -223,6 +223,16 @@ impl<S: StorageProvider> Engine<S> {
             required_capabilities: required_caps,
         };
         self.storage.put_group(&group_record)?;
+        // #740: index this group's transport routing id for O(1) inbound
+        // resolution (see `Engine::transport_group_id_index`). Best-effort: a
+        // routing-read failure only forfeits the fast path (inbound would fall
+        // through to the unknown-group disposition), never fails creation.
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
 
         // 5. Wrap welcomes via the peeler.
         //
@@ -531,6 +541,14 @@ impl<S: StorageProvider> Engine<S> {
         };
         mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;
+        // #740: index this joined group's transport routing id for O(1) inbound
+        // resolution (see `Engine::transport_group_id_index`).
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
 
         // Cache self's capabilities. Other members' capabilities arrive as
         // we ingest commits that touched their leaves; join-via-welcome

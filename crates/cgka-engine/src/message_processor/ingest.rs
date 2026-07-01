@@ -768,6 +768,11 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         self.storage.put_group(&g)?;
                     }
+                    // #740 rotation: a peer's applied commit may have changed the
+                    // Nostr routing component; additively refresh the transport-id
+                    // index so the new nostr_group_id resolves (prior id retained
+                    // for the overlap window). No-op when routing was unchanged.
+                    self.reindex_transport_group_id(&group_id);
                     // Refresh self-cache since our own leaf may have been
                     // updated by the commit's path.
                     crate::capability_manager::cache_self_capabilities(
@@ -1362,26 +1367,19 @@ impl<S: StorageProvider> Engine<S> {
             Err(err) => return Err(EngineError::Storage(err)),
         }
 
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        for group_id in self.storage.list_groups()? {
-            if group_id.as_slice() == transport_group_id {
-                return Ok(group_id);
-            }
-            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-            let Some(mls_group) = MlsGroup::load(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-                &mls_gid,
-            )
-            .map_err(|e| EngineError::Backend(format!("load route candidate: {e:?}")))?
-            else {
-                continue;
-            };
-            if crate::app_components::transport_group_id_of_group(&mls_group)? == transport_group_id
-            {
-                return Ok(group_id);
-            }
+        // #740: for Nostr-routed groups the `transport_group_id` (nostr_group_id)
+        // differs from the MLS group id, so the direct lookup above misses on the
+        // normal production path. Resolve via the authoritative in-memory index
+        // (built at hydration and group establishment; see
+        // `Engine::transport_group_id_index`) instead of the former O(groups)
+        // scan that deserialized every joined `MlsGroup`. That scan ran BEFORE
+        // payload authentication, so a peer flooding kind-445 events with unknown
+        // `transport_group_id`s forced attacker-paced CPU + storage I/O. A miss
+        // now costs one hash probe: the id is not one of our groups, so fall
+        // through to the direct id and let the unknown-group / NotForThisClient
+        // handling drop it without any per-event scan.
+        if let Some(group_id) = self.transport_group_id_index.get(transport_group_id) {
+            return Ok(group_id.clone());
         }
 
         Ok(direct)

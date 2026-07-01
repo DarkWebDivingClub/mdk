@@ -104,6 +104,70 @@ pub struct StoredAppMessageRecord {
     pub source_epoch: Option<u64>,
     pub recorded_at: u64,
     pub received_at: u64,
+    /// Local `app_events` insert order (rowid). The final, LOCAL tiebreak of the
+    /// raw-event replay ordering; see [`AppEventReplayCursor`]. Never used for
+    /// cross-client display order (that is the materialized-timeline surface).
+    pub insert_order: i64,
+}
+
+impl StoredAppMessageRecord {
+    /// The raw-event replay cursor for this row (recovery ordering only).
+    pub fn replay_cursor(&self) -> AppEventReplayCursor {
+        AppEventReplayCursor {
+            recorded_at: self.recorded_at,
+            message_id_hex: self.message_id_hex.clone(),
+            insert_order: self.insert_order,
+        }
+    }
+}
+
+/// Column list for [`SqliteAccountStorage::app_messages`], ending in
+/// `insert_order` (column index 10, read by `app_message_from_row`).
+const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
+     kind, tags_json, source_epoch, recorded_at, received_at, insert_order";
+
+/// The ONE ascending order for the raw-event replay surface (recovery / lag
+/// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
+/// [`AppEventReplayCursor`]'s `Ord` — the runtime recovery watermark and
+/// suppression, so the query order and the watermark cut-point can never drift
+/// (#630, #736 boundary contract 1). This is the RAW-EVENT surface only: it is
+/// NOT the materialized-timeline `(timeline_at, message_id_hex)` display order.
+pub(crate) const APP_EVENT_REPLAY_ORDER_ASC: &str = "recorded_at, message_id_hex, insert_order";
+/// Descending variant of [`APP_EVENT_REPLAY_ORDER_ASC`] for the newest-first
+/// `LIMIT` window that a bounded replay materializes before re-sorting ascending.
+pub(crate) const APP_EVENT_REPLAY_ORDER_DESC: &str =
+    "recorded_at DESC, message_id_hex DESC, insert_order DESC";
+
+/// Total order over the RAW-EVENT replay surface: `(recorded_at, message_id_hex,
+/// insert_order)`. `insert_order` is a LOCAL rowid, which is correct here because
+/// this cursor is only ever a per-client recovery cut-point (the lag-recovery
+/// watermark + suppression), never the cross-client user-visible timeline order.
+/// The third field is load-bearing for unscoped (all-groups) recovery: the same
+/// `message_id_hex` can appear in two groups (it is unique only per group — e.g.
+/// a sender posting identical content to two groups in the same second), so a
+/// two-field cut-point could wrongly suppress a genuinely-new same-second row.
+/// This is the single canonical comparator behind #630; keep it byte-identical
+/// to [`APP_EVENT_REPLAY_ORDER_ASC`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppEventReplayCursor {
+    pub recorded_at: u64,
+    pub message_id_hex: String,
+    pub insert_order: i64,
+}
+
+impl Ord for AppEventReplayCursor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.recorded_at
+            .cmp(&other.recorded_at)
+            .then_with(|| self.message_id_hex.cmp(&other.message_id_hex))
+            .then_with(|| self.insert_order.cmp(&other.insert_order))
+    }
+}
+
+impl PartialOrd for AppEventReplayCursor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,9 +318,12 @@ impl SqliteAccountStorage {
             .storage()?;
         drop(group_statement);
 
+        let mut components_by_group = all_account_group_components(&conn)?;
         let mut groups = Vec::with_capacity(raw_groups.len());
         for raw in raw_groups {
-            let components = account_group_components(&conn, &raw.group_id_hex)?;
+            let components = components_by_group
+                .remove(&raw.group_id_hex)
+                .unwrap_or_default();
             groups.push(StoredAccountGroup {
                 group_id_hex: raw.group_id_hex,
                 endpoint: raw.endpoint,
@@ -511,48 +578,34 @@ impl SqliteAccountStorage {
         &self,
         query: StoredAppMessageQuery,
     ) -> StorageResult<Vec<StoredAppMessageRecord>> {
+        // Single-source the column list + replay ordering so the query order and
+        // the runtime recovery watermark/suppression (via `AppEventReplayCursor`)
+        // cannot drift (#630, #736). The limited variants take the newest-first
+        // `LIMIT` window, then re-sort ascending into replay order.
+        let cols = APP_EVENT_REPLAY_COLUMNS;
+        let asc = APP_EVENT_REPLAY_ORDER_ASC;
+        let desc = APP_EVENT_REPLAY_ORDER_DESC;
         let sql = match (&query.group_id_hex, query.limit) {
-            (Some(_), Some(_)) => {
-                "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, source_epoch, recorded_at, received_at
-                 FROM (
-                    SELECT insert_order, message_id_hex, direction, group_id_hex, sender,
-                           plaintext, kind, tags_json, source_epoch, recorded_at, received_at
-                    FROM app_events
+            (Some(_), Some(_)) => format!(
+                "SELECT {cols} FROM (
+                    SELECT {cols} FROM app_events
                     WHERE group_id_hex = ?1
-                    ORDER BY recorded_at DESC, message_id_hex DESC, insert_order DESC
-                    LIMIT ?2
-                 )
-                 ORDER BY recorded_at, message_id_hex, insert_order"
-            }
+                    ORDER BY {desc} LIMIT ?2
+                 ) ORDER BY {asc}"
+            ),
             (Some(_), None) => {
-                "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, source_epoch, recorded_at, received_at
-                 FROM app_events
-                 WHERE group_id_hex = ?1
-                 ORDER BY recorded_at, message_id_hex, insert_order"
+                format!("SELECT {cols} FROM app_events WHERE group_id_hex = ?1 ORDER BY {asc}")
             }
-            (None, Some(_)) => {
-                "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, source_epoch, recorded_at, received_at
-                 FROM (
-                    SELECT insert_order, message_id_hex, direction, group_id_hex, sender,
-                           plaintext, kind, tags_json, source_epoch, recorded_at, received_at
-                    FROM app_events
-                    ORDER BY recorded_at DESC, message_id_hex DESC, insert_order DESC
-                    LIMIT ?1
-                 )
-                 ORDER BY recorded_at, message_id_hex, insert_order"
-            }
-            (None, None) => {
-                "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, source_epoch, recorded_at, received_at
-                 FROM app_events
-                 ORDER BY recorded_at, message_id_hex, insert_order"
-            }
+            (None, Some(_)) => format!(
+                "SELECT {cols} FROM (
+                    SELECT {cols} FROM app_events
+                    ORDER BY {desc} LIMIT ?1
+                 ) ORDER BY {asc}"
+            ),
+            (None, None) => format!("SELECT {cols} FROM app_events ORDER BY {asc}"),
         };
         let conn = self.lock()?;
-        let mut statement = conn.prepare(sql).storage()?;
+        let mut statement = conn.prepare(&sql).storage()?;
         let rows = match (&query.group_id_hex, query.limit) {
             (Some(group_id_hex), Some(limit)) => statement
                 .query_map(
@@ -1143,29 +1196,39 @@ fn checkpoint_wal_truncate_after_secure_prune(conn: &Connection) -> StorageResul
     })
 }
 
-fn account_group_components(
+/// #762: load ALL account-group components in one ordered query, bucketed by
+/// group in Rust, instead of an N+1 per-group query during full-projection load.
+/// Ordered by `(group_id_hex, component_id)` so each group's components keep
+/// `component_id` order (matching the prior per-group `ORDER BY component_id`).
+fn all_account_group_components(
     conn: &rusqlite::Connection,
-    group_id_hex: &str,
-) -> StorageResult<Vec<StoredAccountGroupComponent>> {
+) -> StorageResult<std::collections::HashMap<String, Vec<StoredAccountGroupComponent>>> {
     let mut statement = conn
         .prepare(
-            "SELECT component_id, component_name, component_data_hex
+            "SELECT group_id_hex, component_id, component_name, component_data_hex
              FROM account_group_app_components
-             WHERE group_id_hex = ?1
-             ORDER BY component_id",
+             ORDER BY group_id_hex, component_id",
         )
         .storage()?;
-    statement
-        .query_map(params![group_id_hex], |row| {
-            Ok(StoredAccountGroupComponent {
-                component_id: i64_to_u16(row.get(0)?, 0)?,
-                component_name: row.get(1)?,
-                component_data_hex: row.get(2)?,
-            })
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredAccountGroupComponent {
+                    component_id: i64_to_u16(row.get(1)?, 1)?,
+                    component_name: row.get(2)?,
+                    component_data_hex: row.get(3)?,
+                },
+            ))
         })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+        .storage()?;
+    let mut by_group: std::collections::HashMap<String, Vec<StoredAccountGroupComponent>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (group_id_hex, component) = row.storage()?;
+        by_group.entry(group_id_hex).or_default().push(component);
+    }
+    Ok(by_group)
 }
 
 fn delete_stale_group_components(
@@ -1244,6 +1307,7 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
             .and_then(|value| value.try_into().ok()),
         recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        insert_order: row.get::<_, i64>(10)?,
     })
 }
 

@@ -574,6 +574,11 @@ impl LegacyAccountProjectionDb {
                     .and_then(|value| value.try_into().ok()),
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
+                // Frozen legacy migration reader (the old `messages` table): its
+                // records are re-inserted into `app_events` with fresh rowids by
+                // the one-time migration and are never used as a replay cursor, so
+                // the value here is immaterial.
+                insert_order: 0,
             })
         };
         let rows = match (&query.group_id_hex, query.limit) {

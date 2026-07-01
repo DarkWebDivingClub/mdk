@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::{
@@ -908,18 +908,104 @@ pub(crate) fn is_push_gossip_kind(kind: u64) -> bool {
     )
 }
 
+/// Per-batch memoization of the notification-building lookups that repeat across
+/// the events drained in one `collect_notifications_after_wake` pass (#639):
+/// account notification settings (keyed by account_label), the group record
+/// (keyed by account_label + group_id_hex), and directory-derived users (keyed by
+/// account_id_hex — shared by the receiver and by every sender). Each backing
+/// lookup re-opens the per-account SQLCipher / directory caches and fans across
+/// accounts, so a busy multi-message batch would otherwise re-pay that per
+/// message. `reaction_target` is intentionally NOT cached — it is keyed by a
+/// distinct reacted-to message id per reaction, so there is nothing to reuse.
+///
+/// Cached values are message-agnostic: `user` stores the raw directory result,
+/// and the per-message sender-display-name fallback is applied to the returned
+/// clone by `notification_user_from_message`, never written back into the cache.
+#[derive(Default)]
+pub(crate) struct NotificationResolver {
+    settings: HashMap<String, NotificationSettings>,
+    groups: HashMap<(String, String), Option<AppGroupRecord>>,
+    users: HashMap<String, NotificationUser>,
+}
+
+impl NotificationResolver {
+    fn settings(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        if let Some(settings) = self.settings.get(account_label) {
+            return Ok(settings.clone());
+        }
+        let settings = app.notification_settings(account_label)?;
+        self.settings
+            .insert(account_label.to_owned(), settings.clone());
+        Ok(settings)
+    }
+
+    fn group(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        let key = (account_label.to_owned(), group_id_hex.to_owned());
+        if let Some(group) = self.groups.get(&key) {
+            return Ok(group.clone());
+        }
+        let group = app.group(account_label, group_id_hex)?;
+        self.groups.insert(key, group.clone());
+        Ok(group)
+    }
+
+    fn user(
+        &mut self,
+        app: &MarmotApp,
+        account_id_hex: &str,
+    ) -> Result<NotificationUser, AppError> {
+        if let Some(user) = self.users.get(account_id_hex) {
+            return Ok(user.clone());
+        }
+        let user = notification_user(app, account_id_hex)?;
+        self.users.insert(account_id_hex.to_owned(), user.clone());
+        Ok(user)
+    }
+}
+
+/// Build a notification for a single event with a throwaway resolver. Used by the
+/// live per-event notification stream, where events arrive one at a time and
+/// there is nothing to memoize across.
 pub(crate) fn notification_update_from_event(
     app: &MarmotApp,
     event: &MarmotAppEvent,
 ) -> Result<Option<NotificationUpdate>, AppError> {
+    let mut resolver = NotificationResolver::default();
+    notification_update_from_event_cached(app, &mut resolver, event)
+}
+
+/// Build a notification for one event, reusing `resolver`'s memoized
+/// settings/group/user lookups across a batch of events (#639).
+pub(crate) fn notification_update_from_event_cached(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    event: &MarmotAppEvent,
+) -> Result<Option<NotificationUpdate>, AppError> {
     match event {
-        MarmotAppEvent::MessageReceived(message) => notification_update_from_message(app, message),
+        MarmotAppEvent::MessageReceived(message) => {
+            notification_update_from_message(app, resolver, message)
+        }
         MarmotAppEvent::GroupJoined {
             account_id_hex,
             account_label,
             group_id,
-        } => notification_update_from_group_join(app, account_label, account_id_hex, group_id)
-            .map(Some),
+        } => notification_update_from_group_join(
+            app,
+            resolver,
+            account_label,
+            account_id_hex,
+            group_id,
+        )
+        .map(Some),
         MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::AgentStreamStarted(_)
@@ -937,9 +1023,10 @@ fn is_notifiable_message_kind(kind: u64) -> bool {
 
 fn notification_update_from_message(
     app: &MarmotApp,
+    resolver: &mut NotificationResolver,
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    let settings = app.notification_settings(&event.account_label)?;
+    let settings = resolver.settings(app, &event.account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
     }
@@ -951,9 +1038,9 @@ fn notification_update_from_message(
         return Ok(None);
     }
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
-    let group = app.group(&event.account_label, &group_id_hex)?;
-    let receiver = notification_user(app, &event.account_id_hex)?;
-    let sender = notification_user_from_message(app, &event.message)?;
+    let group = resolver.group(app, &event.account_label, &group_id_hex)?;
+    let receiver = resolver.user(app, &event.account_id_hex)?;
+    let sender = notification_user_from_message(app, resolver, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
     // Resolve the reacted-to row from the materialized timeline by id (not raw
     // app_events): the timeline reflects deletion/invalidation and never carries
@@ -1006,22 +1093,23 @@ fn notification_update_from_message(
 
 fn notification_update_from_group_join(
     app: &MarmotApp,
+    resolver: &mut NotificationResolver,
     account_label: &str,
     account_id_hex: &str,
     group_id: &cgka_traits::GroupId,
 ) -> Result<NotificationUpdate, AppError> {
-    let settings = app.notification_settings(account_label)?;
+    let settings = resolver.settings(app, account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
     }
     let group_id_hex = hex::encode(group_id.as_slice());
-    let group = app.group(account_label, &group_id_hex)?;
-    let receiver = notification_user(app, account_id_hex)?;
+    let group = resolver.group(app, account_label, &group_id_hex)?;
+    let receiver = resolver.user(app, account_id_hex)?;
     let sender_id = group
         .as_ref()
         .and_then(|group| group.welcomer_account_id_hex.clone())
         .unwrap_or_else(|| account_id_hex.to_owned());
-    let sender = notification_user(app, &sender_id)?;
+    let sender = resolver.user(app, &sender_id)?;
     let invite_ref = group
         .as_ref()
         .and_then(|group| group.via_welcome_message_id_hex.clone())
@@ -1149,9 +1237,14 @@ fn reaction_notification_fields(
 
 fn notification_user_from_message(
     app: &MarmotApp,
+    resolver: &mut NotificationResolver,
     message: &ReceivedMessage,
 ) -> Result<NotificationUser, AppError> {
-    let mut user = notification_user(app, &message.sender)?;
+    // Start from the cached directory-derived user, then apply THIS message's
+    // sender-display-name fallback to the returned clone — never written back
+    // into the resolver cache, so a later message from the same sender still
+    // applies its own fallback.
+    let mut user = resolver.user(app, &message.sender)?;
     if user.display_name.is_none() {
         user.display_name = message.sender_display_name.clone();
     }
@@ -1159,11 +1252,16 @@ fn notification_user_from_message(
 }
 
 fn notification_user(app: &MarmotApp, account_id_hex: &str) -> Result<NotificationUser, AppError> {
-    let profile = app.directory_entry_for_account_id(account_id_hex)?;
+    // #639: fetch the directory entry ONCE and derive both the display name and
+    // picture from it, instead of calling `directory_entry_for_account_id` here
+    // and again inside `display_name_for_account_id` (each re-opens the directory
+    // caches and fans across every account's SQLCipher cache).
+    let entry = app.directory_entry_for_account_id(account_id_hex)?;
+    let display_name = app.display_name_from_directory_entry(account_id_hex, entry.as_ref())?;
     Ok(NotificationUser {
         account_id_hex: account_id_hex.to_owned(),
-        display_name: app.display_name_for_account_id(account_id_hex)?,
-        picture_url: profile.and_then(|entry| entry.profile.and_then(|profile| profile.picture)),
+        display_name,
+        picture_url: entry.and_then(|entry| entry.profile.and_then(|profile| profile.picture)),
     })
 }
 

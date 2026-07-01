@@ -2063,3 +2063,46 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
             .is_none()
     );
 }
+
+// Finding 2: an in-place nostr_group_id / relay rotation on an existing group
+// must switch the transport subscription. `add_group` previously early-returned
+// on a duplicate group_id, so a rotated route never took effect; it now replaces
+// by group_id and reports whether the route set changed.
+#[test]
+fn transport_add_group_replaces_route_for_same_group_on_rotation() {
+    let routing = AppTransportRouting::new(AppRoutingState {
+        local_inbox_endpoints: Vec::new(),
+        key_package_endpoints: Vec::new(),
+        inbox_routes: HashMap::new(),
+        group_routes: Vec::new(),
+        required_acks: 0,
+    });
+    let group_id = GroupId::new(vec![0xAB; 16]);
+    let sub_x = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0x41; 32],
+        endpoints: vec![TransportEndpoint("wss://x.example".to_owned())],
+    };
+    // First insert of a new group route reports a change.
+    assert!(routing.add_group(sub_x.clone()));
+    // Re-adding the identical subscription is a no-op.
+    assert!(!routing.add_group(sub_x.clone()));
+
+    // Rotation: same group_id, new transport_group_id + relay. Must replace the
+    // existing route, report a change, and NOT leave a duplicate for the group.
+    let sub_y = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0x59; 32],
+        endpoints: vec![TransportEndpoint("wss://y.example".to_owned())],
+    };
+    assert!(routing.add_group(sub_y.clone()));
+
+    let snapshot = routing.snapshot();
+    let routes: Vec<_> = snapshot
+        .group_routes
+        .iter()
+        .filter(|route| route.group_id == group_id)
+        .collect();
+    assert_eq!(routes.len(), 1, "rotation must replace, not duplicate");
+    assert_eq!(routes[0], &sub_y);
+}

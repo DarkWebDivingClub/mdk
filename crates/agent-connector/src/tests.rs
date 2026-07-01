@@ -2222,6 +2222,7 @@ fn received_chat_record(
         source_epoch: Some(1),
         recorded_at: 100,
         received_at: 100,
+        insert_order: 0,
     }
 }
 

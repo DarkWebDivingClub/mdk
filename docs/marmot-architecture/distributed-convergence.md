@@ -35,6 +35,11 @@ input quiesces, then canonicalizes stored commits, proposals, and app-message wi
 `MlsGroup`. Accepted application messages and invalidation records are then available for the application layer to
 render, hide, mark, or otherwise handle.
 
+The surrounding inbound plumbing — storage ordering surfaces, runtime lag-recovery, convergence scheduling, transport
+routing, and off-critical-path I/O — is governed by the five boundary contracts in
+[`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md) ("Inbound / Convergence Boundary Contracts").
+Branch selection itself (below) is unchanged by those.
+
 ## Shape
 
 The engine keeps a bounded candidate-state graph. The live `MlsGroup` is a materialized view of the selected branch.

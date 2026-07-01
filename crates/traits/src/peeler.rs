@@ -47,6 +47,23 @@ impl GroupMessageMetadata {
         Self::CommitOrProposal
     }
 
+    /// The `created_at` to stamp on the OUTER transport envelope so the sender
+    /// and every receiver agree on the message's timestamp (#630 cross-client /
+    /// package E). Only application messages carry a sender-authenticated inner
+    /// `created_at`; commits/proposals have none, so `None` here means the
+    /// transport default (wrap time) stands. Binding the outer `created_at` to
+    /// the inner one changes the outer transport event id (it is part of the id
+    /// preimage) and makes broadcasts of identical content to multiple groups
+    /// share a timestamp — an accepted trade-off for cross-client ordering.
+    pub fn outer_created_at(&self) -> Option<u64> {
+        match self {
+            Self::Application {
+                inner_created_at, ..
+            } => Some(*inner_created_at),
+            Self::CommitOrProposal => None,
+        }
+    }
+
     /// Compute the transport-level expiration timestamp, if any.
     pub fn expiration_timestamp(&self) -> Result<Option<u64>, GroupMessageMetadataError> {
         let Self::Application {

@@ -146,6 +146,12 @@ impl<S: StorageProvider> Engine<S> {
         // Post-merge fork-recovery anchor (idempotent, own transaction).
         self.retain_current_epoch_snapshot_for_group(&group_id)?;
 
+        // #740 rotation: a confirmed local UpdateAppComponents commit may have
+        // changed this group's Nostr routing component; additively refresh the
+        // transport-id index so the new nostr_group_id resolves on the inbound
+        // path (the prior id stays mapped for the overlap window).
+        self.reindex_transport_group_id(&group_id);
+
         // Durable state has committed. From here on the steps are in-memory
         // state-machine transitions (idempotent-unsafe but infallible w.r.t. the
         // backend) plus best-effort cleanup. Kind discriminates create (always

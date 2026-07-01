@@ -86,6 +86,28 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Hex-encoded `seen_message_ids` snapshot for the convergence
+    /// `CanonicalizationState`, cached by the seen-set generation (#636). A
+    /// convergence drain calls `converge_stored_openmls_messages` up to 16 times;
+    /// re-hex-encoding the whole (up to 100k-entry) set every pass was pure heap
+    /// churn. The cache is rebuilt only when the set changed since it was last
+    /// encoded, so a settled multi-pass drain encodes it at most once.
+    fn seen_message_ids_hex_for_convergence(&mut self) -> std::collections::BTreeSet<String> {
+        let generation = self.seen_message_ids.generation();
+        if let Some((cached_generation, snapshot)) = &self.seen_message_ids_hex_cache
+            && *cached_generation == generation
+        {
+            return snapshot.clone();
+        }
+        let snapshot: std::collections::BTreeSet<String> = self
+            .seen_message_ids
+            .iter()
+            .map(|message_id| hex::encode(message_id.as_slice()))
+            .collect();
+        self.seen_message_ids_hex_cache = Some((generation, snapshot.clone()));
+        snapshot
+    }
+
     pub(crate) fn convergence_policy_for_group(
         &self,
         group_id: &GroupId,
@@ -237,11 +259,9 @@ impl<S: StorageProvider> Engine<S> {
             current_tip_epoch: previous_tip.0,
             retained_anchor_epoch,
             last_convergence_relevant_input_ms,
-            seen_message_ids: self
-                .seen_message_ids
-                .iter()
-                .map(|message_id| hex::encode(message_id.as_slice()))
-                .collect(),
+            // #636: reuse the cached hex snapshot across the up-to-16 passes of a
+            // convergence drain; it is re-encoded only when the seen set changed.
+            seen_message_ids: self.seen_message_ids_hex_for_convergence(),
         };
 
         let max_rewind_commits = policy.convergence.max_rewind_commits;
@@ -368,6 +388,11 @@ impl<S: StorageProvider> Engine<S> {
             &result,
             max_retained_anchor_rewind,
         )?;
+        // #740 rotation: a routing-component update commit applied through
+        // convergence may have changed this group's nostr_group_id; additively
+        // refresh the transport-id index so it resolves on the inbound path
+        // (prior id retained for the overlap window).
+        self.reindex_transport_group_id(group_id);
         let origin_commit_id = single_accepted_commit_id(&result);
         let origin_commit_actor =
             single_accepted_commit_actor(&observations, origin_commit_id.as_ref());

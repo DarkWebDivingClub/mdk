@@ -483,6 +483,15 @@ async fn run_app_runtime_account_worker(
         }
     }
 
+    // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
+    // / InviteMembers) can buffer convergence groups. The steady-state arms below
+    // drain `take_pending_convergence_groups()` after every command/event, but the
+    // deferred-replay loop above does not — so schedule them here before entering
+    // the loop, otherwise buffered groups stay stranded until the next unrelated
+    // command/event (a liveness gap). `schedule_groups` is an idempotent set
+    // insert, so this is safe even when the loop buffered nothing.
+    scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
 
     loop {

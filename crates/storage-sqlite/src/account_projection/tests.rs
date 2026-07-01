@@ -1396,3 +1396,63 @@ fn all_row_count(store: &SqliteAccountStorage, table: &str) -> i64 {
         })
         .unwrap()
 }
+
+#[test]
+fn app_messages_replay_order_matches_cursor_comparator() {
+    // #630/#736 boundary contract 1: the raw-event replay query order
+    // (`app_messages`) MUST equal the `AppEventReplayCursor` Rust comparator, so
+    // the recovery watermark/suppression and the recovery query can never drift.
+    // Covers the unscoped (all-groups) case where two groups share the same
+    // `(recorded_at, message_id_hex)` and only the local `insert_order`
+    // distinguishes them.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    // Same second, ids inserted in NON-lexical order; plus a cross-group
+    // duplicate id at the same second; plus a later-second row.
+    store.record_app_event(&app_event("bbb", "aa", 50)).unwrap(); // insert_order 1
+    store.record_app_event(&app_event("aaa", "aa", 50)).unwrap(); // insert_order 2 (smaller id, later insert)
+    // The two `dup` rows share `message_id_hex` (allowed: the app_events UNIQUE is
+    // per-(group, message_id)) but carry distinct globally-unique
+    // `source_message_id_hex` (distinct outer transport events), mirroring a
+    // sender posting identical content to two groups in the same second.
+    let mut dup_aa = app_event("dup", "aa", 50);
+    dup_aa.source_message_id_hex = Some("source-dup-aa".to_owned());
+    let mut dup_bb = app_event("dup", "bb", 50);
+    dup_bb.source_message_id_hex = Some("source-dup-bb".to_owned());
+    store.record_app_event(&dup_aa).unwrap(); // insert_order 3
+    store.record_app_event(&dup_bb).unwrap(); // insert_order 4 (same id, other group)
+    store.record_app_event(&app_event("zzz", "aa", 60)).unwrap(); // insert_order 5 (later second)
+
+    let rows = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: None,
+            limit: None,
+        })
+        .unwrap();
+
+    // The SQL ORDER BY must equal sorting the same rows by the cursor comparator.
+    let mut by_cursor = rows.clone();
+    by_cursor.sort_by_key(|r| r.replay_cursor());
+    let key = |r: &StoredAppMessageRecord| (r.message_id_hex.clone(), r.group_id_hex.clone());
+    assert_eq!(
+        rows.iter().map(key).collect::<Vec<_>>(),
+        by_cursor.iter().map(key).collect::<Vec<_>>(),
+        "app_messages SQL order must equal the AppEventReplayCursor comparator"
+    );
+
+    // Concrete order: same-second by id (aaa<bbb<dup), the two `dup` rows by
+    // insert_order (group aa inserted before bb), then the later second.
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aaa", "bbb", "dup", "dup", "zzz"],
+    );
+    let dups: Vec<_> = rows.iter().filter(|r| r.message_id_hex == "dup").collect();
+    assert_eq!(dups.len(), 2);
+    assert!(
+        dups[0].insert_order < dups[1].insert_order,
+        "cross-group same-id rows are ordered by the local insert_order tiebreak"
+    );
+    assert_eq!(dups[0].group_id_hex, "aa");
+    assert_eq!(dups[1].group_id_hex, "bb");
+}

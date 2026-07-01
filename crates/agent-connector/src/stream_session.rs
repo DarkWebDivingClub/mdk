@@ -142,7 +142,30 @@ impl SendIdempotencyStore {
             inner.order.push_back(key);
             true
         };
-        if should_persist && let Err(err) = self.persist_to_disk() {
+        if !should_persist {
+            return;
+        }
+        // #691: persist OFF the async send hot path. The in-memory entry recorded
+        // above already enforces first-write-wins for the lifetime of this process,
+        // so the (fs + double-fsync) disk write does not need to block the caller.
+        // Durability is therefore at-least-once: a crash after the send returns but
+        // before the spawned write lands can lose the on-disk record, so a retry
+        // after restart may re-send — acceptable because the in-process dedup covers
+        // the common retry window and the record only persists after a successful
+        // send. When called outside a tokio runtime (unit tests) we persist inline.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let store = self.clone();
+                tokio::task::spawn_blocking(move || store.persist_to_disk_logged());
+            }
+            Err(_) => self.persist_to_disk_logged(),
+        }
+    }
+
+    /// Persist the current records to disk, logging (not propagating) any error.
+    /// Used by both the off-hot-path `spawn_blocking` write and the inline fallback.
+    fn persist_to_disk_logged(&self) {
+        if let Err(err) = self.persist_to_disk() {
             tracing::warn!(
                 target: "agent_connector",
                 method = "send_idempotency_persist",

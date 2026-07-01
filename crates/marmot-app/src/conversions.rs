@@ -219,6 +219,7 @@ pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> 
         source_epoch: record.source_epoch,
         recorded_at: record.recorded_at,
         received_at: record.received_at,
+        insert_order: record.insert_order,
     }
 }
 

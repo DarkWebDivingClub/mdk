@@ -180,6 +180,37 @@ pub struct Engine<S: StorageProvider> {
     /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
     /// successful [`Self::retry_hydrate_quarantined_group`].
     pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
+
+    /// Authoritative `transport_group_id -> GroupId` resolver for inbound
+    /// routing (#740). A Nostr-routed group's `transport_group_id`
+    /// (`nostr_group_id`) differs from its MLS group id, so the direct
+    /// `get_group` lookup in `group_id_for_transport_group_id` misses on the
+    /// normal production path; this index answers that in O(1) instead of the
+    /// former O(groups) scan that deserialized EVERY joined `MlsGroup` — a scan
+    /// that ran BEFORE payload authentication, so an unauthenticated peer could
+    /// flood unknown `transport_group_id`s to force attacker-paced CPU + storage
+    /// I/O. Populated for every group at hydration
+    /// ([`Self::hydrate_one_stored_group`]) and establishment (`do_create_group`
+    /// / `do_join_welcome`); a `transport_group_id` is immutable for a group's
+    /// maintenance is needed for a static route. A `transport_group_id` CAN
+    /// change via a Nostr routing-component update commit (rotation); every
+    /// commit-apply site therefore calls [`Self::reindex_transport_group_id`],
+    /// which additively inserts the new id while leaving the prior id in place
+    /// for the rotation overlap window (this map is intentionally many-to-one).
+    /// The engine has no group-deletion path today (`StorageProvider::delete_group`
+    /// is never called from engine code; a left group's record is retained), so an
+    /// entry cannot outlive its group — and even a hypothetical stale entry is
+    /// self-correcting, since the resolved `GroupId` is loaded by the caller and a
+    /// missing group is dropped as unknown. If engine-side group deletion is ever
+    /// added, that site MUST remove the corresponding index entries.
+    pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
+
+    /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
+    /// convergence `CanonicalizationState`, tagged with the seen-set generation
+    /// it was built from. A convergence drain runs the pass up to 16× and
+    /// previously re-hex-encoded the whole (up to 100k-entry) set every pass;
+    /// this rebuilds only when the set actually changed. `None` until first use.
+    pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -318,6 +349,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
+            transport_group_id_index: HashMap::new(),
+            seen_message_ids_hex_cache: None,
         })
     }
 }
@@ -635,6 +668,43 @@ impl<S: StorageProvider> Engine<S> {
     /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
     /// scope crash-recovery to staged commits that remove no members, matching
     /// the prior (pre-recovery) behaviour for removal-bearing commits.
+    /// Additively refresh a group's `transport_group_id_index` entry from live
+    /// MLS state after a commit that may have changed the Nostr routing
+    /// component (#740 rotation). Inserts the group's CURRENT `transport_group_id`;
+    /// any prior id is left in place so inbound messages still addressed to the
+    /// pre-rotation route during the overlap window keep resolving (the map is
+    /// many-to-one, matching the spec's "publish to the prior routing address"
+    /// overlap model). Called at the commit-apply sites (`do_confirm_published`
+    /// for local rotation, remote-commit ingest, and convergence apply); these
+    /// only fire on commit application, not per app message, so the extra
+    /// `MlsGroup::load` is cost-appropriate. Best-effort: a load / routing-read
+    /// failure just forfeits the fast path for this group (inbound would fall to
+    /// the unknown-group disposition), never fails the merge.
+    pub(crate) fn reindex_transport_group_id(&mut self, group_id: &GroupId) {
+        let mls_group = {
+            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                &self.crypto,
+                self.storage.mls_storage(),
+            );
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            match openmls::group::MlsGroup::load(
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+                &mls_gid,
+            ) {
+                Ok(Some(group)) => group,
+                _ => return,
+            }
+        };
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
+    }
+
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             if let Err(reason) = self.hydrate_one_stored_group(&group_id) {
@@ -776,6 +846,18 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.leave_requests.remove(group_id);
             self.leaving_groups.remove(group_id);
+        }
+
+        // #740: record this group's transport routing id so inbound resolution
+        // is an O(1) index hit rather than a pre-auth O(groups) MlsGroup-load
+        // scan. `mls_group` is owned here (not borrowing `self`), and the
+        // `provider` borrow is already released, so this direct field insert is
+        // disjoint from the storage/crypto borrows above.
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
         }
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);

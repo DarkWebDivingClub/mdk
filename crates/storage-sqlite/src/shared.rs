@@ -11,6 +11,15 @@ use rusqlite::{OptionalExtension, params};
 
 const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 
+/// Defensive upper bound on how many public-directory users
+/// [`SqliteSharedStorage::public_directory_users`] materializes at once (#761).
+/// The public directory is populated from network data, so without a cap a
+/// hostile or simply large cache could be loaded unboundedly into memory. Set
+/// well above the app-layer directory-search reachability
+/// (`USER_DIRECTORY_SEARCH_MAX_VISITED` == 8192) so it never truncates a
+/// realistic result set; a warn fires if it is ever hit.
+const PUBLIC_DIRECTORY_USERS_MAX: usize = 10_000;
+
 #[derive(Clone, Debug)]
 pub struct SqliteSharedStorage {
     conn: Arc<Mutex<rusqlite::Connection>>,
@@ -283,24 +292,97 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     pub fn public_directory_users(&self) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
-        let ids = {
-            let conn = self.lock();
+        self.public_directory_users_capped(PUBLIC_DIRECTORY_USERS_MAX)
+    }
+
+    fn public_directory_users_capped(
+        &self,
+        max: usize,
+    ) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
+        // #761: two batched queries + Rust bucketing instead of a 2N+1 (one user
+        // row query plus one follows query per user), AND a defensive `max` cap
+        // so a large network-populated directory cache cannot be materialized
+        // unboundedly into memory. The cap sits well above the app-layer
+        // directory-search reachability, so it does not truncate realistic
+        // results; a warn fires if it ever bites. The follows query is scoped to
+        // the SAME capped user set (matching subquery LIMIT) so neither query
+        // loads the whole cache. Ordering preserved (users by account_id_hex;
+        // each user's follows by position then follow id).
+        let cap = i64::try_from(max).unwrap_or(i64::MAX);
+        let conn = self.lock();
+        let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        {
             let mut stmt = self
                 .conn_ref(&conn)
-                .prepare("SELECT account_id_hex FROM directory_users ORDER BY account_id_hex")
+                .prepare(
+                    "SELECT account_id_hex, follow_account_id_hex FROM directory_user_follows
+                     WHERE account_id_hex IN (
+                         SELECT account_id_hex FROM directory_users
+                         ORDER BY account_id_hex LIMIT ?1
+                     )
+                     ORDER BY account_id_hex, position, follow_account_id_hex",
+                )
                 .storage()?;
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?
-        };
-        let mut records = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(record) = self.public_directory_user(&id)? {
-                records.push(record);
+            let rows = stmt
+                .query_map(params![cap], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .storage()?;
+            for row in rows {
+                let (account_id_hex, follow) = row.storage()?;
+                follows_by_account
+                    .entry(account_id_hex)
+                    .or_default()
+                    .push(follow);
             }
         }
-        Ok(records)
+        let mut stmt = self
+            .conn_ref(&conn)
+            .prepare(
+                "SELECT account_id_hex, npub, profile_json, relay_lists_json,
+                        key_package_json, event_id_hex, event_kind, event_created_at
+                 FROM directory_users
+                 ORDER BY account_id_hex
+                 LIMIT ?1",
+            )
+            .storage()?;
+        let records = stmt
+            .query_map(params![cap], |row| {
+                Ok(PublicDirectoryUserRecord {
+                    account_id_hex: row.get(0)?,
+                    npub: row.get(1)?,
+                    profile_json: row.get(2)?,
+                    relay_lists_json: row.get(3)?,
+                    key_package_json: row.get(4)?,
+                    event_id_hex: row.get(5)?,
+                    event_kind: optional_i64_to_u64(row.get::<_, Option<i64>>(6)?),
+                    event_created_at: optional_i64_to_u64(row.get::<_, Option<i64>>(7)?),
+                    follows: Vec::new(),
+                })
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        if records.len() >= max {
+            // no silent caps: surface (aggregate count only, privacy-safe) that
+            // the listing was truncated so an operator can tell the bound bit.
+            tracing::warn!(
+                target: "storage_sqlite::shared",
+                method = "public_directory_users",
+                cap = max,
+                "public directory listing hit the defensive cap; results truncated",
+            );
+        }
+        Ok(records
+            .into_iter()
+            .map(|mut record| {
+                record.follows = follows_by_account
+                    .remove(&record.account_id_hex)
+                    .unwrap_or_default();
+                record
+            })
+            .collect())
     }
 
     pub fn relay_telemetry_settings(&self) -> StorageResult<StoredRelayTelemetrySettings> {
@@ -530,6 +612,44 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             record
+        );
+    }
+
+    // #761: the batched listing is defensively bounded. The uncapped path still
+    // returns every user; the cap bounds the materialized set to the
+    // lowest-ordered users and attaches only their (subquery-scoped) follows,
+    // never loading the whole network-populated cache.
+    #[test]
+    fn public_directory_users_capped_bounds_result_and_scopes_follows() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        for (i, prefix) in ["01", "02", "03"].iter().enumerate() {
+            storage
+                .put_public_directory_user(&PublicDirectoryUserRecord {
+                    account_id_hex: prefix.repeat(32),
+                    npub: format!("npub{i}"),
+                    profile_json: None,
+                    relay_lists_json: "{}".to_owned(),
+                    key_package_json: None,
+                    event_id_hex: None,
+                    event_kind: None,
+                    event_created_at: None,
+                    follows: vec!["ff".repeat(32)],
+                })
+                .unwrap();
+        }
+
+        // Uncapped path returns every user with its follows.
+        assert_eq!(storage.public_directory_users().unwrap().len(), 3);
+
+        // Capped at 2: only the two lowest-ordered users, each with its follows.
+        let capped = storage.public_directory_users_capped(2).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].account_id_hex, "01".repeat(32));
+        assert_eq!(capped[1].account_id_hex, "02".repeat(32));
+        assert!(
+            capped
+                .iter()
+                .all(|user| user.follows == vec!["ff".repeat(32)])
         );
     }
 

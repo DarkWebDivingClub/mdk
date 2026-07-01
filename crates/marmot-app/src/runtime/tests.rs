@@ -924,6 +924,7 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
             source_epoch: None,
             recorded_at: 0,
             received_at: 0,
+            insert_order: 0,
         }],
         Some(&stream_id_hex.to_uppercase()),
     )
@@ -968,6 +969,7 @@ fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMes
         source_epoch: Some(7),
         recorded_at: 11,
         received_at: 12,
+        insert_order: 0,
     }
 }
 
@@ -1096,39 +1098,67 @@ fn limited_subscription_recovery_suppresses_pre_subscription_history() {
     // reloads ALL five rows. Rows 10-50 are at/below the watermark and must be
     // suppressed; a genuinely-new row (60) arriving after subscription must be
     // emitted.
-    let watermark = Some((50_u64, "id50".to_owned()));
+    // #630/#736: the watermark and every compared row are the SAME
+    // `AppEventReplayCursor` the store orders by — `(recorded_at, message_id_hex,
+    // insert_order)` — so the suppression boundary can never disagree with the
+    // recovery query order.
+    use storage_sqlite::AppEventReplayCursor;
+    fn cur(recorded_at: u64, message_id_hex: &str, insert_order: i64) -> AppEventReplayCursor {
+        AppEventReplayCursor {
+            recorded_at,
+            message_id_hex: message_id_hex.to_owned(),
+            insert_order,
+        }
+    }
+    let watermark = Some(cur(50, "id50", 5));
+    let wm = watermark.as_ref();
 
     // Every pre-subscription row (including the watermark row itself) is
-    // suppressed — even the ones the limited snapshot never contained (10/20/30).
-    for (at, id) in [
-        (10, "id10"),
-        (20, "id20"),
-        (30, "id30"),
-        (40, "id40"),
-        (50, "id50"),
+    // suppressed — even the ones the limited snapshot never contained (10/20/30),
+    // and a same-second row with a SMALLER id (existed at subscription time).
+    for row in [
+        cur(10, "id10", 1),
+        cur(20, "id20", 2),
+        cur(30, "id30", 3),
+        cur(40, "id40", 4),
+        cur(50, "id40", 4),
+        cur(50, "id50", 5),
     ] {
         assert!(
-            recovery_row_is_pre_subscription(watermark.as_ref(), at, id),
-            "row ({at}, {id}) existed at subscription time and must be suppressed on recovery"
+            recovery_row_is_pre_subscription(wm, &row),
+            "row {row:?} at/below the watermark must be suppressed on recovery"
         );
     }
 
-    // A genuinely-new post-subscription row is emitted.
+    // Genuinely-new rows strictly greater than the watermark are emitted:
+    // a later second, and a same-second row with a greater id.
     assert!(
-        !recovery_row_is_pre_subscription(watermark.as_ref(), 60, "id60"),
-        "a message newer than the watermark is a real missed live update and must be emitted"
+        !recovery_row_is_pre_subscription(wm, &cur(60, "id60", 6)),
+        "a later-second message must be emitted"
+    );
+    assert!(
+        !recovery_row_is_pre_subscription(wm, &cur(50, "id99", 7)),
+        "same-second row with a greater id sorts after the watermark and must be emitted"
     );
 
-    // Same-second tie-break: a row at the watermark timestamp but a larger
-    // message id sorts strictly after the watermark and must be emitted.
+    // Unscoped (all-groups) case: the same `message_id_hex` can appear in two
+    // groups at the same second (it is unique only per group). `insert_order`
+    // then distinguishes them: a later-inserted duplicate (strictly greater
+    // cursor) is emitted, an earlier one is suppressed. A two-field key could
+    // not tell these apart.
+    let dup_watermark = Some(cur(50, "dup", 5));
     assert!(
-        !recovery_row_is_pre_subscription(watermark.as_ref(), 50, "id99"),
-        "same-timestamp row with a greater id sorts after the watermark and must be emitted"
+        !recovery_row_is_pre_subscription(dup_watermark.as_ref(), &cur(50, "dup", 8)),
+        "a later-inserted same-(recorded_at,id) row is genuinely new and must be emitted"
+    );
+    assert!(
+        recovery_row_is_pre_subscription(dup_watermark.as_ref(), &cur(50, "dup", 3)),
+        "an earlier-inserted same-(recorded_at,id) row existed already and must be suppressed"
     );
 
     // An empty snapshot has no watermark, so recovery suppresses nothing
     // (unchanged behavior for unlimited / empty-history subscriptions).
-    assert!(!recovery_row_is_pre_subscription(None, 10, "id10"));
+    assert!(!recovery_row_is_pre_subscription(None, &cur(10, "id10", 1)));
 }
 
 #[test]

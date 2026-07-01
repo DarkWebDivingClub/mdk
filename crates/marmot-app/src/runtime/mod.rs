@@ -950,11 +950,21 @@ impl MarmotAppRuntime {
         }
 
         let app = self.accounts.app.clone();
+        // #639: one resolver shared across the drained batch so repeated
+        // settings/group/directory-user lookups (same account, group, or sender
+        // across many events) are memoized instead of re-opening the SQLCipher /
+        // directory caches per event.
+        let mut resolver = notifications::NotificationResolver::default();
         let drain_until = Instant::now() + remaining;
         loop {
             match events.try_recv() {
                 Ok(event) => {
-                    collect_notification_update_from_event(&app, &event, &mut notifications);
+                    collect_notification_update_from_event(
+                        &app,
+                        &mut resolver,
+                        &event,
+                        &mut notifications,
+                    );
                 }
                 Err(broadcast::error::TryRecvError::Empty) => {
                     if Instant::now() >= drain_until {
@@ -969,6 +979,7 @@ impl MarmotAppRuntime {
                         Ok(Ok(event)) => {
                             collect_notification_update_from_event(
                                 &app,
+                                &mut resolver,
                                 &event,
                                 &mut notifications,
                             );
@@ -3132,10 +3143,11 @@ where
 
 fn collect_notification_update_from_event(
     app: &MarmotApp,
+    resolver: &mut notifications::NotificationResolver,
     event: &MarmotAppEvent,
     notifications: &mut Vec<NotificationUpdate>,
 ) {
-    match notifications::notification_update_from_event(app, event) {
+    match notifications::notification_update_from_event_cached(app, resolver, event) {
         Ok(Some(update)) => notifications.push(update),
         Ok(None) | Err(AppError::NotificationsDisabled) => {}
         Err(_) => {

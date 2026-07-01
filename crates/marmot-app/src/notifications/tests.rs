@@ -497,12 +497,59 @@ fn group_invite_notification_is_not_a_mention() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 32]);
 
-    let update =
-        notification_update_from_group_join(&app, "alice", &account.account_id_hex, &group_id)
-            .unwrap();
+    let update = notification_update_from_group_join(
+        &app,
+        &mut NotificationResolver::default(),
+        "alice",
+        &account.account_id_hex,
+        &group_id,
+    )
+    .unwrap();
 
     assert!(matches!(update.trigger, NotificationTrigger::GroupInvite));
     assert!(!update.is_mention);
+}
+
+// #639: the per-batch NotificationResolver caches the raw directory-derived user
+// (display_name from the directory, or None). The per-message sender-display-name
+// fallback must apply to the RETURNED clone only, never mutate the cache — so two
+// messages from the same sender (whose directory entry has no name) each get
+// their OWN fallback rather than the first message's leaking to the second.
+#[test]
+fn resolver_sender_display_name_fallback_is_per_message_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let sender = "cc".repeat(32);
+
+    let mut resolver = NotificationResolver::default();
+    // Pre-seed the cache as an absent directory entry would (no display name), so
+    // the resolver serves this cached user and never queries `app`.
+    resolver.users.insert(
+        sender.clone(),
+        NotificationUser {
+            account_id_hex: sender.clone(),
+            display_name: None,
+            picture_url: None,
+        },
+    );
+
+    let mut first = received_chat("hi", vec![]);
+    first.sender = sender.clone();
+    first.sender_display_name = Some("Name From First".to_owned());
+    let user_first = notification_user_from_message(&app, &mut resolver, &first).unwrap();
+    assert_eq!(user_first.display_name.as_deref(), Some("Name From First"));
+
+    let mut second = received_chat("yo", vec![]);
+    second.sender = sender.clone();
+    second.sender_display_name = Some("Name From Second".to_owned());
+    let user_second = notification_user_from_message(&app, &mut resolver, &second).unwrap();
+    // Gets its OWN fallback, not the first message's.
+    assert_eq!(
+        user_second.display_name.as_deref(),
+        Some("Name From Second")
+    );
+    // The cached user is untouched (still no display name).
+    assert_eq!(resolver.users[&sender].display_name, None);
 }
 
 #[test]

@@ -16,6 +16,20 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// The ONE display order for the materialized message-timeline / chat-list
+/// surface: `(timeline_at, message_id_hex)` (#736 boundary contract 1). This is
+/// the cross-client user-visible order (`timeline_at == recorded_at` at
+/// projection). It is a SEPARATE surface from the raw-event replay cursor
+/// (`AppEventReplayCursor`, which additionally tie-breaks on the LOCAL
+/// `insert_order` and is used only for lag-recovery watermark/suppression). Keep
+/// the two distinct: the replay cursor MUST NOT be applied to timeline
+/// pagination. Non-aliased `ORDER BY` sites reference these; a few aliased
+/// subquery lookups and the keyset-pagination predicates express the SAME order
+/// inline (they carry a table alias / bind placeholders that don't fit a plain
+/// fragment).
+pub(crate) const TIMELINE_ORDER_BY_ASC: &str = "ORDER BY timeline_at ASC, message_id_hex ASC";
+pub(crate) const TIMELINE_ORDER_BY_DESC: &str = "ORDER BY timeline_at DESC, message_id_hex DESC";
+
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// Largest number of rows a single timeline cursor query returns. A
 /// materialized window kept above this cannot be re-fetched in one query, so
@@ -1860,7 +1874,7 @@ fn timeline_records_by_ids_tx(
                 deleted, deleted_by_message_id_hex, invalidation_status
          FROM message_timeline
          WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
-         ORDER BY timeline_at ASC, message_id_hex ASC"
+         {TIMELINE_ORDER_BY_ASC}"
     );
     let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
     params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
@@ -1971,10 +1985,8 @@ fn timeline_query_sql(
         format!("WHERE {}", clauses.join(" AND "))
     };
     let order_sql = match pagination.direction {
-        CursorDirection::After => "ORDER BY timeline_at ASC, message_id_hex ASC",
-        CursorDirection::None | CursorDirection::Before => {
-            "ORDER BY timeline_at DESC, message_id_hex DESC"
-        }
+        CursorDirection::After => TIMELINE_ORDER_BY_ASC,
+        CursorDirection::None | CursorDirection::Before => TIMELINE_ORDER_BY_DESC,
     };
     Ok((
         format!(

@@ -18,7 +18,8 @@ use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, encode_group_avatar_url_v1,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, default_group_components, encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -205,6 +206,125 @@ fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id:
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+}
+
+/// Engine that supports the Nostr routing component (the default component set
+/// does not), so a group can carry — and later rotate — a `nostr_group_id`.
+fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
+    let mut components: Vec<_> = default_group_components().into_iter().collect();
+    components.push(NOSTR_ROUTING_COMPONENT_ID);
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry())
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+/// #740 rotation regression: after a Nostr routing-component update commit is
+/// applied, the engine's `transport_group_id_index` must self-heal so inbound
+/// messages addressed to the NEW `nostr_group_id` still resolve to the group.
+/// Before the fix the index was populated only at hydrate/create/join and went
+/// stale on rotation, stranding the group until restart. Exercises the
+/// convergence-apply reindex site on the recipient; `confirm_published` and the
+/// direct remote-commit-apply path call the same `reindex_transport_group_id`.
+#[tokio::test]
+async fn routing_rotation_reindexes_inbound_transport_group_id() {
+    let mut alice = build_with_routing(b"alice");
+    let mut bob = build_with_routing(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    // Create with routing X and invite bob.
+    let routing_x = NostrRoutingV1::new([0x41; 32], vec!["wss://x.example".into()]).unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "orig".into(),
+            description: "d".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing_x).unwrap(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    // Alice rotates the routing X -> Y and confirms locally.
+    let routing_y = NostrRoutingV1::new([0x59; 32], vec!["wss://y.example".into()]).unwrap();
+    let res = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing_y).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (rotate_commit, rotate_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(rotate_pending).await.unwrap();
+
+    // Bob receives the rotation commit. Per the overlap model it is published to
+    // the PRIOR routing address X (peers still address the old id until they
+    // apply the rotation); bob resolves X (indexed at join) and applies it.
+    let routed_rotation = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: routing_x.nostr_group_id.to_vec(),
+        },
+        ..rotate_commit
+    };
+    bob.ingest(routed_rotation).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    // Alice now renames the group; this commit is published to the NEW routing
+    // address Y. Bob can only apply it if his transport-id index self-healed to
+    // map Y -> group when he applied the rotation. A stale index would resolve Y
+    // to a phantom direct GroupId and drop the commit as unknown.
+    let res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("after-rotation".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(rename_pending).await.unwrap();
+
+    let routed_rename = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: routing_y.nostr_group_id.to_vec(),
+        },
+        ..rename_commit
+    };
+    // Resolves to bob's real group (buffered for convergence), not dropped.
+    assert!(matches!(
+        bob.ingest(routed_rename).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    converge_buffered_commit(&mut bob, &gid);
+
+    // Bob followed the post-rotation commit addressed to the NEW nostr_group_id.
+    assert_eq!(bob.group_record(&gid).unwrap().name, "after-rotation");
+    assert_eq!(bob.epoch(&gid).unwrap().0, alice.epoch(&gid).unwrap().0);
 }
 
 fn malicious_app_component_commit(

@@ -154,8 +154,17 @@ impl NostrMlsPeeler {
                 [expiration.to_string()],
             ));
         }
-        let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
-            .tags(tags)
+        // Package E (#630 cross-client): bind the outer kind-445 `created_at` to
+        // the inner app event's sender-authenticated `created_at` so the sender
+        // and every receiver record the same `recorded_at`. Without this the
+        // builder defaults to wrap-time `now()`, which only receivers agree on.
+        // Commits/proposals carry no inner timestamp, so they keep the default.
+        let mut builder =
+            EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content).tags(tags);
+        if let Some(created_at) = metadata.and_then(GroupMessageMetadata::outer_created_at) {
+            builder = builder.custom_created_at(nostr::Timestamp::from_secs(created_at));
+        }
+        let signed = builder
             .sign_with_keys(&ephemeral)
             .map_err(|e| PeelerError::WrapFailed(format!("ephemeral kind-445 sign: {e}")))?;
         let event = NostrTransportEvent::from_nostr_event(&signed).map_err(to_peeler_error)?;
@@ -593,6 +602,34 @@ mod tests {
         assert_eq!(event.tag_value("h"), Some(expected_group_id.as_str()));
         assert_eq!(event.tag_value(EXPIRATION_TAG), Some("1700000060"));
         assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_wrap_binds_outer_created_at_to_inner_for_app_messages() {
+        // Package E (#630 cross-client): the outer kind-445 `created_at` is bound
+        // to the inner app event's sender-authenticated `created_at`, so the
+        // sender and every receiver record the same `recorded_at` for a message.
+        let group_id = vec![0x99; 32];
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(group_id),
+        );
+        let inner_created_at = 1_700_000_123;
+        let wrapped = NostrMlsPeeler::default()
+            .wrap_group_message_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &ctx,
+                &GroupMessageMetadata::application(inner_created_at, None),
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let event = NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+        assert_eq!(event.created_at, inner_created_at);
     }
 
     #[tokio::test]

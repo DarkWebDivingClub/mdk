@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::{GroupId, MessageId};
 use serde::{Deserialize, Serialize};
+use storage_sqlite::AppEventReplayCursor;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use transport_quic_stream::AgentTextStreamCrypto;
 
@@ -773,9 +774,12 @@ impl MarmotAppRuntime {
         // messages worth re-emitting (still deduped via `seen_message_ids`).
         // `None` (empty snapshot) means no pre-existing history, so recovery
         // emits everything as before.
-        let recovery_watermark: Option<(u64, String)> = snapshot
-            .last()
-            .map(|message| (message.recorded_at, message.message_id_hex.clone()));
+        let recovery_watermark: Option<AppEventReplayCursor> =
+            snapshot.last().map(|message| AppEventReplayCursor {
+                recorded_at: message.recorded_at,
+                message_id_hex: message.message_id_hex.clone(),
+                insert_order: message.insert_order,
+            });
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -808,7 +812,7 @@ impl MarmotAppRuntime {
                             Ok(updates) => updates,
                             Err(_) => continue,
                         };
-                        for update in updates {
+                        for (row_cursor, update) in updates {
                             let message = update.message();
                             // Suppress pre-existing history at or below the
                             // subscription watermark. Recovery reloads the full
@@ -816,11 +820,12 @@ impl MarmotAppRuntime {
                             // limited subscriber would receive every older row
                             // as a bogus "live" update on the first lag. Only
                             // messages strictly newer than the watermark are
-                            // genuinely-missed live messages.
+                            // genuinely-missed live messages. The watermark and
+                            // `row_cursor` are the SAME `AppEventReplayCursor` the
+                            // recovery query ordered by, so the cut is exact.
                             if recovery_row_is_pre_subscription(
                                 recovery_watermark.as_ref(),
-                                message.recorded_at,
-                                &message.message_id_hex,
+                                &row_cursor,
                             ) {
                                 continue;
                             }
@@ -1340,25 +1345,26 @@ pub(crate) fn messages_recovery_query(query: &AppMessageQuery) -> AppMessageQuer
 /// watermark — i.e. it existed at subscription time and must NOT be re-emitted
 /// as a live update.
 ///
-/// `watermark` is `(recorded_at, message_id_hex)` of the newest message that
+/// `watermark` is the [`AppEventReplayCursor`] of the newest message that
 /// existed when the subscription was created (the last row of the ascending
 /// snapshot; `None` for an empty snapshot). Because lag recovery drops the
 /// caller's initial-replay `limit` and reloads the full group history (see
 /// #180), a limited subscriber would otherwise receive every older row as a
-/// bogus live update on the first lag. Comparing on the canonical
-/// `(recorded_at, message_id_hex)` key — the same order the store returns —
-/// suppresses pre-subscription history while still admitting genuinely-new
-/// messages (strictly greater than the watermark). An empty watermark means
-/// there was no pre-existing history, so nothing is suppressed.
+/// bogus live update on the first lag. Both the watermark and the compared row
+/// are the SAME `AppEventReplayCursor` the store orders by (#630, #736 boundary
+/// contract 2), so the suppression boundary can never disagree with the recovery
+/// query order — even for an unscoped (all-groups) subscription, where the
+/// `insert_order` tiebreak distinguishes two groups' rows that share
+/// `(recorded_at, message_id_hex)`. A row at or below the watermark is
+/// pre-existing history (suppress); strictly-greater rows are genuinely-new
+/// (emit). An empty watermark means there was no pre-existing history, so
+/// nothing is suppressed.
 pub(crate) fn recovery_row_is_pre_subscription(
-    watermark: Option<&(u64, String)>,
-    recorded_at: u64,
-    message_id_hex: &str,
+    watermark: Option<&AppEventReplayCursor>,
+    row: &AppEventReplayCursor,
 ) -> bool {
     match watermark {
-        Some((watermark_at, watermark_id)) => {
-            (recorded_at, message_id_hex) <= (*watermark_at, watermark_id.as_str())
-        }
+        Some(watermark) => row <= watermark,
         None => false,
     }
 }
@@ -1373,7 +1379,7 @@ fn messages_recovery_updates(
     account_id_hex: &str,
     account_label: &str,
     query: AppMessageQuery,
-) -> Result<Vec<RuntimeMessageUpdate>, AppError> {
+) -> Result<Vec<(AppEventReplayCursor, RuntimeMessageUpdate)>, AppError> {
     let records = app.messages_with_query(account_label, query)?;
     let senders = records
         .iter()
@@ -1385,12 +1391,23 @@ fn messages_recovery_updates(
     let updates = records
         .into_iter()
         .filter_map(|record| {
+            // Capture the replay cursor (incl. the LOCAL `insert_order`) before
+            // the record is consumed into a `RuntimeMessageUpdate`, so the
+            // watermark suppression compares the exact order the recovery query
+            // produced (#630). `insert_order` is deliberately not carried on the
+            // FFI-facing `ReceivedMessage`.
+            let cursor = AppEventReplayCursor {
+                recorded_at: record.recorded_at,
+                message_id_hex: record.message_id_hex.clone(),
+                insert_order: record.insert_order,
+            };
             received_message_update_from_record(
                 account_id_hex,
                 account_label,
                 record,
                 &display_names,
             )
+            .map(|update| (cursor, update))
         })
         .collect();
     Ok(updates)

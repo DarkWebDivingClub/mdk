@@ -286,6 +286,10 @@ fn rebuild_all_chat_list_rows_tx(
     for group in groups {
         rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     }
+    // #750: a full rebuild recomputes every mention count, so the projection is
+    // current — advance the marker so warm-up completeness checks skip the
+    // per-group recompute.
+    set_chat_list_mention_counts_version_tx(tx, CHAT_LIST_MENTION_COUNTS_VERSION)?;
     Ok(())
 }
 
@@ -305,6 +309,34 @@ fn refresh_chat_list_row_tx(
     };
     rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     chat_list_row_tx(tx, group_id_hex)
+}
+
+/// Current chat-list projection reconciliation version (#750). Once the stored
+/// marker reaches this value, the warm-up completeness check trusts the stored
+/// `unread_mention_count`s (kept current by incremental refresh) and skips the
+/// O(groups × unread) per-group recompute. Bump this if a future migration can
+/// again leave the counts stale.
+const CHAT_LIST_MENTION_COUNTS_VERSION: i64 = 1;
+
+fn chat_list_mention_counts_version_tx(tx: &Connection) -> StorageResult<i64> {
+    Ok(tx
+        .query_row(
+            "SELECT mention_counts_version FROM chat_list_projection_meta WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .storage()?
+        .unwrap_or(0))
+}
+
+fn set_chat_list_mention_counts_version_tx(tx: &Connection, version: i64) -> StorageResult<()> {
+    tx.execute(
+        "UPDATE chat_list_projection_meta SET mention_counts_version = ?1 WHERE id = 1",
+        params![version],
+    )
+    .storage()?;
+    Ok(())
 }
 
 fn chat_list_projection_complete_tx(
@@ -462,10 +494,18 @@ fn chat_list_projection_complete_tx(
     )? {
         return Ok(false);
     }
+    // #750: once the mention counts have been reconciled to the current
+    // projection version, the per-group recompute below is redundant —
+    // incremental refresh keeps `unread_mention_count` current — so skip the
+    // O(groups × unread-per-group) scan (which materializes every unread
+    // plaintext). The cheap structural checks above still run every warm-up.
+    if chat_list_mention_counts_version_tx(tx)? >= CHAT_LIST_MENTION_COUNTS_VERSION {
+        return Ok(true);
+    }
     // Mention classification needs the injected closure (not expressible in pure
     // SQL), so the remaining checks recompute the unread-mention count per group
     // and compare it to the stored value. This corrects rows upgraded via
-    // migration 0018 (which defaults the new column to 0) for groups that
+    // migration 0019 (which defaults the new column to 0) for groups that
     // actually have unread mentions.
     for (group_id_hex, stored_mention_count) in chat_list_stored_mention_counts_tx(tx)? {
         let read_state = read_state_tx(tx, &group_id_hex)?;
@@ -480,6 +520,9 @@ fn chat_list_projection_complete_tx(
             return Ok(false);
         }
     }
+    // Counts verified current — record the version so future warm-ups skip the
+    // per-group recompute above.
+    set_chat_list_mention_counts_version_tx(tx, CHAT_LIST_MENTION_COUNTS_VERSION)?;
     Ok(true)
 }
 
@@ -655,32 +698,16 @@ fn unread_summary_tx(
                 "",
             )
         };
-    let sql = format!(
-        "SELECT COUNT(*)
-         FROM message_timeline
-         WHERE group_id_hex = ?1
-           AND kind = ?2
-           AND deleted = 0
-           AND invalidation_status IS NULL
-           AND sender != ?3
-           AND {where_sql}"
-    );
-    let count = tx
-        .query_row(
-            &sql,
-            params![
-                group_id_hex,
-                u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
-                local_account_id_hex,
-                u64_to_i64(marker_at)?,
-                marker_id,
-            ],
-            |row| row.get::<_, i64>(0),
-        )
-        .storage()
-        .and_then(i64_to_u64)?;
-    let first_sql = format!(
-        "SELECT message_id_hex
+    // #704: derive count + first-unread id + mention_count from ONE ordered scan
+    // over the unread window, instead of a separate COUNT(*), a LIMIT 1, and a
+    // full mention scan over the identical predicate. Ordered by the
+    // materialized-timeline key `(timeline_at, message_id_hex)` so the first row
+    // is the first-unread message. Mention classification is injected (the
+    // storage layer never parses nostr/NIP-21); a tag blob that fails to decode
+    // is treated as no tags (no mention) so one malformed row never errors the
+    // whole projection.
+    let scan_sql = format!(
+        "SELECT message_id_hex, plaintext, tags_json
          FROM message_timeline
          WHERE group_id_hex = ?1
            AND kind = ?2
@@ -688,40 +715,10 @@ fn unread_summary_tx(
            AND invalidation_status IS NULL
            AND sender != ?3
            AND {where_sql}
-         ORDER BY timeline_at ASC, message_id_hex ASC
-         LIMIT 1"
+         ORDER BY timeline_at ASC, message_id_hex ASC"
     );
-    let first_message_id = tx
-        .query_row(
-            &first_sql,
-            params![
-                group_id_hex,
-                u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
-                local_account_id_hex,
-                u64_to_i64(marker_at)?,
-                marker_id,
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .storage()?;
-    // Recompute the mention count over the SAME unread window. Mention
-    // classification is injected (the storage layer never parses nostr/NIP-21),
-    // so iterate the unread rows and apply the predicate to each plaintext/tag
-    // pair. A tag blob that fails to decode is treated as no tags (no mention)
-    // so one malformed row never errors the whole projection.
-    let mention_sql = format!(
-        "SELECT plaintext, tags_json
-         FROM message_timeline
-         WHERE group_id_hex = ?1
-           AND kind = ?2
-           AND deleted = 0
-           AND invalidation_status IS NULL
-           AND sender != ?3
-           AND {where_sql}"
-    );
-    let mut mention_stmt = tx.prepare(&mention_sql).storage()?;
-    let mut mention_rows = mention_stmt
+    let mut scan_stmt = tx.prepare(&scan_sql).storage()?;
+    let mut scan_rows = scan_stmt
         .query(params![
             group_id_hex,
             u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
@@ -730,10 +727,17 @@ fn unread_summary_tx(
             marker_id,
         ])
         .storage()?;
+    let mut count: u64 = 0;
     let mut mention_count: u64 = 0;
-    while let Some(row) = mention_rows.next().storage()? {
-        let plaintext: String = row.get(0).storage()?;
-        let tags_json: String = row.get(1).storage()?;
+    let mut first_message_id: Option<String> = None;
+    while let Some(row) = scan_rows.next().storage()? {
+        let message_id_hex: String = row.get(0).storage()?;
+        let plaintext: String = row.get(1).storage()?;
+        let tags_json: String = row.get(2).storage()?;
+        if first_message_id.is_none() {
+            first_message_id = Some(message_id_hex);
+        }
+        count += 1;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
         if mention_classifier(&plaintext, &tags) {
             mention_count += 1;

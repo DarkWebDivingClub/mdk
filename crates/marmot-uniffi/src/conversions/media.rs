@@ -339,6 +339,7 @@ mod tests {
             source_epoch: Some(7),
             recorded_at: 10,
             received_at: 11,
+            insert_order: 0,
         };
 
         let records = media_records_ffi(vec![message]);
@@ -451,6 +452,7 @@ mod tests {
             source_epoch: Some(7),
             recorded_at: 10,
             received_at: 11,
+            insert_order: 0,
         };
 
         let from_list: Vec<MediaAttachmentReference> = media_records_ffi(vec![message])

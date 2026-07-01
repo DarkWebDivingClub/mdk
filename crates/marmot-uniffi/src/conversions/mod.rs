@@ -361,6 +361,7 @@ mod tests {
             source_epoch: None,
             recorded_at: 10,
             received_at: 11,
+            insert_order: 0,
         };
 
         let ffi = AppMessageRecordFfi::from(record);

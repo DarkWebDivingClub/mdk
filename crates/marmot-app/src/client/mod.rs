@@ -1941,13 +1941,24 @@ impl AppClient {
         AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()
     }
 
-    pub(crate) fn refresh_group_routes(&mut self) -> Result<(), AppError> {
+    /// Upsert every group's current transport subscription into the routing
+    /// state, returning whether any route was added or modified. A modified
+    /// route means an in-place `nostr_group_id` / relay rotation on an existing
+    /// group (Finding 2) — `add_group` now replaces by `group_id` instead of
+    /// early-returning — so callers can trigger a single resync when routes
+    /// actually change rather than only on a membership-count change.
+    pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
+        let mut changed = false;
         for group in &self.state.groups {
             let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            self.routing
-                .add_group(group.nostr_routing.subscription(&group_id)?);
+            if self
+                .routing
+                .add_group(group.nostr_routing.subscription(&group_id)?)
+            {
+                changed = true;
+            }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
