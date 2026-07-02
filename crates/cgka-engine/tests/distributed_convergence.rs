@@ -1151,6 +1151,90 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     );
 }
 
+/// Reuse-path sibling of `engine_materializes_multi_commit_path_from_stored_commits`: the same
+/// multi-commit chain but with NO pending application message buffered, so canonicalization takes
+/// the #635 reuse branch (BFS-materialized candidates are reused instead of re-materialized). The
+/// canonical commits and resulting epoch must match the fresh path exactly.
+#[tokio::test]
+async fn engine_reuses_bfs_materialized_candidates_when_no_pending_app_messages() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-chain-app-free".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_david, pending_david) = evolution(invite_david);
+    alice.confirm_published(pending_david).await.unwrap();
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_eve, pending_eve) = evolution(invite_eve);
+    alice.confirm_published(pending_eve).await.unwrap();
+
+    let commit_eve = route(commit_eve, &group_id);
+    let commit_david = route(commit_david, &group_id);
+    // Buffer the child before the parent, and crucially NO app message — this keeps the
+    // canonicalization pass free of pending application messages so the reuse branch fires.
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_eve.clone(), 1_000)
+        .expect("child commit buffered first");
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000)
+        .expect("parent commit buffered second");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored parent and child commits converge as one reused path");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        result.accepted_commits,
+        vec![content_hex(&commit_david), content_hex(&commit_eve)]
+    );
+    assert!(result.accepted_app_messages.is_empty());
+    assert_message_state(&carol_storage, &commit_david, MessageState::Processed);
+    assert_message_state(&carol_storage, &commit_eve, MessageState::Processed);
+    let members = carol.members(&group_id).unwrap();
+    assert!(members.iter().any(|member| member.id == david.self_id()));
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+}
+
 #[tokio::test]
 async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     let (mut alice, _alice_storage) = build_client(b"alice");

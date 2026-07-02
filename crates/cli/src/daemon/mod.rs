@@ -325,28 +325,19 @@ async fn handle_daemon_connection(
             let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
         DaemonRequest::StreamWatch { cli } => {
-            let mut workers_guard = workers.lock().await;
             let _ = handle_stream_watch_connection(
                 cli,
                 &mut stream,
                 &defaults,
                 state,
                 events,
-                &mut workers_guard,
+                &workers,
             )
             .await;
         }
         DaemonRequest::Execute { cli } => {
-            let mut workers_guard = workers.lock().await;
-            let _ = handle_execute_connection(
-                cli,
-                &mut stream,
-                &defaults,
-                state,
-                events,
-                &mut workers_guard,
-            )
-            .await;
+            let _ = handle_execute_connection(cli, &mut stream, &defaults, state, events, &workers)
+                .await;
         }
     }
 }
@@ -377,23 +368,21 @@ async fn handle_stream_watch_connection(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    workers: &mut DaemonWorkers,
+    workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     apply_defaults(&mut cli, defaults);
-    reconcile_app_runtime(
-        defaults,
-        state.clone(),
-        events.clone(),
-        &mut workers.runtime,
-    )
-    .await;
-    let output = start_stream_watch(
-        *cli,
-        defaults,
-        workers.runtime.runtime.as_ref(),
-        &workers.runtime.stream_watch,
-    )
-    .await;
+    // Hold the lock only for the host-mutating reconcile; clone the runtime handle and the
+    // (interior-mutable) stream-watch registry, then spawn the watch + open the broker
+    // connection off the lock (#633).
+    let (runtime, stream_watch) = {
+        let mut guard = workers.lock().await;
+        reconcile_app_runtime(defaults, state.clone(), events.clone(), &mut guard.runtime).await;
+        (
+            guard.runtime.runtime.clone(),
+            guard.runtime.stream_watch.clone(),
+        )
+    };
+    let output = start_stream_watch(*cli, defaults, runtime.as_ref(), &stream_watch).await;
 
     write_daemon_output(stream, &output).await;
     Ok(())
@@ -405,25 +394,44 @@ async fn handle_execute_connection(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    workers: &mut DaemonWorkers,
+    workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     apply_defaults(&mut cli, defaults);
     if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    if let Some(output) = handle_stream_compose_request(
-        &cli,
-        defaults,
-        state.clone(),
-        events.clone(),
-        &mut workers.runtime,
-        &mut workers.stream_compose,
-    )
-    .await
-    {
-        write_daemon_output(stream, &output).await;
-        return Ok(());
+    // Stream-compose commands mutate the compose session map and the runtime host together, so
+    // that low-traffic QUIC-preview path keeps the lock for its (short) duration. Gate on the
+    // compose subcommands specifically: non-compose stream commands (start/finish/watch/send) are
+    // hosted-runtime commands and must not take the workers lock here, or they would block behind
+    // an unrelated busy workers mutex before falling through to the off-lock hosted path.
+    if matches!(
+        cli.command,
+        crate::Command::Stream {
+            command: crate::StreamCommand::ComposeOpen { .. }
+                | crate::StreamCommand::ComposeAppend { .. }
+                | crate::StreamCommand::ComposeFinish { .. }
+                | crate::StreamCommand::ComposeCancel { .. },
+        }
+    ) {
+        let compose_output = {
+            let mut guard = workers.lock().await;
+            let guard = &mut *guard;
+            handle_stream_compose_request(
+                &cli,
+                defaults,
+                state.clone(),
+                events.clone(),
+                &mut guard.runtime,
+                &mut guard.stream_compose,
+            )
+            .await
+        };
+        if let Some(output) = compose_output {
+            write_daemon_output(stream, &output).await;
+            return Ok(());
+        }
     }
     let refresh = app_runtime_refresh_after_execute(&cli);
     if let Some(output) = handle_app_runtime_account_setup_request(
@@ -431,35 +439,25 @@ async fn handle_execute_connection(
         defaults,
         state.clone(),
         events.clone(),
-        &mut workers.runtime,
+        workers,
     )
     .await
     {
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    if let Some(output) = handle_app_runtime_command_request(
-        &cli,
-        defaults,
-        state.clone(),
-        events.clone(),
-        &mut workers.runtime,
-    )
-    .await
+    if let Some(output) =
+        handle_app_runtime_command_request(&cli, defaults, state.clone(), events.clone(), workers)
+            .await
     {
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
+    // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
+    // entirely off the workers lock — the core head-of-line fix (#633).
     let output = crate::run_cli_local(*cli).await;
     if output.code == 0 {
-        refresh_app_runtime(
-            defaults,
-            state.clone(),
-            events.clone(),
-            &mut workers.runtime,
-            refresh,
-        )
-        .await;
+        refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }
 
     write_daemon_output(stream, &output).await;

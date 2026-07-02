@@ -54,12 +54,28 @@ pub(crate) fn app_runtime_enabled(defaults: &DaemonDefaults) -> bool {
     defaults.relay.is_some()
 }
 
+/// Reconcile the app runtime under the workers lock and return a cloned runtime handle so the
+/// caller can perform relay I/O WITHOUT holding the lock. The lock is held only for the
+/// host-mutating reconcile (runtime create / bridge spawn / account reconcile), matching the
+/// subscription handlers and fixing the head-of-line blocking in #633. Returns `None` when no
+/// runtime could be brought up (missing relay / open error).
+pub(crate) async fn reconcile_and_clone_runtime(
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: &SharedDaemonWorkers,
+) -> Option<marmot_app::MarmotAppRuntime> {
+    let mut guard = workers.lock().await;
+    reconcile_app_runtime(defaults, state, events, &mut guard.runtime).await;
+    guard.runtime.runtime.clone()
+}
+
 pub(crate) async fn handle_app_runtime_account_setup_request(
     cli: &Cli,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    host: &mut AppRuntimeHost,
+    workers: &SharedDaemonWorkers,
 ) -> Option<CliOutput> {
     let request = match app_runtime_account_setup_request(cli) {
         Ok(Some(request)) => request,
@@ -69,13 +85,14 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
     if !app_runtime_enabled(defaults) {
         return None;
     }
-    reconcile_app_runtime(defaults, state.clone(), events, host).await;
-    let Some(runtime) = &host.runtime else {
+    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::DmError::MissingRelay),
         ));
     };
+    // create_or_import_account drives relay I/O through the cloned runtime handle (internally
+    // synchronized), so it runs off the workers lock.
     let output = runtime
         .create_or_import_account(request)
         .await
@@ -84,7 +101,31 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
     Some(crate::command_output_result(cli.json, output))
 }
 
+/// Execute-path entry: reconcile under the lock, then dispatch the hosted command off the lock
+/// against a cloned runtime handle (#633). This is the common `dm group|message|chats|…` path.
 pub(crate) async fn handle_app_runtime_command_request(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: &SharedDaemonWorkers,
+) -> Option<CliOutput> {
+    if !app_runtime_enabled(defaults) || !is_hosted_runtime_command(cli) {
+        return None;
+    }
+    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
+        return Some(crate::command_output_result(
+            cli.json,
+            Err(crate::DmError::MissingRelay),
+        ));
+    };
+    dispatch_hosted_runtime_command(cli, defaults, &runtime).await
+}
+
+/// Host-based entry used by the stream-compose path (`run_hosted_stream_marker_cli_json`), which
+/// already holds the workers lock and owns a `&mut AppRuntimeHost`. Reconciles in place and
+/// dispatches against the host's runtime — no re-entrant lock (which would deadlock).
+pub(crate) async fn handle_hosted_runtime_command_with_host(
     cli: &Cli,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
@@ -94,14 +135,24 @@ pub(crate) async fn handle_app_runtime_command_request(
     if !app_runtime_enabled(defaults) || !is_hosted_runtime_command(cli) {
         return None;
     }
-    reconcile_app_runtime(defaults, state.clone(), events, host).await;
+    reconcile_app_runtime(defaults, state, events, host).await;
     let Some(runtime) = &host.runtime else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::DmError::MissingRelay),
         ));
     };
+    dispatch_hosted_runtime_command(cli, defaults, runtime).await
+}
 
+/// Dispatch a hosted runtime command against an already-resolved runtime handle. Performs the
+/// relay-backed command work and touches no shared daemon state, so callers run it off the
+/// workers lock.
+async fn dispatch_hosted_runtime_command(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    runtime: &marmot_app::MarmotAppRuntime,
+) -> Option<CliOutput> {
     let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
         Ok(secret_store) => secret_store,
         Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
@@ -352,7 +403,7 @@ pub(crate) async fn refresh_app_runtime(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    host: &mut AppRuntimeHost,
+    workers: &SharedDaemonWorkers,
     refresh: AppRuntimeRefresh,
 ) {
     if !app_runtime_enabled(defaults) {
@@ -361,26 +412,45 @@ pub(crate) async fn refresh_app_runtime(
     match refresh {
         AppRuntimeRefresh::None => {}
         AppRuntimeRefresh::Reconcile => {
-            reconcile_app_runtime(defaults, state, events, host).await;
+            let _ = reconcile_and_clone_runtime(defaults, state, events, workers).await;
         }
         AppRuntimeRefresh::RestartSelected(selector) => {
-            if host.runtime.is_none() {
-                reconcile_app_runtime(defaults, state, events, host).await;
+            // Bring the runtime up under the lock if it is missing (matching the original
+            // "reconcile + return, no restart" for a cold host); otherwise clone the handle and
+            // restart off the lock.
+            let runtime = {
+                let mut guard = workers.lock().await;
+                if guard.runtime.runtime.is_none() {
+                    reconcile_app_runtime(
+                        defaults,
+                        state.clone(),
+                        events.clone(),
+                        &mut guard.runtime,
+                    )
+                    .await;
+                    None
+                } else {
+                    guard.runtime.runtime.clone()
+                }
+            };
+            let Some(runtime) = runtime else {
                 return;
-            }
+            };
             if let Some(account_id) = resolve_app_runtime_account_id(defaults, selector).await {
-                if let Some(runtime) = &host.runtime
-                    && let Err(err) = runtime.restart_account(&account_id).await
-                {
+                if let Err(err) = runtime.restart_account(&account_id).await {
                     record_runtime_activity_error(&state, err.to_string());
                 }
             } else {
-                reconcile_app_runtime(defaults, state, events, host).await;
+                // Account not resolvable → reconcile as the original fallback did.
+                let mut guard = workers.lock().await;
+                reconcile_app_runtime(defaults, state.clone(), events.clone(), &mut guard.runtime)
+                    .await;
             }
         }
         AppRuntimeRefresh::CatchUpAll => {
-            reconcile_app_runtime(defaults, state.clone(), events, host).await;
-            if let Some(runtime) = &host.runtime
+            let runtime =
+                reconcile_and_clone_runtime(defaults, state.clone(), events, workers).await;
+            if let Some(runtime) = runtime
                 && let Err(err) = runtime.catch_up_accounts().await
             {
                 record_runtime_activity_error(&state, err.to_string());

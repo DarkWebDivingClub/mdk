@@ -613,6 +613,50 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
 }
 
 #[tokio::test]
+async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
+    // A relay-less local command takes the `run_cli_local` path, which opens its own
+    // account/session and touches no shared daemon state. It must run WITHOUT acquiring the
+    // workers lock, so a concurrent lock holder (e.g. another command mid-reconcile against a
+    // slow relay) cannot head-of-line block it (#633). We hold the workers lock for the entire
+    // call: if the handler tried to lock it, this would deadlock and hit the timeout.
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/dm-daemon-home-hol"),
+        socket: PathBuf::from("/tmp/dm-daemon-hol.sock"),
+        pid_path: PathBuf::from("/tmp/dm-daemon-hol.pid"),
+        log_path: PathBuf::from("/tmp/dm-daemon-hol.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("daemon-keychain".to_owned()),
+    };
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 1,
+        started_at: 0,
+        last_runtime_activity: None,
+    }));
+    let events = DaemonEventHub::new();
+    let workers = SharedDaemonWorkers::default();
+
+    // Hold the workers lock for the whole Execute.
+    let busy = workers.lock().await;
+
+    let (mut server, client) = UnixStream::pair().expect("unix stream pair");
+    let cli = Box::new(daemon_test_cli(crate::Command::Whoami));
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle_execute_connection(cli, &mut server, &defaults, state, events, &workers),
+    )
+    .await
+    .expect("a relay-less Execute must not block on the held workers lock");
+    result.expect("handle_execute_connection should succeed off the lock");
+
+    drop(busy);
+    drop(client);
+}
+
+#[tokio::test]
 async fn daemon_request_reader_within_returns_request_before_timeout() {
     let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
     let writer = tokio::spawn(async move {

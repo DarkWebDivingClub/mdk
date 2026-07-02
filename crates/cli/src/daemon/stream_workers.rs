@@ -703,7 +703,7 @@ pub(crate) async fn run_hosted_stream_marker_cli_json(
     runtime_host: &mut AppRuntimeHost,
 ) -> Result<serde_json::Value, String> {
     let Some(output) =
-        handle_app_runtime_command_request(cli, defaults, state, events, runtime_host).await
+        handle_hosted_runtime_command_with_host(cli, defaults, state, events, runtime_host).await
     else {
         return Err("stream marker command did not use the daemon runtime".to_owned());
     };

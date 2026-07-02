@@ -132,12 +132,69 @@ struct CandidatePathProbe {
     messages: Vec<TransportMessage>,
     digests: Vec<[u8; 32]>,
     tip_epoch: u64,
+    /// The materialized candidate from the probe that produced this node (folding only
+    /// pending proposals — not applications). `None` only for the empty seed node, which is
+    /// never completed. Retained so a completed path can be reused by the canonicalization
+    /// core without a second full replay (#635), on the app-free path where it is
+    /// byte-identical to a fresh materialize.
+    materialized: Option<OpenMlsMaterializedCandidate>,
 }
 
 #[derive(Clone, Debug)]
 struct StoredOpenMlsCandidatePathResult {
     candidate_paths: Vec<OpenMlsCandidatePath>,
+    /// Terminal materialized candidates for `candidate_paths`, in the same order. Reusable by
+    /// the canonicalization core only when the pass has no pending application messages (the
+    /// BFS folds proposals but not applications), otherwise the core re-materializes. Empty
+    /// (or shorter than `candidate_paths`) means "do not reuse".
+    materialized: Vec<OpenMlsMaterializedCandidate>,
     invalid_commit_drops: Vec<DroppedMessage>,
+}
+
+/// Bounds the total OpenMLS replay round-trips a single convergence pass may perform, so
+/// attacker-driven same-epoch commit branching cannot amplify into unbounded CPU/IO (#635).
+/// The pass fails closed (`ReplayBudgetExceeded`) rather than returning a partial result.
+struct ReplayBudget {
+    remaining: u64,
+}
+
+/// Multiplicative slack over the linear `commits × (max_rewind_commits + 1)` probe estimate.
+/// Generous enough that legitimate forks never trip the budget; small enough that pathological
+/// `B^D` branching fails closed well before it materializes.
+const CANDIDATE_REPLAY_BUDGET_SLACK: u64 = 4;
+/// Floor so tiny passes (few commits, shallow rewind) always have headroom.
+const CANDIDATE_REPLAY_BUDGET_FLOOR: u64 = 32;
+
+impl ReplayBudget {
+    fn new(limit: u64) -> Self {
+        Self { remaining: limit }
+    }
+
+    /// Unlimited budget for callers outside the bounded convergence BFS (e.g. the public
+    /// `materialize_openmls_candidate_paths`, used directly by conformance vectors).
+    fn unlimited() -> Self {
+        Self {
+            remaining: u64::MAX,
+        }
+    }
+
+    /// Derive the per-pass replay ceiling from the number of competing commits and the rewind
+    /// horizon. Saturating throughout so a hostile large input cannot overflow into a small cap.
+    fn for_pass(commit_count: usize, max_rewind_commits: u64) -> Self {
+        let limit = (commit_count as u64)
+            .saturating_mul(max_rewind_commits.saturating_add(1))
+            .saturating_mul(CANDIDATE_REPLAY_BUDGET_SLACK)
+            .saturating_add(CANDIDATE_REPLAY_BUDGET_FLOOR);
+        Self::new(limit)
+    }
+
+    fn consume(&mut self) -> Result<(), OpenMlsProjectionError> {
+        if self.remaining == 0 {
+            return Err(OpenMlsProjectionError::ReplayBudgetExceeded);
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +264,7 @@ pub enum OpenMlsProjectionError {
     Serialize(String),
     Storage(String),
     InvalidPolicy(String),
+    ReplayBudgetExceeded,
 }
 
 impl std::fmt::Display for OpenMlsProjectionError {
@@ -235,6 +293,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
             OpenMlsProjectionError::InvalidPolicy(e) => {
                 write!(f, "invalid convergence policy: {e}")
+            }
+            OpenMlsProjectionError::ReplayBudgetExceeded => {
+                write!(f, "convergence replay budget exceeded")
             }
         }
     }
@@ -295,6 +356,20 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
     group_id: &GroupId,
     paths: &[OpenMlsCandidatePath],
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
+    materialize_openmls_candidate_paths_budgeted(
+        storage,
+        group_id,
+        paths,
+        &mut ReplayBudget::unlimited(),
+    )
+}
+
+fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    paths: &[OpenMlsCandidatePath],
+    budget: &mut ReplayBudget,
+) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     let mut candidates = Vec::with_capacity(paths.len());
     for path in paths {
         if path.messages.is_empty() {
@@ -302,6 +377,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
                 path.branch_id.clone(),
             ));
         }
+        budget.consume()?;
         let observations = replay_openmls_messages(storage, group_id, &path.messages)?;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
@@ -374,6 +450,20 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
         &batch.pending_messages,
     )?;
     let materialized = materialize_openmls_candidate_paths(storage, group_id, &candidate_paths)?;
+    canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)
+}
+
+/// Canonicalization core over already-materialized candidates. Split out of
+/// [`canonicalize_openmls_batch`] so the stored-message hot path can reuse the candidates the
+/// BFS already materialized instead of replaying every completed path a second time (#635).
+/// `materialized` MUST equal what `materialize_openmls_candidate_paths` would produce for
+/// `batch.candidate_paths` folded with `batch.pending_messages` (same order, sorted by
+/// `branch_id`); the caller guarantees this only on the app-free reuse path.
+fn canonicalize_openmls_batch_with_materialized(
+    group_id: &GroupId,
+    batch: OpenMlsCanonicalizationBatch,
+    materialized: Vec<OpenMlsMaterializedCandidate>,
+) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let proposal_id_by_ref = proposal_id_by_ref(&materialized);
     let materialized_candidates: Vec<_> = materialized
         .iter()
@@ -576,20 +666,33 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         work.commit_messages,
         &work.pending_messages,
         work.replay_start_epoch,
+        work.policy.convergence.max_rewind_commits,
     )?;
 
-    let mut result = canonicalize_openmls_batch(
-        storage,
-        group_id,
-        OpenMlsCanonicalizationBatch {
-            state: work.state,
-            candidate_paths: path_result.candidate_paths,
-            pending_messages: work.pending_messages,
-            outbound_intents: work.outbound_intents,
-            policy: work.policy,
-            now_ms: work.now_ms,
-        },
-    )?;
+    // Reuse the candidates the BFS already materialized instead of replaying every completed
+    // path a second time — but ONLY when the pass has no pending application messages. The BFS
+    // probes fold pending proposals but not applications, so with pending apps the reused
+    // candidate would be missing the ApplicationProcessed observations the canonicalization
+    // core consumes; that case falls back to a fresh full materialize (#635).
+    let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
+    let can_reuse_materialized =
+        !has_pending_apps && path_result.materialized.len() == path_result.candidate_paths.len();
+
+    let batch = OpenMlsCanonicalizationBatch {
+        state: work.state,
+        candidate_paths: path_result.candidate_paths,
+        pending_messages: work.pending_messages,
+        outbound_intents: work.outbound_intents,
+        policy: work.policy,
+        now_ms: work.now_ms,
+    };
+    let mut result = if can_reuse_materialized {
+        let mut materialized = path_result.materialized;
+        materialized.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
+        canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)?
+    } else {
+        canonicalize_openmls_batch(storage, group_id, batch)?
+    };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     Ok(result)
 }
@@ -646,6 +749,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     mut commits: Vec<StoredCommitMessage>,
     pending_messages: &[TransportMessage],
     starting_epoch: u64,
+    max_rewind_commits: u64,
 ) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
@@ -654,11 +758,13 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
             .then_with(|| a.message.payload.cmp(&b.message.payload))
     });
 
+    let mut budget = ReplayBudget::for_pass(commits.len(), max_rewind_commits);
     let pending_proposals = pending_proposal_messages(pending_messages)?;
     let mut frontier = vec![CandidatePathProbe {
         messages: Vec::new(),
         digests: Vec::new(),
         tip_epoch: starting_epoch,
+        materialized: None,
     }];
     let mut completed = Vec::new();
     let mut invalid_commit_drops = Vec::new();
@@ -688,6 +794,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     messages.clone(),
                     &digests,
                     &pending_proposals,
+                    &mut budget,
                 )? {
                     CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
                     CandidatePathProbeResult::Materialized(None) => continue,
@@ -710,10 +817,12 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                 };
 
                 extended = true;
+                let tip_epoch = candidate.tip_epoch;
                 next_frontier.push(CandidatePathProbe {
                     messages,
                     digests,
-                    tip_epoch: candidate.tip_epoch,
+                    tip_epoch,
+                    materialized: Some(candidate),
                 });
             }
 
@@ -725,16 +834,39 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         frontier = next_frontier;
     }
 
+    let mut candidate_paths = Vec::with_capacity(completed.len());
+    let mut materialized = Vec::with_capacity(completed.len());
+    for path in completed {
+        candidate_paths.push(OpenMlsCandidatePath {
+            branch_id: branch_id_for_path_digests(&path.digests),
+            messages: path.messages,
+        });
+        // Every completed path is a non-empty node created via a probe, so `materialized` is
+        // always `Some`. Push in lockstep with `candidate_paths`; if the invariant is ever
+        // broken the length mismatch makes the caller fall back to a fresh materialize.
+        if let Some(candidate) = path.materialized {
+            materialized.push(candidate);
+        }
+    }
+
     Ok(StoredOpenMlsCandidatePathResult {
-        candidate_paths: completed
-            .into_iter()
-            .map(|path| OpenMlsCandidatePath {
-                branch_id: branch_id_for_path_digests(&path.digests),
-                messages: path.messages,
-            })
-            .collect(),
+        candidate_paths,
+        materialized,
         invalid_commit_drops,
     })
+}
+
+/// True if any pending message is an application message (used to decide whether the BFS's
+/// proposal-only materialized candidates can be reused by the canonicalization core — #635).
+fn pending_messages_contain_application(
+    pending_messages: &[TransportMessage],
+) -> Result<bool, OpenMlsProjectionError> {
+    for message in pending_messages {
+        if project_mls_message(&message.payload)?.kind == OpenMlsContentKind::Application {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn pending_proposal_messages(
@@ -755,13 +887,14 @@ fn probe_candidate_path<S: StorageProvider>(
     messages: Vec<TransportMessage>,
     digests: &[[u8; 32]],
     pending_proposals: &[TransportMessage],
+    budget: &mut ReplayBudget,
 ) -> Result<CandidatePathProbeResult, OpenMlsProjectionError> {
     let path = OpenMlsCandidatePath {
         branch_id: branch_id_for_path_digests(digests),
         messages,
     };
     let replay_paths = candidate_paths_with_pending_replay_messages(&[path], pending_proposals)?;
-    match materialize_openmls_candidate_paths(storage, group_id, &replay_paths) {
+    match materialize_openmls_candidate_paths_budgeted(storage, group_id, &replay_paths, budget) {
         Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
@@ -1712,4 +1845,61 @@ fn tls_hex<T: TlsSerialize>(value: &T) -> Result<String, OpenMlsProjectionError>
         .tls_serialize_detached()
         .map(hex::encode)
         .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))
+}
+
+#[cfg(test)]
+mod replay_budget_tests {
+    use super::{
+        CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, OpenMlsProjectionError,
+        ReplayBudget,
+    };
+
+    #[test]
+    fn for_pass_scales_with_commits_and_rewind_and_keeps_a_floor() {
+        // Zero commits still gets the floor so tiny passes always have headroom.
+        let mut empty = ReplayBudget::for_pass(0, 5);
+        assert_eq!(empty.remaining, CANDIDATE_REPLAY_BUDGET_FLOOR);
+        for _ in 0..CANDIDATE_REPLAY_BUDGET_FLOOR {
+            empty.consume().expect("floor budget covers the floor");
+        }
+        assert!(matches!(
+            empty.consume(),
+            Err(OpenMlsProjectionError::ReplayBudgetExceeded)
+        ));
+
+        // commits × (max_rewind + 1) × slack + floor.
+        let budget = ReplayBudget::for_pass(3, 5);
+        assert_eq!(
+            budget.remaining,
+            3 * (5 + 1) * CANDIDATE_REPLAY_BUDGET_SLACK + CANDIDATE_REPLAY_BUDGET_FLOOR
+        );
+    }
+
+    #[test]
+    fn for_pass_saturates_instead_of_overflowing() {
+        // A hostile huge input must not wrap to a small cap.
+        let budget = ReplayBudget::for_pass(usize::MAX, u64::MAX);
+        assert_eq!(budget.remaining, u64::MAX);
+    }
+
+    #[test]
+    fn consume_fails_closed_when_exhausted() {
+        let mut budget = ReplayBudget::new(2);
+        budget.consume().expect("first replay within budget");
+        budget.consume().expect("second replay within budget");
+        assert!(matches!(
+            budget.consume(),
+            Err(OpenMlsProjectionError::ReplayBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn unlimited_budget_never_trips() {
+        let mut budget = ReplayBudget::unlimited();
+        for _ in 0..10_000 {
+            budget
+                .consume()
+                .expect("unlimited budget never fails closed");
+        }
+    }
 }
