@@ -53,6 +53,12 @@ The image exposes UDP `4450` and runs:
 marmot-quic-broker --bind 0.0.0.0:4450
 ```
 
+Operator limits beyond the defaults: `--per-subscriber-queue`, `--max-backlog`, `--replay-ttl-secs`, and the
+forward-role publish bounds `--publish-max-records` (default 65536) and `--publish-max-frame-bytes` (default 64 MiB).
+The publish bounds cap what the broker forwards per publish stream, counted as carried on the wire (ciphertext for
+encrypted previews, plaintext otherwise) since the broker never decrypts; subscribers still enforce their own
+(receive-side, decrypted-plaintext) limits.
+
 ## VM Run
 
 For a real VM, provision a certificate whose DNS name matches the broker candidate host, open UDP `4450`, then run:
