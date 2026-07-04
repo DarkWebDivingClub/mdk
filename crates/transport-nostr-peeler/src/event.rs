@@ -30,18 +30,28 @@ pub struct NostrTransportEvent {
 impl NostrTransportEvent {
     /// Convert a Nostr event into the raw transport message the engine ingests.
     pub fn to_transport_message(&self) -> Result<TransportMessage, NostrPeelerError> {
+        // #709/#351 — the resulting `TransportMessage.id` keys routing metrics,
+        // telemetry, and the forensic `wire_id`, so bind it to the event hash
+        // here rather than trusting the self-reported id. Signature
+        // verification still happens at peel time.
+        if !self.id.eq_ignore_ascii_case(&self.computed_id()) {
+            return Err(NostrPeelerError::Malformed(
+                "event id does not match event hash".into(),
+            ));
+        }
         let id = MessageId::new(decode_hex_exact("event id", &self.id, 32)?);
         let envelope = match self.kind {
             KIND_MARMOT_GROUP_MESSAGE => {
                 let group_id = self.single_tag_value(GROUP_TAG)?;
                 TransportEnvelope::GroupMessage {
-                    transport_group_id: decode_hex("group h tag", group_id)?,
+                    // The `h` tag is the hex of the 32-byte nostr_group_id
+                    // (spec/transports/nostr.md); shorter/longer route ids are
+                    // rejected, not passed through.
+                    transport_group_id: decode_hex_exact("group h tag", group_id, 32)?,
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
-                let recipient = self
-                    .tag_value(RECIPIENT_TAG)
-                    .ok_or_else(|| NostrPeelerError::MissingTag(RECIPIENT_TAG.into()))?;
+                let recipient = self.single_tag_value(RECIPIENT_TAG)?;
                 TransportEnvelope::Welcome {
                     recipient: MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?),
                 }
@@ -123,16 +133,40 @@ impl NostrTransportEvent {
             .collect()
     }
 
-    /// Return exactly one value for a Nostr tag name.
+    /// Return the value of exactly one Nostr tag.
+    ///
+    /// Counts tag *occurrences* (any tag whose name matches), not extracted
+    /// values, so a valueless duplicate like `["p"]` next to `["p", <value>]`
+    /// is still rejected instead of collapsing to a single first-match value.
     pub fn single_tag_value(&self, name: &str) -> Result<&str, NostrPeelerError> {
-        let values = self.tag_values(name);
-        match values.as_slice() {
-            [] => Err(NostrPeelerError::MissingTag(name.into())),
-            [value] => Ok(value),
-            _ => Err(NostrPeelerError::Malformed(format!(
+        let mut matches = self
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name));
+        let first = matches
+            .next()
+            .ok_or_else(|| NostrPeelerError::MissingTag(name.into()))?;
+        if matches.next().is_some() {
+            return Err(NostrPeelerError::Malformed(format!(
                 "Nostr event must contain exactly one {name} tag"
-            ))),
+            )));
         }
+        first.get(1).map(String::as_str).ok_or_else(|| {
+            NostrPeelerError::Malformed(format!("Nostr event {name} tag has no value"))
+        })
+    }
+
+    /// NIP-01 event id (lowercase hex sha256 of the canonical serialization)
+    /// computed from this event's own fields, independent of the self-reported
+    /// `id` field.
+    pub fn computed_id(&self) -> String {
+        pre_signing_id(
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        )
     }
 
     /// Build an unsigned local Nostr DTO and precompute the event id for the
@@ -212,19 +246,23 @@ mod tests {
 
     #[test]
     fn kind_445_event_maps_to_group_transport_message() {
-        let event = NostrTransportEvent {
-            id: "11".repeat(32),
+        let mut event = NostrTransportEvent {
+            id: String::new(),
             pubkey: "22".repeat(32),
             created_at: 1_700_000_000,
             kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "aa55".into()]],
+            tags: vec![vec!["h".into(), "aa".repeat(32)]],
             content: "encrypted body".into(),
             sig: None,
         };
+        event.id = event.computed_id();
 
         let msg = event.to_transport_message().expect("event maps");
 
-        assert_eq!(msg.id.as_slice(), vec![0x11; 32].as_slice());
+        assert_eq!(
+            msg.id.as_slice(),
+            hex::decode(&event.id).unwrap().as_slice()
+        );
         assert_eq!(msg.timestamp.0, 1_700_000_000);
         assert_eq!(msg.source.0, NOSTR_SOURCE);
         // The peeler does not extract `e` causal-dependency tags (kind 445 carries
@@ -233,7 +271,7 @@ mod tests {
         assert_eq!(
             msg.envelope,
             TransportEnvelope::GroupMessage {
-                transport_group_id: vec![0xaa, 0x55],
+                transport_group_id: vec![0xaa; 32],
             }
         );
         assert_eq!(
@@ -273,8 +311,8 @@ mod tests {
 
     #[test]
     fn kind_1059_route_mapping_defers_signature_verification_to_peeling() {
-        let event = NostrTransportEvent {
-            id: "33".repeat(32),
+        let mut event = NostrTransportEvent {
+            id: String::new(),
             pubkey: "44".repeat(32),
             created_at: 1_700_000_001,
             kind: KIND_NIP59_GIFT_WRAP,
@@ -282,6 +320,7 @@ mod tests {
             content: "gift wrap body".into(),
             sig: None,
         };
+        event.id = event.computed_id();
 
         let msg = event
             .to_transport_message()
@@ -293,5 +332,147 @@ mod tests {
                 recipient: MemberId::new(vec![0x55; 32]),
             }
         );
+    }
+
+    #[test]
+    fn route_mapping_rejects_forged_event_id() {
+        // #351 — `TransportMessage.id` keys routing/telemetry/forensics, so a
+        // self-reported id that does not match the event hash fails closed.
+        let event = NostrTransportEvent {
+            id: "33".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "aa".repeat(32)]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        assert_ne!(event.id, event.computed_id());
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn route_mapping_rejects_duplicate_recipient_tags() {
+        // #336 — gift-wrap `p` extraction is strict single-tag, matching the
+        // kind-445 `h` path; a multi-`p` wrap is rejected, not first-matched.
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![
+                vec!["p".into(), "55".repeat(32)],
+                vec!["p".into(), "66".repeat(32)],
+            ],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        event.id = event.computed_id();
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn route_mapping_rejects_non_32_byte_group_route_id() {
+        // The `h` tag is the hex of the 32-byte nostr_group_id
+        // (spec/transports/nostr.md); a short route id must be rejected at the
+        // boundary, not passed through into the transport envelope.
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "aa55".into()]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        event.id = event.computed_id();
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn single_tag_enforcement_counts_valueless_duplicate_tags() {
+        // A valueless `["p"]` next to `["p", <valid>]` must not collapse into
+        // "exactly one value" — duplicate occurrences are rejected regardless
+        // of whether each carries a value. Same contract for `h`.
+        let mut gift_wrap = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into()], vec!["p".into(), "55".repeat(32)]],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        gift_wrap.id = gift_wrap.computed_id();
+        assert!(matches!(
+            gift_wrap.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+
+        let mut group = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into()], vec!["h".into(), "aa".repeat(32)]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        group.id = group.computed_id();
+        assert!(matches!(
+            group.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+
+        // A single matching tag with no value is malformed, not missing.
+        let mut valueless = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into()]],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        valueless.id = valueless.computed_id();
+        assert!(matches!(
+            valueless.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn computed_id_matches_sdk_signed_event_id() {
+        // `to_transport_message` verifies self-reported ids against
+        // `computed_id`, so the local NIP-01 id computation must agree with the
+        // Nostr SDK's — including for content that needs JSON escaping.
+        let content = "line\nbreak \"quote\" back\\slash tab\t unicode ✨ control \u{1}";
+        let signed = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+            content,
+        )
+        .tags([nostr::Tag::custom(
+            nostr::TagKind::custom("h"),
+            [hex::encode([0x99; 32])],
+        )])
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign kind-445");
+
+        let dto = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+
+        assert_eq!(dto.id, dto.computed_id());
+        assert!(dto.to_transport_message().is_ok());
     }
 }
