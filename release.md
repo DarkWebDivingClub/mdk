@@ -60,6 +60,32 @@ Title GitHub Releases with the version first so release lists group artifacts by
 - WN Agent releases: `v0.9.2 - wn-agent`;
 - MarmotKit binding releases: `v0.9.2 - MarmotKit`.
 
+For a full cohort release across all three current tracks, use the coordinator:
+
+```sh
+just release-all 0.9.2
+```
+
+This creates `v<version>`, `wn-agent-v<version>`, and `marmotkit-v<version>` on the same `origin/master` commit,
+creates the MDK source GitHub Release with generated notes starting from the previous `v*` tag, pushes the artifact
+tags, waits for the WN Agent and MarmotKit release workflows, verifies expected release metadata/assets, and marks the
+MDK source release as Latest.
+
+To stage the same cohort for manual review, leave every GitHub Release draft:
+
+```sh
+just release-all-draft 0.9.2
+```
+
+Draft mode creates draft release objects after each tag is pushed. The WN Agent and MarmotKit workflows upload their
+assets into those draft releases and leave them draft, so a human can review and publish them from GitHub.
+
+For a no-op rehearsal:
+
+```sh
+just release-all-dry-run 0.9.2
+```
+
 Use a new version when public behavior changes. That includes:
 
 - UniFFI records, enums, object methods, async methods, or error variants;
@@ -178,6 +204,9 @@ Cut the release tag from the current `origin/master` commit:
 just release-wn-agent 0.9.2
 ```
 
+For releases that should include the matching MDK source and MarmotKit tracks, prefer `just release-all 0.9.2` or
+`just release-all-draft 0.9.2`.
+
 For a dry run:
 
 ```sh
@@ -241,6 +270,9 @@ Create the tag:
 git tag -a marmotkit-v0.9.0 -m "MarmotKit v0.9.0"
 git push origin marmotkit-v0.9.0
 ```
+
+For releases that should include the matching MDK source and WN Agent tracks, prefer `just release-all 0.9.2` or
+`just release-all-draft 0.9.2`.
 
 The release job creates these assets:
 

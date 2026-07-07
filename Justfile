@@ -69,6 +69,15 @@ hermes-dev-teardown args="":
 hermes-dev-script-test:
     integrations/hermes/marmot/tests/test_dev_scripts.sh
 
+release-all version:
+    ./scripts/cut-full-release.sh {{version}}
+
+release-all-draft version:
+    ./scripts/cut-full-release.sh --draft {{version}}
+
+release-all-dry-run version:
+    ./scripts/cut-full-release.sh --dry-run {{version}}
+
 release-wn-agent version:
     ./scripts/cut-wn-agent-release.sh {{version}}
 

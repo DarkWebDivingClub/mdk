@@ -290,5 +290,6 @@ jobs:
             gh release create "$tag" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "v$version - MarmotKit" \
-              --notes-file "$notes"
+              --notes-file "$notes" \
+              --latest=false
           fi

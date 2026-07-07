@@ -79,6 +79,8 @@ The canonical protocol specification lives in
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
 - Title GitHub Releases with the version first so release lists group by cohort: whole-workspace `v<version> - MDK`,
   WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
+- Prefer `just release-all <version>` for a full MDK/WN Agent/MarmotKit cohort release, or
+  `just release-all-draft <version>` when releases should stay draft for manual publication.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification
