@@ -5,6 +5,41 @@ All notable changes to `wn-cli` (previously `darkmatter-cli`) are tracked here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses semantic
 versioning through the workspace version in the root `Cargo.toml`.
 
+## [0.9.3] - 2026-07-07
+
+### Added
+
+- Added host-provided external signer account support for app integrations whose Nostr private key stays outside MDK.
+  UniFFI can now register/login external signer accounts, account summaries expose whether signing is local or
+  external, and runtime signing paths cover media upload auth, push/gift-wrap publishing, relay auth, directory
+  publishing, and account identity proofs.
+- UniFFI now exposes encrypted Blossom group avatars to host apps through `AppGroupRecordFfi.image_hash_hex` and
+  `download_group_blossom_image`, allowing clients to detect, cache, fetch, verify, and decrypt encrypted group avatar
+  images.
+- Added production-shaped `wn-opencode` release packaging alongside `wn-agent`: versioned harness binaries, the
+  `install-opencode-marmot.sh` installer, service setup paths, deterministic installer tests, and connector E2E
+  coverage.
+- Added SafeAAD app-component support advertisement so engine leaves declare support for the SafeAAD component and reject
+  attempts to override it as caller-supplied group component data.
+
+### Changed
+
+- Account identity proofs now use a v2 canonical unpublished Nostr event signature, making account setup compatible
+  with platform signers that can sign Nostr events but do not expose raw digest signing.
+- WN Agent non-draft releases refresh `wn-agent-latest` installer aliases for Hermes, OpenClaw, and OpenCode while
+  keeping versioned release assets pinned to their immutable `wn-agent-v<version>` release.
+- Release metadata now uses standardized titles across the MDK, WN Agent, and MarmotKit tracks, and the new
+  `just release-all <version>` coordinator cuts the whole cohort from one checked `origin/master` commit.
+
+### Fixed
+
+- Android MarmotKit binding generation now keeps the host UniFFI dylib unstripped and fails loudly if Kotlin output is
+  missing, avoiding empty binding bundles when release builds set `RUSTFLAGS="-C strip=symbols"`.
+- External signer account setup now discovers existing account profiles before setup and keeps account discovery
+  relay-scoped.
+- Push owner proof verification accepts the new event-based proof while retaining legacy verification fallback for
+  already-published owner proofs.
+
 ## [0.9.2] - 2026-07-06
 
 ### Changed

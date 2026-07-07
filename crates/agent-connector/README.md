@@ -148,13 +148,13 @@ defaults to 30000 bytes per Marmot reply chunk.
 After the release commit is merged to `master`, cut a WN Agent release tag with:
 
 ```sh
-just release-wn-agent 0.9.2
+just release-wn-agent 0.9.3
 ```
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.9.2
+just release-wn-agent-dry-run 0.9.3
 ```
 
 The helper checks that:

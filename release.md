@@ -56,14 +56,14 @@ skip versions when it has no changed artifact to publish. Do not reuse the same 
 
 Title GitHub Releases with the version first so release lists group artifacts by compatibility cohort:
 
-- whole-workspace source releases: `v0.9.2 - MDK`;
-- WN Agent releases: `v0.9.2 - wn-agent`;
-- MarmotKit binding releases: `v0.9.2 - MarmotKit`.
+- whole-workspace source releases: `v0.9.3 - MDK`;
+- WN Agent releases: `v0.9.3 - wn-agent`;
+- MarmotKit binding releases: `v0.9.3 - MarmotKit`.
 
 For a full cohort release across all three current tracks, use the coordinator:
 
 ```sh
-just release-all 0.9.2
+just release-all 0.9.3
 ```
 
 This creates `v<version>`, `wn-agent-v<version>`, and `marmotkit-v<version>` on the same `origin/master` commit,
@@ -74,7 +74,7 @@ MDK source release as Latest.
 To stage the same cohort for manual review, leave every GitHub Release draft:
 
 ```sh
-just release-all-draft 0.9.2
+just release-all-draft 0.9.3
 ```
 
 Draft mode creates draft release objects after each tag is pushed. The WN Agent and MarmotKit workflows upload their
@@ -83,7 +83,7 @@ assets into those draft releases and leave them draft, so a human can review and
 For a no-op rehearsal:
 
 ```sh
-just release-all-dry-run 0.9.2
+just release-all-dry-run 0.9.3
 ```
 
 Use a new version when public behavior changes. That includes:
@@ -204,16 +204,16 @@ bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(prin
 Cut the release tag from the current `origin/master` commit:
 
 ```sh
-just release-wn-agent 0.9.2
+just release-wn-agent 0.9.3
 ```
 
-For releases that should include the matching MDK source and MarmotKit tracks, prefer `just release-all 0.9.2` or
-`just release-all-draft 0.9.2`.
+For releases that should include the matching MDK source and MarmotKit tracks, prefer `just release-all 0.9.3` or
+`just release-all-draft 0.9.3`.
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.9.2
+just release-wn-agent-dry-run 0.9.3
 ```
 
 The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
@@ -291,8 +291,8 @@ git tag -a marmotkit-v0.9.0 -m "MarmotKit v0.9.0"
 git push origin marmotkit-v0.9.0
 ```
 
-For releases that should include the matching MDK source and WN Agent tracks, prefer `just release-all 0.9.2` or
-`just release-all-draft 0.9.2`.
+For releases that should include the matching MDK source and WN Agent tracks, prefer `just release-all 0.9.3` or
+`just release-all-draft 0.9.3`.
 
 The release job creates these assets:
 
