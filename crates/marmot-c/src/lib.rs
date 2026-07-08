@@ -255,3 +255,14 @@ pub unsafe extern "C" fn marmot_string_free(s: *mut c_char) {
         MarmotStatus::Ok
     });
 }
+
+/// Free a byte buffer returned by this library as a `(data, len)` pair (e.g.
+/// `marmot_download_group_blossom_image`). `(NULL, 0)` is a no-op.
+///
+/// # Safety
+/// `data`/`len` must be exactly a pair returned by this library that has not
+/// been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_bytes_free(data: *mut u8, len: usize) {
+    memory::free_guard(|| unsafe { memory::free_vec(data, len) });
+}

@@ -14,7 +14,7 @@ use crate::types::group::{
 use crate::{MarmotClient, client_ref, ffi_guard};
 
 use super::account::try_arg;
-use super::{deliver, deliver_scalar, deliver_string};
+use super::{deliver, deliver_bytes, deliver_scalar, deliver_string};
 
 /// Create a new MLS group with `name` and the given members. Members are
 /// referenced by `npub` or hex account id. Writes the new group id as a hex
@@ -492,6 +492,40 @@ pub unsafe extern "C" fn marmot_replace_encrypted_media_blob_endpoints(
                     endpoints,
                 )),
                 out_summary,
+            )
+        }
+    })
+}
+
+/// Fetch, verify, and decrypt the group's Blossom-hosted encrypted image,
+/// writing the plaintext bytes to `out_data`/`out_len`. The image hash comes
+/// from `MarmotAppGroupRecord.image_hash_hex`. Needs a relay/Blossom, so it
+/// fails offline. Free the buffer with `marmot_bytes_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` and `group_id_hex` valid
+/// strings; `out_data` and `out_len` valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_download_group_blossom_image(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        unsafe {
+            deliver_bytes(
+                client.block_on(
+                    client
+                        .marmot
+                        .download_group_blossom_image(account_ref, group_id_hex),
+                ),
+                out_data,
+                out_len,
             )
         }
     })

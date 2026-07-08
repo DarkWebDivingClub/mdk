@@ -9,6 +9,13 @@ C ABI bindings for the Marmot app runtime. Read `README.md` first for build, lin
 - Own `c-bindings.sh` (cdylib + staticlib + header + pkg-config staging into `output/`) and the `examples/` consumers
   (`smoke.{c,zig,nim,go,odin,lua,php}`) driven by `c-smoke.sh`.
 
+## Known gaps
+
+- External-signer accounts (`register_external_signer` / `login_external_signer`) are not yet exposed. They take a
+  host-implemented `ExternalAccountSignerFfi` trait (public key, sign event, NIP-04 encrypt/decrypt). A C mapping needs a
+  callback vtable (function pointers + `user_data`) invoked from runtime worker threads, with owned-string return and
+  error signalling across the boundary. That deserves its own focused design + tests rather than a rushed vtable.
+
 ## Architecture
 
 - `marmot-uniffi` is the single source of truth for FFI DTO shapes and the runtime object; this crate never talks to

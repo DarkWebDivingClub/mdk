@@ -191,6 +191,17 @@ int main(int argc, char **argv) {
         print_last_error("create_identity");
     }
 
+    /* ---- byte-buffer command + NULL-safe bytes free ------------------- */
+    uint8_t *img = NULL;
+    uintptr_t img_len = 0;
+    st = marmot_download_group_blossom_image(client, "no-such-account",
+                                             "aabb", &img, &img_len);
+    check(st != MARMOT_STATUS_OK,
+          "blossom image download on unknown account errors");
+    marmot_bytes_free(img, img_len); /* (NULL, 0) on the error path */
+    marmot_bytes_free(NULL, 0);      /* no-op */
+    ok("bytes free is NULL-safe");
+
     /* ---- shutdown ----------------------------------------------------- */
     st = marmot_client_shutdown(client);
     check(st == MARMOT_STATUS_OK, "client shutdown");

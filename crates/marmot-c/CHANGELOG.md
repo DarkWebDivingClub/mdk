@@ -21,6 +21,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added memory-safety scaffolding: an `alloc-audit` test feature that proves deep-free completeness, `catch_unwind` at
   every ABI boundary so panics never unwind into C, and a typed `MarmotStatus` code per `MarmotKitError` variant with a
   thread-local last-error detail channel.
+- Added `marmot_download_group_blossom_image` (fetch + verify + decrypt the group's encrypted Blossom image to an owned
+  byte buffer freed with `marmot_bytes_free`), completing the group-image surface alongside `image_hash_hex`. External
+  signer accounts remain a documented gap pending a C callback-vtable design.
 - Added packaging and cross-language verification: `c-bindings.sh` (staged libraries + header + pkg-config),
   `c-smoke.sh`, and seven worked example consumers (`examples/smoke.{c,zig,nim,go,odin,lua,php}`) exercised in CI, plus a
   `marmotc-v*` release track titled `v<version> - Marmot C`.

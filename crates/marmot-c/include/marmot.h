@@ -2641,6 +2641,16 @@ char *marmot_last_error_message(void);
 void marmot_string_free(char *s);
 
 /**
+ * Free a byte buffer returned by this library as a `(data, len)` pair (e.g.
+ * `marmot_download_group_blossom_image`). `(NULL, 0)` is a no-op.
+ *
+ * # Safety
+ * `data`/`len` must be exactly a pair returned by this library that has not
+ * been freed already.
+ */
+void marmot_bytes_free(uint8_t *data, uintptr_t len);
+
+/**
  * List every account known to this device.
  *
  * # Safety
@@ -3391,6 +3401,22 @@ enum MarmotStatus marmot_replace_encrypted_media_blob_endpoints(const struct Mar
                                                                 const struct MarmotAppBlobEndpoint *endpoints,
                                                                 uintptr_t endpoints_len,
                                                                 struct MarmotSendSummary **out_summary);
+
+/**
+ * Fetch, verify, and decrypt the group's Blossom-hosted encrypted image,
+ * writing the plaintext bytes to `out_data`/`out_len`. The image hash comes
+ * from `MarmotAppGroupRecord.image_hash_hex`. Needs a relay/Blossom, so it
+ * fails offline. Free the buffer with `marmot_bytes_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `account_ref` and `group_id_hex` valid
+ * strings; `out_data` and `out_len` valid pointers.
+ */
+enum MarmotStatus marmot_download_group_blossom_image(const struct MarmotClient *client,
+                                                      const char *account_ref,
+                                                      const char *group_id_hex,
+                                                      uint8_t **out_data,
+                                                      uintptr_t *out_len);
 
 /**
  * Grant admin rights to `member_ref` (npub or hex). Requires the caller

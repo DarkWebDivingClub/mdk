@@ -125,3 +125,75 @@ pub(crate) fn deliver_unit(result: Result<(), MarmotKitError>) -> MarmotStatus {
         Err(err) => status_from_error(&err),
     }
 }
+
+/// Deliver a fallible `Vec<u8>` result as an owned `(ptr, len)` byte buffer.
+/// The caller frees it with `marmot_bytes_free`. Empty is `(NULL, 0)`.
+pub(crate) unsafe fn deliver_bytes(
+    result: Result<Vec<u8>, MarmotKitError>,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> MarmotStatus {
+    match result {
+        Ok(bytes) => {
+            if out_data.is_null() || out_len.is_null() {
+                crate::status::set_last_error("out-pointer argument was NULL");
+                return MarmotStatus::NullPointer;
+            }
+            let (ptr, len) = crate::memory::owned_vec(bytes);
+            unsafe {
+                out_data.write(ptr);
+                out_len.write(len);
+            }
+            MarmotStatus::Ok
+        }
+        Err(err) => status_from_error(&err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deliver_bytes_writes_pair() {
+        let _guard = crate::memory::audit::test_lock();
+        let mut data: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 999;
+        let status = unsafe { deliver_bytes(Ok(vec![1, 2, 3]), &mut data, &mut len) };
+        assert_eq!(status, MarmotStatus::Ok);
+        assert!(!data.is_null());
+        assert_eq!(len, 3);
+        assert_eq!(unsafe { std::slice::from_raw_parts(data, len) }, &[1, 2, 3]);
+        unsafe { crate::memory::free_vec(data, len) };
+    }
+
+    #[test]
+    fn deliver_bytes_empty_is_null() {
+        let _guard = crate::memory::audit::test_lock();
+        let mut data: *mut u8 = (&mut 0u8) as *mut u8;
+        let mut len: usize = 999;
+        let status = unsafe { deliver_bytes(Ok(Vec::new()), &mut data, &mut len) };
+        assert_eq!(status, MarmotStatus::Ok);
+        assert!(data.is_null());
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn deliver_bytes_rejects_null_out() {
+        let status =
+            unsafe { deliver_bytes(Ok(vec![1]), std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(status, MarmotStatus::NullPointer);
+    }
+
+    #[test]
+    fn deliver_bytes_maps_error() {
+        let status = unsafe {
+            deliver_bytes(
+                Err(MarmotKitError::RuntimeStopping),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, MarmotStatus::RuntimeStopping);
+    }
+}
