@@ -12,10 +12,23 @@
 //! - **Callbacks:** `marmot_*_subscription_set_callback(sub, cb, user_data)`
 //!   spawns a runtime task that invokes `cb` with a *borrowed* item pointer
 //!   valid only for the duration of the call, then a final NULL item when
-//!   the stream closes. Callbacks run on runtime worker threads; `user_data`
-//!   must be safe to touch from another thread. Clearing the callback (or
-//!   freeing the handle) cancels the task at its next await point — an
-//!   in-flight callback always runs to completion first.
+//!   the stream closes. Callbacks run on runtime worker threads, so `cb` and
+//!   any access to `user_data` must be thread-safe.
+//!
+//!   **`user_data` lifetime — read carefully.** `clear_callback` and
+//!   `*_subscription_free` only *request* cancellation: internally they call
+//!   tokio's `JoinHandle::abort`, which is non-blocking. A callback already
+//!   executing on a worker thread keeps running and returns after the
+//!   clear/free call has returned; the abort only takes effect at the pump's
+//!   next await point. So clearing or freeing is **not** a synchronization
+//!   point — you must not free `user_data` (or invalidate anything the
+//!   callback touches) just because clear/free returned. `user_data` must
+//!   outlive every possible callback invocation. To reclaim it safely, use
+//!   your own synchronization: e.g. have the callback signal an atomic/latch
+//!   and observe the terminal NULL-item call (or a quiescent flag) before
+//!   freeing, or only free at process teardown. Making cancellation blocking
+//!   here would risk deadlock (the pump may be inside `cb`), so the wait is
+//!   left to the caller who knows the callback's own locking.
 //!
 //! Do not mix blocking reads and an installed callback on the same handle:
 //! both compete for the same inner receiver and items go to whichever wins.
@@ -292,13 +305,16 @@ pub unsafe extern "C" fn marmot_events_subscription_next(
 /// Install a callback pump for this subscription. `callback` runs on a
 /// runtime worker thread with a borrowed event pointer (valid only during
 /// the call; do not store or free it) and a final NULL event on close.
-/// `user_data` must be safe to use from another thread. Fails if a
+/// `callback` and `user_data` access must be thread-safe. Fails if a
 /// callback is already installed.
 ///
 /// # Safety
 /// `sub` must be a live handle; `callback` must be a valid function
-/// pointer; `user_data` must remain valid until the callback is cleared
-/// or the handle freed.
+/// pointer. `user_data` must outlive every callback invocation. Note that
+/// `clear_callback` / `*_subscription_free` request cancellation without
+/// waiting (tokio `abort` is non-blocking), so a callback can still be
+/// running after they return — do not free `user_data` until your own
+/// synchronization proves no callback is in flight (see the module docs).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_events_subscription_set_callback(
     sub: *const MarmotEventsSubscription,
@@ -324,8 +340,11 @@ pub unsafe extern "C" fn marmot_events_subscription_set_callback(
     })
 }
 
-/// Cancel this subscription's callback pump, if any. An in-flight
-/// callback completes before the pump stops; no further calls follow.
+/// Request cancellation of this subscription's callback pump, if any. This
+/// does not wait: a callback already running on a worker thread keeps
+/// executing and returns after this call does (tokio `abort` is
+/// non-blocking). It is not a synchronization point for freeing
+/// `user_data` — see the module docs.
 ///
 /// # Safety
 /// `sub` must be a live handle.
@@ -343,8 +362,10 @@ pub unsafe extern "C" fn marmot_events_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -608,8 +629,10 @@ pub unsafe extern "C" fn marmot_timeline_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -748,8 +771,10 @@ pub unsafe extern "C" fn marmot_notifications_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -922,8 +947,10 @@ pub unsafe extern "C" fn marmot_chats_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -1122,8 +1149,10 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -1306,8 +1335,10 @@ pub unsafe extern "C" fn marmot_messages_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -1482,8 +1513,10 @@ pub unsafe extern "C" fn marmot_group_state_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from
@@ -1695,8 +1728,10 @@ pub unsafe extern "C" fn marmot_agent_stream_subscription_clear_callback(
     })
 }
 
-/// Free the subscription handle (cancels any callback pump). NULL is a
-/// no-op. Must be freed before the client.
+/// Free the subscription handle. Requests callback-pump cancellation
+/// without waiting (see the module docs: a callback may still be running
+/// after this returns, so do not free `user_data` here on that basis).
+/// NULL is a no-op. Free every handle before the client that created it.
 ///
 /// # Safety
 /// `sub` must be NULL or an unfreed pointer from

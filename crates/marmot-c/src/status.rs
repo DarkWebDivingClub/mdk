@@ -15,7 +15,12 @@ use marmot_uniffi::MarmotKitError;
 /// typed error variants one-to-one. Retrieve the human-readable detail for
 /// the most recent failure on the current thread with
 /// `marmot_last_error_message()`.
-#[repr(C)]
+// `i32`-backed so the discriminant width is fixed across platforms/compilers
+// (a bare C enum's width is implementation-defined). `#[repr(i32)]` — not
+// `#[repr(C, i32)]`, which is only valid on enums with fields — gives a plain
+// fixed-width fieldless enum; cbindgen emits it as `int32_t`-backed. The
+// numeric values are stable ABI: append new codes, never renumber.
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarmotStatus {
     Ok = 0,

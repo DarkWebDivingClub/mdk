@@ -129,7 +129,9 @@ jobs:
       - name: Header diff gate
         run: |
           set -euo pipefail
-          cargo install cbindgen --locked
+          # Pin the exact version so a newer cbindgen can't reformat the
+          # checked-in header and fail the diff gate on unrelated PRs.
+          cargo install cbindgen --version 0.29.4 --locked
           cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c \
             --output crates/marmot-c/include/marmot.h crates/marmot-c
           git diff --exit-code crates/marmot-c/include/marmot.h

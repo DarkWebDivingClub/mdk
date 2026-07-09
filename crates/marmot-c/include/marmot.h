@@ -35,7 +35,11 @@
  * the most recent failure on the current thread with
  * `marmot_last_error_message()`.
  */
-typedef enum MarmotStatus {
+enum MarmotStatus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
   MARMOT_STATUS_OK = 0,
   /**
    * A required pointer argument was NULL.
@@ -84,7 +88,14 @@ typedef enum MarmotStatus {
   MARMOT_STATUS_EXTERNAL_SIGNER_UNAVAILABLE = 32,
   MARMOT_STATUS_EXTERNAL_SIGNER_MISMATCH = 33,
   MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED = 34,
-} MarmotStatus;
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotStatus MarmotStatus;
+#else
+typedef int32_t MarmotStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * A relay list the account is missing, as a stable typed variant clients
@@ -2582,10 +2593,10 @@ extern "C" {
  * must point to `relay_urls_len` valid strings (or be NULL with length
  * 0); `out_client` must be a valid pointer.
  */
-enum MarmotStatus marmot_client_new(const char *root_path,
-                                    const char *const *relay_urls,
-                                    uintptr_t relay_urls_len,
-                                    struct MarmotClient **out_client);
+MarmotStatus marmot_client_new(const char *root_path,
+                               const char *const *relay_urls,
+                               uintptr_t relay_urls_len,
+                               struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe
@@ -2594,7 +2605,7 @@ enum MarmotStatus marmot_client_new(const char *root_path,
  * # Safety
  * `client` must be a live handle from `marmot_client_new`.
  */
-enum MarmotStatus marmot_client_start(const struct MarmotClient *client);
+MarmotStatus marmot_client_start(const struct MarmotClient *client);
 
 /**
  * Shut the runtime down. Open subscriptions drain and report
@@ -2603,7 +2614,7 @@ enum MarmotStatus marmot_client_start(const struct MarmotClient *client);
  * # Safety
  * `client` must be a live handle from `marmot_client_new`.
  */
-enum MarmotStatus marmot_client_shutdown(const struct MarmotClient *client);
+MarmotStatus marmot_client_shutdown(const struct MarmotClient *client);
 
 /**
  * Whether the runtime is currently shutting down. Writes to `out_stopping`.
@@ -2611,7 +2622,7 @@ enum MarmotStatus marmot_client_shutdown(const struct MarmotClient *client);
  * # Safety
  * `client` must be a live handle; `out_stopping` must be valid.
  */
-enum MarmotStatus marmot_client_is_stopping(const struct MarmotClient *client, bool *out_stopping);
+MarmotStatus marmot_client_is_stopping(const struct MarmotClient *client, bool *out_stopping);
 
 /**
  * Destroy a client handle. Call `marmot_client_shutdown` first for a
@@ -2657,8 +2668,8 @@ void marmot_bytes_free(uint8_t *data, uintptr_t len);
  * `client` must be a live handle; `out_list` must be a valid pointer.
  * Free the result with `marmot_account_summary_list_free`.
  */
-enum MarmotStatus marmot_list_accounts(const struct MarmotClient *client,
-                                       struct MarmotAccountSummaryList **out_list);
+MarmotStatus marmot_list_accounts(const struct MarmotClient *client,
+                                  struct MarmotAccountSummaryList **out_list);
 
 /**
  * Per-account unread aggregates for the account-switcher badge.
@@ -2667,8 +2678,8 @@ enum MarmotStatus marmot_list_accounts(const struct MarmotClient *client,
  * `client` must be a live handle; `out_list` must be a valid pointer.
  * Free the result with `marmot_account_unread_list_free`.
  */
-enum MarmotStatus marmot_account_unread_summary(const struct MarmotClient *client,
-                                                struct MarmotAccountUnreadList **out_list);
+MarmotStatus marmot_account_unread_summary(const struct MarmotClient *client,
+                                           struct MarmotAccountUnreadList **out_list);
 
 /**
  * Remove an account and its local state from this device.
@@ -2676,7 +2687,7 @@ enum MarmotStatus marmot_account_unread_summary(const struct MarmotClient *clien
  * # Safety
  * `client` must be a live handle; `account_ref` a valid string.
  */
-enum MarmotStatus marmot_remove_account(const struct MarmotClient *client, const char *account_ref);
+MarmotStatus marmot_remove_account(const struct MarmotClient *client, const char *account_ref);
 
 /**
  * Destructive sign-out: leave groups, delete relay KeyPackages, wipe
@@ -2686,9 +2697,9 @@ enum MarmotStatus marmot_remove_account(const struct MarmotClient *client, const
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_outcome` a valid pointer. Free with `marmot_wipe_outcome_free`.
  */
-enum MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
-                                           const char *account_ref,
-                                           struct MarmotWipeOutcome **out_outcome);
+MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      struct MarmotWipeOutcome **out_outcome);
 
 /**
  * Non-destructive sign-out: deactivate the account on this device,
@@ -2700,10 +2711,10 @@ enum MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_outcome` a valid pointer. Free with `marmot_sign_out_outcome_free`.
  */
-enum MarmotStatus marmot_sign_out(const struct MarmotClient *client,
-                                  const char *account_ref,
-                                  bool delete_key_packages,
-                                  struct MarmotSignOutOutcome **out_outcome);
+MarmotStatus marmot_sign_out(const struct MarmotClient *client,
+                             const char *account_ref,
+                             bool delete_key_packages,
+                             struct MarmotSignOutOutcome **out_outcome);
 
 /**
  * Create a brand-new Nostr identity, store its secret in the platform
@@ -2714,12 +2725,12 @@ enum MarmotStatus marmot_sign_out(const struct MarmotClient *client,
  * strings (or be NULL with len 0); `out_summary` must be valid. Free
  * with `marmot_account_summary_free`.
  */
-enum MarmotStatus marmot_create_identity(const struct MarmotClient *client,
-                                         const char *const *default_relays,
-                                         uintptr_t default_relays_len,
-                                         const char *const *bootstrap_relays,
-                                         uintptr_t bootstrap_relays_len,
-                                         struct MarmotAccountSummary **out_summary);
+MarmotStatus marmot_create_identity(const struct MarmotClient *client,
+                                    const char *const *default_relays,
+                                    uintptr_t default_relays_len,
+                                    const char *const *bootstrap_relays,
+                                    uintptr_t bootstrap_relays_len,
+                                    struct MarmotAccountSummary **out_summary);
 
 /**
  * Log in with an existing identity: an `nsec` (private key) for a
@@ -2729,13 +2740,13 @@ enum MarmotStatus marmot_create_identity(const struct MarmotClient *client,
  * Same as `marmot_create_identity`, plus `identity` must be a valid
  * string. Free with `marmot_account_summary_free`.
  */
-enum MarmotStatus marmot_login(const struct MarmotClient *client,
-                               const char *identity,
-                               const char *const *default_relays,
-                               uintptr_t default_relays_len,
-                               const char *const *bootstrap_relays,
-                               uintptr_t bootstrap_relays_len,
-                               struct MarmotAccountSummary **out_summary);
+MarmotStatus marmot_login(const struct MarmotClient *client,
+                          const char *identity,
+                          const char *const *default_relays,
+                          uintptr_t default_relays_len,
+                          const char *const *bootstrap_relays,
+                          uintptr_t bootstrap_relays_len,
+                          struct MarmotAccountSummary **out_summary);
 
 /**
  * Re-activate a non-destructively signed-out local account.
@@ -2744,9 +2755,9 @@ enum MarmotStatus marmot_login(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_summary` valid. Free with `marmot_account_summary_free`.
  */
-enum MarmotStatus marmot_sign_in_account(const struct MarmotClient *client,
-                                         const char *account_ref,
-                                         struct MarmotAccountSummary **out_summary);
+MarmotStatus marmot_sign_in_account(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    struct MarmotAccountSummary **out_summary);
 
 /**
  * Publish NIP-65 + inbox relay lists for the account.
@@ -2755,12 +2766,12 @@ enum MarmotStatus marmot_sign_in_account(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string; relay
  * arrays must hold `len` valid strings (or NULL with len 0).
  */
-enum MarmotStatus marmot_publish_relay_lists(const struct MarmotClient *client,
-                                             const char *account_ref,
-                                             const char *const *default_relays,
-                                             uintptr_t default_relays_len,
-                                             const char *const *bootstrap_relays,
-                                             uintptr_t bootstrap_relays_len);
+MarmotStatus marmot_publish_relay_lists(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *const *default_relays,
+                                        uintptr_t default_relays_len,
+                                        const char *const *bootstrap_relays,
+                                        uintptr_t bootstrap_relays_len);
 
 /**
  * The account's NIP-65 relay list.
@@ -2769,9 +2780,9 @@ enum MarmotStatus marmot_publish_relay_lists(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_list` valid. Free with `marmot_string_list_free`.
  */
-enum MarmotStatus marmot_account_nip65_relays(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              struct MarmotStringList **out_list);
+MarmotStatus marmot_account_nip65_relays(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotStringList **out_list);
 
 /**
  * The account's inbox relay list.
@@ -2780,9 +2791,9 @@ enum MarmotStatus marmot_account_nip65_relays(const struct MarmotClient *client,
  * Same as `marmot_account_nip65_relays`. Free with
  * `marmot_string_list_free`.
  */
-enum MarmotStatus marmot_account_inbox_relays(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              struct MarmotStringList **out_list);
+MarmotStatus marmot_account_inbox_relays(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotStringList **out_list);
 
 /**
  * Local + relay-published KeyPackages for the account.
@@ -2792,11 +2803,11 @@ enum MarmotStatus marmot_account_inbox_relays(const struct MarmotClient *client,
  * relay array must hold `len` valid strings (or NULL with len 0);
  * `out_list` valid. Free with `marmot_account_key_package_list_free`.
  */
-enum MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *const *bootstrap_relays,
-                                              uintptr_t bootstrap_relays_len,
-                                              struct MarmotAccountKeyPackageList **out_list);
+MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *const *bootstrap_relays,
+                                         uintptr_t bootstrap_relays_len,
+                                         struct MarmotAccountKeyPackageList **out_list);
 
 /**
  * Publish a fresh KeyPackage. Writes the number of relays that accepted
@@ -2806,9 +2817,9 @@ enum MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_accepted` valid.
  */
-enum MarmotStatus marmot_publish_new_key_package(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 uint64_t *out_accepted);
+MarmotStatus marmot_publish_new_key_package(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            uint64_t *out_accepted);
 
 /**
  * Re-publish the latest cached KeyPackage when possible, otherwise
@@ -2817,9 +2828,9 @@ enum MarmotStatus marmot_publish_new_key_package(const struct MarmotClient *clie
  * # Safety
  * Same as `marmot_publish_new_key_package`.
  */
-enum MarmotStatus marmot_republish_key_package(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               uint64_t *out_accepted);
+MarmotStatus marmot_republish_key_package(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          uint64_t *out_accepted);
 
 /**
  * Publish a NIP-09 deletion for a KeyPackage event. Writes the
@@ -2830,12 +2841,12 @@ enum MarmotStatus marmot_republish_key_package(const struct MarmotClient *client
  * valid strings; the relay array must hold `len` valid strings (or
  * NULL with len 0); `out_accepted` valid.
  */
-enum MarmotStatus marmot_delete_account_key_package(const struct MarmotClient *client,
-                                                    const char *account_ref,
-                                                    const char *event_id_hex,
-                                                    const char *const *relays,
-                                                    uintptr_t relays_len,
-                                                    uint64_t *out_accepted);
+MarmotStatus marmot_delete_account_key_package(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *event_id_hex,
+                                               const char *const *relays,
+                                               uintptr_t relays_len,
+                                               uint64_t *out_accepted);
 
 /**
  * Replace the account's NIP-65 relay list and publish it.
@@ -2845,13 +2856,13 @@ enum MarmotStatus marmot_delete_account_key_package(const struct MarmotClient *c
  * arrays valid per `marmot_publish_relay_lists`; `out_lists` valid.
  * Free with `marmot_account_relay_lists_free`.
  */
-enum MarmotStatus marmot_set_account_nip65_relays(const struct MarmotClient *client,
-                                                  const char *account_ref,
-                                                  const char *const *relays,
-                                                  uintptr_t relays_len,
-                                                  const char *const *bootstrap_relays,
-                                                  uintptr_t bootstrap_relays_len,
-                                                  struct MarmotAccountRelayLists **out_lists);
+MarmotStatus marmot_set_account_nip65_relays(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *const *relays,
+                                             uintptr_t relays_len,
+                                             const char *const *bootstrap_relays,
+                                             uintptr_t bootstrap_relays_len,
+                                             struct MarmotAccountRelayLists **out_lists);
 
 /**
  * Replace the account's inbox relay list and publish it.
@@ -2860,13 +2871,13 @@ enum MarmotStatus marmot_set_account_nip65_relays(const struct MarmotClient *cli
  * Same as `marmot_set_account_nip65_relays`. Free with
  * `marmot_account_relay_lists_free`.
  */
-enum MarmotStatus marmot_set_account_inbox_relays(const struct MarmotClient *client,
-                                                  const char *account_ref,
-                                                  const char *const *relays,
-                                                  uintptr_t relays_len,
-                                                  const char *const *bootstrap_relays,
-                                                  uintptr_t bootstrap_relays_len,
-                                                  struct MarmotAccountRelayLists **out_lists);
+MarmotStatus marmot_set_account_inbox_relays(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *const *relays,
+                                             uintptr_t relays_len,
+                                             const char *const *bootstrap_relays,
+                                             uintptr_t bootstrap_relays_len,
+                                             struct MarmotAccountRelayLists **out_lists);
 
 /**
  * Export the account's raw private key as `nsec1…` bech32.
@@ -2880,9 +2891,9 @@ enum MarmotStatus marmot_set_account_inbox_relays(const struct MarmotClient *cli
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_nsec` valid.
  */
-enum MarmotStatus marmot_reveal_nsec(const struct MarmotClient *client,
-                                     const char *account_ref,
-                                     char **out_nsec);
+MarmotStatus marmot_reveal_nsec(const struct MarmotClient *client,
+                                const char *account_ref,
+                                char **out_nsec);
 
 /**
  * Export the account's private key NIP-49-encrypted under `passphrase`.
@@ -2892,10 +2903,10 @@ enum MarmotStatus marmot_reveal_nsec(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `passphrase` valid
  * strings; `out_encrypted` valid.
  */
-enum MarmotStatus marmot_export_encrypted_secret_key(const struct MarmotClient *client,
-                                                     const char *account_ref,
-                                                     const char *passphrase,
-                                                     char **out_encrypted);
+MarmotStatus marmot_export_encrypted_secret_key(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *passphrase,
+                                                char **out_encrypted);
 
 /**
  * Publish the account's kind:0 profile metadata. The returned profile is
@@ -2907,14 +2918,14 @@ enum MarmotStatus marmot_export_encrypted_secret_key(const struct MarmotClient *
  * arrays valid per `marmot_publish_relay_lists`; `out_profile` valid.
  * Free the result with `marmot_user_profile_metadata_free`.
  */
-enum MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const struct MarmotUserProfileMetadata *profile,
-                                              const char *const *default_relays,
-                                              uintptr_t default_relays_len,
-                                              const char *const *bootstrap_relays,
-                                              uintptr_t bootstrap_relays_len,
-                                              struct MarmotUserProfileMetadata **out_profile);
+MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const struct MarmotUserProfileMetadata *profile,
+                                         const char *const *default_relays,
+                                         uintptr_t default_relays_len,
+                                         const char *const *bootstrap_relays,
+                                         uintptr_t bootstrap_relays_len,
+                                         struct MarmotUserProfileMetadata **out_profile);
 
 /**
  * Anchor a live agent text stream start in the encrypted group history.
@@ -2931,13 +2942,13 @@ enum MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
  * `out_start` must be a valid pointer. Free the result with
  * `marmot_agent_stream_start_free`.
  */
-enum MarmotStatus marmot_start_agent_text_stream(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 const char *stream_id_hex,
-                                                 const char *const *quic_candidates,
-                                                 uintptr_t quic_candidates_len,
-                                                 struct MarmotAgentStreamStart **out_start);
+MarmotStatus marmot_start_agent_text_stream(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const char *stream_id_hex,
+                                            const char *const *quic_candidates,
+                                            uintptr_t quic_candidates_len,
+                                            struct MarmotAgentStreamStart **out_start);
 
 /**
  * Local forensic audit-log recording settings. Recording is opt-in and only
@@ -2947,8 +2958,8 @@ enum MarmotStatus marmot_start_agent_text_stream(const struct MarmotClient *clie
  * `client` must be a live handle; `out_settings` must be a valid pointer.
  * Free the result with `marmot_audit_log_settings_free`.
  */
-enum MarmotStatus marmot_audit_log_settings(const struct MarmotClient *client,
-                                            struct MarmotAuditLogSettings **out_settings);
+MarmotStatus marmot_audit_log_settings(const struct MarmotClient *client,
+                                       struct MarmotAuditLogSettings **out_settings);
 
 /**
  * Persist local forensic audit-log recording settings and return the stored
@@ -2963,9 +2974,9 @@ enum MarmotStatus marmot_audit_log_settings(const struct MarmotClient *client,
  * freed by the library); `out_settings` a valid pointer. Free the result
  * with `marmot_audit_log_settings_free`.
  */
-enum MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *client,
-                                                const struct MarmotAuditLogSettings *settings,
-                                                struct MarmotAuditLogSettings **out_settings);
+MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *client,
+                                           const struct MarmotAuditLogSettings *settings,
+                                           struct MarmotAuditLogSettings **out_settings);
 
 /**
  * Supply non-persisted audit tracker upload metadata: optional Goggles
@@ -2981,9 +2992,9 @@ enum MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *clien
  * NUL-terminated strings; `out_config` a valid pointer. Free the result
  * with `marmot_audit_log_tracker_config_free`.
  */
-enum MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *client,
-                                                      const struct MarmotAuditLogTrackerConfig *config,
-                                                      struct MarmotAuditLogTrackerConfig **out_config);
+MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *client,
+                                                 const struct MarmotAuditLogTrackerConfig *config,
+                                                 struct MarmotAuditLogTrackerConfig **out_config);
 
 /**
  * Local JSONL audit logs available for explicit forensic upload.
@@ -2992,8 +3003,8 @@ enum MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient 
  * `client` must be a live handle; `out_list` must be a valid pointer.
  * Free the result with `marmot_audit_log_file_list_free`.
  */
-enum MarmotStatus marmot_audit_log_files(const struct MarmotClient *client,
-                                         struct MarmotAuditLogFileList **out_list);
+MarmotStatus marmot_audit_log_files(const struct MarmotClient *client,
+                                    struct MarmotAuditLogFileList **out_list);
 
 /**
  * POST one selected JSONL audit log to a forensic analyzer endpoint.
@@ -3003,10 +3014,10 @@ enum MarmotStatus marmot_audit_log_files(const struct MarmotClient *client,
  * `out_result` a valid pointer. Free the result with
  * `marmot_audit_log_upload_result_free`.
  */
-enum MarmotStatus marmot_post_audit_log_file(const struct MarmotClient *client,
-                                             const char *path,
-                                             const char *endpoint,
-                                             struct MarmotAuditLogUploadResult **out_result);
+MarmotStatus marmot_post_audit_log_file(const struct MarmotClient *client,
+                                        const char *path,
+                                        const char *endpoint,
+                                        struct MarmotAuditLogUploadResult **out_result);
 
 /**
  * Delete one local JSONL audit log file (e.g. behind a "clear audit log"
@@ -3024,9 +3035,9 @@ enum MarmotStatus marmot_post_audit_log_file(const struct MarmotClient *client,
  * valid pointer. Free the result with
  * `marmot_audit_log_delete_result_free`.
  */
-enum MarmotStatus marmot_delete_audit_log_file(const struct MarmotClient *client,
-                                               const char *path,
-                                               struct MarmotAuditLogDeleteResult **out_result);
+MarmotStatus marmot_delete_audit_log_file(const struct MarmotClient *client,
+                                          const char *path,
+                                          struct MarmotAuditLogDeleteResult **out_result);
 
 /**
  * POST all local audit logs to the configured tracker when audit logging is
@@ -3037,8 +3048,8 @@ enum MarmotStatus marmot_delete_audit_log_file(const struct MarmotClient *client
  * `client` must be a live handle; `out_result` a valid pointer. Free the
  * result with `marmot_audit_log_tracker_update_result_free`.
  */
-enum MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *client,
-                                                       struct MarmotAuditLogTrackerUpdateResult **out_result);
+MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *client,
+                                                  struct MarmotAuditLogTrackerUpdateResult **out_result);
 
 /**
  * Durable chat-list rows for fast app launch. Rows include the group
@@ -3049,10 +3060,10 @@ enum MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient
  * `out_list` a valid pointer. Free the result with
  * `marmot_chat_list_row_list_free`.
  */
-enum MarmotStatus marmot_chat_list(const struct MarmotClient *client,
-                                   const char *account_ref,
-                                   bool include_archived,
-                                   struct MarmotChatListRowList **out_list);
+MarmotStatus marmot_chat_list(const struct MarmotClient *client,
+                              const char *account_ref,
+                              bool include_archived,
+                              struct MarmotChatListRowList **out_list);
 
 /**
  * Establish the unread baseline the first time a user opens a group.
@@ -3065,10 +3076,10 @@ enum MarmotStatus marmot_chat_list(const struct MarmotClient *client,
  * strings; `out_row` a valid pointer. Free the result with
  * `marmot_chat_list_row_free`.
  */
-enum MarmotStatus marmot_initialize_chat_read_state(const struct MarmotClient *client,
-                                                    const char *account_ref,
-                                                    const char *group_id_hex,
-                                                    struct MarmotChatListRow **out_row);
+MarmotStatus marmot_initialize_chat_read_state(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               struct MarmotChatListRow **out_row);
 
 /**
  * Mark a kind-9 timeline message visible/read. Own kind-9 messages can
@@ -3080,11 +3091,11 @@ enum MarmotStatus marmot_initialize_chat_read_state(const struct MarmotClient *c
  * `message_id_hex` valid strings; `out_row` a valid pointer. Free the
  * result with `marmot_chat_list_row_free`.
  */
-enum MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *client,
-                                                    const char *account_ref,
-                                                    const char *group_id_hex,
-                                                    const char *message_id_hex,
-                                                    struct MarmotChatListRow **out_row);
+MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               const char *message_id_hex,
+                                               struct MarmotChatListRow **out_row);
 
 /**
  * Best-effort cached display name for an account id. Returns the Nostr
@@ -3098,9 +3109,9 @@ enum MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *c
  * `out_name` a valid pointer. Free a non-NULL result with
  * `marmot_string_free`.
  */
-enum MarmotStatus marmot_display_name(const struct MarmotClient *client,
-                                      const char *account_id_hex,
-                                      char **out_name);
+MarmotStatus marmot_display_name(const struct MarmotClient *client,
+                                 const char *account_id_hex,
+                                 char **out_name);
 
 /**
  * Convert a hex account id (Nostr public key) into its `npub…` bech32
@@ -3112,9 +3123,9 @@ enum MarmotStatus marmot_display_name(const struct MarmotClient *client,
  * `out_npub` a valid pointer. Free a non-NULL result with
  * `marmot_string_free`.
  */
-enum MarmotStatus marmot_npub(const struct MarmotClient *client,
-                              const char *account_id_hex,
-                              char **out_npub);
+MarmotStatus marmot_npub(const struct MarmotClient *client,
+                         const char *account_id_hex,
+                         char **out_npub);
 
 /**
  * Normalize a public-key reference (npub or hex) to canonical hex.
@@ -3127,9 +3138,9 @@ enum MarmotStatus marmot_npub(const struct MarmotClient *client,
  * `out_hex` a valid pointer. Free a non-NULL result with
  * `marmot_string_free`.
  */
-enum MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
-                                        const char *reference,
-                                        char **out_hex);
+MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
+                                   const char *reference,
+                                   char **out_hex);
 
 /**
  * Parse plaintext message content into the same Markdown AST returned on
@@ -3141,9 +3152,9 @@ enum MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
  * `out_document` a valid pointer. Free the result with
  * `marmot_markdown_document_free`.
  */
-enum MarmotStatus marmot_parse_markdown(const struct MarmotClient *client,
-                                        const char *text,
-                                        struct MarmotMarkdownDocument **out_document);
+MarmotStatus marmot_parse_markdown(const struct MarmotClient *client,
+                                   const char *text,
+                                   struct MarmotMarkdownDocument **out_document);
 
 /**
  * Full cached Nostr kind:0 profile for an account id (name, display
@@ -3158,9 +3169,9 @@ enum MarmotStatus marmot_parse_markdown(const struct MarmotClient *client,
  * `out_profile` a valid pointer. Free a non-NULL result with
  * `marmot_user_profile_metadata_free`.
  */
-enum MarmotStatus marmot_user_profile(const struct MarmotClient *client,
-                                      const char *account_id_hex,
-                                      struct MarmotUserProfileMetadata **out_profile);
+MarmotStatus marmot_user_profile(const struct MarmotClient *client,
+                                 const char *account_id_hex,
+                                 struct MarmotUserProfileMetadata **out_profile);
 
 /**
  * Fetch and cache an account's own Nostr kind:0 profile from `relays`.
@@ -3173,10 +3184,10 @@ enum MarmotStatus marmot_user_profile(const struct MarmotClient *client,
  * relay array must hold `relays_len` valid strings (or be NULL with
  * len 0).
  */
-enum MarmotStatus marmot_refresh_profile(const struct MarmotClient *client,
-                                         const char *account_id_hex,
-                                         const char *const *relays,
-                                         uintptr_t relays_len);
+MarmotStatus marmot_refresh_profile(const struct MarmotClient *client,
+                                    const char *account_id_hex,
+                                    const char *const *relays,
+                                    uintptr_t relays_len);
 
 /**
  * Create a new MLS group with `name` and the given members. Members are
@@ -3189,13 +3200,13 @@ enum MarmotStatus marmot_refresh_profile(const struct MarmotClient *client,
  * len 0); `description` NULL or a valid string; `out_group_id_hex` valid.
  * Free the result with `marmot_string_free`.
  */
-enum MarmotStatus marmot_create_group(const struct MarmotClient *client,
-                                      const char *account_ref,
-                                      const char *name,
-                                      const char *const *member_refs,
-                                      uintptr_t member_refs_len,
-                                      const char *description,
-                                      char **out_group_id_hex);
+MarmotStatus marmot_create_group(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *name,
+                                 const char *const *member_refs,
+                                 uintptr_t member_refs_len,
+                                 const char *description,
+                                 char **out_group_id_hex);
 
 /**
  * Normalize a member reference for group-management UI. Accepts hex,
@@ -3205,9 +3216,9 @@ enum MarmotStatus marmot_create_group(const struct MarmotClient *client,
  * `client` must be a live handle; `member_ref` a valid string;
  * `out_member_ref` valid. Free with `marmot_member_ref_free`.
  */
-enum MarmotStatus marmot_normalize_member_ref(const struct MarmotClient *client,
-                                              const char *member_ref,
-                                              struct MarmotMemberRef **out_member_ref);
+MarmotStatus marmot_normalize_member_ref(const struct MarmotClient *client,
+                                         const char *member_ref,
+                                         struct MarmotMemberRef **out_member_ref);
 
 /**
  * Membership roster for `group_id_hex`.
@@ -3217,10 +3228,10 @@ enum MarmotStatus marmot_normalize_member_ref(const struct MarmotClient *client,
  * strings; `out_list` valid. Free with
  * `marmot_app_group_member_record_list_free`.
  */
-enum MarmotStatus marmot_group_members(const struct MarmotClient *client,
-                                       const char *account_ref,
-                                       const char *group_id_hex,
-                                       struct MarmotAppGroupMemberRecordList **out_list);
+MarmotStatus marmot_group_members(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  struct MarmotAppGroupMemberRecordList **out_list);
 
 /**
  * Group plus enriched member rows for detail screens.
@@ -3229,10 +3240,10 @@ enum MarmotStatus marmot_group_members(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_details` valid. Free with `marmot_group_details_free`.
  */
-enum MarmotStatus marmot_group_details(const struct MarmotClient *client,
-                                       const char *account_ref,
-                                       const char *group_id_hex,
-                                       struct MarmotGroupDetails **out_details);
+MarmotStatus marmot_group_details(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  struct MarmotGroupDetails **out_details);
 
 /**
  * Current caller permissions plus per-member action availability.
@@ -3242,10 +3253,10 @@ enum MarmotStatus marmot_group_details(const struct MarmotClient *client,
  * strings; `out_state` valid. Free with
  * `marmot_group_management_state_free`.
  */
-enum MarmotStatus marmot_group_management_state(const struct MarmotClient *client,
-                                                const char *account_ref,
-                                                const char *group_id_hex,
-                                                struct MarmotGroupManagementState **out_state);
+MarmotStatus marmot_group_management_state(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *group_id_hex,
+                                           struct MarmotGroupManagementState **out_state);
 
 /**
  * Invite members (by `npub` or hex account id) into the group. Requires
@@ -3257,12 +3268,12 @@ enum MarmotStatus marmot_group_management_state(const struct MarmotClient *clien
  * NULL with len 0); `out_summary` valid. Free with
  * `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_invite_members(const struct MarmotClient *client,
-                                        const char *account_ref,
-                                        const char *group_id_hex,
-                                        const char *const *member_refs,
-                                        uintptr_t member_refs_len,
-                                        struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_invite_members(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const char *const *member_refs,
+                                   uintptr_t member_refs_len,
+                                   struct MarmotSendSummary **out_summary);
 
 /**
  * Remove members from the group. Requires the caller to be an admin;
@@ -3271,12 +3282,12 @@ enum MarmotStatus marmot_invite_members(const struct MarmotClient *client,
  * # Safety
  * Same as `marmot_invite_members`. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_remove_members(const struct MarmotClient *client,
-                                        const char *account_ref,
-                                        const char *group_id_hex,
-                                        const char *const *member_refs,
-                                        uintptr_t member_refs_len,
-                                        struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_remove_members(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const char *const *member_refs,
+                                   uintptr_t member_refs_len,
+                                   struct MarmotSendSummary **out_summary);
 
 /**
  * Leave the group as the active account. Admins must self-demote first.
@@ -3285,10 +3296,10 @@ enum MarmotStatus marmot_remove_members(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_summary` valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_leave_group(const struct MarmotClient *client,
-                                     const char *account_ref,
-                                     const char *group_id_hex,
-                                     struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_leave_group(const struct MarmotClient *client,
+                                const char *account_ref,
+                                const char *group_id_hex,
+                                struct MarmotSendSummary **out_summary);
 
 /**
  * Delete this group's local app data without performing an MLS leave. The
@@ -3304,10 +3315,10 @@ enum MarmotStatus marmot_leave_group(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_removed` valid.
  */
-enum MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const char *group_id_hex,
-                                            bool *out_removed);
+MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       bool *out_removed);
 
 /**
  * Set the per-group disappearing-message retention.
@@ -3318,11 +3329,11 @@ enum MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_summary` valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
-                                                  const char *account_ref,
-                                                  const char *group_id_hex,
-                                                  uint64_t disappearing_message_secs,
-                                                  struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *group_id_hex,
+                                             uint64_t disappearing_message_secs,
+                                             struct MarmotSendSummary **out_summary);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group record.
@@ -3331,10 +3342,10 @@ enum MarmotStatus marmot_update_message_retention(const struct MarmotClient *cli
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_group` valid. Free with `marmot_app_group_record_free`.
  */
-enum MarmotStatus marmot_accept_group_invite(const struct MarmotClient *client,
-                                             const char *account_ref,
-                                             const char *group_id_hex,
-                                             struct MarmotAppGroupRecord **out_group);
+MarmotStatus marmot_accept_group_invite(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        struct MarmotAppGroupRecord **out_group);
 
 /**
  * Decline a pending group invite; writes the updated group record plus
@@ -3345,10 +3356,10 @@ enum MarmotStatus marmot_accept_group_invite(const struct MarmotClient *client,
  * strings; `out_result` valid. Free with
  * `marmot_group_invite_decline_result_free`.
  */
-enum MarmotStatus marmot_decline_group_invite(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *group_id_hex,
-                                              struct MarmotGroupInviteDeclineResult **out_result);
+MarmotStatus marmot_decline_group_invite(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         struct MarmotGroupInviteDeclineResult **out_result);
 
 /**
  * Update the group's name and/or description. NULL leaves a field
@@ -3359,12 +3370,12 @@ enum MarmotStatus marmot_decline_group_invite(const struct MarmotClient *client,
  * strings; `name` and `description` NULL or valid strings; `out_summary`
  * valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_update_group_profile(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *group_id_hex,
-                                              const char *name,
-                                              const char *description,
-                                              struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_update_group_profile(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         const char *name,
+                                         const char *description,
+                                         struct MarmotSendSummary **out_summary);
 
 /**
  * Set (or clear, with `url` NULL) the group's URL-based avatar
@@ -3376,13 +3387,13 @@ enum MarmotStatus marmot_update_group_profile(const struct MarmotClient *client,
  * strings; `url`, `dim`, and `thumbhash` NULL or valid strings;
  * `out_summary` valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_update_group_avatar_url(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 const char *url,
-                                                 const char *dim,
-                                                 const char *thumbhash,
-                                                 struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_update_group_avatar_url(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const char *url,
+                                            const char *dim,
+                                            const char *thumbhash,
+                                            struct MarmotSendSummary **out_summary);
 
 /**
  * Replace the group's encrypted-media default blob endpoints as a full
@@ -3395,12 +3406,12 @@ enum MarmotStatus marmot_update_group_avatar_url(const struct MarmotClient *clie
  * structs (or be NULL with len 0) — the library never frees or retains
  * them; `out_summary` valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_replace_encrypted_media_blob_endpoints(const struct MarmotClient *client,
-                                                                const char *account_ref,
-                                                                const char *group_id_hex,
-                                                                const struct MarmotAppBlobEndpoint *endpoints,
-                                                                uintptr_t endpoints_len,
-                                                                struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_replace_encrypted_media_blob_endpoints(const struct MarmotClient *client,
+                                                           const char *account_ref,
+                                                           const char *group_id_hex,
+                                                           const struct MarmotAppBlobEndpoint *endpoints,
+                                                           uintptr_t endpoints_len,
+                                                           struct MarmotSendSummary **out_summary);
 
 /**
  * Fetch, verify, and decrypt the group's Blossom-hosted encrypted image,
@@ -3412,11 +3423,11 @@ enum MarmotStatus marmot_replace_encrypted_media_blob_endpoints(const struct Mar
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_data` and `out_len` valid pointers.
  */
-enum MarmotStatus marmot_download_group_blossom_image(const struct MarmotClient *client,
-                                                      const char *account_ref,
-                                                      const char *group_id_hex,
-                                                      uint8_t **out_data,
-                                                      uintptr_t *out_len);
+MarmotStatus marmot_download_group_blossom_image(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 uint8_t **out_data,
+                                                 uintptr_t *out_len);
 
 /**
  * Grant admin rights to `member_ref` (npub or hex). Requires the caller
@@ -3427,11 +3438,11 @@ enum MarmotStatus marmot_download_group_blossom_image(const struct MarmotClient 
  * `member_ref` valid strings; `out_summary` valid. Free with
  * `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_promote_admin(const struct MarmotClient *client,
-                                       const char *account_ref,
-                                       const char *group_id_hex,
-                                       const char *member_ref,
-                                       struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_promote_admin(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  const char *member_ref,
+                                  struct MarmotSendSummary **out_summary);
 
 /**
  * Revoke `member_ref`'s admin rights.
@@ -3439,11 +3450,11 @@ enum MarmotStatus marmot_promote_admin(const struct MarmotClient *client,
  * # Safety
  * Same as `marmot_promote_admin`. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_demote_admin(const struct MarmotClient *client,
-                                      const char *account_ref,
-                                      const char *group_id_hex,
-                                      const char *member_ref,
-                                      struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_demote_admin(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *group_id_hex,
+                                 const char *member_ref,
+                                 struct MarmotSendSummary **out_summary);
 
 /**
  * Step down as an admin of `group_id_hex` (demote the active account).
@@ -3452,10 +3463,10 @@ enum MarmotStatus marmot_demote_admin(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_summary` valid. Free with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_self_demote_admin(const struct MarmotClient *client,
-                                           const char *account_ref,
-                                           const char *group_id_hex,
-                                           struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_self_demote_admin(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      struct MarmotSendSummary **out_summary);
 
 /**
  * `marmot_invite_members` plus refreshed group details and management
@@ -3465,12 +3476,12 @@ enum MarmotStatus marmot_self_demote_admin(const struct MarmotClient *client,
  * Same as `marmot_invite_members`; `out_result` valid. Free with
  * `marmot_group_mutation_result_free`.
  */
-enum MarmotStatus marmot_invite_members_detailed(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 const char *const *member_refs,
-                                                 uintptr_t member_refs_len,
-                                                 struct MarmotGroupMutationResult **out_result);
+MarmotStatus marmot_invite_members_detailed(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const char *const *member_refs,
+                                            uintptr_t member_refs_len,
+                                            struct MarmotGroupMutationResult **out_result);
 
 /**
  * `marmot_remove_members` plus refreshed group details and management
@@ -3480,12 +3491,12 @@ enum MarmotStatus marmot_invite_members_detailed(const struct MarmotClient *clie
  * Same as `marmot_remove_members`; `out_result` valid. Free with
  * `marmot_group_mutation_result_free`.
  */
-enum MarmotStatus marmot_remove_members_detailed(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 const char *const *member_refs,
-                                                 uintptr_t member_refs_len,
-                                                 struct MarmotGroupMutationResult **out_result);
+MarmotStatus marmot_remove_members_detailed(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const char *const *member_refs,
+                                            uintptr_t member_refs_len,
+                                            struct MarmotGroupMutationResult **out_result);
 
 /**
  * `marmot_promote_admin` plus refreshed group details and management
@@ -3495,11 +3506,11 @@ enum MarmotStatus marmot_remove_members_detailed(const struct MarmotClient *clie
  * Same as `marmot_promote_admin`; `out_result` valid. Free with
  * `marmot_group_mutation_result_free`.
  */
-enum MarmotStatus marmot_promote_admin_detailed(const struct MarmotClient *client,
-                                                const char *account_ref,
-                                                const char *group_id_hex,
-                                                const char *member_ref,
-                                                struct MarmotGroupMutationResult **out_result);
+MarmotStatus marmot_promote_admin_detailed(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *group_id_hex,
+                                           const char *member_ref,
+                                           struct MarmotGroupMutationResult **out_result);
 
 /**
  * `marmot_demote_admin` plus refreshed group details and management state
@@ -3509,11 +3520,11 @@ enum MarmotStatus marmot_promote_admin_detailed(const struct MarmotClient *clien
  * Same as `marmot_demote_admin`; `out_result` valid. Free with
  * `marmot_group_mutation_result_free`.
  */
-enum MarmotStatus marmot_demote_admin_detailed(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               const char *group_id_hex,
-                                               const char *member_ref,
-                                               struct MarmotGroupMutationResult **out_result);
+MarmotStatus marmot_demote_admin_detailed(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          const char *member_ref,
+                                          struct MarmotGroupMutationResult **out_result);
 
 /**
  * `marmot_self_demote_admin` plus refreshed group details and management
@@ -3523,10 +3534,10 @@ enum MarmotStatus marmot_demote_admin_detailed(const struct MarmotClient *client
  * Same as `marmot_self_demote_admin`; `out_result` valid. Free with
  * `marmot_group_mutation_result_free`.
  */
-enum MarmotStatus marmot_self_demote_admin_detailed(const struct MarmotClient *client,
-                                                    const char *account_ref,
-                                                    const char *group_id_hex,
-                                                    struct MarmotGroupMutationResult **out_result);
+MarmotStatus marmot_self_demote_admin_detailed(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               struct MarmotGroupMutationResult **out_result);
 
 /**
  * Current MLS state (epoch, member count, required components) for the
@@ -3536,10 +3547,10 @@ enum MarmotStatus marmot_self_demote_admin_detailed(const struct MarmotClient *c
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_state` valid. Free with `marmot_app_group_mls_state_free`.
  */
-enum MarmotStatus marmot_group_mls_state(const struct MarmotClient *client,
-                                         const char *account_ref,
-                                         const char *group_id_hex,
-                                         struct MarmotAppGroupMlsState **out_state);
+MarmotStatus marmot_group_mls_state(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *group_id_hex,
+                                    struct MarmotAppGroupMlsState **out_state);
 
 /**
  * Stored groups that failed session-open hydration and were skipped so
@@ -3553,9 +3564,9 @@ enum MarmotStatus marmot_group_mls_state(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_list` valid. Free with `marmot_app_quarantined_group_list_free`.
  */
-enum MarmotStatus marmot_quarantined_groups(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            struct MarmotAppQuarantinedGroupList **out_list);
+MarmotStatus marmot_quarantined_groups(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       struct MarmotAppQuarantinedGroupList **out_list);
 
 /**
  * Re-attempt hydration of a single quarantined group.
@@ -3571,10 +3582,10 @@ enum MarmotStatus marmot_quarantined_groups(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_recovered` valid.
  */
-enum MarmotStatus marmot_retry_hydrate_quarantined_group(const struct MarmotClient *client,
-                                                         const char *account_ref,
-                                                         const char *group_id_hex,
-                                                         bool *out_recovered);
+MarmotStatus marmot_retry_hydrate_quarantined_group(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    const char *group_id_hex,
+                                                    bool *out_recovered);
 
 /**
  * Flag a group archived (or restore it). Local-only projection state —
@@ -3585,11 +3596,11 @@ enum MarmotStatus marmot_retry_hydrate_quarantined_group(const struct MarmotClie
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_group` valid. Free with `marmot_app_group_record_free`.
  */
-enum MarmotStatus marmot_set_group_archived(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const char *group_id_hex,
-                                            bool archived,
-                                            struct MarmotAppGroupRecord **out_group);
+MarmotStatus marmot_set_group_archived(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       bool archived,
+                                       struct MarmotAppGroupRecord **out_group);
 
 /**
  * Send already-uploaded encrypted media attachments as a kind-9 chat
@@ -3602,13 +3613,13 @@ enum MarmotStatus marmot_set_group_archived(const struct MarmotClient *client,
  * string; `out_summary` valid. Input structs are never freed by the
  * library. Free the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_send_media_attachments(const struct MarmotClient *client,
-                                                const char *account_ref,
-                                                const char *group_id_hex,
-                                                const struct MarmotMediaAttachmentReference *attachments,
-                                                uintptr_t attachments_len,
-                                                const char *caption,
-                                                struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_send_media_attachments(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *group_id_hex,
+                                           const struct MarmotMediaAttachmentReference *attachments,
+                                           uintptr_t attachments_len,
+                                           const char *caption,
+                                           struct MarmotSendSummary **out_summary);
 
 /**
  * Backward-compatible single-attachment send helper. Prefer
@@ -3621,12 +3632,12 @@ enum MarmotStatus marmot_send_media_attachments(const struct MarmotClient *clien
  * by the library); `caption` NULL or a valid string; `out_summary` valid.
  * Free the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_send_media_reference(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *group_id_hex,
-                                              const struct MarmotMediaAttachmentReference *reference,
-                                              const char *caption,
-                                              struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_send_media_reference(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         const struct MarmotMediaAttachmentReference *reference,
+                                         const char *caption,
+                                         struct MarmotSendSummary **out_summary);
 
 /**
  * Encrypt plaintext attachments, upload the ciphertext blobs, and
@@ -3638,11 +3649,11 @@ enum MarmotStatus marmot_send_media_reference(const struct MarmotClient *client,
  * library); `out_result` valid. Free the result with
  * `marmot_media_upload_result_free`.
  */
-enum MarmotStatus marmot_upload_media(const struct MarmotClient *client,
-                                      const char *account_ref,
-                                      const char *group_id_hex,
-                                      const struct MarmotMediaUploadRequest *request,
-                                      struct MarmotMediaUploadResult **out_result);
+MarmotStatus marmot_upload_media(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *group_id_hex,
+                                 const struct MarmotMediaUploadRequest *request,
+                                 struct MarmotMediaUploadResult **out_result);
 
 /**
  * Fetch an encrypted media blob and decrypt it using the group's
@@ -3654,11 +3665,11 @@ enum MarmotStatus marmot_upload_media(const struct MarmotClient *client,
  * by the library); `out_result` valid. Free the result with
  * `marmot_media_download_result_free`.
  */
-enum MarmotStatus marmot_download_media(const struct MarmotClient *client,
-                                        const char *account_ref,
-                                        const char *group_id_hex,
-                                        const struct MarmotMediaAttachmentReference *reference,
-                                        struct MarmotMediaDownloadResult **out_result);
+MarmotStatus marmot_download_media(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const struct MarmotMediaAttachmentReference *reference,
+                                   struct MarmotMediaDownloadResult **out_result);
 
 /**
  * Typed media references projected from group message history. Each
@@ -3671,12 +3682,12 @@ enum MarmotStatus marmot_download_media(const struct MarmotClient *client,
  * strings; `out_list` valid. Free the result with
  * `marmot_media_record_list_free`.
  */
-enum MarmotStatus marmot_list_media(const struct MarmotClient *client,
-                                    const char *account_ref,
-                                    const char *group_id_hex,
-                                    bool has_limit,
-                                    uint32_t limit,
-                                    struct MarmotMediaRecordList **out_list);
+MarmotStatus marmot_list_media(const struct MarmotClient *client,
+                               const char *account_ref,
+                               const char *group_id_hex,
+                               bool has_limit,
+                               uint32_t limit,
+                               struct MarmotMediaRecordList **out_list);
 
 /**
  * Send a plain UTF-8 text message. Structured payloads (reactions,
@@ -3687,11 +3698,11 @@ enum MarmotStatus marmot_list_media(const struct MarmotClient *client,
  * `text` valid strings; `out_summary` a valid pointer. Free the result
  * with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_send_text(const struct MarmotClient *client,
-                                   const char *account_ref,
-                                   const char *group_id_hex,
-                                   const char *text,
-                                   struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_send_text(const struct MarmotClient *client,
+                              const char *account_ref,
+                              const char *group_id_hex,
+                              const char *text,
+                              struct MarmotSendSummary **out_summary);
 
 /**
  * Re-attempt publishing a group's pending (committed-but-undelivered)
@@ -3712,10 +3723,10 @@ enum MarmotStatus marmot_send_text(const struct MarmotClient *client,
  * strings; `out_summary` a valid pointer. Free the result with
  * `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_retry_group_convergence(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_retry_group_convergence(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            struct MarmotSendSummary **out_summary);
 
 /**
  * React to `target_message_id` with `emoji` (an "add" reaction).
@@ -3725,12 +3736,12 @@ enum MarmotStatus marmot_retry_group_convergence(const struct MarmotClient *clie
  * `target_message_id`, and `emoji` valid strings; `out_summary` a valid
  * pointer. Free the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_react_to_message(const struct MarmotClient *client,
-                                          const char *account_ref,
-                                          const char *group_id_hex,
-                                          const char *target_message_id,
-                                          const char *emoji,
-                                          struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_react_to_message(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const char *target_message_id,
+                                     const char *emoji,
+                                     struct MarmotSendSummary **out_summary);
 
 /**
  * Remove this account's reaction from `target_message_id`.
@@ -3740,11 +3751,11 @@ enum MarmotStatus marmot_react_to_message(const struct MarmotClient *client,
  * `target_message_id` valid strings; `out_summary` a valid pointer. Free
  * the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_unreact_from_message(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *group_id_hex,
-                                              const char *target_message_id,
-                                              struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_unreact_from_message(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         const char *target_message_id,
+                                         struct MarmotSendSummary **out_summary);
 
 /**
  * Send `text` as a reply that quotes `target_message_id`.
@@ -3754,12 +3765,12 @@ enum MarmotStatus marmot_unreact_from_message(const struct MarmotClient *client,
  * `target_message_id`, and `text` valid strings; `out_summary` a valid
  * pointer. Free the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_reply_to_message(const struct MarmotClient *client,
-                                          const char *account_ref,
-                                          const char *group_id_hex,
-                                          const char *target_message_id,
-                                          const char *text,
-                                          struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_reply_to_message(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const char *target_message_id,
+                                     const char *text,
+                                     struct MarmotSendSummary **out_summary);
 
 /**
  * Mark `target_message_id` deleted for the whole group. This is a
@@ -3771,11 +3782,11 @@ enum MarmotStatus marmot_reply_to_message(const struct MarmotClient *client,
  * `target_message_id` valid strings; `out_summary` a valid pointer. Free
  * the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_delete_message(const struct MarmotClient *client,
-                                        const char *account_ref,
-                                        const char *group_id_hex,
-                                        const char *target_message_id,
-                                        struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_delete_message(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const char *target_message_id,
+                                   struct MarmotSendSummary **out_summary);
 
 /**
  * Securely scrub and prune expired disappearing-message plaintext for a
@@ -3788,10 +3799,10 @@ enum MarmotStatus marmot_delete_message(const struct MarmotClient *client,
  * strings; `out_result` a valid pointer. Free the result with
  * `marmot_secure_delete_expired_result_free`.
  */
-enum MarmotStatus marmot_secure_delete_expired(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               const char *group_id_hex,
-                                               struct MarmotSecureDeleteExpiredResult **out_result);
+MarmotStatus marmot_secure_delete_expired(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotSecureDeleteExpiredResult **out_result);
 
 /**
  * Edit `target_message_id` by publishing a kind-1009 event that
@@ -3810,12 +3821,12 @@ enum MarmotStatus marmot_secure_delete_expired(const struct MarmotClient *client
  * `target_message_id`, and `content` valid strings; `out_summary` a valid
  * pointer. Free the result with `marmot_send_summary_free`.
  */
-enum MarmotStatus marmot_edit_message(const struct MarmotClient *client,
-                                      const char *account_ref,
-                                      const char *group_id_hex,
-                                      const char *target_message_id,
-                                      const char *content,
-                                      struct MarmotSendSummary **out_summary);
+MarmotStatus marmot_edit_message(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *group_id_hex,
+                                 const char *target_message_id,
+                                 const char *content,
+                                 struct MarmotSendSummary **out_summary);
 
 /**
  * Initial history fetch for a group (or, when `group_id_hex` is NULL,
@@ -3828,12 +3839,12 @@ enum MarmotStatus marmot_edit_message(const struct MarmotClient *client,
  * `group_id_hex` NULL or a valid string; `out_list` a valid pointer.
  * Free the result with `marmot_app_message_record_list_free`.
  */
-enum MarmotStatus marmot_messages(const struct MarmotClient *client,
-                                  const char *account_ref,
-                                  const char *group_id_hex,
-                                  bool has_limit,
-                                  uint32_t limit,
-                                  struct MarmotAppMessageRecordList **out_list);
+MarmotStatus marmot_messages(const struct MarmotClient *client,
+                             const char *account_ref,
+                             const char *group_id_hex,
+                             bool has_limit,
+                             uint32_t limit,
+                             struct MarmotAppMessageRecordList **out_list);
 
 /**
  * The account's current notification preferences.
@@ -3843,9 +3854,9 @@ enum MarmotStatus marmot_messages(const struct MarmotClient *client,
  * `out_settings` a valid pointer. Free the result with
  * `marmot_notification_settings_free`.
  */
-enum MarmotStatus marmot_notification_settings(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               struct MarmotNotificationSettings **out_settings);
+MarmotStatus marmot_notification_settings(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          struct MarmotNotificationSettings **out_settings);
 
 /**
  * Enable or disable locally rendered notifications for the account.
@@ -3856,10 +3867,10 @@ enum MarmotStatus marmot_notification_settings(const struct MarmotClient *client
  * `out_settings` a valid pointer. Free the result with
  * `marmot_notification_settings_free`.
  */
-enum MarmotStatus marmot_set_local_notifications_enabled(const struct MarmotClient *client,
-                                                         const char *account_ref,
-                                                         bool enabled,
-                                                         struct MarmotNotificationSettings **out_settings);
+MarmotStatus marmot_set_local_notifications_enabled(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    bool enabled,
+                                                    struct MarmotNotificationSettings **out_settings);
 
 /**
  * Enable or disable native push (APNs/FCM) delivery for the account.
@@ -3870,10 +3881,10 @@ enum MarmotStatus marmot_set_local_notifications_enabled(const struct MarmotClie
  * `out_settings` a valid pointer. Free the result with
  * `marmot_notification_settings_free`.
  */
-enum MarmotStatus marmot_set_native_push_enabled(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 bool enabled,
-                                                 struct MarmotNotificationSettings **out_settings);
+MarmotStatus marmot_set_native_push_enabled(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            bool enabled,
+                                            struct MarmotNotificationSettings **out_settings);
 
 /**
  * Catch up all accounts on missed events (explicit foreground catch-up).
@@ -3881,7 +3892,7 @@ enum MarmotStatus marmot_set_native_push_enabled(const struct MarmotClient *clie
  * # Safety
  * `client` must be a live handle.
  */
-enum MarmotStatus marmot_catch_up_accounts(const struct MarmotClient *client);
+MarmotStatus marmot_catch_up_accounts(const struct MarmotClient *client);
 
 /**
  * Run a bounded background notification collection pass after a platform
@@ -3893,10 +3904,10 @@ enum MarmotStatus marmot_catch_up_accounts(const struct MarmotClient *client);
  * `client` must be a live handle; `out_collection` a valid pointer. Free
  * the result with `marmot_background_notification_collection_free`.
  */
-enum MarmotStatus marmot_collect_notifications_after_wake(const struct MarmotClient *client,
-                                                          uint32_t max_wait_ms,
-                                                          enum MarmotNotificationWakeSource source,
-                                                          struct MarmotBackgroundNotificationCollection **out_collection);
+MarmotStatus marmot_collect_notifications_after_wake(const struct MarmotClient *client,
+                                                     uint32_t max_wait_ms,
+                                                     enum MarmotNotificationWakeSource source,
+                                                     struct MarmotBackgroundNotificationCollection **out_collection);
 
 /**
  * The account's current local native-push registration, if any. Writes
@@ -3908,9 +3919,9 @@ enum MarmotStatus marmot_collect_notifications_after_wake(const struct MarmotCli
  * `out_registration` a valid pointer. Free a non-NULL result with
  * `marmot_push_registration_free`.
  */
-enum MarmotStatus marmot_push_registration(const struct MarmotClient *client,
-                                           const char *account_ref,
-                                           struct MarmotPushRegistration **out_registration);
+MarmotStatus marmot_push_registration(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      struct MarmotPushRegistration **out_registration);
 
 /**
  * Create or update the account's native-push registration for a device
@@ -3923,13 +3934,13 @@ enum MarmotStatus marmot_push_registration(const struct MarmotClient *client,
  * `out_registration` a valid pointer. Free the result with
  * `marmot_push_registration_free`.
  */
-enum MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
-                                                  const char *account_ref,
-                                                  enum MarmotPushPlatform platform,
-                                                  const char *raw_token,
-                                                  const char *server_pubkey_hex,
-                                                  const char *relay_hint,
-                                                  struct MarmotPushRegistration **out_registration);
+MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             enum MarmotPushPlatform platform,
+                                             const char *raw_token,
+                                             const char *server_pubkey_hex,
+                                             const char *relay_hint,
+                                             struct MarmotPushRegistration **out_registration);
 
 /**
  * Remove the account's local native-push registration.
@@ -3937,8 +3948,8 @@ enum MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *cli
  * # Safety
  * `client` must be a live handle; `account_ref` a valid string.
  */
-enum MarmotStatus marmot_clear_push_registration(const struct MarmotClient *client,
-                                                 const char *account_ref);
+MarmotStatus marmot_clear_push_registration(const struct MarmotClient *client,
+                                            const char *account_ref);
 
 /**
  * Aggregated push-token diagnostics for one group: token counts, the
@@ -3952,10 +3963,10 @@ enum MarmotStatus marmot_clear_push_registration(const struct MarmotClient *clie
  * strings; `out_info` a valid pointer. Free the result with
  * `marmot_group_push_debug_info_free`.
  */
-enum MarmotStatus marmot_group_push_debug_info(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               const char *group_id_hex,
-                                               struct MarmotGroupPushDebugInfo **out_info);
+MarmotStatus marmot_group_push_debug_info(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotGroupPushDebugInfo **out_info);
 
 /**
  * Per-account relay lists: the NIP-65 and inbox lists the account has
@@ -3966,9 +3977,9 @@ enum MarmotStatus marmot_group_push_debug_info(const struct MarmotClient *client
  * `out_lists` a valid pointer. Free the result with
  * `marmot_account_relay_lists_free`.
  */
-enum MarmotStatus marmot_account_relay_lists(const struct MarmotClient *client,
-                                             const char *account_ref,
-                                             struct MarmotAccountRelayLists **out_lists);
+MarmotStatus marmot_account_relay_lists(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        struct MarmotAccountRelayLists **out_lists);
 
 /**
  * Live relay-plane connection health (connected / connecting /
@@ -3978,8 +3989,8 @@ enum MarmotStatus marmot_account_relay_lists(const struct MarmotClient *client,
  * `client` must be a live handle; `out_health` a valid pointer. Free
  * the result with `marmot_relay_health_free`.
  */
-enum MarmotStatus marmot_relay_health(const struct MarmotClient *client,
-                                      struct MarmotRelayHealth **out_health);
+MarmotStatus marmot_relay_health(const struct MarmotClient *client,
+                                 struct MarmotRelayHealth **out_health);
 
 /**
  * Device-wide relay telemetry export settings. Export is opt-in and stays
@@ -3990,8 +4001,8 @@ enum MarmotStatus marmot_relay_health(const struct MarmotClient *client,
  * `client` must be a live handle; `out_settings` a valid pointer. Free
  * the result with `marmot_relay_telemetry_settings_free`.
  */
-enum MarmotStatus marmot_relay_telemetry_settings(const struct MarmotClient *client,
-                                                  struct MarmotRelayTelemetrySettings **out_settings);
+MarmotStatus marmot_relay_telemetry_settings(const struct MarmotClient *client,
+                                             struct MarmotRelayTelemetrySettings **out_settings);
 
 /**
  * Stable random identifier for this app install, suitable for the OTLP
@@ -4002,8 +4013,7 @@ enum MarmotStatus marmot_relay_telemetry_settings(const struct MarmotClient *cli
  * `client` must be a live handle; `out_install_id` a valid pointer. Free
  * the result with `marmot_string_free`.
  */
-enum MarmotStatus marmot_telemetry_install_id(const struct MarmotClient *client,
-                                              char **out_install_id);
+MarmotStatus marmot_telemetry_install_id(const struct MarmotClient *client, char **out_install_id);
 
 /**
  * Supply non-persisted OTLP runtime metadata: optional metrics URL
@@ -4015,8 +4025,8 @@ enum MarmotStatus marmot_telemetry_install_id(const struct MarmotClient *client,
  * caller-owned `MarmotRelayTelemetryRuntimeConfig` (never freed by the
  * library).
  */
-enum MarmotStatus marmot_set_relay_telemetry_runtime_config(const struct MarmotClient *client,
-                                                            const struct MarmotRelayTelemetryRuntimeConfig *config);
+MarmotStatus marmot_set_relay_telemetry_runtime_config(const struct MarmotClient *client,
+                                                       const struct MarmotRelayTelemetryRuntimeConfig *config);
 
 /**
  * Persist device-wide relay telemetry export settings and return the
@@ -4028,9 +4038,9 @@ enum MarmotStatus marmot_set_relay_telemetry_runtime_config(const struct MarmotC
  * library); `out_settings` a valid pointer. Free the result with
  * `marmot_relay_telemetry_settings_free`.
  */
-enum MarmotStatus marmot_set_relay_telemetry_settings(const struct MarmotClient *client,
-                                                      const struct MarmotRelayTelemetrySettings *settings,
-                                                      struct MarmotRelayTelemetrySettings **out_settings);
+MarmotStatus marmot_set_relay_telemetry_settings(const struct MarmotClient *client,
+                                                 const struct MarmotRelayTelemetrySettings *settings,
+                                                 struct MarmotRelayTelemetrySettings **out_settings);
 
 /**
  * Materialized conversation timeline for a group or account-wide tail.
@@ -4054,10 +4064,10 @@ enum MarmotStatus marmot_set_relay_telemetry_settings(const struct MarmotClient 
  * fields are valid NUL-terminated strings; `out_page` a valid pointer.
  * Free the result with `marmot_timeline_page_free`.
  */
-enum MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
-                                           const char *account_ref,
-                                           const struct MarmotTimelineMessageQuery *query,
-                                           struct MarmotTimelinePage **out_page);
+MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const struct MarmotTimelineMessageQuery *query,
+                                      struct MarmotTimelinePage **out_page);
 
 /**
  * Subscribe to the event firehose. Free with
@@ -4066,8 +4076,8 @@ enum MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
  * # Safety
  * `client` must be a live handle; `out_sub` must be a valid pointer.
  */
-enum MarmotStatus marmot_subscribe_events(const struct MarmotClient *client,
-                                          struct MarmotEventsSubscription **out_sub);
+MarmotStatus marmot_subscribe_events(const struct MarmotClient *client,
+                                     struct MarmotEventsSubscription **out_sub);
 
 /**
  * Block until the next event, the timeout, or stream close.
@@ -4079,38 +4089,46 @@ enum MarmotStatus marmot_subscribe_events(const struct MarmotClient *client,
  * `sub` must be a live handle from `marmot_subscribe_events`;
  * `out_event` must be a valid pointer.
  */
-enum MarmotStatus marmot_events_subscription_next(const struct MarmotEventsSubscription *sub,
-                                                  uint32_t timeout_ms,
-                                                  struct MarmotEvent **out_event);
+MarmotStatus marmot_events_subscription_next(const struct MarmotEventsSubscription *sub,
+                                             uint32_t timeout_ms,
+                                             struct MarmotEvent **out_event);
 
 /**
  * Install a callback pump for this subscription. `callback` runs on a
  * runtime worker thread with a borrowed event pointer (valid only during
  * the call; do not store or free it) and a final NULL event on close.
- * `user_data` must be safe to use from another thread. Fails if a
+ * `callback` and `user_data` access must be thread-safe. Fails if a
  * callback is already installed.
  *
  * # Safety
  * `sub` must be a live handle; `callback` must be a valid function
- * pointer; `user_data` must remain valid until the callback is cleared
- * or the handle freed.
+ * pointer. `user_data` must outlive every callback invocation. Note that
+ * `clear_callback` / `*_subscription_free` request cancellation without
+ * waiting (tokio `abort` is non-blocking), so a callback can still be
+ * running after they return — do not free `user_data` until your own
+ * synchronization proves no callback is in flight (see the module docs).
  */
-enum MarmotStatus marmot_events_subscription_set_callback(const struct MarmotEventsSubscription *sub,
-                                                          MarmotEventCallback callback,
-                                                          void *user_data);
+MarmotStatus marmot_events_subscription_set_callback(const struct MarmotEventsSubscription *sub,
+                                                     MarmotEventCallback callback,
+                                                     void *user_data);
 
 /**
- * Cancel this subscription's callback pump, if any. An in-flight
- * callback completes before the pump stops; no further calls follow.
+ * Request cancellation of this subscription's callback pump, if any. This
+ * does not wait: a callback already running on a worker thread keeps
+ * executing and returns after this call does (tokio `abort` is
+ * non-blocking). It is not a synchronization point for freeing
+ * `user_data` — see the module docs.
  *
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_events_subscription_clear_callback(const struct MarmotEventsSubscription *sub);
+MarmotStatus marmot_events_subscription_clear_callback(const struct MarmotEventsSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4128,12 +4146,12 @@ void marmot_events_subscription_free(struct MarmotEventsSubscription *sub);
  * `client` must be a live handle; `account_ref` a valid string;
  * `group_id_hex` NULL or a valid string; `out_sub` valid.
  */
-enum MarmotStatus marmot_subscribe_timeline_messages(const struct MarmotClient *client,
-                                                     const char *account_ref,
-                                                     const char *group_id_hex,
-                                                     bool has_limit,
-                                                     uint32_t limit,
-                                                     struct MarmotTimelineSubscription **out_sub);
+MarmotStatus marmot_subscribe_timeline_messages(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                bool has_limit,
+                                                uint32_t limit,
+                                                struct MarmotTimelineSubscription **out_sub);
 
 /**
  * Take the initial window snapshot. Yields the page exactly once: later
@@ -4143,8 +4161,8 @@ enum MarmotStatus marmot_subscribe_timeline_messages(const struct MarmotClient *
  * # Safety
  * `sub` must be a live handle; `out_page` valid.
  */
-enum MarmotStatus marmot_timeline_subscription_snapshot(const struct MarmotTimelineSubscription *sub,
-                                                        struct MarmotTimelinePage **out_page);
+MarmotStatus marmot_timeline_subscription_snapshot(const struct MarmotTimelineSubscription *sub,
+                                                   struct MarmotTimelinePage **out_page);
 
 /**
  * Block until the next live update and return the resulting full window
@@ -4155,9 +4173,9 @@ enum MarmotStatus marmot_timeline_subscription_snapshot(const struct MarmotTimel
  * # Safety
  * `sub` must be a live handle; `out_page` valid.
  */
-enum MarmotStatus marmot_timeline_subscription_next(const struct MarmotTimelineSubscription *sub,
-                                                    uint32_t timeout_ms,
-                                                    struct MarmotTimelinePage **out_page);
+MarmotStatus marmot_timeline_subscription_next(const struct MarmotTimelineSubscription *sub,
+                                               uint32_t timeout_ms,
+                                               struct MarmotTimelinePage **out_page);
 
 /**
  * Block until the next raw delta (page replacement or projection
@@ -4166,9 +4184,9 @@ enum MarmotStatus marmot_timeline_subscription_next(const struct MarmotTimelineS
  * # Safety
  * `sub` must be a live handle; `out_update` valid.
  */
-enum MarmotStatus marmot_timeline_subscription_next_update(const struct MarmotTimelineSubscription *sub,
-                                                           uint32_t timeout_ms,
-                                                           struct MarmotTimelineSubscriptionUpdate **out_update);
+MarmotStatus marmot_timeline_subscription_next_update(const struct MarmotTimelineSubscription *sub,
+                                                      uint32_t timeout_ms,
+                                                      struct MarmotTimelineSubscriptionUpdate **out_update);
 
 /**
  * Extend the window toward older history by up to `count` messages and
@@ -4179,9 +4197,9 @@ enum MarmotStatus marmot_timeline_subscription_next_update(const struct MarmotTi
  * # Safety
  * `sub` must be a live handle; `out_page` valid.
  */
-enum MarmotStatus marmot_timeline_subscription_paginate_backwards(const struct MarmotTimelineSubscription *sub,
-                                                                  uint32_t count,
-                                                                  struct MarmotTimelinePage **out_page);
+MarmotStatus marmot_timeline_subscription_paginate_backwards(const struct MarmotTimelineSubscription *sub,
+                                                             uint32_t count,
+                                                             struct MarmotTimelinePage **out_page);
 
 /**
  * Extend the window toward the live head by up to `count` messages and
@@ -4191,9 +4209,9 @@ enum MarmotStatus marmot_timeline_subscription_paginate_backwards(const struct M
  * # Safety
  * `sub` must be a live handle; `out_page` valid.
  */
-enum MarmotStatus marmot_timeline_subscription_paginate_forwards(const struct MarmotTimelineSubscription *sub,
-                                                                 uint32_t count,
-                                                                 struct MarmotTimelinePage **out_page);
+MarmotStatus marmot_timeline_subscription_paginate_forwards(const struct MarmotTimelineSubscription *sub,
+                                                            uint32_t count,
+                                                            struct MarmotTimelinePage **out_page);
 
 /**
  * Install a full-window callback pump (each call receives the borrowed
@@ -4203,9 +4221,9 @@ enum MarmotStatus marmot_timeline_subscription_paginate_forwards(const struct Ma
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_timeline_subscription_set_callback(const struct MarmotTimelineSubscription *sub,
-                                                            MarmotTimelinePageCallback callback,
-                                                            void *user_data);
+MarmotStatus marmot_timeline_subscription_set_callback(const struct MarmotTimelineSubscription *sub,
+                                                       MarmotTimelinePageCallback callback,
+                                                       void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4213,11 +4231,13 @@ enum MarmotStatus marmot_timeline_subscription_set_callback(const struct MarmotT
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_timeline_subscription_clear_callback(const struct MarmotTimelineSubscription *sub);
+MarmotStatus marmot_timeline_subscription_clear_callback(const struct MarmotTimelineSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4232,8 +4252,8 @@ void marmot_timeline_subscription_free(struct MarmotTimelineSubscription *sub);
  * # Safety
  * `client` must be a live handle; `out_sub` must be a valid pointer.
  */
-enum MarmotStatus marmot_subscribe_notifications(const struct MarmotClient *client,
-                                                 struct MarmotNotificationsSubscription **out_sub);
+MarmotStatus marmot_subscribe_notifications(const struct MarmotClient *client,
+                                            struct MarmotNotificationsSubscription **out_sub);
 
 /**
  * Block until the next notification update, the timeout, or stream
@@ -4246,9 +4266,9 @@ enum MarmotStatus marmot_subscribe_notifications(const struct MarmotClient *clie
  * `sub` must be a live handle from `marmot_subscribe_notifications`;
  * `out_update` must be a valid pointer.
  */
-enum MarmotStatus marmot_notifications_subscription_next(const struct MarmotNotificationsSubscription *sub,
-                                                         uint32_t timeout_ms,
-                                                         struct MarmotNotificationUpdate **out_update);
+MarmotStatus marmot_notifications_subscription_next(const struct MarmotNotificationsSubscription *sub,
+                                                    uint32_t timeout_ms,
+                                                    struct MarmotNotificationUpdate **out_update);
 
 /**
  * Install a callback pump for this subscription. Same rules as
@@ -4258,9 +4278,9 @@ enum MarmotStatus marmot_notifications_subscription_next(const struct MarmotNoti
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_notifications_subscription_set_callback(const struct MarmotNotificationsSubscription *sub,
-                                                                 MarmotNotificationUpdateCallback callback,
-                                                                 void *user_data);
+MarmotStatus marmot_notifications_subscription_set_callback(const struct MarmotNotificationsSubscription *sub,
+                                                            MarmotNotificationUpdateCallback callback,
+                                                            void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4268,11 +4288,13 @@ enum MarmotStatus marmot_notifications_subscription_set_callback(const struct Ma
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_notifications_subscription_clear_callback(const struct MarmotNotificationsSubscription *sub);
+MarmotStatus marmot_notifications_subscription_clear_callback(const struct MarmotNotificationsSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4289,10 +4311,10 @@ void marmot_notifications_subscription_free(struct MarmotNotificationsSubscripti
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_sub` valid.
  */
-enum MarmotStatus marmot_subscribe_chats(const struct MarmotClient *client,
-                                         const char *account_ref,
-                                         bool include_archived,
-                                         struct MarmotChatsSubscription **out_sub);
+MarmotStatus marmot_subscribe_chats(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    bool include_archived,
+                                    struct MarmotChatsSubscription **out_sub);
 
 /**
  * Take the initial chats snapshot. Yields the populated list exactly
@@ -4302,8 +4324,8 @@ enum MarmotStatus marmot_subscribe_chats(const struct MarmotClient *client,
  * # Safety
  * `sub` must be a live handle; `out_list` valid.
  */
-enum MarmotStatus marmot_chats_subscription_snapshot(const struct MarmotChatsSubscription *sub,
-                                                     struct MarmotAppGroupRecordList **out_list);
+MarmotStatus marmot_chats_subscription_snapshot(const struct MarmotChatsSubscription *sub,
+                                                struct MarmotAppGroupRecordList **out_list);
 
 /**
  * Block until the next changed group record, the timeout, or stream
@@ -4313,9 +4335,9 @@ enum MarmotStatus marmot_chats_subscription_snapshot(const struct MarmotChatsSub
  * # Safety
  * `sub` must be a live handle; `out_record` valid.
  */
-enum MarmotStatus marmot_chats_subscription_next(const struct MarmotChatsSubscription *sub,
-                                                 uint32_t timeout_ms,
-                                                 struct MarmotAppGroupRecord **out_record);
+MarmotStatus marmot_chats_subscription_next(const struct MarmotChatsSubscription *sub,
+                                            uint32_t timeout_ms,
+                                            struct MarmotAppGroupRecord **out_record);
 
 /**
  * Install a callback pump for this subscription. Same rules as
@@ -4324,9 +4346,9 @@ enum MarmotStatus marmot_chats_subscription_next(const struct MarmotChatsSubscri
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_chats_subscription_set_callback(const struct MarmotChatsSubscription *sub,
-                                                         MarmotAppGroupRecordCallback callback,
-                                                         void *user_data);
+MarmotStatus marmot_chats_subscription_set_callback(const struct MarmotChatsSubscription *sub,
+                                                    MarmotAppGroupRecordCallback callback,
+                                                    void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4334,11 +4356,13 @@ enum MarmotStatus marmot_chats_subscription_set_callback(const struct MarmotChat
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_chats_subscription_clear_callback(const struct MarmotChatsSubscription *sub);
+MarmotStatus marmot_chats_subscription_clear_callback(const struct MarmotChatsSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4354,10 +4378,10 @@ void marmot_chats_subscription_free(struct MarmotChatsSubscription *sub);
  * `client` must be a live handle; `account_ref` a valid string;
  * `out_sub` valid.
  */
-enum MarmotStatus marmot_subscribe_chat_list(const struct MarmotClient *client,
-                                             const char *account_ref,
-                                             bool include_archived,
-                                             struct MarmotChatListSubscription **out_sub);
+MarmotStatus marmot_subscribe_chat_list(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        bool include_archived,
+                                        struct MarmotChatListSubscription **out_sub);
 
 /**
  * Take the initial chat-list snapshot. Yields the populated list exactly
@@ -4367,8 +4391,8 @@ enum MarmotStatus marmot_subscribe_chat_list(const struct MarmotClient *client,
  * # Safety
  * `sub` must be a live handle; `out_list` valid.
  */
-enum MarmotStatus marmot_chat_list_subscription_snapshot(const struct MarmotChatListSubscription *sub,
-                                                         struct MarmotChatListRowList **out_list);
+MarmotStatus marmot_chat_list_subscription_snapshot(const struct MarmotChatListSubscription *sub,
+                                                    struct MarmotChatListRowList **out_list);
 
 /**
  * Block until the next upserted row, the timeout, or stream close.
@@ -4379,9 +4403,9 @@ enum MarmotStatus marmot_chat_list_subscription_snapshot(const struct MarmotChat
  * # Safety
  * `sub` must be a live handle; `out_row` valid.
  */
-enum MarmotStatus marmot_chat_list_subscription_next(const struct MarmotChatListSubscription *sub,
-                                                     uint32_t timeout_ms,
-                                                     struct MarmotChatListRow **out_row);
+MarmotStatus marmot_chat_list_subscription_next(const struct MarmotChatListSubscription *sub,
+                                                uint32_t timeout_ms,
+                                                struct MarmotChatListRow **out_row);
 
 /**
  * Block until the next raw chat-list delta (row upsert or removal). Free
@@ -4390,9 +4414,9 @@ enum MarmotStatus marmot_chat_list_subscription_next(const struct MarmotChatList
  * # Safety
  * `sub` must be a live handle; `out_update` valid.
  */
-enum MarmotStatus marmot_chat_list_subscription_next_update(const struct MarmotChatListSubscription *sub,
-                                                            uint32_t timeout_ms,
-                                                            struct MarmotChatListSubscriptionUpdate **out_update);
+MarmotStatus marmot_chat_list_subscription_next_update(const struct MarmotChatListSubscription *sub,
+                                                       uint32_t timeout_ms,
+                                                       struct MarmotChatListSubscriptionUpdate **out_update);
 
 /**
  * Install an upserted-row callback pump for this subscription. Same
@@ -4401,9 +4425,9 @@ enum MarmotStatus marmot_chat_list_subscription_next_update(const struct MarmotC
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_chat_list_subscription_set_callback(const struct MarmotChatListSubscription *sub,
-                                                             MarmotChatListRowCallback callback,
-                                                             void *user_data);
+MarmotStatus marmot_chat_list_subscription_set_callback(const struct MarmotChatListSubscription *sub,
+                                                        MarmotChatListRowCallback callback,
+                                                        void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4411,11 +4435,13 @@ enum MarmotStatus marmot_chat_list_subscription_set_callback(const struct Marmot
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_chat_list_subscription_clear_callback(const struct MarmotChatListSubscription *sub);
+MarmotStatus marmot_chat_list_subscription_clear_callback(const struct MarmotChatListSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4433,12 +4459,12 @@ void marmot_chat_list_subscription_free(struct MarmotChatListSubscription *sub);
  * `client` must be a live handle; `account_ref` a valid string;
  * `group_id_hex` NULL or a valid string; `out_sub` valid.
  */
-enum MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const char *group_id_hex,
-                                            bool has_limit,
-                                            uint32_t limit,
-                                            struct MarmotMessagesSubscription **out_sub);
+MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       bool has_limit,
+                                       uint32_t limit,
+                                       struct MarmotMessagesSubscription **out_sub);
 
 /**
  * Take the initial message-record snapshot. Yields the populated list
@@ -4449,8 +4475,8 @@ enum MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
  * # Safety
  * `sub` must be a live handle; `out_list` valid.
  */
-enum MarmotStatus marmot_messages_subscription_snapshot(const struct MarmotMessagesSubscription *sub,
-                                                        struct MarmotAppMessageRecordList **out_list);
+MarmotStatus marmot_messages_subscription_snapshot(const struct MarmotMessagesSubscription *sub,
+                                                   struct MarmotAppMessageRecordList **out_list);
 
 /**
  * Block until the next message update, the timeout, or stream close.
@@ -4460,9 +4486,9 @@ enum MarmotStatus marmot_messages_subscription_snapshot(const struct MarmotMessa
  * # Safety
  * `sub` must be a live handle; `out_update` valid.
  */
-enum MarmotStatus marmot_messages_subscription_next(const struct MarmotMessagesSubscription *sub,
-                                                    uint32_t timeout_ms,
-                                                    struct MarmotMessageUpdate **out_update);
+MarmotStatus marmot_messages_subscription_next(const struct MarmotMessagesSubscription *sub,
+                                               uint32_t timeout_ms,
+                                               struct MarmotMessageUpdate **out_update);
 
 /**
  * Install a callback pump for this subscription. Same rules as
@@ -4471,9 +4497,9 @@ enum MarmotStatus marmot_messages_subscription_next(const struct MarmotMessagesS
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_messages_subscription_set_callback(const struct MarmotMessagesSubscription *sub,
-                                                            MarmotMessageUpdateCallback callback,
-                                                            void *user_data);
+MarmotStatus marmot_messages_subscription_set_callback(const struct MarmotMessagesSubscription *sub,
+                                                       MarmotMessageUpdateCallback callback,
+                                                       void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4481,11 +4507,13 @@ enum MarmotStatus marmot_messages_subscription_set_callback(const struct MarmotM
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_messages_subscription_clear_callback(const struct MarmotMessagesSubscription *sub);
+MarmotStatus marmot_messages_subscription_clear_callback(const struct MarmotMessagesSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4501,10 +4529,10 @@ void marmot_messages_subscription_free(struct MarmotMessagesSubscription *sub);
  * `client` must be a live handle; `account_ref` and `group_id_hex` valid
  * strings; `out_sub` valid.
  */
-enum MarmotStatus marmot_subscribe_group_state(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               const char *group_id_hex,
-                                               struct MarmotGroupStateSubscription **out_sub);
+MarmotStatus marmot_subscribe_group_state(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotGroupStateSubscription **out_sub);
 
 /**
  * Take the initial group-record snapshot. Yields the record exactly
@@ -4515,8 +4543,8 @@ enum MarmotStatus marmot_subscribe_group_state(const struct MarmotClient *client
  * # Safety
  * `sub` must be a live handle; `out_record` valid.
  */
-enum MarmotStatus marmot_group_state_subscription_snapshot(const struct MarmotGroupStateSubscription *sub,
-                                                           struct MarmotAppGroupRecord **out_record);
+MarmotStatus marmot_group_state_subscription_snapshot(const struct MarmotGroupStateSubscription *sub,
+                                                      struct MarmotAppGroupRecord **out_record);
 
 /**
  * Block until the group's next full record, the timeout, or stream
@@ -4526,9 +4554,9 @@ enum MarmotStatus marmot_group_state_subscription_snapshot(const struct MarmotGr
  * # Safety
  * `sub` must be a live handle; `out_record` valid.
  */
-enum MarmotStatus marmot_group_state_subscription_next(const struct MarmotGroupStateSubscription *sub,
-                                                       uint32_t timeout_ms,
-                                                       struct MarmotAppGroupRecord **out_record);
+MarmotStatus marmot_group_state_subscription_next(const struct MarmotGroupStateSubscription *sub,
+                                                  uint32_t timeout_ms,
+                                                  struct MarmotAppGroupRecord **out_record);
 
 /**
  * Install a callback pump for this subscription. Same rules as
@@ -4537,9 +4565,9 @@ enum MarmotStatus marmot_group_state_subscription_next(const struct MarmotGroupS
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_group_state_subscription_set_callback(const struct MarmotGroupStateSubscription *sub,
-                                                               MarmotAppGroupRecordCallback callback,
-                                                               void *user_data);
+MarmotStatus marmot_group_state_subscription_set_callback(const struct MarmotGroupStateSubscription *sub,
+                                                          MarmotAppGroupRecordCallback callback,
+                                                          void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4547,11 +4575,13 @@ enum MarmotStatus marmot_group_state_subscription_set_callback(const struct Marm
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_group_state_subscription_clear_callback(const struct MarmotGroupStateSubscription *sub);
+MarmotStatus marmot_group_state_subscription_clear_callback(const struct MarmotGroupStateSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
@@ -4575,14 +4605,14 @@ void marmot_group_state_subscription_free(struct MarmotGroupStateSubscription *s
  * NULL with length 0, or a pointer to `server_cert_der_len` valid bytes;
  * `out_sub` valid.
  */
-enum MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *client,
-                                                 const char *account_ref,
-                                                 const char *group_id_hex,
-                                                 const char *stream_id_hex,
-                                                 const uint8_t *server_cert_der,
-                                                 uintptr_t server_cert_der_len,
-                                                 bool insecure_local,
-                                                 struct MarmotAgentStreamSubscription **out_sub);
+MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const char *stream_id_hex,
+                                            const uint8_t *server_cert_der,
+                                            uintptr_t server_cert_der_len,
+                                            bool insecure_local,
+                                            struct MarmotAgentStreamSubscription **out_sub);
 
 /**
  * The resolved stream id this watch is following (hex). Writes an owned
@@ -4592,8 +4622,8 @@ enum MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *clie
  * `sub` must be a live handle from `marmot_watch_agent_text_stream`;
  * `out_stream_id_hex` must be a valid pointer.
  */
-enum MarmotStatus marmot_agent_stream_subscription_stream_id_hex(const struct MarmotAgentStreamSubscription *sub,
-                                                                 char **out_stream_id_hex);
+MarmotStatus marmot_agent_stream_subscription_stream_id_hex(const struct MarmotAgentStreamSubscription *sub,
+                                                            char **out_stream_id_hex);
 
 /**
  * Block until the next agent-stream update, the timeout, or stream
@@ -4604,9 +4634,9 @@ enum MarmotStatus marmot_agent_stream_subscription_stream_id_hex(const struct Ma
  * # Safety
  * `sub` must be a live handle; `out_update` valid.
  */
-enum MarmotStatus marmot_agent_stream_subscription_next(const struct MarmotAgentStreamSubscription *sub,
-                                                        uint32_t timeout_ms,
-                                                        struct MarmotAgentStreamUpdate **out_update);
+MarmotStatus marmot_agent_stream_subscription_next(const struct MarmotAgentStreamSubscription *sub,
+                                                   uint32_t timeout_ms,
+                                                   struct MarmotAgentStreamUpdate **out_update);
 
 /**
  * Install a callback pump for this subscription. Same rules as
@@ -4615,9 +4645,9 @@ enum MarmotStatus marmot_agent_stream_subscription_next(const struct MarmotAgent
  * # Safety
  * Same as `marmot_events_subscription_set_callback`.
  */
-enum MarmotStatus marmot_agent_stream_subscription_set_callback(const struct MarmotAgentStreamSubscription *sub,
-                                                                MarmotAgentStreamUpdateCallback callback,
-                                                                void *user_data);
+MarmotStatus marmot_agent_stream_subscription_set_callback(const struct MarmotAgentStreamSubscription *sub,
+                                                           MarmotAgentStreamUpdateCallback callback,
+                                                           void *user_data);
 
 /**
  * Cancel this subscription's callback pump, if any.
@@ -4625,11 +4655,13 @@ enum MarmotStatus marmot_agent_stream_subscription_set_callback(const struct Mar
  * # Safety
  * `sub` must be a live handle.
  */
-enum MarmotStatus marmot_agent_stream_subscription_clear_callback(const struct MarmotAgentStreamSubscription *sub);
+MarmotStatus marmot_agent_stream_subscription_clear_callback(const struct MarmotAgentStreamSubscription *sub);
 
 /**
- * Free the subscription handle (cancels any callback pump). NULL is a
- * no-op. Must be freed before the client.
+ * Free the subscription handle. Requests callback-pump cancellation
+ * without waiting (see the module docs: a callback may still be running
+ * after this returns, so do not free `user_data` here on that basis).
+ * NULL is a no-op. Free every handle before the client that created it.
  *
  * # Safety
  * `sub` must be NULL or an unfreed pointer from
