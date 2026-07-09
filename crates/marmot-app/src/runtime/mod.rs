@@ -18,13 +18,15 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::agent_streams::AgentStreamWatchManager;
-use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+use crate::app_telemetry::{
+    AppPerformanceOperation, AppPerformanceTelemetry, bounded_advisory_step,
+};
 use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
 use crate::ids::normalize_group_id_hex_app;
 use crate::messages::AppMessageIntent;
 use crate::notifications;
 use crate::{
-    APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+    ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
     AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
@@ -2958,12 +2960,18 @@ impl AccountManager {
             // the app's own messaging relays, where its outbox metadata does not
             // live. Runs before the relay-list setup below so discovery never
             // clobbers, or is clobbered by, the publish-missing-relay-lists step.
-            let _ = self
-                .preflight_existing_account_directory(
+            // Advisory: bounded so a stalled indexer cannot hang import or
+            // reactivation, exactly like the external-signer login path.
+            let _ = bounded_advisory_step(
+                &self.shared.app_performance_telemetry(),
+                ACCOUNT_SETUP_ADVISORY_WAIT,
+                "import_directory_preflight",
+                self.preflight_existing_account_directory(
                     &account.account_id_hex,
                     directory_discovery_relays_for_setup(&request),
-                )
-                .await;
+                ),
+            )
+            .await;
         }
 
         let relay_lists = match self
@@ -3018,13 +3026,18 @@ impl AccountManager {
         };
 
         self.shared.lifecycle().ensure_running()?;
-        let _ = self
-            .app
-            .refresh_user_directory_for_account_id(
+        // Advisory refresh, bounded like the matching step in
+        // login_external_signer.
+        let _ = bounded_advisory_step(
+            &self.shared.app_performance_telemetry(),
+            ACCOUNT_SETUP_ADVISORY_WAIT,
+            "import_directory_refresh",
+            self.app.refresh_user_directory_for_account_id(
                 &account.account_id_hex,
                 directory_bootstrap_relays.clone(),
-            )
-            .await;
+            ),
+        )
+        .await;
         if account.signed_out {
             account = self
                 .app
@@ -3089,12 +3102,18 @@ impl AccountManager {
         // its profile from public indexers (its outbox metadata does not live on
         // the app's messaging relays). Runs before the relay-list setup so
         // discovery keeps its anti-clobber ordering.
-        let _ = self
-            .preflight_existing_account_directory(
+        // Discovery is advisory (its error path already proceeds without it),
+        // so a stalled indexer must not hold the whole login hostage.
+        let _ = bounded_advisory_step(
+            &self.shared.app_performance_telemetry(),
+            ACCOUNT_SETUP_ADVISORY_WAIT,
+            "login_directory_preflight",
+            self.preflight_existing_account_directory(
                 &account.account_id_hex,
                 directory_discovery_relays_for_setup(&request),
-            )
-            .await;
+            ),
+        )
+        .await;
 
         let relay_lists = match self
             .setup_relay_lists_for_account(&account, &request, true, false)
@@ -3127,13 +3146,17 @@ impl AccountManager {
             None
         };
 
-        let _ = self
-            .app
-            .refresh_user_directory_for_account_id(
+        // Advisory refresh, same bound as the preflight above.
+        let _ = bounded_advisory_step(
+            &self.shared.app_performance_telemetry(),
+            ACCOUNT_SETUP_ADVISORY_WAIT,
+            "login_directory_refresh",
+            self.app.refresh_user_directory_for_account_id(
                 &account.account_id_hex,
                 directory_bootstrap_relays,
-            )
-            .await;
+            ),
+        )
+        .await;
         if account.signed_out {
             account = self
                 .app
