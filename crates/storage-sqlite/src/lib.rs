@@ -10,6 +10,7 @@ mod chat_list;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
+mod message_drafts;
 mod migrations;
 mod openmls_storage;
 mod pending_welcome_delivery;
@@ -31,6 +32,10 @@ pub use connection::SqliteStorage;
 pub use connection::{
     SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteJournalMode,
     SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
+};
+pub use message_drafts::{
+    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
+    StoredMessageDraftSummary,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;

@@ -69,6 +69,7 @@ mod client;
 mod config;
 mod conversions;
 mod directory;
+mod drafts;
 mod error;
 mod external_signer;
 mod groups;
@@ -123,6 +124,9 @@ pub use config::{
 pub use directory::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
+};
+pub use drafts::{
+    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
 };
 pub use error::AppError;
 pub use groups::{
