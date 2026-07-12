@@ -473,6 +473,16 @@ systemd_quote() {
     printf '"%s"' "$value"
 }
 
+enable_or_restart_systemd_user_service() {
+    local service="$1"
+    if systemctl --user is-active --quiet "$service"; then
+        run systemctl --user enable "$service" || return 1
+        run systemctl --user restart "$service" || return 1
+    else
+        run systemctl --user enable --now "$service" || return 1
+    fi
+}
+
 install_linux_wn_agent_service() {
     local service_dir service program relay
     service_dir="$HOME/.config/systemd/user"
@@ -510,7 +520,7 @@ install_linux_wn_agent_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
+    enable_or_restart_systemd_user_service "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
     log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
 }
 
@@ -557,7 +567,7 @@ install_linux_opencode_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    run systemctl --user enable --now wn-opencode.service || return 1
+    enable_or_restart_systemd_user_service wn-opencode.service || return 1
     log "installed and started systemd user service: wn-opencode.service"
 }
 
