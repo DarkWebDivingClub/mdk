@@ -51,6 +51,33 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Build an identity from a pre-constructed external [`MlsSigner`],
+    /// skipping internal key generation. The caller is responsible for
+    /// providing a signer whose public key is the MLS signing key for this
+    /// identity. The `AccountDeviceSignerBinding` is persisted so the engine
+    /// recognises the key on subsequent opens.
+    pub fn with_external_signer<S>(
+        signer: Box<dyn cgka_traits::mls_signer::MlsSigner>,
+        ciphersuite: Ciphersuite,
+        identity_bytes: Vec<u8>,
+        storage: &S,
+        proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
+    ) -> Result<Self, String>
+    where
+        S: CgkaStorageProvider,
+    {
+        validate_credential_identity(&identity_bytes).map_err(|e| e.to_string())?;
+        let self_id = MemberId::new(identity_bytes.clone());
+        let mls_pubkey = signer.public_key().to_vec();
+        storage_err(
+            storage.put_account_device_signer(&AccountDeviceSignerBinding {
+                marmot_identity: self_id,
+                mls_signature_public_key: mls_pubkey,
+            }),
+        )?;
+        Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer)
+    }
+
     /// Load or create an identity with a basic credential whose `identity`
     /// field carries `identity_bytes` (opaque — typically a stable pubkey).
     pub fn load_or_generate<S>(

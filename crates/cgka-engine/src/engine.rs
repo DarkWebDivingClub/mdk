@@ -236,6 +236,7 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    mls_signer: Option<Box<dyn cgka_traits::mls_signer::MlsSigner>>,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
@@ -250,6 +251,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            mls_signer: None,
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
@@ -280,6 +282,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Supply an external MLS signer, bypassing internal key generation.
+    /// The signer's public key becomes the engine's MLS signing key.
+    pub fn mls_signer(mut self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) -> Self {
+        self.mls_signer = Some(signer);
         self
     }
 
@@ -325,13 +334,24 @@ impl<S: StorageProvider> EngineBuilder<S> {
             EngineError::Other("account identity proof signer is required".into())
         })?;
         let crypto = RustCrypto::default();
-        let identity = Identity::load_or_generate(
-            self.ciphersuite,
-            identity_bytes,
-            &self.storage,
-            proof_signer.as_ref(),
-        )
-        .map_err(EngineError::Other)?;
+        let identity = if let Some(signer) = self.mls_signer {
+            Identity::with_external_signer(
+                signer,
+                self.ciphersuite,
+                identity_bytes,
+                &self.storage,
+                proof_signer.as_ref(),
+            )
+            .map_err(EngineError::Other)?
+        } else {
+            Identity::load_or_generate(
+                self.ciphersuite,
+                identity_bytes,
+                &self.storage,
+                proof_signer.as_ref(),
+            )
+            .map_err(EngineError::Other)?
+        };
 
         Ok(Engine {
             storage: self.storage,
