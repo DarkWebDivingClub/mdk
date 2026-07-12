@@ -491,7 +491,7 @@ install_linux_wn_agent_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
+        log "would enable/start, or restart if already active, systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
     fi
 
@@ -532,7 +532,7 @@ install_linux_opencode_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now wn-opencode.service"
+        log "would enable/start, or restart if already active, systemd user service: wn-opencode.service"
         return 0
     fi
 

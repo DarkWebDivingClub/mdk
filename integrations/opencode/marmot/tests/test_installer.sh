@@ -36,6 +36,7 @@ run_linux_service_case() {
     local active="$2"
     local log_file="$3"
     local mock_bin="$fixture_root/mock-bin"
+    shift 3
 
     : >"$log_file"
     SYSTEMCTL_ACTIVE="$active" \
@@ -47,7 +48,7 @@ run_linux_service_case() {
     WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     WN_OPENCODE_BIN="/bin/echo" \
-        "$installer" --yes --allow-welcomer "$allow_hex" >/dev/null 2>&1
+        "$installer" --yes --allow-welcomer "$allow_hex" "$@" >/dev/null 2>&1
 }
 
 if [ "$(uname -s)" = Linux ]; then
@@ -140,6 +141,14 @@ EOF
     assert_log_contains "$upgrade_log" "--user restart wn-opencode.service"
     assert_log_excludes "$upgrade_log" "--user enable --now wn-agent-harnesses.service"
     assert_log_excludes "$upgrade_log" "--user enable --now wn-opencode.service"
+
+    no_start_opencode_log="$fixture_root/systemctl-no-start-opencode.log"
+    run_linux_service_case "$fixture_root" 1 "$no_start_opencode_log" --no-start-wn-opencode
+    assert_log_contains "$no_start_opencode_log" "--user restart wn-agent-harnesses.service"
+    assert_log_excludes "$no_start_opencode_log" "--user is-active --quiet wn-opencode.service"
+    assert_log_excludes "$no_start_opencode_log" "--user enable wn-opencode.service"
+    assert_log_excludes "$no_start_opencode_log" "--user enable --now wn-opencode.service"
+    assert_log_excludes "$no_start_opencode_log" "--user restart wn-opencode.service"
 fi
 
 installer_dry_run="$(
@@ -271,6 +280,14 @@ case "$(uname -s)" in
         case "$installer_service_dry_run" in
             *"would install systemd user unit"*"wn-opencode.service"* ) ;;
             *) echo "opencode installer service dry-run did not plan wn-opencode systemd unit" >&2; exit 1;;
+        esac
+        case "$installer_service_dry_run" in
+            *"would enable/start, or restart if already active, systemd user service: wn-agent-harnesses.service"* ) ;;
+            *) echo "opencode installer service dry-run did not describe wn-agent upgrade restart" >&2; exit 1;;
+        esac
+        case "$installer_service_dry_run" in
+            *"would enable/start, or restart if already active, systemd user service: wn-opencode.service"* ) ;;
+            *) echo "opencode installer service dry-run did not describe wn-opencode upgrade restart" >&2; exit 1;;
         esac
         ;;
 esac
