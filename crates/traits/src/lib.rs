@@ -16,6 +16,7 @@ pub mod group;
 pub mod group_context;
 pub mod ingest;
 pub mod message;
+pub mod mls_signer;
 pub mod peeler;
 pub mod storage;
 pub mod transport;
@@ -78,6 +79,7 @@ pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
+pub use mls_signer::MlsSigner;
 pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
 pub use storage::{
     CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,

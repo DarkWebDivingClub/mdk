@@ -18,9 +18,33 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
 
+/// Newtype wrapper so we can implement `MlsSigner` for `SignatureKeyPair`
+/// without violating the orphan rule (neither the trait nor the inner type
+/// is defined in this crate).
+struct SignatureKeyPairSigner(SignatureKeyPair);
+
+impl openmls_traits::signatures::Signer for SignatureKeyPairSigner {
+    fn sign(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, openmls_traits::signatures::SignerError> {
+        self.0.sign(payload)
+    }
+
+    fn signature_scheme(&self) -> openmls_traits::types::SignatureScheme {
+        self.0.signature_scheme()
+    }
+}
+
+impl cgka_traits::mls_signer::MlsSigner for SignatureKeyPairSigner {
+    fn public_key(&self) -> &[u8] {
+        self.0.public()
+    }
+}
+
 /// Bundle of everything needed to sign + identify the local client.
 pub struct Identity {
-    pub(crate) signer: SignatureKeyPair,
+    pub(crate) signer: Box<dyn cgka_traits::mls_signer::MlsSigner>,
     pub(crate) credential_with_key: CredentialWithKey,
     pub(crate) self_id: MemberId,
     pub(crate) account_identity_proof_extension: Extension,
@@ -54,24 +78,35 @@ impl Identity {
                 "identity storage: local signer record exists, but OpenMLS keypair is missing"
                     .to_string()
             })?;
-            return Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer);
+            return Self::from_signer(
+                Box::new(SignatureKeyPairSigner(signer)),
+                identity_bytes,
+                ciphersuite,
+                proof_signer,
+            );
         }
 
         let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
         signer
             .store(storage.mls_storage())
             .map_err(|e| format!("store signer: {e:?}"))?;
+        let mls_pubkey = signer.to_public_vec();
         storage_err(
             storage.put_account_device_signer(&AccountDeviceSignerBinding {
                 marmot_identity: self_id,
-                mls_signature_public_key: signer.to_public_vec(),
+                mls_signature_public_key: mls_pubkey,
             }),
         )?;
-        Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer)
+        Self::from_signer(
+            Box::new(SignatureKeyPairSigner(signer)),
+            identity_bytes,
+            ciphersuite,
+            proof_signer,
+        )
     }
 
     fn from_signer(
-        signer: SignatureKeyPair,
+        signer: Box<dyn cgka_traits::mls_signer::MlsSigner>,
         identity_bytes: Vec<u8>,
         ciphersuite: Ciphersuite,
         proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
@@ -79,12 +114,12 @@ impl Identity {
         let credential = BasicCredential::new(identity_bytes.clone());
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
-            signature_key: signer.public().into(),
+            signature_key: signer.public_key().to_vec().into(),
         };
         let account_identity_proof_extension =
             crate::account_identity_proof::account_identity_proof_extension(
                 &identity_bytes,
-                &signer.to_public_vec(),
+                signer.public_key(),
                 ciphersuite,
                 ciphersuite.signature_algorithm(),
                 proof_signer,
