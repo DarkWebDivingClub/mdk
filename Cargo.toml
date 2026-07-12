@@ -31,12 +31,12 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — tilde-pinned to avoid silent companion-crate skew.
-openmls = { version = "~0.8.1", features = ["extensions-draft-08"] }
-openmls_basic_credential = "~0.5"
-openmls_memory_storage = { version = "~0.5", features = ["extensions-draft-08"] }
-openmls_rust_crypto = "~0.5"
-openmls_traits = { version = "~0.5", features = ["extensions-draft-08"] }
+# OpenMLS family — local fork with init_keypair setter for vault-backed HPKE.
+openmls = { path = "../openmls/openmls", features = ["extensions-draft-08"] }
+openmls_basic_credential = { path = "../openmls/basic_credential" }
+openmls_memory_storage = { path = "../openmls/memory_storage", features = ["extensions-draft-08"] }
+openmls_rust_crypto = { path = "../openmls/openmls_rust_crypto" }
+openmls_traits = { path = "../openmls/traits", features = ["extensions-draft-08"] }
 tls_codec = "~0.4"
 
 # async

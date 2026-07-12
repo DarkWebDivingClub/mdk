@@ -5,11 +5,20 @@
 //! provide.
 
 use openmls_traits::signatures::{Signer, SignerError};
-use openmls_traits::types::SignatureScheme;
+use openmls_traits::types::{HpkeKeyPair, SignatureScheme};
 
 /// An MLS-compatible signer that can also expose its public key bytes.
 pub trait MlsSigner: Signer + Send + Sync {
     fn public_key(&self) -> &[u8];
+
+    /// Return the next HPKE init keypair for KeyPackage generation.
+    ///
+    /// Vault-backed signers return `Some(keypair)` with deterministically
+    /// derived keys. Returns `None` to let OpenMLS generate a random keypair
+    /// (the default).
+    fn next_hpke_init_keypair(&self) -> Option<HpkeKeyPair> {
+        None
+    }
 }
 
 /// Blanket `Signer` impl for `Box<dyn MlsSigner>` so that a

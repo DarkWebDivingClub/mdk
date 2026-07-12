@@ -96,10 +96,16 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
 
-        let bundle = MlsKeyPackage::builder()
+        let mut builder = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)
             .leaf_node_extensions(leaf_extensions)
-            .mark_as_last_resort()
+            .mark_as_last_resort();
+
+        if let Some(hpke_keypair) = self.identity.signer.next_hpke_init_keypair() {
+            builder = builder.init_keypair(hpke_keypair);
+        }
+
+        let bundle = builder
             .build(
                 self.ciphersuite,
                 &provider,
