@@ -69,6 +69,7 @@ pub struct SessionConfig {
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
+    mls_signer: Option<Box<dyn cgka_traits::mls_signer::MlsSigner>>,
 }
 
 impl SessionConfig {
@@ -89,6 +90,7 @@ impl SessionConfig {
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
+            mls_signer: None,
         }
     }
 
@@ -127,6 +129,14 @@ impl SessionConfig {
 
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
+        self
+    }
+
+    /// Supply an external MLS signer (e.g. vault-backed) that will be
+    /// forwarded to the `EngineBuilder`. When set, the engine uses this
+    /// signer instead of generating random MLS keys.
+    pub fn mls_signer(mut self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) -> Self {
+        self.mls_signer = Some(signer);
         self
     }
 }
@@ -215,6 +225,9 @@ impl AccountDeviceSession {
             .peeler(config.peeler);
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);
+        }
+        if let Some(mls_signer) = config.mls_signer {
+            builder = builder.mls_signer(mls_signer);
         }
         let mut engine = builder.build()?;
         engine.hydrate_stable_groups_from_storage()?;
@@ -477,10 +490,22 @@ impl AccountDeviceSession {
             "ingesting transport delivery"
         );
         let transport_context = audit_transport_context(delivery.source);
-        let outcome = self
+        let outcome = match self
             .engine
             .ingest_with_audit_context(delivery.message, Some(transport_context))
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    method = "ingest_delivery",
+                    error = %e,
+                    "ingest FAILED"
+                );
+                return Err(e.into());
+            }
+        };
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest_delivery",

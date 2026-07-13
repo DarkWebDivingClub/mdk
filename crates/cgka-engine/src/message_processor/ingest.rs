@@ -78,7 +78,13 @@ impl<S: StorageProvider> Engine<S> {
             Err(EngineError::Peeler(PeelerError::Malformed(_))) => Ok(IngestOutcome::Stale {
                 reason: StaleReason::PeelFailed,
             }),
-            Err(other) => Err(other),
+            Err(other) => {
+                tracing::error!(
+                    "ingest_welcome FAILED (non-peel error): {}",
+                    other
+                );
+                Err(other)
+            }
         }
     }
 

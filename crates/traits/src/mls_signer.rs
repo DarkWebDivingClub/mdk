@@ -32,3 +32,28 @@ impl Signer for Box<dyn MlsSigner> {
         (**self).signature_scheme()
     }
 }
+
+/// Clonable wrapper around a shared `MlsSigner`. Allows a single vault-backed
+/// signer to be reused across multiple `open_account` calls without consuming
+/// the original.
+pub struct SharedMlsSigner(pub std::sync::Arc<dyn MlsSigner>);
+
+impl Signer for SharedMlsSigner {
+    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, SignerError> {
+        self.0.sign(payload)
+    }
+
+    fn signature_scheme(&self) -> SignatureScheme {
+        self.0.signature_scheme()
+    }
+}
+
+impl MlsSigner for SharedMlsSigner {
+    fn public_key(&self) -> &[u8] {
+        self.0.public_key()
+    }
+
+    fn next_hpke_init_keypair(&self) -> Option<HpkeKeyPair> {
+        self.0.next_hpke_init_keypair()
+    }
+}

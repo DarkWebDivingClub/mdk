@@ -409,6 +409,7 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    mls_signer: Arc<Mutex<Option<Arc<dyn cgka_traits::mls_signer::MlsSigner>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -965,6 +966,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            mls_signer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1009,11 +1011,19 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            mls_signer: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn runtime(&self) -> MarmotAppRuntime {
         MarmotAppRuntime::new(self.clone())
+    }
+
+    /// Install a vault-backed MLS signer. The signer is shared across all
+    /// `open_account` calls for the lifetime of the app — each open clones
+    /// the `Arc` and wraps it in a `Box<dyn MlsSigner>` for the session.
+    pub fn set_mls_signer(&self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) {
+        *self.mls_signer.lock().unwrap() = Some(Arc::from(signer));
     }
 
     #[cfg(test)]
@@ -2014,6 +2024,12 @@ impl MarmotApp {
         };
         if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
             session_config = session_config.recorder(recorder);
+        }
+        if let Some(signer) = self.mls_signer.lock().unwrap().clone() {
+            tracing::debug!(target: "marmot_app", "open_account: injecting vault-backed MLS signer");
+            session_config = session_config.mls_signer(Box::new(
+                cgka_traits::mls_signer::SharedMlsSigner(signer),
+            ));
         }
         let session =
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
