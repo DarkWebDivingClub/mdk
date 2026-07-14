@@ -27,7 +27,7 @@ use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::RustCrypto;
+use cgka_engine::vault_crypto::VaultCryptoProvider;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -236,7 +236,7 @@ fn clone_key_package_for_invite(kp: &KeyPackage) -> openmls::prelude::KeyPackage
         MlsMessageBodyIn::KeyPackage(kp) => kp,
         _ => panic!("expected MLS KeyPackage message"),
     };
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     kp_in
         .validate(&crypto, ProtocolVersion::Mls10)
         .expect("validate KeyPackage")
@@ -248,7 +248,7 @@ fn welcome_from_existing_non_admin(
     group_id: &GroupId,
     invitee_key_package: &KeyPackage,
 ) -> TransportMessage {
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -302,7 +302,7 @@ fn welcome_from_fork_with_self_promoted_admin(
     invitee_key_package: &KeyPackage,
     forged_admin_policy: Vec<u8>,
 ) -> TransportMessage {
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

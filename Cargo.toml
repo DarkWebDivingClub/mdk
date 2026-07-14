@@ -31,7 +31,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — local fork with init_keypair setter for vault-backed HPKE.
+# OpenMLS family — local fork with HpkeKeyPurpose for vault-backed HPKE.
 openmls = { path = "../openmls/openmls", features = ["extensions-draft-08"] }
 openmls_basic_credential = { path = "../openmls/basic_credential" }
 openmls_memory_storage = { path = "../openmls/memory_storage", features = ["extensions-draft-08"] }
@@ -52,6 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 libc = "0.2"
 hkdf = "0.12"
+hpke-rs = { version = "0.6.0", default-features = false, features = ["hazmat"] }
+hpke-rs-crypto = "0.6.0"
+hpke-rs-rust-crypto = "0.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4.6", features = ["derive"] }
@@ -65,6 +68,7 @@ unicode-normalization = "0.1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 psl = "2"
 bech32 = "0.11"
 chacha20poly1305 = "0.10"

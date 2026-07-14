@@ -790,6 +790,10 @@ dependencies = [
  "async-trait",
  "cgka-traits",
  "hex",
+ "hkdf",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "hpke-rs-rust-crypto",
  "insta",
  "k256",
  "marmot-forensics",
@@ -810,6 +814,7 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

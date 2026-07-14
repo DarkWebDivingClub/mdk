@@ -31,7 +31,7 @@ use openmls::prelude::{
 };
 use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::RustCrypto;
+use cgka_engine::vault_crypto::VaultCryptoProvider;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -179,7 +179,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
 /// can construct raw commits of arbitrary shape against the real group state.
 fn load_group_and_signer<'a>(
     storage: &'a SqliteAccountStorage,
-    crypto: &'a RustCrypto,
+    crypto: &'a VaultCryptoProvider,
     member: &MemberId,
     group_id: &GroupId,
 ) -> (MlsGroup, SignatureKeyPair) {
@@ -208,7 +208,7 @@ fn load_group_and_signer<'a>(
 /// group can be reused.
 fn requires_admin_for_proposals(
     storage: &SqliteAccountStorage,
-    crypto: &RustCrypto,
+    crypto: &VaultCryptoProvider,
     mls_group: &mut MlsGroup,
     signer: &SignatureKeyPair,
     proposals: Vec<Proposal>,
@@ -234,7 +234,7 @@ fn requires_admin_for_proposals(
 
 fn spoofed_self_update_commit(
     storage: &SqliteAccountStorage,
-    crypto: &RustCrypto,
+    crypto: &VaultCryptoProvider,
     attacker: &MemberId,
     victim: &MemberId,
     group_id: &GroupId,
@@ -271,7 +271,7 @@ fn spoofed_self_update_commit(
 
 fn spoofed_update_proposal(
     storage: &SqliteAccountStorage,
-    crypto: &RustCrypto,
+    crypto: &VaultCryptoProvider,
     attacker: &MemberId,
     victim: &MemberId,
     group_id: &GroupId,
@@ -307,7 +307,7 @@ fn spoofed_update_proposal(
 
 fn commit_pending_proposals(
     storage: &SqliteAccountStorage,
-    crypto: &RustCrypto,
+    crypto: &VaultCryptoProvider,
     committer: &MemberId,
     group_id: &GroupId,
     proposal: &TransportMessage,
@@ -398,7 +398,7 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
     bob.join_welcome(welcome_for_bob).await.unwrap();
 
     let before_epoch = alice.epoch(&group_id).expect("alice has group");
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let spoofed = spoofed_self_update_commit(
         &bob_storage,
         &crypto,
@@ -472,7 +472,7 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
     bob.join_welcome(welcome_for_bob).await.unwrap();
     carol.join_welcome(welcome_for_carol).await.unwrap();
 
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let spoofed_proposal = spoofed_update_proposal(
         &bob_storage,
         &crypto,
@@ -555,7 +555,7 @@ async fn non_admin_commit_allowlist_accepts_only_self_update_and_self_remove() {
     };
     alice.confirm_published(pending).await.unwrap();
 
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let (mut group, signer) =
         load_group_and_signer(&alice_storage, &crypto, &alice.self_id(), &group_id);
 
@@ -660,7 +660,7 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
 
     // The staged commit on alice's group is a SelfRemove-only commit. The
     // allowlist must classify it as a shape a non-admin is permitted to make.
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

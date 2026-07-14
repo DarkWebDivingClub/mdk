@@ -13,6 +13,10 @@ openmls_basic_credential.workspace = true
 openmls_memory_storage.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
+hpke-rs.workspace = true
+hpke-rs-crypto.workspace = true
+hpke-rs-rust-crypto.workspace = true
+hkdf.workspace = true
 tls_codec = { workspace = true, features = ["derive", "std"] }
 async-trait.workspace = true
 thiserror.workspace = true
@@ -40,3 +44,4 @@ tempfile.workspace = true
 # from ergonomic seed labels (see the `pad32` helper in tests/).
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 sha2.workspace = true
+x25519-dalek.workspace = true

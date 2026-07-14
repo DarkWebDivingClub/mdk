@@ -462,7 +462,7 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_id = welcome_msg.id.clone();
 
         // 3. Peel.
-        tracing::debug!("do_join_welcome: step 3 — peeling");
+        tracing::debug!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", "step 3 — peeling");
         let peeled = self
             .peeler
             .peel_welcome(&welcome_msg)
@@ -481,7 +481,7 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         // 4. Deserialize.
-        tracing::debug!("do_join_welcome: step 4 — deserialize ({} bytes)", welcome_bytes.len());
+        tracing::debug!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", byte_count = welcome_bytes.len(), "step 4 — deserialize");
         let msg_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes.as_slice())
             .map_err(|e| EngineError::Serialize(format!("welcome deserialize: {e:?}")))?;
         let welcome = match msg_in.extract() {
@@ -518,13 +518,13 @@ impl<S: StorageProvider> Engine<S> {
         // only for the group being re-joined. We never clear a group we are
         // still an active member of.
         let join_config = join_config(self.max_past_epochs);
-        tracing::debug!("do_join_welcome: step 5 — ProcessedWelcome::new_from_welcome");
+        tracing::debug!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", "step 5 — ProcessedWelcome");
         let processed = {
             let provider =
                 EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
             openmls::group::ProcessedWelcome::new_from_welcome(&provider, &join_config, welcome)
                 .map_err(|e| {
-                    tracing::error!("do_join_welcome: ProcessedWelcome FAILED: {e:?}");
+                    tracing::error!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", "ProcessedWelcome failed");
                     EngineError::Backend(format!("process welcome: {e:?}"))
                 })?
         };
@@ -542,11 +542,11 @@ impl<S: StorageProvider> Engine<S> {
             self.clear_live_openmls_group(&group_id)?;
         }
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        tracing::debug!("do_join_welcome: step 5b — into_staged_welcome");
+        tracing::debug!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", "step 5b — into_staged_welcome");
         let staged = processed
             .into_staged_welcome(&provider, None)
             .map_err(|e| {
-                tracing::error!("do_join_welcome: into_staged_welcome FAILED: {e:?}");
+                tracing::error!(target: "cgka_engine::group_lifecycle", method = "do_join_welcome", "into_staged_welcome failed");
                 EngineError::Backend(format!("stage welcome: {e:?}"))
             })?;
         let welcome_sender = staged

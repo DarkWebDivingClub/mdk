@@ -16,6 +16,7 @@ use cgka_conformance_simulator::openmls_projection::{
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
+use cgka_engine::vault_crypto::VaultCryptoProvider;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
@@ -25,7 +26,6 @@ use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
-use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -143,6 +143,7 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
         carol.storage(),
         &group_id,
         &[proposal_msg, commit_msg.clone()],
+        &VaultCryptoProvider::new(),
     )
     .expect("probe replay succeeds");
     let proposal_ref = observations
@@ -241,6 +242,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
                 messages: vec![commit_messages[1].clone()],
             },
         ],
+        &VaultCryptoProvider::new(),
     )
     .expect("candidate paths materialize");
 
@@ -382,6 +384,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
             },
             now_ms: 2_000,
         },
+        &VaultCryptoProvider::new(),
     )
     .expect("OpenMLS canonicalization adapter succeeds");
 
@@ -498,6 +501,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
             },
             now_ms: 2_000,
         },
+        &VaultCryptoProvider::new(),
     )
     .expect("OpenMLS canonicalization adapter succeeds");
 
@@ -606,6 +610,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
             settlement_quiescence_ms: 1_000,
         },
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("stored OpenMLS canonicalization succeeds");
 
@@ -712,6 +717,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
             settlement_quiescence_ms: 1_000,
         },
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("stored OpenMLS canonicalization succeeds");
 
@@ -821,6 +827,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
             settlement_quiescence_ms: 1_000,
         },
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("stored OpenMLS canonicalization succeeds");
 
@@ -831,6 +838,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
         CanonicalizationPolicy::default()
             .convergence
             .max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("selected OpenMLS branch applies");
 
@@ -927,6 +935,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         vec![],
         policy.clone(),
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("online branch canonicalizes");
     apply_openmls_canonicalization_result(
@@ -934,6 +943,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         &group_id,
         &first_result,
         policy.convergence.max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("online branch applies and retains epoch 1");
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
@@ -951,6 +961,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         vec![],
         policy.clone(),
         3_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("late branch canonicalizes from retained anchor");
 
@@ -964,6 +975,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         &group_id,
         &late_result,
         policy.convergence.max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("selected retained-anchor branch applies");
 
@@ -1032,6 +1044,7 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         vec![],
         policy.clone(),
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("online branch canonicalizes");
     apply_openmls_canonicalization_result(
@@ -1039,6 +1052,7 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         &group_id,
         &first_result,
         policy.convergence.max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("online branch applies and retains epoch 1");
     carol
@@ -1059,6 +1073,7 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         vec![],
         policy,
         3_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("missing retained anchor is reported in result");
 
@@ -1141,6 +1156,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         vec![],
         policy.clone(),
         2_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("david branch canonicalizes");
     apply_openmls_canonicalization_result(
@@ -1148,6 +1164,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         &group_id,
         &david_result,
         policy.convergence.max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("david branch applies");
     alice.confirm(alice_pending).await;
@@ -1172,6 +1189,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         vec![],
         policy.clone(),
         3_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("eve branch canonicalizes");
     apply_openmls_canonicalization_result(
@@ -1179,6 +1197,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         &group_id,
         &eve_result,
         policy.convergence.max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect("eve branch applies and prunes epoch 1");
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 3);
@@ -1196,6 +1215,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         vec![],
         policy,
         4_000,
+        &VaultCryptoProvider::new(),
     )
     .expect("stale branch canonicalizes as a disposition-only drop");
 
@@ -1289,6 +1309,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         CanonicalizationPolicy::default()
             .convergence
             .max_rewind_commits,
+        &VaultCryptoProvider::new(),
     )
     .expect_err("conflicting same-epoch commits cannot both apply");
 
@@ -1391,7 +1412,7 @@ fn assert_message_id_state(
 }
 
 fn stored_openmls_epoch(storage: &storage_sqlite::SqliteAccountStorage, group_id: &GroupId) -> u64 {
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
         &crypto,
         storage.mls_storage(),

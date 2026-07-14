@@ -7,6 +7,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use cgka_engine::vault_crypto::HpkeVaultBackend;
+
 use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -70,6 +72,7 @@ pub struct SessionConfig {
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
     mls_signer: Option<Box<dyn cgka_traits::mls_signer::MlsSigner>>,
+    vault_backend: Option<(Arc<dyn HpkeVaultBackend>, u32, u32)>,
 }
 
 impl SessionConfig {
@@ -91,6 +94,7 @@ impl SessionConfig {
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
             mls_signer: None,
+            vault_backend: None,
         }
     }
 
@@ -137,6 +141,21 @@ impl SessionConfig {
     /// signer instead of generating random MLS keys.
     pub fn mls_signer(mut self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) -> Self {
         self.mls_signer = Some(signer);
+        self
+    }
+
+    /// Supply a vault backend for HPKE key operations.
+    ///
+    /// When set, `derive_hpke_keypair` for `InitKey` and `EncryptionKey`
+    /// purposes routes to the vault, and `hpke_open` recognizes vault-path
+    /// markers. `init_index` and `enc_index` are the starting counter values.
+    pub fn vault_backend(
+        mut self,
+        backend: Arc<dyn HpkeVaultBackend>,
+        init_index: u32,
+        enc_index: u32,
+    ) -> Self {
+        self.vault_backend = Some((backend, init_index, enc_index));
         self
     }
 }
@@ -228,6 +247,9 @@ impl AccountDeviceSession {
         }
         if let Some(mls_signer) = config.mls_signer {
             builder = builder.mls_signer(mls_signer);
+        }
+        if let Some((vault, init_idx, enc_idx)) = config.vault_backend {
+            builder = builder.vault_backend(vault, init_idx, enc_idx);
         }
         let mut engine = builder.build()?;
         engine.hydrate_stable_groups_from_storage()?;
@@ -500,8 +522,7 @@ impl AccountDeviceSession {
                 tracing::error!(
                     target: TRACE_TARGET,
                     method = "ingest_delivery",
-                    error = %e,
-                    "ingest FAILED"
+                    "ingest failed"
                 );
                 return Err(e.into());
             }

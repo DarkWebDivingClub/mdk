@@ -80,8 +80,9 @@ impl<S: StorageProvider> Engine<S> {
             }),
             Err(other) => {
                 tracing::error!(
-                    "ingest_welcome FAILED (non-peel error): {}",
-                    other
+                    target: "cgka_engine::ingest",
+                    method = "ingest_welcome",
+                    "non-peel error"
                 );
                 Err(other)
             }

@@ -39,7 +39,7 @@ use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::RustCrypto;
+use cgka_engine::vault_crypto::VaultCryptoProvider;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
@@ -430,7 +430,7 @@ fn malicious_app_component_commit(
     group_id: &GroupId,
     updates: Vec<AppComponentData>,
 ) -> TransportMessage {
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

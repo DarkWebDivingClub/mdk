@@ -308,7 +308,7 @@ fn raw_remove_members_commit(
     group_id: &GroupId,
     targets: &[MemberId],
 ) -> TransportMessage {
-    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let crypto = cgka_engine::vault_crypto::VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -371,7 +371,7 @@ fn raw_app_message_with_payload(
     group_id: &GroupId,
     payload: &[u8],
 ) -> TransportMessage {
-    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let crypto = cgka_engine::vault_crypto::VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -419,7 +419,7 @@ fn raw_remove_members_commit_dropping_app_data_dictionary(
     group_id: &GroupId,
     targets: &[MemberId],
 ) -> TransportMessage {
-    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let crypto = cgka_engine::vault_crypto::VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -490,7 +490,7 @@ fn raw_remove_members_commit_with_admin_policy(
     targets: &[MemberId],
     resulting_admins: &[MemberId],
 ) -> TransportMessage {
-    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let crypto = cgka_engine::vault_crypto::VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -589,7 +589,7 @@ fn raw_group_context_extensions_tamper_commit(
     group_id: &GroupId,
     tamper: GceDictionaryTamper,
 ) -> TransportMessage {
-    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let crypto = cgka_engine::vault_crypto::VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

@@ -23,7 +23,7 @@ use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
     ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
 };
-use openmls_rust_crypto::RustCrypto;
+use crate::vault_crypto::VaultCryptoProvider;
 use openmls_traits::OpenMlsProvider;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
@@ -459,12 +459,14 @@ pub fn replay_openmls_messages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     messages: &[TransportMessage],
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     replay_openmls_messages_prevalidated(
         storage,
         group_id,
         messages,
         &PrevalidatedOwnCommits::default(),
+        crypto,
     )
 }
 
@@ -473,6 +475,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
@@ -484,7 +487,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let result = process_openmls_messages_inner(storage, group_id, messages, own_commits)
+    let result = process_openmls_messages_inner(storage, group_id, messages, own_commits, crypto)
         .map(|out| out.observations);
     guard
         .commit()
@@ -496,6 +499,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     paths: &[OpenMlsCandidatePath],
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     materialize_openmls_candidate_paths_budgeted(
         storage,
@@ -503,6 +507,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
         paths,
         &PrevalidatedOwnCommits::default(),
         &mut ReplayBudget::unlimited(),
+        crypto,
     )
 }
 
@@ -512,6 +517,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
     paths: &[OpenMlsCandidatePath],
     own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     let mut candidates = Vec::with_capacity(paths.len());
     for path in paths {
@@ -522,7 +528,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
         }
         budget.consume()?;
         let observations =
-            replay_openmls_messages_prevalidated(storage, group_id, &path.messages, own_commits)?;
+            replay_openmls_messages_prevalidated(storage, group_id, &path.messages, own_commits, crypto)?;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
         let mut tip_digest: Option<[u8; 32]> = None;
@@ -588,12 +594,14 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     batch: OpenMlsCanonicalizationBatch,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     canonicalize_openmls_batch_prevalidated(
         storage,
         group_id,
         batch,
         &PrevalidatedOwnCommits::default(),
+        crypto,
     )
 }
 
@@ -602,6 +610,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     group_id: &GroupId,
     batch: OpenMlsCanonicalizationBatch,
     own_commits: &PrevalidatedOwnCommits,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let candidate_paths = candidate_paths_with_pending_replay_messages(
         &batch.candidate_paths,
@@ -613,6 +622,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
         &candidate_paths,
         own_commits,
         &mut ReplayBudget::unlimited(),
+        crypto,
     )?;
     canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)
 }
@@ -665,6 +675,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     outbound_intents: Vec<OutboundIntent>,
     policy: CanonicalizationPolicy,
     now_ms: u64,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let current_epoch = storage
         .get_group(group_id)
@@ -777,6 +788,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                 replay_start_epoch,
                 own_commits,
             },
+            crypto,
         )?;
         append_dropped_messages(&mut result, stale_commit_drops);
         return Ok(result);
@@ -796,6 +808,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             replay_start_epoch,
             own_commits,
         },
+        crypto,
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
     Ok(result)
@@ -822,6 +835,7 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     storage: &S,
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let live_snapshot = retained_anchor_probe_snapshot_name(group_id, work.replay_start_epoch);
     storage
@@ -830,7 +844,7 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
     let result = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
-        Ok(()) => canonicalize_stored_openmls_messages_from_current(storage, group_id, work),
+        Ok(()) => canonicalize_stored_openmls_messages_from_current(storage, group_id, work, crypto),
         Err(StorageError::SnapshotMissing(_)) => Ok(missing_retained_anchor_result(
             work.state,
             work.outbound_intents,
@@ -881,6 +895,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let path_result = build_stored_openmls_candidate_paths(
         storage,
@@ -890,6 +905,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         work.replay_start_epoch,
         work.policy.convergence.max_rewind_commits,
         &work.own_commits,
+        crypto,
     )?;
 
     let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
@@ -913,7 +929,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         materialized.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
         canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)?
     } else {
-        canonicalize_openmls_batch_prevalidated(storage, group_id, batch, &work.own_commits)?
+        canonicalize_openmls_batch_prevalidated(storage, group_id, batch, &work.own_commits, crypto)?
     };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     Ok(result)
@@ -976,6 +992,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     starting_epoch: u64,
     max_rewind_commits: u64,
     own_commits: &PrevalidatedOwnCommits,
+    crypto: &VaultCryptoProvider,
 ) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
@@ -1022,6 +1039,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     &pending_proposals,
                     own_commits,
                     &mut budget,
+                    crypto,
                 )? {
                     CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
                     CandidatePathProbeResult::Materialized(None) => continue,
@@ -1118,6 +1136,7 @@ fn probe_candidate_path<S: StorageProvider>(
     pending_proposals: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
+    crypto: &VaultCryptoProvider,
 ) -> Result<CandidatePathProbeResult, OpenMlsProjectionError> {
     let path = OpenMlsCandidatePath {
         branch_id: branch_id_for_path_digests(digests),
@@ -1130,6 +1149,7 @@ fn probe_candidate_path<S: StorageProvider>(
         &replay_paths,
         own_commits,
         budget,
+        crypto,
     ) {
         Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
@@ -1149,6 +1169,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     let current_epoch = storage
         .get_group(group_id)
@@ -1206,7 +1227,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     }
 
     let apply_result =
-        apply_openmls_canonicalization_result_inner(storage, group_id, result, &replay_messages);
+        apply_openmls_canonicalization_result_inner(storage, group_id, result, &replay_messages, crypto);
 
     match apply_result {
         Ok(observations) => {
@@ -1395,6 +1416,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
+    crypto: &VaultCryptoProvider,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     // #157/#424: the convergence-apply multi-write durable sequence
     // (merge_staged_commit's 7+ provider writes, the Marmot group-record
@@ -1418,8 +1440,9 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
             group_id,
             replay_messages,
             &PrevalidatedOwnCommits::default(),
+            crypto,
         )?;
-        update_group_record_from_replay(storage, group_id, &output)?;
+        update_group_record_from_replay(storage, group_id, &output, crypto)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
         Ok(output.observations)
     })
@@ -1476,6 +1499,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     output: &OpenMlsReplayOutput,
+    crypto: &VaultCryptoProvider,
 ) -> Result<(), OpenMlsProjectionError> {
     let mut group = match storage.get_group(group_id) {
         Ok(group) => group,
@@ -1490,8 +1514,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
     // app-component state. Mirror those into the Marmot record so
     // `feature_status` / `members()` / display name / admin checks all see
     // the post-canonical truth.
-    let crypto = RustCrypto::default();
-    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     if let Some(mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
         .map_err(|e| OpenMlsProjectionError::Replay(format!("load post-replay group: {e:?}")))?
@@ -1784,9 +1807,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
+    crypto: &VaultCryptoProvider,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
-    let crypto = RustCrypto::default();
-    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
         .map_err(|e| OpenMlsProjectionError::Replay(format!("load: {e:?}")))?

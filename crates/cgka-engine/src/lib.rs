@@ -62,6 +62,7 @@ pub mod publish;
 pub mod snapshot_guard;
 pub mod update_group_data;
 pub mod upgrade;
+pub mod vault_crypto;
 pub mod wire_format;
 
 pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};

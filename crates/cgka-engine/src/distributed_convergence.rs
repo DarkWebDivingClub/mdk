@@ -332,6 +332,7 @@ impl<S: StorageProvider> Engine<S> {
             vec![],
             policy,
             now_ms,
+            &self.crypto,
         )?;
         let error_kinds: Vec<String> = result
             .errors
@@ -434,6 +435,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             &result,
             max_retained_anchor_rewind,
+            &self.crypto,
         )?;
         // #740 rotation: a routing-component update commit applied through
         // convergence may have changed this group's nostr_group_id; additively

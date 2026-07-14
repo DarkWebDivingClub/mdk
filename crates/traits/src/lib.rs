@@ -14,6 +14,7 @@ pub mod engine_state;
 pub mod error;
 pub mod group;
 pub mod group_context;
+pub mod hpke_vault;
 pub mod ingest;
 pub mod message;
 pub mod mls_signer;
@@ -77,6 +78,7 @@ pub use engine_state::{
 pub use error::{EngineError, PeelerError};
 pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
+pub use hpke_vault::HpkeVaultBackend;
 pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
 pub use mls_signer::MlsSigner;

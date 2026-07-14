@@ -30,7 +30,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::RustCrypto;
+use cgka_engine::vault_crypto::VaultCryptoProvider;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
@@ -166,7 +166,7 @@ fn raw_self_update_commit(
     sender: &MemberId,
     group_id: &cgka_traits::types::GroupId,
 ) -> TransportMessage {
-    let crypto = RustCrypto::default();
+    let crypto = VaultCryptoProvider::new();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

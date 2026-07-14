@@ -1,8 +1,8 @@
 //! [`Engine<S>`] is the OpenMLS-backed [`CgkaEngine`] implementation.
 //!
-//! Generic over `S: cgka_traits::StorageProvider`. Holds OpenMLS RustCrypto
-//! for the crypto + rand half of OpenMLS's provider surface, materializing an
-//! `EngineOpenMlsProvider` on demand per MLS call.
+//! Generic over `S: cgka_traits::StorageProvider`. Holds a `VaultCryptoProvider`
+//! (wrapping RustCrypto) for the crypto + rand half of OpenMLS's provider
+//! surface, materializing an `EngineOpenMlsProvider` on demand per MLS call.
 //!
 //! This file owns construction, trait dispatch, event drains, and small
 //! read-only helpers. Group creation, ingest/send, publish lifecycle,
@@ -36,8 +36,8 @@ use marmot_forensics::{
 use openmls::prelude::{
     MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolMessage,
 };
-use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
+use crate::vault_crypto::VaultCryptoProvider;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -88,7 +88,7 @@ pub(crate) struct ScheduledSelfRemoveAutoCommit {
 
 pub struct Engine<S: StorageProvider> {
     pub(crate) storage: S,
-    pub(crate) crypto: RustCrypto,
+    pub(crate) crypto: VaultCryptoProvider,
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
@@ -237,6 +237,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     mls_signer: Option<Box<dyn cgka_traits::mls_signer::MlsSigner>>,
+    vault_backend: Option<(Arc<dyn crate::vault_crypto::HpkeVaultBackend>, u32, u32)>,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
@@ -252,6 +253,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
             mls_signer: None,
+            vault_backend: None,
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
@@ -289,6 +291,21 @@ impl<S: StorageProvider> EngineBuilder<S> {
     /// The signer's public key becomes the engine's MLS signing key.
     pub fn mls_signer(mut self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) -> Self {
         self.mls_signer = Some(signer);
+        self
+    }
+
+    /// Supply a vault backend for HPKE key operations.
+    ///
+    /// When set, `derive_hpke_keypair` for `InitKey` and `EncryptionKey`
+    /// purposes routes to the vault, and `hpke_open` recognizes vault-path
+    /// markers. `init_index` and `enc_index` are the starting counter values.
+    pub fn vault_backend(
+        mut self,
+        backend: Arc<dyn crate::vault_crypto::HpkeVaultBackend>,
+        init_index: u32,
+        enc_index: u32,
+    ) -> Self {
+        self.vault_backend = Some((backend, init_index, enc_index));
         self
     }
 
@@ -333,7 +350,11 @@ impl<S: StorageProvider> EngineBuilder<S> {
         let proof_signer = self.account_identity_proof_signer.ok_or_else(|| {
             EngineError::Other("account identity proof signer is required".into())
         })?;
-        let crypto = RustCrypto::default();
+        let crypto = if let Some((vault, init_idx, enc_idx)) = self.vault_backend {
+            VaultCryptoProvider::with_vault(vault, init_idx, enc_idx)
+        } else {
+            VaultCryptoProvider::new()
+        };
         let identity = if let Some(signer) = self.mls_signer {
             Identity::with_external_signer(
                 signer,

@@ -410,6 +410,7 @@ pub struct MarmotApp {
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     mls_signer: Arc<Mutex<Option<Arc<dyn cgka_traits::mls_signer::MlsSigner>>>>,
+    vault_backend: Arc<Mutex<Option<Arc<dyn cgka_traits::HpkeVaultBackend>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -967,6 +968,7 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             mls_signer: Arc::new(Mutex::new(None)),
+            vault_backend: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1012,6 +1014,7 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             mls_signer: Arc::new(Mutex::new(None)),
+            vault_backend: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1024,6 +1027,13 @@ impl MarmotApp {
     /// the `Arc` and wraps it in a `Box<dyn MlsSigner>` for the session.
     pub fn set_mls_signer(&self, signer: Box<dyn cgka_traits::mls_signer::MlsSigner>) {
         *self.mls_signer.lock().unwrap() = Some(Arc::from(signer));
+    }
+
+    /// Install a vault backend for HPKE key operations. Shared across all
+    /// `open_account` calls — each open clones the `Arc` and passes it to
+    /// the session's `EngineBuilder`.
+    pub fn set_vault_backend(&self, backend: Arc<dyn cgka_traits::HpkeVaultBackend>) {
+        *self.vault_backend.lock().unwrap() = Some(backend);
     }
 
     #[cfg(test)]
@@ -2026,10 +2036,14 @@ impl MarmotApp {
             session_config = session_config.recorder(recorder);
         }
         if let Some(signer) = self.mls_signer.lock().unwrap().clone() {
-            tracing::debug!(target: "marmot_app", "open_account: injecting vault-backed MLS signer");
+            tracing::debug!(target: "marmot_app", method = "open_account", "injecting vault-backed MLS signer");
             session_config = session_config.mls_signer(Box::new(
                 cgka_traits::mls_signer::SharedMlsSigner(signer),
             ));
+        }
+        if let Some(vault) = self.vault_backend.lock().unwrap().clone() {
+            tracing::debug!(target: "marmot_app", method = "open_account", "injecting vault-backed HPKE backend");
+            session_config = session_config.vault_backend(vault, 0, 0);
         }
         let session =
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
