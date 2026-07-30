@@ -31,7 +31,6 @@
 
 use openmls::group::MlsGroupJoinConfig;
 pub use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
-use openmls::prelude::SenderRatchetConfiguration;
 
 /// Default number of past MLS epochs retained for delayed application
 /// messages. This is intentionally small because it trades away some forward
@@ -55,8 +54,5 @@ pub fn join_config(max_past_epochs: usize) -> MlsGroupJoinConfig {
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(max_past_epochs)
         .use_ratchet_tree_extension(true)
-        .sender_ratchet_configuration(
-            SenderRatchetConfiguration::default().with_own_message_decryption(true),
-        )
         .build()
 }

@@ -30,7 +30,6 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
-use openmls::prelude::SenderRatchetConfiguration;
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
 use openmls::treesync::Node;
 use openmls_traits::types::Ciphersuite;
@@ -211,9 +210,6 @@ impl<S: StorageProvider> Engine<S> {
             .max_past_epochs(self.max_past_epochs)
             .with_group_context_extensions(gc_exts)
             .use_ratchet_tree_extension(true)
-            .sender_ratchet_configuration(
-                SenderRatchetConfiguration::default().with_own_message_decryption(true),
-            )
             .build();
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
