@@ -411,6 +411,8 @@ pub struct MarmotApp {
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     mls_signer: Arc<Mutex<Option<Arc<dyn cgka_traits::mls_signer::MlsSigner>>>>,
     vault_backend: Arc<Mutex<Option<Arc<dyn cgka_traits::HpkeVaultBackend>>>>,
+    per_account_mls_signer: Arc<Mutex<HashMap<String, Arc<dyn cgka_traits::mls_signer::MlsSigner>>>>,
+    per_account_vault_backend: Arc<Mutex<HashMap<String, Arc<dyn cgka_traits::HpkeVaultBackend>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -969,6 +971,8 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             mls_signer: Arc::new(Mutex::new(None)),
             vault_backend: Arc::new(Mutex::new(None)),
+            per_account_mls_signer: Arc::new(Mutex::new(HashMap::new())),
+            per_account_vault_backend: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1015,6 +1019,8 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             mls_signer: Arc::new(Mutex::new(None)),
             vault_backend: Arc::new(Mutex::new(None)),
+            per_account_mls_signer: Arc::new(Mutex::new(HashMap::new())),
+            per_account_vault_backend: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1034,6 +1040,34 @@ impl MarmotApp {
     /// the session's `EngineBuilder`.
     pub fn set_vault_backend(&self, backend: Arc<dyn cgka_traits::HpkeVaultBackend>) {
         *self.vault_backend.lock().unwrap() = Some(backend);
+    }
+
+    /// Install a vault-backed MLS signer for a specific account.
+    /// Per-account signers take priority over the global signer in
+    /// `open_account`.
+    pub fn set_mls_signer_for_account(
+        &self,
+        account_id_hex: &str,
+        signer: Box<dyn cgka_traits::mls_signer::MlsSigner>,
+    ) {
+        self.per_account_mls_signer
+            .lock()
+            .unwrap()
+            .insert(account_id_hex.to_string(), Arc::from(signer));
+    }
+
+    /// Install a vault backend for a specific account.
+    /// Per-account backends take priority over the global backend in
+    /// `open_account`.
+    pub fn set_vault_backend_for_account(
+        &self,
+        account_id_hex: &str,
+        backend: Arc<dyn cgka_traits::HpkeVaultBackend>,
+    ) {
+        self.per_account_vault_backend
+            .lock()
+            .unwrap()
+            .insert(account_id_hex.to_string(), backend);
     }
 
     #[cfg(test)]
@@ -2035,13 +2069,29 @@ impl MarmotApp {
         if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
             session_config = session_config.recorder(recorder);
         }
-        if let Some(signer) = self.mls_signer.lock().unwrap().clone() {
+        // Per-account signer takes priority over global.
+        let account_id_hex = &account.account_id_hex;
+        let per_mls = self
+            .per_account_mls_signer
+            .lock()
+            .unwrap()
+            .get(account_id_hex)
+            .cloned();
+        let mls = per_mls.or_else(|| self.mls_signer.lock().unwrap().clone());
+        if let Some(signer) = mls {
             tracing::debug!(target: "marmot_app", method = "open_account", "injecting vault-backed MLS signer");
             session_config = session_config.mls_signer(Box::new(
                 cgka_traits::mls_signer::SharedMlsSigner(signer),
             ));
         }
-        if let Some(vault) = self.vault_backend.lock().unwrap().clone() {
+        let per_vault = self
+            .per_account_vault_backend
+            .lock()
+            .unwrap()
+            .get(account_id_hex)
+            .cloned();
+        let vault = per_vault.or_else(|| self.vault_backend.lock().unwrap().clone());
+        if let Some(vault) = vault {
             tracing::debug!(target: "marmot_app", method = "open_account", "injecting vault-backed HPKE backend");
             session_config = session_config.vault_backend(vault, 0, 0);
         }
