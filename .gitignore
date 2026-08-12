@@ -16,3 +16,6 @@ dev/data/
 
 # Project specific optional env-vars
 .env
+
+# Local Cargo path overrides for development (see .cargo/config.toml.dev)
+.cargo/config.toml

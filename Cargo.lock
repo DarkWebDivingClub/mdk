@@ -3281,6 +3281,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openmls"
 version = "0.8.1"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "log",
  "openmls_libcrux_crypto",
@@ -3298,6 +3299,7 @@ dependencies = [
 [[package]]
 name = "openmls_basic_credential"
 version = "0.5.0"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "ed25519-dalek",
  "openmls_traits",
@@ -3310,6 +3312,7 @@ dependencies = [
 [[package]]
 name = "openmls_libcrux_crypto"
 version = "0.3.1"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "hpke-rs",
  "hpke-rs-crypto",
@@ -3330,6 +3333,7 @@ dependencies = [
 [[package]]
 name = "openmls_memory_storage"
 version = "0.5.0"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "hex",
  "log",
@@ -3342,6 +3346,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.5.1"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -3365,6 +3370,7 @@ dependencies = [
 [[package]]
 name = "openmls_sqlite_storage"
 version = "0.2.0"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "log",
  "openmls_traits",
@@ -3377,6 +3383,7 @@ dependencies = [
 [[package]]
 name = "openmls_traits"
 version = "0.5.0"
+source = "git+https://github.com/DarkWebDivingClub/openmls.git?tag=v0.8.1-dwdc.4#bbeaf6ec0581f9aab240e90a8f894514ce124a27"
 dependencies = [
  "serde",
  "tls_codec",

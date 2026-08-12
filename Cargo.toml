@@ -31,12 +31,12 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — local fork with HpkeKeyPurpose for vault-backed HPKE.
-openmls = { path = "../openmls/openmls", features = ["extensions-draft-08"] }
-openmls_basic_credential = { path = "../openmls/basic_credential" }
-openmls_memory_storage = { path = "../openmls/memory_storage", features = ["extensions-draft-08"] }
-openmls_rust_crypto = { path = "../openmls/openmls_rust_crypto" }
-openmls_traits = { path = "../openmls/traits", features = ["extensions-draft-08"] }
+# OpenMLS family — DWDC fork with HpkeKeyPurpose for vault-backed HPKE.
+openmls = { git = "https://github.com/DarkWebDivingClub/openmls.git", tag = "v0.8.1-dwdc.4", features = ["extensions-draft-08"] }
+openmls_basic_credential = { git = "https://github.com/DarkWebDivingClub/openmls.git", tag = "v0.8.1-dwdc.4" }
+openmls_memory_storage = { git = "https://github.com/DarkWebDivingClub/openmls.git", tag = "v0.8.1-dwdc.4", features = ["extensions-draft-08"] }
+openmls_rust_crypto = { git = "https://github.com/DarkWebDivingClub/openmls.git", tag = "v0.8.1-dwdc.4" }
+openmls_traits = { git = "https://github.com/DarkWebDivingClub/openmls.git", tag = "v0.8.1-dwdc.4", features = ["extensions-draft-08"] }
 tls_codec = "~0.4"
 
 # async

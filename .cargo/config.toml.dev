@@ -1,0 +1,9 @@
+# Copy to .cargo/config.toml for local development with path overrides.
+# This file is a template -- .cargo/config.toml is gitignored.
+paths = [
+    "../openmls/openmls",
+    "../openmls/basic_credential",
+    "../openmls/memory_storage",
+    "../openmls/openmls_rust_crypto",
+    "../openmls/traits",
+]
